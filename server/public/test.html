@@ -1,0 +1,115 @@
+<!DOCTYPE HTML>
+<html>
+
+<head>
+	<title>WebSocket Server Control</title>
+	<style>
+		body {
+			color: white;
+			background: black;
+			font-family: monospace;
+		}
+
+		.butt {
+			background-color: #ffffff;
+			display: inline-block;
+			cursor: pointer;
+			color: #000000;
+			font-family: Arial;
+			font-size: 15px;
+			font-weight: bold;
+			padding: 6px 37px;
+			text-decoration: none;
+		}
+
+		.butt:hover {
+			background-color: #e3e3e3;
+		}
+	</style>
+</head>
+
+<body>
+	<h1>Info</h1>
+	<p id="info"></p>
+	<button onclick="send('player', {name:'bob', pos:[6, 9, 99]});">Click to Update Info</button>
+
+	<script src="js/jquery.min.js"></script>
+	<script src="js/schemapack.min.js"></script>
+	<script>
+		var things = {};
+		var formNames = new Array();
+		var sock = new WebSocket("ws://localhost:8080");
+
+		function recieve(obj) {
+			let thing = formNames[obj[0]];
+			let data = things[thing].scheme.decode(obj.slice(1));
+			console.log("RECIEVE %s", thing);
+
+			switch (thing) {
+			case "init": //{name: "string"}
+				$("#info").html($("#info").html() + `<br>server name: ${data.name}`);
+				break;
+			case "player": //{name: "string", pos: ["float32"]}
+				$("#info").html($("#info").html() + `<br>player name: ${data.name}`);
+				$("#info").html($("#info").html() + `<br>player pos: ${data.pos}`);
+				break;
+			case "goodbye": //{reason: "string"}
+				alert(data.reason);
+				break;
+			default:
+				console.log("RECIEVE UNHANDLED: %s", thing);
+				break;
+			}
+		}
+
+		function send(thingName, instance) {
+			let encoded = things[thingName].scheme.encode(instance);
+			//console.log(encoded);
+			let array = new Uint8Array(encoded.length + 1);
+			array[0] = things[thingName].ID;
+			array.set(encoded, 1);
+			//console.log(array);
+			sock.send(array);
+		}
+
+
+		var deblobber = (function () {
+			var reader = new FileReader();
+			reader.addEventListener("loadend", function (event) {
+				recieve(new Uint8Array(this.result));
+			});
+
+			return {
+				read: function (data) {
+					if (reader.readyState == reader.LOADING)
+						setTimeout(function () {
+							deblobber.read(data);
+						}, 2);
+					else
+						reader.readAsArrayBuffer(data);
+				}
+			};
+		}());
+		sock.onopen = function (event) {
+			console.log("SOCKET OPENED");
+		}
+		sock.onmessage = function (msg) {
+			if (typeof msg.data == "string") {
+				//Load "Things" from server, and generate schemes
+				let types = JSON.parse(msg.data);
+				for (let i = 0; i < types.length; i++) {
+					formNames.push(types[i][0]);
+					things[types[i][0]] = {
+						scheme: schemapack.build(types[i][1]),
+						ID: i
+					};
+				}
+				console.log(`SERVER THINGS: ${formNames.length} types of things`);
+				send("hello", {});
+			} else
+				deblobber.read(msg.data)
+		};
+	</script>
+</body>
+
+</html>

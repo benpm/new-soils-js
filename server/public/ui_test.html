@@ -1,0 +1,118 @@
+<!DOCTYPE HTML>
+<html>
+	<head>
+		<title>UI Test</title>
+		<link rel="stylesheet" type="text/css" href="style/jquery-ui.min.css">
+		<link rel="stylesheet" type="text/css" href="style/ui.css">
+		<style>
+			body {
+				margin: 0;
+				padding: 0;
+				overflow: hidden;
+			}
+		</style>
+	</head>
+	<body>
+		<script src="js/jquery.min.js"></script>
+		<script src="js/jquery-ui.min.js"></script>
+		<script src="js/ui.js"></script>
+		<script>
+			var tabs = new ui.Tabs({
+				center: true
+			});
+			var menu = new ui.Tabs({
+				x: 0, y: 0, moveable: true
+			});
+
+			var login = new ui.Panel({
+				label: "Login",
+				height: 85
+			}, tabs);
+			new ui.Input({
+				name: "username"
+			}, login);
+			new ui.Input({
+				name: "password",
+				type: "password"
+			}, login);
+			new ui.Button({
+				name: "Submit",
+				action: function(event){
+					tabs.loading = true;
+					setTimeout(function(){
+						tabs.loading = false;
+					}, 1000);
+				}
+			}, login);
+
+			var signup = new ui.Panel({
+				label: "Signup",
+				height: 85
+			}, tabs);
+			new ui.Input({
+				name: "username"
+			}, signup);
+			new ui.Input({
+				name: "password",
+				type: "password"
+			}, signup);
+			new ui.Input({
+				name: "confirm password",
+				type: "password"
+			}, signup);
+			new ui.Button({
+				name: "Submit"
+			}, signup);
+
+			var settings = new ui.Panel({
+				label: "Settings", height: 180
+			}, menu);
+			new ui.Button({
+				name: "Log Out", stacked: true
+			}, settings);
+			new ui.Button({
+				name: "Website", stacked: true
+			}, settings);
+			new ui.Slider({
+				name: "Volume", stacked: true, value: 100,
+				action: function(value, element) {
+					console.log(value);
+				}
+			}, settings);
+			new ui.Slider({
+				name: "Load Radius", 
+				display: ui.wholeNumber,
+				value: 4,
+				bounds: [2, 8],
+				stacked: true,
+				action: function(value, element) {
+					console.log(value);
+				}
+			}, settings);
+			new ui.Checkbox({
+				name: "Shaders"
+			}, settings);
+			new ui.Checkbox({
+				name: "Debug"
+			}, settings);
+			new ui.Checkbox({
+				name: "Occlusion",
+				checked: true
+			}, settings);
+			new ui.Checkbox({
+				name: "Fog",
+				checked: true
+			}, settings);
+
+			var about = new ui.Panel({
+				label: "About"
+			}, menu);
+			new ui.Text({
+				text: "New Soils is a Minecraft-esque game with a twist. Visit <a href='https://www.newsoils.us'>New Soils</a> now!"
+			}, about);
+
+			tabs.current = login;
+			menu.current = settings;
+		</script>
+	</body>
+</html>

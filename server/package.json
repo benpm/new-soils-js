@@ -1,0 +1,19 @@
+{
+  "name": "new_soils",
+  "version": "0.0.16",
+  "private": true,
+  "dependencies": {
+    "aws-sdk": "latest",
+    "ws": "latest",
+    "express": "latest",
+    "schemapack": "latest",
+    "mysql": "latest",
+    "simplex-noise": "latest",
+    "js-yaml": "latest",
+    "pako": "latest",
+    "alea": "latest"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}

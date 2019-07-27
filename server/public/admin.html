@@ -1,0 +1,93 @@
+<!DOCTYPE HTML>
+<html>
+	<head>
+		<title>New Soils Admin</title>
+		<style>
+			body {
+				background-color: black;
+				color: white;
+				font-family: "Consolas", monospace;
+			}
+			#info {
+				position: absolute;
+				top: 24px;
+				left: 4px;
+			}
+			#msg {
+				position: absolute;
+				top: 4px;
+				left: 50vw;
+				font-size: 12px;
+			}
+		</style>
+	</head>
+	<body>
+		<h1>New Soils Admin</h1>
+		<p id="info">no info</p>
+		<p id="msg"></p>
+		<script src="js/jquery.min.js"></script>
+		<script>
+			"use strict";
+			var protocol = "ws";
+			var port = "8080";
+			var url;
+			var local = true;
+			var socket;
+
+			function disconnect() {
+				socket.close();
+			}
+
+			function connect() {
+				socket = new WebSocket(url);
+				socket.onopen = function() {
+					socket.send("admin");
+				}
+				socket.onmessage = function (msg) {
+					if (msg.data[0] == "~"){
+						$("#msg").prepend(msg.data);
+						console.log(msg.data);
+					}
+					else
+						$("#info").html(msg.data);
+					
+				};
+				socket.onclose = function (msg) {
+					$("#msg").prepend("<br>**CLOSED**<br>");
+				};
+				socket.onerror = function (msg) {
+					$("#msg").prepend(msg);
+				};
+			}
+
+			$.get("?environment", function (data) {
+				local = (data == "private");
+				if (local) {
+					console.log("PRIVATE server");
+					port = 8080;
+					protocol = "ws";
+				} else {
+					console.log("PUBLIC server");
+					port = 500;
+					protocol = "wss";
+				}
+
+				url = `${protocol}://${window.location.hostname}:${port}`;
+				connect();
+			});
+			
+			window.onblur = function(){
+				console.log("LOST FOCUS");
+				if (socket && socket.readyState != WebSocket.CLOSED)
+				disconnect();
+			};
+			
+			window.onfocus = function(){
+				console.log("GAINED FOCUS");
+				if (!socket || socket.readyState != WebSocket.OPEN)
+				connect();
+			};
+
+		</script>
+	</body>
+</html>

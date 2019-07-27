@@ -1,0 +1,240 @@
+@font-face {
+	font-family: "pix";
+	src: url("../font/pixel.TTF") format("truetype");
+	font-weight: normal;
+	font-style: normal;
+}
+@keyframes spin {
+	from {transform: rotate(0deg);}
+	to {transform: rotate(360deg);}
+}
+
+/* Base */
+#ui {
+	z-index: 2;
+	width: 100vw;
+	height: 100vh;
+}
+#ui * {
+	background: rgba(0, 0, 0, 0);
+	image-rendering: optimizeSpeed, pixelated;
+	font-family: "pix", monospace;
+	font-size: 100%;
+	text-shadow: rgba(0, 0, 0, 0.2) 0px 2px 0px;
+	color: black;
+	user-select: none;
+}
+#ui p {
+	padding: 0px;
+	margin: 0px;
+	padding-left: 4px;
+	padding-top: 2px;
+}
+#ui .moveable {
+	cursor: move;
+}
+
+/* Materials */
+#ui .wooden {
+	background: url("../img/bg-wood.png");
+	background-size: 512px 512px;
+	background-repeat: repeat;
+	background-clip: padding-box;
+	border: 8px solid transparent;
+	border-image: url("../img/panel-wood.png") 4 repeat;
+	border-radius: 8px;
+}
+#ui .stone {
+	background: url("../img/bg-button-back.png");
+	background-size: 128px 128px;
+	background-repeat: repeat;
+	background-clip: padding-box;
+	border: 4px solid transparent;
+	border-image: url("../img/bg-button.png") 2 repeat;
+	border-radius: 4px;
+}
+
+/* Panels and Tabs */
+#ui .panel {
+	position: absolute;
+	overflow: hidden;
+	box-shadow: 5px 5px 10px rgba(0, 0, 0, 0.6);
+}
+#ui .tabs .panel {
+	position: relative;
+	border-top: none;
+}
+#ui .tabs {
+	position: absolute;
+	padding: 0px;
+}
+
+/* Label */
+#ui .label {
+	position: relative;
+	background: url("../img/label.png");
+	background-size: contain;
+	width: 104px;
+	height: 20px;
+	margin: auto;
+	text-align: center;
+}
+
+/* Forms / Input */
+#ui input[type=text], #ui input[type=password] {
+	color: white;
+	position: relative;
+	background: url("../img/text-slot.png");
+	background-size: contain;
+	width: calc(100% - 4px);
+	height: 28px;
+	border: none;
+	padding: 0px;
+	margin: 0px;
+	padding-left: 4px;
+	padding-top: 2px;
+	user-select: auto;
+	cursor: text;
+}
+#ui form {
+	padding-top: 8px;
+}
+
+/* Buttons */
+#ui button {
+	position: relative;
+	padding: 4px 4px 4px 4px;
+	margin: 20px 0px 20px 0px;
+	float: right;
+	text-align: center;
+	cursor: pointer;
+}
+#ui button:active {
+	border-image: url("../img/bg-button-alt.png") 2 repeat;
+	color: gray;
+}
+
+/* Checkboxes */
+#ui .checkbox {
+	margin: 20px 5px 0px 5px;
+	height: 24px;
+	background: rgba(0, 0, 0, 0.4);
+	width: calc(50% - 10px);
+	display: inline-block;
+}
+#ui .checkbox p {
+	padding: 0;
+	margin: 0;
+	transform: translateY(-8px);
+	color: rgba(255, 255, 255, 0.4);
+	text-align: center;
+	display: inline-block;
+	padding: 4px;
+}
+#ui input[type=checkbox] {
+	-webkit-appearance: none;
+	padding: 0;
+	margin: 0px 8px 0px 0px;
+	display: inline-block;
+	width: 24px;
+	height: 24px;
+	background: rgba(0, 0, 0, 0.6);
+	box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.6) inset;
+	cursor: pointer;
+}
+#ui input[type=checkbox]:checked {
+	background: url("../img/check.png");
+	background-size: 24px 24px;
+}
+
+
+/* Sliders */
+#ui .slider {
+	margin: 20px 0px 20px 0px;
+	background: rgba(0, 0, 0, 0.6);
+	box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.6) inset;
+}
+#ui .slider p {
+	padding: 0;
+	color: rgba(255, 255, 255, 0.4);
+	text-align: center;
+	background: rgba(0, 0, 0, 0.4);
+	border-top: 3px solid rgba(255, 255, 255, 0.1);
+}
+#ui .slide {
+	width: 6px;
+	height: 12px;
+	cursor: ew-resize;
+}
+
+/* Individual Tabs */
+#ui .tab-bar {
+	position: relative;
+	display: flex;
+	flex-direction: row;
+	flex-flow: row;
+	height: 30px;
+}
+#ui .tab {
+	position: relative;
+	display: inline-block;
+	box-shadow: none;
+	text-align: center;
+	border-bottom: none;
+	overflow: hidden;
+	color: rgba(255, 255, 255, 0.4);
+	transition: top 0.2s;
+}
+#ui .tab[state=unfocus] {
+	top: 4px;
+}
+#ui .tab[state=unfocus]:hover {
+	top: 0px;
+	cursor: pointer;
+}
+
+/* Icons / Indicators */
+#ui .loading {
+	width: 32px;
+	height: 32px;
+	animation: spin 2s linear infinite;
+	position: relative;
+	margin-left: calc(50% - 16px);
+	margin-top: calc(30% - 16px);
+	mix-blend-mode: multiply;
+}
+
+/* Text (w/ Paper Texture) */
+#ui .text {
+	background: url("../img/bg-paper-back.png");
+	background-size: 216px 216px;
+	background-repeat: repeat;
+	background-clip: content-box;
+	border-radius: 12px;
+	width: 100%;
+	height: calc(100% - 8px);
+	padding: 0;
+	margin-top: 8px;
+}
+#ui .text p {
+	padding: 6px 6px 6px 6px;
+}
+
+
+/* Miscellaneous Properties */
+textarea:focus, input:focus, button:focus{
+    outline: none;
+}
+input:-webkit-autofill {
+	box-shadow: 0 0 0 30px #3b2c1b inset;
+	-webkit-text-fill-color: white !important;
+}
+#ui .stacked button, #ui .stacked {
+	width: 100%;
+	padding: 0;
+	margin-bottom: 0px;
+	float: none;
+}
+#ui a:hover {
+	cursor: pointer;
+}

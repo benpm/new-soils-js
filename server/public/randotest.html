@@ -1,0 +1,89 @@
+<!DOCTYPE HTML>
+<html>
+	<head>
+		<title>UI Test</title>
+		<link rel="stylesheet" type="text/css" href="style/jquery-ui.min.css">
+		<link rel="stylesheet" type="text/css" href="style/ui.css">
+		<style>
+			body {
+				font-family: Consolas;
+			}
+			.t1 {
+				float: right;
+			}
+			.common {
+				color: black;
+				background: lightgray;
+				border: 2px lightgoldenrodyellow;
+			}
+			.uncommon {
+				color: green;
+				background: lightblue;
+				border: 2px cornflowerblue;
+			}
+			.rare {
+				color: blue;
+				background: coral;
+				border: 2px skyblue;
+			}
+			.mythical {
+				color: yellow;
+				background: darkslategray;
+				border: 2px black;
+			}
+
+			.Exceptional {
+				background: lightsteelblue;
+			}
+
+			.Masterwork {
+				background: lightgreen;
+			}
+
+			.Transcendent {
+				background: black;
+				color: white;
+			}
+		</style>
+	</head>
+	<body>
+		<h1>Rarity Tests</h1>
+		<div style="width:50%;">
+			<h2>Item Quality <span class="t1">Rarity of Item</span></h2><p id="i"></p>
+		</div>
+		
+		<p id="i2"></p>
+		<script src="js/jquery.min.js"></script>
+		<script src="js/chance.min.js"></script>
+		<script>
+			function quality() {
+				var q = Math.round(chance.normal({mean: 80, dev: 15}));
+				var qname = "";
+				if (q < 50) qname = "Terrible";
+				else if (q < 60) qname = "Poor";
+				else if (q < 70) qname = "Mediocre";
+				else if (q < 80) qname = "Average";
+				else if (q < 90) qname = "Above Average";
+				else if (q < 100) qname = "Excellent";
+				else if (q < 120) qname = "Exceptional";
+				else if (q < 140) qname = "Masterwork";
+				else qname = "Transcendent";
+				return [q, qname];
+			}
+			function rarity() {
+				return chance.weighted([
+				"<span class='t1 common'>common</span>", 
+				"<span class='t1 uncommon'>uncommon</span>", 
+				"<span class='t1 rare'>rare</span>",
+				"<span class='t1 mythical'>mythical</span>"], 
+				[1.0, 0.5, 0.1, 0.01]);
+			}
+			for (let i = 0; i < 10; i++) {
+				var q = quality();
+				$("#i").append(`
+					(${i+1}) <span class='${q[1]}'>${q.join("% : ")} ${rarity()}</span>
+					${q[0] >= 120 ? `NAME: '${chance.capitalize(chance.word())}'` : ""}<br>`);
+			}
+		</script>
+	</body>
+</html>

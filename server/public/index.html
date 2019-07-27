@@ -1,0 +1,198 @@
+<!DOCTYPE HTML>
+<html>
+
+<head>
+	<title>New Soils</title>
+	<link rel="icon" type="image/png" href="img/cubeicon.png" />
+	<style>
+		#page * {
+			cursor: default;
+			user-select: none;
+		}
+
+		body {
+			margin: 0px;
+			overflow: hidden;
+			font-family: monospace;
+			color: white;
+			background-image: url("img/menu-bg.jpg");
+			background-size: cover;
+			background-attachment: fixed;
+			background-color: black;
+		}
+		
+		#page {
+			position: fixed;
+			width: 100vw;
+			height: 100vh;
+			top: 0px;
+			left: 0px;
+		}
+		
+		canvas {
+			position: fixed;
+			width: 100%;
+			height: 100%;
+			top: 0px;
+			left: 0px;
+			z-index: -1;
+			opacity: 0;
+		}
+		
+		#page h1, #page p, #page ul {
+			position: absolute;
+			padding: 6px;
+			background: rgba(0, 0, 0, 0.3);
+		}
+		
+		h1 {
+			text-align: center;
+		}
+		
+		#lock, #command, #msg {
+			position: absolute;
+			bottom: 50%;
+			display: none;
+			text-align: center;
+			width: 100%;
+			height: 1em;
+			overflow: visible;
+			text-shadow: black 0px 1px 0px;
+		}
+		
+		#lock, #msg {
+			font-size: 2em;
+		}
+		
+		.list-header {
+			text-decoration: underline white;
+		}
+		
+		#page input[type=text] {
+			border: none;
+			background: rgba(0, 0, 0, 0.8);
+			color: white;
+			padding: 10px;
+			font-family: monospace;
+			font-size: 16px;
+			width: 40%;
+		}
+
+		form ul {
+			text-align: left;
+			position: absolute;
+			left: 25%;
+			top: calc(50% + 3em);
+			list-style-type: none;
+			background: rgba(0, 0, 0, 0.8);
+		}
+		
+		input:autofill,
+		input:autofill:hover,
+		input:autofill:focus,
+		input:autofill:active {
+			box-shadow: none;
+			background: rgba(0, 0, 0, 0.8);
+		}
+
+		.game {
+			display: none;
+		}
+
+		#debug-container {
+			display: none;
+		}
+
+		#reticle {
+			position: absolute;
+			top: calc(50% - 8px);
+			left: calc(50% - 8px);
+		}
+
+		#msg {
+			top: 16px;
+			color: rgba(255, 255, 255, 0.5);
+			font-size: 18px;
+		}
+		
+		#title {
+			width: 100%;
+			background: none;
+			font-size: 600%;
+			text-align: center;
+			text-shadow: 0px 8px 0px #39403a;
+			padding-top: 64px; 
+			font-family: "pix";
+			color: #7f8342;
+		}
+
+		#vignette {
+			position: relative;
+			width: 100vw;
+			height: 100vh;
+			top: 0;
+			left: 0;
+			z-index: 0;
+			opacity: 0.4;
+		}
+	</style>
+	<link rel="stylesheet" type="text/css" href="style/jquery-ui.min.css">
+	<link rel="stylesheet" type="text/css" href="style/ui.css">
+</head>
+
+<body>
+
+	<!-- Page -->
+	<div id="page">
+		<img src="img/vignette.png" class="game" id="vignette">
+		<img src="img/reticle.png" class="game" id="reticle">
+		<div id="msg" style="display: initial;">Loading scripts</div>
+		<div id="title">New Soils</div>
+
+		<!-- Game -->
+		<ul id="debug-container" style="top: 4px;">
+			<li class="list-header">Debug Info</li>
+			<li id="debug"></li>
+		</ul>
+		<!--<div id="lock">paused<br>click to focus</div>-->
+		<form autocomplete="off" id="command" onsubmit="return commands.execute($(this).children('input').val());">
+			<input type="text" name="command" placeholder="Enter command...">
+			<ul>
+				<strong>Commands:</strong>
+				<li>loadradius [1-8]</li>
+				<li>shaders [on / off]</li>
+				<li>occlusion [on / off]</li>
+				<li>fog [on / off]</li>
+				<li>wireframe [on / off]</li>
+				<li>tp [x] [y] [z]</li>
+				<li>tp [player]</li>
+				<li>warp [world name]</li>
+				<li>daytime [0-midday, 0.5-midnight]</li>
+				<li>webworkercount [1-6]</li>
+			</ul>
+		</form>
+	</div>
+
+	<!-- Scripts -->
+	<script src="js/buffer.min.js"></script>
+	<script src="js/jquery.min.js"></script>
+	<script src="js/jquery-ui.min.js"></script>
+	<script src="js/pako.min.js"></script>
+	<script src="js/js-yaml.min.js"></script>
+	<script src="js/ui.js"></script>
+	<script src="js/schemapack.min.js"></script>
+	<script src="js/three.min.js"></script>
+	<script src="js/PointerLockControls.js"></script>
+	<script src="js/SSAOShader.js"></script>
+	<script src="js/EdgeShader2.js"></script>
+	<script src="js/CopyShader.js"></script>
+	<script src="js/EffectComposer.js"></script>
+	<script src="js/RenderPass.js"></script>
+	<script src="js/ShaderPass.js"></script>
+	<script src="js/MaskPass.js"></script>
+	<script src="js/SkyShader.js"></script>
+	<script src="js/blocks.js"></script>
+	<script src="js/voxels.js"></script>
+</body>
+
+</html>

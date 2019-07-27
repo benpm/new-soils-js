@@ -1,0 +1,14 @@
+{
+    "compilerOptions": {
+        "checkJs": true,
+        "target": "es6"
+    },
+    "typeAcquisition": {
+        "include": [
+            "jquery", "three", "ws", "schemapack", "simplex-noise", "js-yaml", "pako", "alea"
+        ]
+    },
+    "exclude": [
+        "node_modules"
+    ]
+}

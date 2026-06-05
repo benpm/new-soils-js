@@ -5,6 +5,7 @@
 //! counterpart to `server.js`, trimmed to what the vertical slice needs (no
 //! MySQL auth, no region-file persistence, no schemapack).
 
+mod region;
 mod world;
 
 use std::sync::{

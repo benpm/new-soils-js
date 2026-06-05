@@ -11,3 +11,4 @@ glam = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+flate2 = "1"

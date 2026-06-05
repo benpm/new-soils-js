@@ -13,8 +13,14 @@ What works today:
   protocol; the client streams chunks in a load radius around the player.
 - **Greedy meshing** — ported from `mesher_worker.js`, run off-thread on Bevy's
   `AsyncComputeTaskPool`.
-- **Atlas texturing** — reuses the original `blocks.png` / `blocks.yaml`; per-face
-  tile UVs on a nearest-filtered `StandardMaterial`.
+- **Atlas texturing** — reuses the original `blocks.png` / `blocks.yaml`. A custom
+  WGSL material (`assets/shaders/atlas.wgsl`, ported from `atlas.frag`) does
+  world-space per-face tiling, ambient occlusion, and a normal brightness tint.
+- **Greedy quad merging** — AO-aware: faces only merge when block id *and* corner
+  AO match, so flat areas collapse to big quads without smearing AO.
+- **Ambient occlusion** — per-vertex, from the canonical 3-sample corner formula.
+- **Region-file persistence** — chunks are zlib-compressed into 16³ region files
+  (`data/worlds/default/regions/`) and reloaded on restart; edits are saved.
 - **First-person player** — fly/walk movement with AABB voxel collision,
   mouse-look, pointer lock.
 - **Block editing** — raycast break (left click) / place (right click), applied
@@ -60,6 +66,10 @@ cargo test --workspace                          # protocol + worldgen unit tests
 # End-to-end server check (run the server first):
 cargo run -p soils-server --example smoke       # logs in, requests chunks, asserts terrain
 
+# Persistence check (write an edit, restart the server, then verify):
+cargo run -p soils-server --example editcheck -- write
+cargo run -p soils-server --example editcheck -- verify
+
 # Headless client self-test (streams + meshes + renders + screenshots, then exits):
 SOILS_SELFTEST=1 cargo run -p soils-client      # writes /tmp/soils-selftest.png
 ```
@@ -68,14 +78,12 @@ SOILS_SELFTEST=1 cargo run -p soils-client      # writes /tmp/soils-selftest.png
 
 - Terrain uses the Rust `noise` crate, so it is equivalent in character but not
   byte-identical to the JS `alea` + `simplex-noise` output.
-- The greedy mesher currently emits per-face quads (`merge = false`) so atlas
-  tiles aren't stretched under the simple `StandardMaterial`. Quads are rendered
-  double-sided as a slice-level shortcut.
+- Region saves are append-only: rewriting a chunk appends a fresh compressed
+  block and repoints the header, leaking the old block until a future compaction
+  pass. Quads are rendered double-sided rather than fixing per-quad winding.
 
-## Planned (phase B)
+## Planned (later)
 
-- Greedy quad **merging** + a custom WGSL `AtlasMaterial` porting `atlas.frag`
-  (world-space tiling, 4-tap sampling, ambient occlusion, normal tint).
-- **Region-file persistence** (`flate2` sectors + header) replacing the in-memory
-  chunk cache.
-- Other-player rendering, sky/fog, and RLE chunk compression.
+- Other-player (actor) rendering, a sky/atmosphere shader, and distance fog.
+- RLE chunk compression and region compaction.
+- Chunk demote/unload timers to cap server memory.

@@ -1,0 +1,10 @@
+[package]
+name = "soils-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+bincode = { version = "2", features = ["serde"] }
+glam = { workspace = true }

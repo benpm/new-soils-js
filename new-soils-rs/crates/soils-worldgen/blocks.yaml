@@ -1,0 +1,38 @@
+Air:
+  faces: [0, 0, 0]
+Dirt:
+  faces: [1, 1, 1]
+Grass:
+  faces: [3, 2, 1]
+Stone:
+  faces: [4, 4, 4]
+Cobblestone:
+  faces: [5, 5, 5]
+Moss Stone:
+  faces: [6, 6, 6]
+Iron Ore:
+  faces: [7, 7, 7]
+Copper Ore:
+  faces: [8, 8, 8]
+Diamond Ore:
+  faces: [9, 9, 9]
+Coal Ore:
+  faces: [10, 10, 10]
+Ruby Ore:
+  faces: [11, 11, 11]
+Stone Bricks:
+  faces: [12, 12, 12]
+Slate:
+  faces: [13, 13, 13]
+Tough Dirt:
+  faces: [14, 14, 14]
+Rocky Dirt:
+  faces: [15, 15, 15]
+Wooden Crate:
+  faces: [17, 16, 17]
+Clay Pot:
+  faces: [18, 19, 20]
+Log:
+  faces: [23, 21, 23]
+Leaves:
+  faces: [22, 22, 22]

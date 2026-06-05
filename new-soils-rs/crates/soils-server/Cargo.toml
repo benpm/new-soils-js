@@ -1,0 +1,13 @@
+[package]
+name = "soils-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+soils-protocol = { workspace = true }
+soils-worldgen = { workspace = true }
+glam = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

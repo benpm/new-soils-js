@@ -8,7 +8,7 @@ use soils_protocol::CHUNK_SIZE;
 use soils_worldgen::{MeshData, greedy_mesh};
 
 use crate::chunk::{Blocks, NeedsRemesh, VoxelChunk};
-use crate::material::{AtlasMaterial, build_mesh};
+use crate::material::{ChunkMaterial, build_mesh};
 
 /// An in-flight meshing job for a chunk.
 #[derive(Component)]
@@ -22,8 +22,8 @@ pub fn dispatch_meshing(
     let pool = AsyncComputeTaskPool::get();
     for (entity, chunk) in &query {
         let volume = chunk.volume.clone();
-        // `merge = false`: per-face quads so atlas tiles aren't stretched.
-        let task = pool.spawn(async move { greedy_mesh(&volume, false) });
+        // AO-aware greedy merging; the custom atlas shader tiles merged quads.
+        let task = pool.spawn(async move { greedy_mesh(&volume, true) });
         commands.entity(entity).insert(MeshingTask(task)).remove::<NeedsRemesh>();
     }
 }
@@ -34,7 +34,7 @@ pub fn apply_meshing(
     mut tasks: Query<(Entity, &VoxelChunk, &mut MeshingTask)>,
     mut meshes: ResMut<Assets<Mesh>>,
     registry: Res<Blocks>,
-    material: Res<AtlasMaterial>,
+    material: Res<ChunkMaterial>,
 ) {
     for (entity, chunk, mut task) in &mut tasks {
         let Some(data) = block_on(future::poll_once(&mut task.0)) else { continue };

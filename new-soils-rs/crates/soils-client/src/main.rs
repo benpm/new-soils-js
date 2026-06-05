@@ -15,6 +15,7 @@ use soils_protocol::{ChunkVolume, ClientMsg, ServerMsg};
 use soils_worldgen::default_registry;
 
 use chunk::{Blocks, ChunkMap, NeedsRemesh, VoxelChunk, WorldTime};
+use material::AtlasMaterial;
 use net::NetClient;
 use player::{Player, Streaming};
 
@@ -31,6 +32,7 @@ fn main() {
             }),
             ..default()
         }))
+        .add_plugins(MaterialPlugin::<AtlasMaterial>::default())
         .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 1.0)))
         .insert_resource(ChunkMap::default())
         .insert_resource(WorldTime::default())

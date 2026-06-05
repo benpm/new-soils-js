@@ -4,21 +4,25 @@
 //! treats anything outside the chunk as Air, so faces on chunk borders are always
 //! emitted (matching the original's behavior).
 //!
-//! The 3-axis sweep with a signed mask is ported closely from the JS. A `merge`
-//! flag controls quad merging: with `merge = false` every exposed face becomes a
-//! 1×1 quad, which keeps atlas UVs un-stretched for the simple StandardMaterial
-//! path. Ambient occlusion from the JS version is intentionally omitted for now.
+//! The 3-axis sweep with a signed mask is ported closely from the JS. Per-vertex
+//! ambient occlusion is computed with the canonical 3-sample corner formula (the
+//! same `occlusion()` the JS used). Merging is **AO-aware**: two faces only merge
+//! when both their block id and their four corner AO levels match, so flat areas
+//! collapse into big quads without smearing AO across them.
 
 use soils_protocol::{CHUNK_SIZE, ChunkVolume};
 
-/// Geometry produced for one chunk. Positions/normals are per-vertex; `block_ids`
-/// is per-quad (one entry per two triangles), so the client can pick atlas tiles.
+/// Geometry produced for one chunk. Positions/normals/ao are per-vertex;
+/// `block_ids` is per-quad (one entry per two triangles) so the client can pick
+/// atlas tiles.
 #[derive(Debug, Default, Clone)]
 pub struct MeshData {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub indices: Vec<u32>,
     pub block_ids: Vec<u8>,
+    /// Per-vertex ambient-occlusion brightness in `[0.1, 1.0]` (1.0 = unoccluded).
+    pub ao: Vec<f32>,
 }
 
 impl MeshData {
@@ -27,15 +31,42 @@ impl MeshData {
     }
 }
 
+/// The four face-corner positions in `(u, v)` order, matching the vertex push
+/// order `[origin, +du, +du+dv, +dv]`.
+const CORNER_UV: [(i32, i32); 4] = [(0, 0), (1, 0), (1, 1), (0, 1)];
+/// Neighbor offsets used to gather the side/corner occluders for a vertex.
+const AO_OFFSETS: [(i32, i32); 4] = [(-1, 0), (-1, -1), (0, -1), (0, 0)];
+
+#[inline]
+fn occlusion(side1: bool, side2: bool, corner: bool) -> i32 {
+    if side1 && side2 {
+        0
+    } else {
+        3 - (side1 as i32 + side2 as i32 + corner as i32)
+    }
+}
+
 /// Run the greedy sweep over a chunk volume.
 pub fn greedy_mesh(vol: &ChunkVolume, merge: bool) -> MeshData {
     let dims = [CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE];
     let mut out = MeshData::default();
 
-    // Voxel lookup; callers only ever pass in-range coordinates here.
     let query = |i: i32, j: i32, k: i32| -> i32 { vol.get(i, j, k) as i32 };
+    // Bounds-checked occupancy for AO; outside the chunk counts as Air.
+    let solid = |p: [i32; 3]| -> bool {
+        p[0] >= 0
+            && p[0] < CHUNK_SIZE
+            && p[1] >= 0
+            && p[1] < CHUNK_SIZE
+            && p[2] >= 0
+            && p[2] < CHUNK_SIZE
+            && vol.get(p[0], p[1], p[2]) != 0
+    };
 
     let mut mask = vec![0i32; (dims[0] * dims[1]) as usize];
+    // Per-cell AO: comparison key (occlusion levels) + emit brightness.
+    let mut ao_key = vec![[0u8; 4]; mask.len()];
+    let mut ao_bright = vec![[1.0f32; 4]; mask.len()];
 
     for d in 0..3usize {
         let u = (d + 1) % 3;
@@ -47,6 +78,8 @@ pub fn greedy_mesh(vol: &ChunkVolume, merge: bool) -> MeshData {
         let mask_len = (dims[u] * dims[v]) as usize;
         if mask.len() < mask_len {
             mask.resize(mask_len, 0);
+            ao_key.resize(mask_len, [0u8; 4]);
+            ao_bright.resize(mask_len, [1.0f32; 4]);
         }
 
         x[d] = -1;
@@ -78,7 +111,55 @@ pub fn greedy_mesh(vol: &ChunkVolume, merge: bool) -> MeshData {
 
             x[d] += 1;
 
-            // --- Generate quads from the mask. ---
+            // --- Compute per-cell ambient occlusion for this slice's faces. ---
+            n = 0;
+            for j in 0..dims[v] {
+                for i in 0..dims[u] {
+                    let c = mask[n];
+                    if c != 0 {
+                        let positive = c > 0;
+                        let mut norm = [0i32; 3];
+                        norm[d] = if positive { 1 } else { -1 };
+                        // In-plane basis (cx, cy), mirroring the emit step.
+                        let (mut cx, mut cy) = ([0i32; 3], [0i32; 3]);
+                        if positive {
+                            cy[(d + 2) % 3] = 1;
+                            cx[(d + 1) % 3] = 1;
+                        } else {
+                            cx[(d + 2) % 3] = 1;
+                            cy[(d + 1) % 3] = 1;
+                        }
+                        let mut base = [0i32; 3];
+                        base[d] = x[d];
+                        base[u] = i;
+                        base[v] = j;
+
+                        for (w, &(a, b)) in CORNER_UV.iter().enumerate() {
+                            let vpos = [
+                                base[0] + cx[0] * a + cy[0] * b,
+                                base[1] + cx[1] * a + cy[1] * b,
+                                base[2] + cx[2] * a + cy[2] * b,
+                            ];
+                            let at = |o: (i32, i32)| -> bool {
+                                solid([
+                                    vpos[0] + norm[0] + cx[0] * o.0 + cy[0] * o.1,
+                                    vpos[1] + norm[1] + cx[1] * o.0 + cy[1] * o.1,
+                                    vpos[2] + norm[2] + cx[2] * o.0 + cy[2] * o.1,
+                                ])
+                            };
+                            let s1 = at(AO_OFFSETS[w]);
+                            let s2 = at(AO_OFFSETS[(w + 2) % 4]);
+                            let cc = at(AO_OFFSETS[(w + 1) % 4]);
+                            let level = occlusion(s1, s2, cc);
+                            ao_key[n][w] = level as u8;
+                            ao_bright[n][w] = 0.1 + level as f32 * 0.3;
+                        }
+                    }
+                    n += 1;
+                }
+            }
+
+            // --- Generate quads from the mask (AO-aware merging). ---
             n = 0;
             let mut j = 0i32;
             while j < dims[v] {
@@ -86,10 +167,14 @@ pub fn greedy_mesh(vol: &ChunkVolume, merge: bool) -> MeshData {
                 while i < dims[u] {
                     let mut c = mask[n];
                     if c != 0 {
-                        // Quad width along u.
+                        let base_key = ao_key[n];
+                        // Quad width along u: same block id and same corner AO.
                         let mut width = 1i32;
                         if merge {
-                            while i + width < dims[u] && mask[n + width as usize] == c {
+                            while i + width < dims[u]
+                                && mask[n + width as usize] == c
+                                && ao_key[n + width as usize] == base_key
+                            {
                                 width += 1;
                             }
                         }
@@ -99,7 +184,8 @@ pub fn greedy_mesh(vol: &ChunkVolume, merge: bool) -> MeshData {
                             'h: while j + height < dims[v] {
                                 let mut k = 0i32;
                                 while k < width {
-                                    if mask[n + (k + height * dims[u]) as usize] != c {
+                                    let idx = n + (k + height * dims[u]) as usize;
+                                    if mask[idx] != c || ao_key[idx] != base_key {
                                         break 'h;
                                     }
                                     k += 1;
@@ -137,10 +223,13 @@ pub fn greedy_mesh(vol: &ChunkVolume, merge: bool) -> MeshData {
                         for _ in 0..4 {
                             out.normals.push(norm);
                         }
+                        // AO is uniform across the merged region, so use the base
+                        // cell's four corner values in vertex order.
+                        let bright = ao_bright[n];
+                        out.ao.extend_from_slice(&bright);
                         out.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
                         out.block_ids.push((c & 255) as u8);
 
-                        // Zero out the consumed mask region.
                         for l in 0..height {
                             for k in 0..width {
                                 mask[n + (k + l * dims[u]) as usize] = 0;
@@ -183,10 +272,10 @@ mod tests {
         let mut vol = ChunkVolume::empty();
         vol.set(5, 5, 5, 1);
         let mesh = greedy_mesh(&vol, false);
-        // 6 faces -> 6 quads -> 24 verts, 36 indices.
         assert_eq!(mesh.block_ids.len(), 6);
         assert_eq!(mesh.positions.len(), 24);
         assert_eq!(mesh.indices.len(), 36);
+        assert_eq!(mesh.ao.len(), 24);
     }
 
     #[test]
@@ -197,8 +286,6 @@ mod tests {
 
     #[test]
     fn merge_reduces_quad_count() {
-        // A 4x1x4 slab of one block: top/bottom should merge into 1 quad each
-        // when merging is enabled, vs 16 each when not.
         let mut vol = ChunkVolume::empty();
         for x in 0..4 {
             for z in 0..4 {
@@ -208,5 +295,26 @@ mod tests {
         let merged = greedy_mesh(&vol, true);
         let unmerged = greedy_mesh(&vol, false);
         assert!(merged.block_ids.len() < unmerged.block_ids.len());
+    }
+
+    #[test]
+    fn flat_top_merges_into_one_quad() {
+        // A solid 4x1x4 slab: its +Y top has uniform AO, so it should merge
+        // into a single quad.
+        let mut vol = ChunkVolume::empty();
+        for x in 0..4 {
+            for z in 0..4 {
+                vol.set(x, 0, z, 1);
+            }
+        }
+        let merged = greedy_mesh(&vol, true);
+        // Count +Y-facing quads.
+        let top_quads = merged
+            .normals
+            .iter()
+            .step_by(4)
+            .filter(|n| n[1] > 0.5)
+            .count();
+        assert_eq!(top_quads, 1, "flat top with uniform AO should be one quad");
     }
 }

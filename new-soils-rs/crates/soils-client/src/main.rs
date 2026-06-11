@@ -2,6 +2,7 @@
 //! meshes chunks, renders them with the atlas material, and runs the
 //! first-person player + block editing.
 
+mod actor;
 mod chunk;
 mod edit;
 mod mesh;
@@ -14,6 +15,7 @@ use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use soils_protocol::{ChunkVolume, ClientMsg, ServerMsg};
 use soils_worldgen::default_registry;
 
+use actor::{Actor, ActorAssets, ActorMap, LocalPlayer};
 use chunk::{Blocks, ChunkMap, NeedsRemesh, VoxelChunk, WorldTime};
 use material::AtlasMaterial;
 use net::NetClient;
@@ -38,8 +40,19 @@ fn main() {
         .insert_resource(WorldTime::default())
         .insert_resource(Streaming::default())
         .insert_resource(Blocks(default_registry()))
+        .insert_resource(LocalPlayer::default())
+        .insert_resource(ActorMap::default())
         .insert_resource(net::connect())
-        .add_systems(Startup, (setup, material::setup_material, player::grab_cursor, login))
+        .add_systems(
+            Startup,
+            (
+                setup,
+                material::setup_material,
+                actor::setup_actor_assets,
+                player::grab_cursor,
+                login,
+            ),
+        )
         .add_systems(
             Update,
             (
@@ -51,6 +64,8 @@ fn main() {
                 player::movement,
                 player::cursor_toggle,
                 edit::edit_blocks,
+                actor::send_move,
+                actor::interpolate_actors,
                 day_night,
                 self_test,
                 screenshot_once,
@@ -68,6 +83,7 @@ fn screenshot_once(
     mut taken: Local<bool>,
     mut camera: Query<&mut Transform, With<Player>>,
     meshed: Query<(&VoxelChunk, &Transform), (With<Mesh3d>, Without<Player>)>,
+    remote_actors: Query<&Transform, (With<Actor>, Without<Player>)>,
 ) {
     if *taken || std::env::var("SOILS_SELFTEST").is_err() {
         return;
@@ -75,9 +91,17 @@ fn screenshot_once(
     if time.elapsed_secs() > 6.5 {
         *taken = true;
         if let Ok(mut t) = camera.single_mut() {
-            t.translation = Vec3::new(282.0, 330.0, 268.0);
-            t.look_at(Vec3::new(300.0, 256.0, 250.0), Vec3::Y);
-            info!("SELFTEST: camera at {:?} looking_at terrain", t.translation);
+            if let Some(actor) = remote_actors.iter().next() {
+                // Frame a remote actor so its body is visible in the shot.
+                let p = actor.translation;
+                t.translation = p + Vec3::new(4.0, 1.5, 4.0);
+                t.look_at(p, Vec3::Y);
+                info!("SELFTEST: framing actor at {:?}", p);
+            } else {
+                t.translation = Vec3::new(282.0, 330.0, 268.0);
+                t.look_at(Vec3::new(300.0, 256.0, 250.0), Vec3::Y);
+                info!("SELFTEST: camera at {:?} looking_at terrain", t.translation);
+            }
         }
         let mut sample = 0;
         for (chunk, t) in &meshed {
@@ -101,6 +125,7 @@ fn self_test(
     time: Res<Time>,
     map: Res<ChunkMap>,
     meshed: Query<&Mesh3d>,
+    remote_actors: Query<&Actor>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if std::env::var("SOILS_SELFTEST").is_err() {
@@ -109,7 +134,8 @@ fn self_test(
     if time.elapsed_secs() > 8.0 {
         let chunks = map.map.len();
         let meshes = meshed.iter().count();
-        info!("SELFTEST: {chunks} chunks loaded, {meshes} chunk meshes built");
+        let actors = remote_actors.iter().count();
+        info!("SELFTEST: {chunks} chunks loaded, {meshes} chunk meshes built, {actors} actors");
         assert!(chunks > 0, "no chunks streamed from server");
         assert!(meshes > 0, "no chunk meshes were built");
         info!("SELFTEST PASSED");
@@ -156,10 +182,15 @@ fn net_receive(
     mut chunks: Query<&mut VoxelChunk>,
     mut world_time: ResMut<WorldTime>,
     mut player: Query<&mut Transform, With<Player>>,
+    mut local: ResMut<LocalPlayer>,
+    mut actor_map: ResMut<ActorMap>,
+    actor_assets: Res<ActorAssets>,
+    mut actors: Query<&mut Actor>,
 ) {
     for msg in net.drain() {
         match msg {
-            ServerMsg::Init { spawn, daytime, .. } => {
+            ServerMsg::Init { id, spawn, daytime, .. } => {
+                local.id = id;
                 world_time.daytime = daytime;
                 if let Ok(mut transform) = player.single_mut() {
                     transform.translation = Vec3::from_array(spawn);
@@ -194,8 +225,33 @@ fn net_receive(
             ServerMsg::Time { daytime } => {
                 world_time.daytime = daytime;
             }
-            ServerMsg::ActorUpdate { .. } | ServerMsg::ActorRemove { .. } => {
-                // Other-player rendering is out of scope for the slice.
+            ServerMsg::ActorUpdate { actors: states } => {
+                for state in states {
+                    if state.id == local.id {
+                        continue; // don't render ourselves
+                    }
+                    let target = Vec3::from_array(state.pos);
+                    if let Some(&entity) = actor_map.map.get(&state.id) {
+                        if let Ok(mut actor) = actors.get_mut(entity) {
+                            actor.target = target;
+                        }
+                    } else {
+                        let entity = commands
+                            .spawn((
+                                Actor { target },
+                                Mesh3d(actor_assets.mesh.clone()),
+                                MeshMaterial3d(actor_assets.material.clone()),
+                                Transform::from_translation(target - Vec3::Y * 0.9),
+                            ))
+                            .id();
+                        actor_map.map.insert(state.id, entity);
+                    }
+                }
+            }
+            ServerMsg::ActorRemove { id } => {
+                if let Some(entity) = actor_map.map.remove(&id) {
+                    commands.entity(entity).despawn();
+                }
             }
         }
     }

@@ -8,6 +8,7 @@
 mod region;
 mod world;
 
+use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU16, Ordering},
@@ -16,7 +17,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use glam::IVec3;
-use soils_protocol::{ClientMsg, ServerMsg, decode, encode};
+use soils_protocol::{ActorState, ClientMsg, ServerMsg, decode, encode};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -27,16 +28,21 @@ const ADDR: &str = "127.0.0.1:9001";
 /// Real seconds for a full day cycle (JS used ~20 minutes; shortened so the
 /// effect is visible while testing the slice).
 const DAY_SECONDS: f32 = 120.0;
+/// How often to broadcast actor positions.
+const ACTOR_TICK: Duration = Duration::from_millis(100);
 
 type SharedWorld = Arc<Mutex<World>>;
 /// Outgoing broadcast: `(sender_id, message)`. The sender is excluded so an
 /// editor doesn't receive an echo of its own optimistic edit.
 type Broadcast = broadcast::Sender<(u16, ServerMsg)>;
+/// Connected players' latest reported state, keyed by connection id.
+type Players = Arc<Mutex<HashMap<u16, ActorState>>>;
 
 #[tokio::main]
 async fn main() {
     let world: SharedWorld = Arc::new(Mutex::new(World::new(0)));
     let (bcast, _) = broadcast::channel::<(u16, ServerMsg)>(1024);
+    let players: Players = Arc::new(Mutex::new(HashMap::new()));
     let next_id = Arc::new(AtomicU16::new(1));
 
     // Day/night clock: advance and broadcast time of day every second.
@@ -57,6 +63,23 @@ async fn main() {
         });
     }
 
+    // Actor sync: broadcast everyone's position a few times a second. Each
+    // client filters out its own id when rendering.
+    {
+        let players = players.clone();
+        let bcast = bcast.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(ACTOR_TICK);
+            loop {
+                interval.tick().await;
+                let actors: Vec<ActorState> = players.lock().unwrap().values().cloned().collect();
+                if !actors.is_empty() {
+                    let _ = bcast.send((0, ServerMsg::ActorUpdate { actors }));
+                }
+            }
+        });
+    }
+
     let listener = TcpListener::bind(ADDR).await.expect("bind");
     println!("new-soils server listening on ws://{ADDR}");
 
@@ -64,10 +87,15 @@ async fn main() {
         let id = next_id.fetch_add(1, Ordering::Relaxed);
         let world = world.clone();
         let bcast = bcast.clone();
+        let players = players.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, id, world, bcast).await {
+            let cleanup_bcast = bcast.clone();
+            if let Err(e) = handle_connection(stream, id, world, bcast, players.clone()).await {
                 eprintln!("connection {peer} ({id}) ended: {e}");
             }
+            // Clean up on disconnect and tell everyone the actor is gone.
+            players.lock().unwrap().remove(&id);
+            let _ = cleanup_bcast.send((id, ServerMsg::ActorRemove { id }));
         });
     }
 }
@@ -77,6 +105,7 @@ async fn handle_connection(
     id: u16,
     world: SharedWorld,
     bcast: Broadcast,
+    players: Players,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut ws_tx, mut ws_rx) = ws.split();
@@ -121,6 +150,10 @@ async fn handle_connection(
                     let w = world.lock().unwrap();
                     (w.spawn, w.seed, w.daytime)
                 };
+                players
+                    .lock()
+                    .unwrap()
+                    .insert(id, ActorState { id, pos: spawn, velocity: [0.0; 3] });
                 let _ = out_tx.send(ServerMsg::Init { id, spawn, seed, daytime });
             }
             ClientMsg::ReqChunks { positions } => {
@@ -147,8 +180,11 @@ async fn handle_connection(
                     let _ = bcast.send((id, ServerMsg::Edit { pos, value }));
                 }
             }
-            ClientMsg::Move { .. } => {
-                // Multi-player actor sync is out of scope for the slice.
+            ClientMsg::Move { pos, velocity } => {
+                if let Some(actor) = players.lock().unwrap().get_mut(&id) {
+                    actor.pos = pos;
+                    actor.velocity = velocity;
+                }
             }
         }
     }

@@ -25,6 +25,8 @@ What works today:
   mouse-look, pointer lock.
 - **Block editing** — raycast break (left click) / place (right click), applied
   optimistically and broadcast to other clients by the server.
+- **Multiplayer actors** — clients report their position; the server broadcasts
+  everyone's positions and each client renders the others as interpolated bodies.
 - **Day/night** — server-driven time of day swinging a directional light.
 
 ## Workspace layout
@@ -70,6 +72,9 @@ cargo run -p soils-server --example smoke       # logs in, requests chunks, asse
 cargo run -p soils-server --example editcheck -- write
 cargo run -p soils-server --example editcheck -- verify
 
+# Actor check: a headless peer the client will render as another player.
+cargo run -p soils-server --example peer
+
 # Headless client self-test (streams + meshes + renders + screenshots, then exits):
 SOILS_SELFTEST=1 cargo run -p soils-client      # writes /tmp/soils-selftest.png
 ```
@@ -84,6 +89,7 @@ SOILS_SELFTEST=1 cargo run -p soils-client      # writes /tmp/soils-selftest.png
 
 ## Planned (later)
 
-- Other-player (actor) rendering, a sky/atmosphere shader, and distance fog.
+- A sky/atmosphere shader and distance fog; nicer actor avatars (nameplates,
+  orientation, animation).
 - RLE chunk compression and region compaction.
 - Chunk demote/unload timers to cap server memory.

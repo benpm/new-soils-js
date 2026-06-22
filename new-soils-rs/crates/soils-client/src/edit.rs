@@ -3,10 +3,12 @@
 //! an `Edit` sent to the server).
 
 use bevy::prelude::*;
+use bevy::render::storage::ShaderStorageBuffer;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use soils_protocol::{CHUNK_BIT, CHUNK_CLIP, ClientMsg};
 
-use crate::chunk::{Blocks, ChunkMap, NeedsRemesh, VoxelChunk};
+use crate::chunk::{Blocks, ChunkMap, VoxelChunk};
+use crate::gpu_mesh::{self, GpuChunk};
 use crate::net::NetClient;
 use crate::player::Player;
 
@@ -15,13 +17,14 @@ const REACH: i32 = 8;
 const PLACE_BLOCK: &str = "Stone";
 
 pub fn edit_blocks(
-    mut commands: Commands,
     buttons: Res<ButtonInput<MouseButton>>,
     cursor: Query<&CursorOptions, With<PrimaryWindow>>,
     net: Res<NetClient>,
     registry: Res<Blocks>,
     map: Res<ChunkMap>,
     mut chunks: Query<&mut VoxelChunk>,
+    mut gpu_chunks: Query<&mut GpuChunk>,
+    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
     camera: Query<&Transform, With<Player>>,
 ) {
     // Ignore clicks while the cursor isn't grabbed (UI/escape state).
@@ -49,7 +52,7 @@ pub fn edit_blocks(
         (hit.prev, id)
     };
 
-    apply_edit(&mut commands, &map, &mut chunks, target, value);
+    apply_edit(&map, &mut chunks, &mut gpu_chunks, &mut buffers, target, value);
     net.send(ClientMsg::Edit { pos: [target.x, target.y, target.z], value });
 }
 
@@ -127,11 +130,13 @@ fn read_voxel(map: &ChunkMap, chunks: &Query<&mut VoxelChunk>, v: IVec3) -> u8 {
     chunk.volume.get(v.x & CHUNK_CLIP, v.y & CHUNK_CLIP, v.z & CHUNK_CLIP)
 }
 
-/// Apply an edit to a local chunk and flag it for remeshing.
+/// Apply an edit to a local chunk: update the CPU voxels, re-upload the GPU
+/// voxel buffer, and mark the chunk dirty so the compute mesher regenerates it.
 pub fn apply_edit(
-    commands: &mut Commands,
     map: &ChunkMap,
     chunks: &mut Query<&mut VoxelChunk>,
+    gpu_chunks: &mut Query<&mut GpuChunk>,
+    buffers: &mut Assets<ShaderStorageBuffer>,
     v: IVec3,
     value: u8,
 ) {
@@ -139,5 +144,8 @@ pub fn apply_edit(
     let Some(&e) = map.map.get(&cpos) else { return };
     let Ok(mut chunk) = chunks.get_mut(e) else { return };
     chunk.volume.set(v.x & CHUNK_CLIP, v.y & CHUNK_CLIP, v.z & CHUNK_CLIP, value);
-    commands.entity(e).insert(NeedsRemesh);
+    let vol = chunk.volume.clone();
+    if let Ok(mut gc) = gpu_chunks.get_mut(e) {
+        gpu_mesh::refresh_gpu_chunk(buffers, &mut gc, &vol);
+    }
 }

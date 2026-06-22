@@ -12,10 +12,6 @@ pub struct VoxelChunk {
     pub volume: ChunkVolume,
 }
 
-/// Marker: this chunk's geometry is stale and should be (re)meshed.
-#[derive(Component)]
-pub struct NeedsRemesh;
-
 /// Maps chunk coordinates to their spawned entity.
 #[derive(Resource, Default)]
 pub struct ChunkMap {

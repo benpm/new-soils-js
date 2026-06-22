@@ -11,14 +11,20 @@ What works today:
   outcrops, and 3D-noise caves, ported from `server.js`'s `Chunk.generate`.
 - **Client/server networking** — WebSocket transport with a clean bincode
   protocol; the client streams chunks in a load radius around the player.
-- **Greedy meshing** — ported from `mesher_worker.js`, run off-thread on Bevy's
-  `AsyncComputeTaskPool`.
-- **Atlas texturing** — reuses the original `blocks.png` / `blocks.yaml`. A custom
-  WGSL material (`assets/shaders/atlas.wgsl`, ported from `atlas.frag`) does
-  world-space per-face tiling, ambient occlusion, and a normal brightness tint.
-- **Greedy quad merging** — AO-aware: faces only merge when block id *and* corner
-  AO match, so flat areas collapse to big quads without smearing AO.
-- **Ambient occlusion** — per-vertex, from the canonical 3-sample corner formula.
+- **GPU-resident greedy meshing** — chunk triangle meshes are generated entirely
+  on the GPU by a compute shader (`assets/shaders/voxel_mesh.wgsl`, a port of the
+  CPU `greedy.rs`): one workgroup per (axis, plane) runs the AO-aware greedy sweep
+  and appends merged quads to a per-chunk storage buffer via an atomic counter. No
+  CPU meshing, no readback. (The CPU `greedy_mesh` in `soils-worldgen` is kept as
+  the reference/oracle and stays unit-tested.)
+- **Vertex pulling** — each chunk's `ChunkMeshMaterial` (`assets/shaders/
+  atlas.wgsl`) pulls quads straight from the compute output buffer via
+  `vertex_index` (a shared dummy mesh just sets the draw count). The fragment is
+  the original `atlas.frag` port: world-space per-face tiling of `blocks.png`,
+  ambient occlusion, and a normal brightness tint.
+- **Ambient occlusion** — per-vertex 3-sample corner occlusion, computed in the
+  compute shader; greedy merging is AO-aware (faces merge only when block id *and*
+  corner AO match).
 - **Region-file persistence** — chunks are zlib-compressed into 16³ region files
   (`data/worlds/default/regions/`) and reloaded on restart; edits are saved.
 - **First-person player** — fly/walk movement with AABB voxel collision,
@@ -34,9 +40,9 @@ What works today:
 | Crate | Role |
 |-------|------|
 | `soils-protocol` | Shared chunk coords, voxel storage, and the bincode wire protocol. No Bevy/tokio. |
-| `soils-worldgen` | Block registry, terrain generation, greedy mesher. Pure, heavily unit-tested. |
+| `soils-worldgen` | Block registry, terrain generation, reference CPU greedy mesher. Pure, unit-tested. |
 | `soils-server`   | tokio WebSocket server: generates/caches chunks, applies & broadcasts edits, ticks time. |
-| `soils-client`   | Bevy app: networking bridge, chunk streaming, async meshing, rendering, player, editing. |
+| `soils-client`   | Bevy app: networking bridge, chunk streaming, GPU compute meshing + vertex-pulling render, player, editing. |
 
 ## Running
 

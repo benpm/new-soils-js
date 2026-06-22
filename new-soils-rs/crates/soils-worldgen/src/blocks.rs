@@ -76,6 +76,16 @@ impl BlockRegistry {
         self.blocks.len()
     }
 
+    /// Per-block atlas tiles as `[sides, top, bottom, 0]`, indexed by block id.
+    /// Uploaded to the GPU so the compute mesher can resolve tiles itself
+    /// (std430-friendly `vec4<u32>` rows).
+    pub fn faces_table(&self) -> Vec<[u32; 4]> {
+        self.blocks
+            .iter()
+            .map(|b| [b.faces[0] as u32, b.faces[1] as u32, b.faces[2] as u32, 0])
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }

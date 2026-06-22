@@ -5,19 +5,21 @@
 mod actor;
 mod chunk;
 mod edit;
-mod mesh;
+mod gpu_mesh;
 mod material;
 mod net;
 mod player;
 
 use bevy::prelude::*;
+use bevy::render::storage::ShaderStorageBuffer;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use soils_protocol::{ChunkVolume, ClientMsg, ServerMsg};
 use soils_worldgen::default_registry;
 
 use actor::{Actor, ActorAssets, ActorMap, LocalPlayer};
-use chunk::{Blocks, ChunkMap, NeedsRemesh, VoxelChunk, WorldTime};
-use material::AtlasMaterial;
+use chunk::{Blocks, ChunkMap, VoxelChunk, WorldTime};
+use gpu_mesh::{AtlasAssets, GpuChunk, GpuMeshPlugin};
+use material::ChunkMeshMaterial;
 use net::NetClient;
 use player::{Player, Streaming};
 
@@ -34,7 +36,7 @@ fn main() {
             }),
             ..default()
         }))
-        .add_plugins(MaterialPlugin::<AtlasMaterial>::default())
+        .add_plugins(GpuMeshPlugin)
         .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 1.0)))
         .insert_resource(ChunkMap::default())
         .insert_resource(WorldTime::default())
@@ -45,21 +47,13 @@ fn main() {
         .insert_resource(net::connect())
         .add_systems(
             Startup,
-            (
-                setup,
-                material::setup_material,
-                actor::setup_actor_assets,
-                player::grab_cursor,
-                login,
-            ),
+            (setup, actor::setup_actor_assets, player::grab_cursor, login),
         )
         .add_systems(
             Update,
             (
                 net_receive,
                 player::request_chunks,
-                mesh::dispatch_meshing,
-                mesh::apply_meshing,
                 player::mouse_look,
                 player::movement,
                 player::cursor_toggle,
@@ -180,6 +174,10 @@ fn net_receive(
     net: Res<NetClient>,
     mut map: ResMut<ChunkMap>,
     mut chunks: Query<&mut VoxelChunk>,
+    mut gpu_chunks: Query<&mut GpuChunk>,
+    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut materials: ResMut<Assets<ChunkMeshMaterial>>,
+    atlas: Res<AtlasAssets>,
     mut world_time: ResMut<WorldTime>,
     mut player: Query<&mut Transform, With<Player>>,
     mut local: ResMut<LocalPlayer>,
@@ -204,23 +202,35 @@ fn net_receive(
                     ChunkVolume::from_bytes(&voxels)
                 };
                 if let Some(&entity) = map.map.get(&cpos) {
+                    // Existing chunk: update CPU copy + re-upload voxels if it has
+                    // a GPU mesh, else (was empty) leave as-is.
                     if let Ok(mut vc) = chunks.get_mut(entity) {
-                        vc.volume = volume;
+                        vc.volume = volume.clone();
                     }
                     if !empty {
-                        commands.entity(entity).insert(NeedsRemesh);
+                        if let Ok(mut gc) = gpu_chunks.get_mut(entity) {
+                            gpu_mesh::refresh_gpu_chunk(&mut buffers, &mut gc, &volume);
+                        }
                     }
+                } else if empty {
+                    // Track empty chunks so they aren't re-requested; no mesh.
+                    let e = commands.spawn(VoxelChunk { pos: cpos, volume }).id();
+                    map.map.insert(cpos, e);
                 } else {
-                    let mut e = commands.spawn(VoxelChunk { pos: cpos, volume });
-                    if !empty {
-                        e.insert(NeedsRemesh);
-                    }
-                    map.map.insert(cpos, e.id());
+                    let e = gpu_mesh::spawn_gpu_chunk(
+                        &mut commands,
+                        &mut buffers,
+                        &mut materials,
+                        &atlas,
+                        cpos,
+                        volume,
+                    );
+                    map.map.insert(cpos, e);
                 }
             }
             ServerMsg::Edit { pos, value } => {
                 let v = IVec3::from_array(pos);
-                edit::apply_edit(&mut commands, &map, &mut chunks, v, value);
+                edit::apply_edit(&map, &mut chunks, &mut gpu_chunks, &mut buffers, v, value);
             }
             ServerMsg::Time { daytime } => {
                 world_time.daytime = daytime;

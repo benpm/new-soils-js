@@ -12,6 +12,10 @@ use serde::Deserialize;
 pub struct BlockDef {
     pub name: String,
     /// Atlas tile indices: `[sides, top, bottom]`.
+    ///
+    /// Note the YAML source order is `[top, sides, bottom]` (matching the JS
+    /// `Block(id, name, top, sides, bottom)` constructor); `from_yaml`
+    /// reorders it into this `[sides, top, bottom]` layout.
     pub faces: [u8; 3],
 }
 
@@ -48,10 +52,17 @@ impl BlockRegistry {
             serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
         let mut reg = BlockRegistry::default();
         for (name, b) in parsed {
+            // YAML face order is `[top, sides, bottom]` (JS `Block(id, name,
+            // top, sides, bottom)`); store the internal `[sides, top, bottom]`.
+            // Defaults mirror the JS ctor: sides->top, bottom->top, empty->id.
             let faces = match b.faces.len() {
+                0 => {
+                    let id = reg.len() as u8;
+                    [id, id, id]
+                }
                 1 => [b.faces[0], b.faces[0], b.faces[0]],
-                2 => [b.faces[0], b.faces[1], b.faces[0]],
-                _ => [b.faces[0], b.faces[1], b.faces[2]],
+                2 => [b.faces[1], b.faces[0], b.faces[0]],
+                _ => [b.faces[1], b.faces[0], b.faces[2]],
             };
             reg.push(BlockDef { name, faces });
         }
@@ -103,14 +114,17 @@ mod tests {
         assert_eq!(reg.id_of("Air"), Some(0));
         assert_eq!(reg.id_of("Dirt"), Some(1));
         assert_eq!(reg.id_of("Grass"), Some(2));
-        assert_eq!(reg.get(2).unwrap().faces, [3, 2, 1]);
+        // YAML `[3, 2, 1]` = [top, sides, bottom] -> internal [sides, top, bottom].
+        assert_eq!(reg.get(2).unwrap().faces, [2, 3, 1]);
     }
 
     #[test]
     fn grass_top_uses_top_tile() {
         let reg = BlockRegistry::from_yaml(YAML).unwrap();
         let grass = reg.get(2).unwrap();
-        // Upward normal should select the "top" tile (2).
-        assert_eq!(grass.tile_for_normal([0, 1, 0]), 2);
+        // YAML grass faces `[3, 2, 1]` = top=3, sides=2, bottom=1.
+        assert_eq!(grass.tile_for_normal([0, 1, 0]), 3); // top
+        assert_eq!(grass.tile_for_normal([1, 0, 0]), 2); // side
+        assert_eq!(grass.tile_for_normal([0, -1, 0]), 1); // bottom
     }
 }

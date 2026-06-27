@@ -9,6 +9,7 @@ mod gpu_mesh;
 mod hud;
 mod material;
 mod net;
+mod pause;
 mod player;
 
 use bevy::prelude::*;
@@ -56,6 +57,7 @@ fn main() {
         .insert_resource(LocalPlayer::default())
         .insert_resource(ActorMap::default())
         .insert_resource(edit::Hotbar::default())
+        .insert_resource(pause::RenderToggles::default())
         .insert_resource(net::connect())
         .add_systems(
             Startup,
@@ -65,6 +67,7 @@ fn main() {
                 player::grab_cursor,
                 edit::setup_crosshair,
                 hud::setup_hud,
+                pause::setup_pause_menu,
                 login,
             ),
         )
@@ -81,6 +84,11 @@ fn main() {
                 edit::selection_highlight,
                 hud::update_hud,
                 hud::toggle_hud,
+                (
+                    pause::pause_menu_visibility,
+                    pause::pause_menu_buttons,
+                    pause::update_pause_labels,
+                ),
                 actor::send_move,
                 actor::interpolate_actors,
                 self_test_daytime.after(net_receive).before(day_night),
@@ -242,7 +250,13 @@ fn net_receive(
     mut actor_map: ResMut<ActorMap>,
     actor_assets: Res<ActorAssets>,
     mut actors: Query<&mut Actor>,
+    toggles: Res<pause::RenderToggles>,
 ) {
+    let chunk_params = material::AtlasParams {
+        ambient_occlusion: if toggles.ao { 1.0 } else { 0.0 },
+        fog_density: if toggles.fog { material::FOG_DENSITY } else { 0.0 },
+        ..default()
+    };
     for msg in net.drain() {
         match msg {
             ServerMsg::Init { id, spawn, daytime, .. } => {
@@ -282,6 +296,7 @@ fn net_receive(
                         &atlas,
                         cpos,
                         volume,
+                        chunk_params.clone(),
                     );
                     map.map.insert(cpos, e);
                 }

@@ -14,6 +14,10 @@ struct AtlasParams {
     // Effective illuminance applied to the (otherwise unlit) terrain so it sits
     // in the same exposure regime as the physically-bright atmosphere sky.
     brightness: f32,
+    // Exponential-squared distance fog (JS `FogExp2`): density per world unit,
+    // colour in the same lux regime as `brightness` so it dims with exposure.
+    fog_density: f32,
+    fog_color: vec3<f32>,
 };
 
 struct QuadGpu {
@@ -41,6 +45,7 @@ struct VertexOutput {
     @location(1) normal: vec3<f32>,
     @location(2) @interpolate(flat) tile: u32,
     @location(3) ao: f32,
+    @location(4) world_position: vec3<f32>,
 };
 
 // Two triangles per quad: corners [0,1,2, 0,2,3] over [origin, +du, +du+dv, +dv].
@@ -76,6 +81,7 @@ fn vertex(
     );
     out.clip_position = position_world_to_clip(world_position.xyz);
     out.local_position = p;
+    out.world_position = world_position.xyz;
     out.normal = normal;
     out.tile = quad.tile;
     out.ao = quad.ao[corner];
@@ -125,6 +131,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // exposure regime: scale by an effective illuminance and the view exposure
     // (which the day/night cycle drives to dim everything together at night).
     color = vec4<f32>(color.rgb * params.brightness * view.exposure, color.a);
+
+    // Exponential-squared distance fog toward the (exposure-scaled) horizon
+    // colour, blending the chunk-load boundary into the atmosphere haze.
+    let dist = length(in.world_position - view.world_position);
+    let fog = 1.0 - exp(-pow(dist * params.fog_density, 2.0));
+    color = vec4<f32>(mix(color.rgb, params.fog_color * view.exposure, fog), color.a);
 
     return color;
 }

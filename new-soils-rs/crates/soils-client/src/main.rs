@@ -101,6 +101,12 @@ fn screenshot_once(
                 t.translation = p + Vec3::new(4.0, 1.5, 4.0);
                 t.look_at(p, Vec3::Y);
                 info!("SELFTEST: framing actor at {:?}", p);
+            } else if std::env::var("SOILS_CAM").as_deref() == Ok("ground") {
+                // Player-eye view: at the surface looking out to the horizon, to
+                // judge the chunk-load boundary the way it's actually seen.
+                t.translation = Vec3::new(282.0, 273.0, 268.0);
+                t.look_at(Vec3::new(360.0, 271.0, 300.0), Vec3::Y);
+                info!("SELFTEST: ground camera at {:?}", t.translation);
             } else {
                 // Natural horizon view: terrain fills the lower frame, sky the
                 // upper, so atmosphere + terrain can be judged together.

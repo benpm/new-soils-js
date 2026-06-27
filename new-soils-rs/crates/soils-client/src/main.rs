@@ -11,6 +11,10 @@ mod net;
 mod player;
 
 use bevy::prelude::*;
+use bevy::camera::Exposure;
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::light::{AtmosphereEnvironmentMapLight, light_consts::lux};
+use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::render::storage::ShaderStorageBuffer;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use soils_protocol::{ChunkVolume, ClientMsg, ServerMsg};
@@ -26,6 +30,11 @@ use player::{Player, Streaming};
 /// Marks the sun so we can swing it with the day/night cycle.
 #[derive(Component)]
 struct Sun;
+
+/// Camera exposure (EV100) at noon and midnight. Lower = brighter image; the
+/// day/night cycle interpolates between them so the whole scene dims at night.
+const EV100_DAY: f32 = 13.0;
+const EV100_NIGHT: f32 = 16.5;
 
 fn main() {
     App::new()
@@ -60,6 +69,7 @@ fn main() {
                 edit::edit_blocks,
                 actor::send_move,
                 actor::interpolate_actors,
+                self_test_daytime.after(net_receive).before(day_night),
                 day_night,
                 self_test,
                 screenshot_once,
@@ -92,8 +102,10 @@ fn screenshot_once(
                 t.look_at(p, Vec3::Y);
                 info!("SELFTEST: framing actor at {:?}", p);
             } else {
-                t.translation = Vec3::new(282.0, 330.0, 268.0);
-                t.look_at(Vec3::new(300.0, 256.0, 250.0), Vec3::Y);
+                // Natural horizon view: terrain fills the lower frame, sky the
+                // upper, so atmosphere + terrain can be judged together.
+                t.translation = Vec3::new(240.0, 280.0, 268.0);
+                t.look_at(Vec3::new(320.0, 264.0, 290.0), Vec3::Y);
                 info!("SELFTEST: camera at {:?} looking_at terrain", t.translation);
             }
         }
@@ -110,6 +122,17 @@ fn screenshot_once(
             .observe(save_to_disk("/tmp/soils-selftest.png"));
         info!("SELFTEST: screenshot requested");
     }
+}
+
+/// In self-test mode, pin the time of day so screenshots are deterministic
+/// (the server's clock drifts with wall-time). `SOILS_DAYTIME` overrides the
+/// default noon (0.0); e.g. 0.25 = dawn/dusk, 0.5 = midnight.
+fn self_test_daytime(mut world_time: ResMut<WorldTime>) {
+    if std::env::var("SOILS_SELFTEST").is_err() {
+        return;
+    }
+    let d = std::env::var("SOILS_DAYTIME").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    world_time.daytime = d;
 }
 
 /// When `SOILS_SELFTEST` is set, report how much of the world streamed in and
@@ -138,12 +161,14 @@ fn self_test(
 }
 
 /// Spawn the camera/player and the sun.
-fn setup(mut commands: Commands) {
+fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) {
     commands.spawn((
         Camera3d::default(),
         Projection::from(PerspectiveProjection {
             fov: 65.0_f32.to_radians(),
-            far: 2_000_000.0,
+            // A sane far plane keeps reverse-Z depth precise; an enormous one
+            // (the old 2e6) crushes near-terrain depth toward 0.
+            far: 8_000.0,
             ..default()
         }),
         // Provisional spawn; corrected by the server's `Init` message. The
@@ -152,14 +177,27 @@ fn setup(mut commands: Commands) {
         Transform::from_xyz(282.0, 285.0, 268.0)
             .with_rotation(Quat::from_axis_angle(Vec3::X, -0.5)),
         Player::default(),
-        // Global ambient fill so shaded faces aren't pure black.
-        AmbientLight { brightness: 350.0, ..default() },
+        // Physically-based sky. `Atmosphere` requires (and auto-inserts) `Hdr`;
+        // pair it with a tonemapper, an exposure the day/night cycle drives, and
+        // sky-derived image-based lighting for the lit actors. 1 world unit ==
+        // 1 block ~= 1 metre, so the default `scene_units_to_m` is correct.
+        //
+        // NOTE: no `Bloom` — with our unlit, manually-exposed terrain the bright
+        // HDR sky bloom washes the whole frame to a flat haze regardless of
+        // prefilter threshold; the atmosphere still draws the sun disc itself.
+        Atmosphere::earthlike(mediums.add(ScatteringMedium::default())),
+        AtmosphereSettings::default(),
+        AtmosphereEnvironmentMapLight::default(),
+        Exposure { ev100: EV100_DAY },
+        Tonemapping::AcesFitted,
     ));
 
     commands.spawn((
         Sun,
-        DirectionalLight { illuminance: 10_000.0, shadows_enabled: false, ..default() },
-        Transform::from_xyz(0.0, 1.0, 0.0).looking_to(Vec3::new(-0.3, -1.0, -0.2), Vec3::Y),
+        // RAW (pre-atmosphere) sunlight is the correct input for the atmosphere
+        // to filter; `day_night` rotates it and dims it toward night.
+        DirectionalLight { illuminance: lux::RAW_SUNLIGHT, shadows_enabled: false, ..default() },
+        Transform::default(),
     ));
 }
 
@@ -267,16 +305,37 @@ fn net_receive(
     }
 }
 
-/// Swing the sun around with the day/night cycle and dim it at night.
+/// Day-length easing ported from the JS `ease10`: a steep ease-in/out that
+/// holds bright through midday and dark through midnight.
+fn ease10(t: f32) -> f32 {
+    let v = if t < 0.5 {
+        512.0 * t.powi(10)
+    } else {
+        -512.0 * (t - 1.0).powi(10) + 1.0
+    };
+    v.clamp(0.0, 1.0)
+}
+
+/// Swing the sun with the day/night cycle and dim the world toward night.
+/// JS convention: `daytime` 0.0 = noon (sun overhead), 0.5 = midnight.
 fn day_night(
     world_time: Res<WorldTime>,
     mut sun: Query<(&mut Transform, &mut DirectionalLight), With<Sun>>,
+    mut exposure: Query<&mut Exposure, With<Player>>,
 ) {
-    let Ok((mut transform, mut light)) = sun.single_mut() else { return };
-    // daytime 0.0 = noon, 0.5 = midnight (matching the JS convention).
-    let angle = world_time.daytime * std::f32::consts::TAU;
-    let dir = Vec3::new(angle.sin() * 0.6, -angle.cos(), 0.3).normalize();
-    transform.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, dir);
-    // Brightest at noon, dark at midnight.
-    light.illuminance = 10_000.0 * ((-angle.cos()).max(0.0) * 0.9 + 0.1);
+    // JS: theta = PI*(dayTime*2 - 0.5); the sun sweeps the Y-Z plane. The light
+    // travels in `dir` (straight down at noon); a small +X tilt keeps it off the
+    // exact vertical / antiparallel singularities of `look_to`.
+    let theta = std::f32::consts::PI * (world_time.daytime * 2.0 - 0.5);
+    let dir = Vec3::new(0.15, theta.sin(), theta.cos()).normalize();
+    // Daylight factor: 1 at noon, 0 at midnight (JS `ease10(dayTime*2 - 1)`).
+    let day = ease10(world_time.daytime * 2.0 - 1.0);
+
+    if let Ok((mut transform, mut light)) = sun.single_mut() {
+        transform.look_to(dir, Vec3::Y);
+        light.illuminance = lux::RAW_SUNLIGHT * (0.02 + 0.98 * day);
+    }
+    if let Ok(mut exp) = exposure.single_mut() {
+        exp.ev100 = EV100_NIGHT + (EV100_DAY - EV100_NIGHT) * day;
+    }
 }

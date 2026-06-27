@@ -5,11 +5,15 @@
 
 #import bevy_pbr::{
     mesh_functions,
+    mesh_view_bindings::view,
     view_transformations::position_world_to_clip,
 }
 
 struct AtlasParams {
     ambient_occlusion: f32,
+    // Effective illuminance applied to the (otherwise unlit) terrain so it sits
+    // in the same exposure regime as the physically-bright atmosphere sky.
+    brightness: f32,
 };
 
 struct QuadGpu {
@@ -116,6 +120,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Subtle brightness boost on side faces (matches the JS normal tint).
     let tint = 1.0 + abs(n.x + n.y) * 0.2;
     color = vec4<f32>(color.rgb * tint, color.a);
+
+    // The terrain is unlit, so lift it into the atmosphere's physical-light
+    // exposure regime: scale by an effective illuminance and the view exposure
+    // (which the day/night cycle drives to dim everything together at night).
+    color = vec4<f32>(color.rgb * params.brightness * view.exposure, color.a);
 
     return color;
 }

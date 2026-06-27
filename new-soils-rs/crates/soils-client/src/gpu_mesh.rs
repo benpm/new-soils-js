@@ -126,7 +126,7 @@ pub fn spawn_gpu_chunk(
     let material = materials.add(ChunkMeshMaterial {
         quads: quads.clone(),
         atlas: atlas.texture.clone(),
-        params: AtlasParams { ambient_occlusion: 1.0 },
+        params: AtlasParams::default(),
     });
     let origin = (cpos * CHUNK_SIZE).as_vec3();
     commands

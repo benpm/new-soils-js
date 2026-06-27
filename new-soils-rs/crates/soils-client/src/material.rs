@@ -11,11 +11,26 @@ use bevy::render::render_resource::{
 use bevy::render::storage::ShaderStorageBuffer;
 use bevy::shader::ShaderRef;
 
+/// Effective illuminance (lux-ish) applied to the unlit terrain so it sits in
+/// the same exposure regime as the physically-bright atmosphere sky. Tuned so a
+/// mid-albedo block lands around `albedo * 4` at the daytime exposure — bright
+/// enough to read clearly through the atmosphere's in-scattering veil.
+pub const TERRAIN_BRIGHTNESS: f32 = 45_000.0;
+
 /// Uniform parameters for the atlas shader.
-#[derive(Clone, Default, ShaderType)]
+#[derive(Clone, ShaderType)]
 pub struct AtlasParams {
     /// >0.5 enables AO multiply.
     pub ambient_occlusion: f32,
+    /// Effective illuminance scaling the unlit terrain into the HDR/atmosphere
+    /// exposure regime (see [`TERRAIN_BRIGHTNESS`]).
+    pub brightness: f32,
+}
+
+impl Default for AtlasParams {
+    fn default() -> Self {
+        Self { ambient_occlusion: 1.0, brightness: TERRAIN_BRIGHTNESS }
+    }
 }
 
 /// One material per chunk: its quad storage buffer (vertex-pulled) plus the

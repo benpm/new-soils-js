@@ -53,10 +53,11 @@ fn main() {
         .insert_resource(Blocks(default_registry()))
         .insert_resource(LocalPlayer::default())
         .insert_resource(ActorMap::default())
+        .insert_resource(edit::Hotbar::default())
         .insert_resource(net::connect())
         .add_systems(
             Startup,
-            (setup, actor::setup_actor_assets, player::grab_cursor, login),
+            (setup, actor::setup_actor_assets, player::grab_cursor, edit::setup_crosshair, login),
         )
         .add_systems(
             Update,
@@ -67,6 +68,8 @@ fn main() {
                 player::movement,
                 player::cursor_toggle,
                 edit::edit_blocks,
+                edit::hotbar_select,
+                edit::selection_highlight,
                 actor::send_move,
                 actor::interpolate_actors,
                 self_test_daytime.after(net_receive).before(day_night),

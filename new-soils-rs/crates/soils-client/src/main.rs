@@ -6,6 +6,7 @@ mod actor;
 mod chunk;
 mod edit;
 mod gpu_mesh;
+mod hud;
 mod material;
 mod net;
 mod player;
@@ -46,6 +47,7 @@ fn main() {
             ..default()
         }))
         .add_plugins(GpuMeshPlugin)
+        .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
         .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 1.0)))
         .insert_resource(ChunkMap::default())
         .insert_resource(WorldTime::default())
@@ -57,7 +59,14 @@ fn main() {
         .insert_resource(net::connect())
         .add_systems(
             Startup,
-            (setup, actor::setup_actor_assets, player::grab_cursor, edit::setup_crosshair, login),
+            (
+                setup,
+                actor::setup_actor_assets,
+                player::grab_cursor,
+                edit::setup_crosshair,
+                hud::setup_hud,
+                login,
+            ),
         )
         .add_systems(
             Update,
@@ -70,6 +79,8 @@ fn main() {
                 edit::edit_blocks,
                 edit::hotbar_select,
                 edit::selection_highlight,
+                hud::update_hud,
+                hud::toggle_hud,
                 actor::send_move,
                 actor::interpolate_actors,
                 self_test_daytime.after(net_receive).before(day_night),

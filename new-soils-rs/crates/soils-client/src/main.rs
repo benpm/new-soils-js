@@ -267,38 +267,17 @@ fn net_receive(
                 }
             }
             ServerMsg::Chunk { pos, empty, voxels } => {
-                let cpos = IVec3::from_array(pos);
-                let volume = if empty {
-                    ChunkVolume::empty()
-                } else {
-                    ChunkVolume::from_bytes(&voxels)
-                };
-                if let Some(&entity) = map.map.get(&cpos) {
-                    // Existing chunk: update CPU copy + re-upload voxels if it has
-                    // a GPU mesh, else (was empty) leave as-is.
-                    if let Ok(mut vc) = chunks.get_mut(entity) {
-                        vc.volume = volume.clone();
-                    }
-                    if !empty {
-                        if let Ok(mut gc) = gpu_chunks.get_mut(entity) {
-                            gpu_mesh::refresh_gpu_chunk(&mut buffers, &mut gc, &volume);
-                        }
-                    }
-                } else if empty {
-                    // Track empty chunks so they aren't re-requested; no mesh.
-                    let e = commands.spawn(VoxelChunk { pos: cpos, volume }).id();
-                    map.map.insert(cpos, e);
-                } else {
-                    let e = gpu_mesh::spawn_gpu_chunk(
-                        &mut commands,
-                        &mut buffers,
-                        &mut materials,
-                        &atlas,
-                        cpos,
-                        volume,
-                        chunk_params.clone(),
+                apply_chunk(
+                    &mut commands, &mut map, &mut chunks, &mut gpu_chunks, &mut buffers,
+                    &mut materials, &atlas, &chunk_params, pos, empty, voxels,
+                );
+            }
+            ServerMsg::Bundle { chunks: datas } => {
+                for d in datas {
+                    apply_chunk(
+                        &mut commands, &mut map, &mut chunks, &mut gpu_chunks, &mut buffers,
+                        &mut materials, &atlas, &chunk_params, d.pos, d.empty, d.voxels,
                     );
-                    map.map.insert(cpos, e);
                 }
             }
             ServerMsg::Edit { pos, value } => {
@@ -337,6 +316,45 @@ fn net_receive(
                 }
             }
         }
+    }
+}
+
+/// Apply one streamed chunk: update an existing chunk's voxels or spawn a new
+/// (meshed or empty-tracked) chunk entity. Shared by `Chunk` and `Bundle`.
+#[allow(clippy::too_many_arguments)]
+fn apply_chunk(
+    commands: &mut Commands,
+    map: &mut ChunkMap,
+    chunks: &mut Query<&mut VoxelChunk>,
+    gpu_chunks: &mut Query<&mut GpuChunk>,
+    buffers: &mut Assets<ShaderStorageBuffer>,
+    materials: &mut Assets<ChunkMeshMaterial>,
+    atlas: &AtlasAssets,
+    params: &material::AtlasParams,
+    pos: [i32; 3],
+    empty: bool,
+    voxels: Vec<u8>,
+) {
+    let cpos = IVec3::from_array(pos);
+    let volume = if empty { ChunkVolume::empty() } else { ChunkVolume::from_bytes(&voxels) };
+    if let Some(&entity) = map.map.get(&cpos) {
+        // Existing chunk: update CPU copy + re-upload voxels if it has a GPU
+        // mesh, else (was empty) leave as-is.
+        if let Ok(mut vc) = chunks.get_mut(entity) {
+            vc.volume = volume.clone();
+        }
+        if !empty {
+            if let Ok(mut gc) = gpu_chunks.get_mut(entity) {
+                gpu_mesh::refresh_gpu_chunk(buffers, &mut gc, &volume);
+            }
+        }
+    } else if empty {
+        // Track empty chunks so they aren't re-requested; no mesh.
+        let e = commands.spawn(VoxelChunk { pos: cpos, volume }).id();
+        map.map.insert(cpos, e);
+    } else {
+        let e = gpu_mesh::spawn_gpu_chunk(commands, buffers, materials, atlas, cpos, volume, params.clone());
+        map.map.insert(cpos, e);
     }
 }
 

@@ -44,6 +44,9 @@ pub enum ServerMsg {
     Init { id: u16, spawn: [f32; 3], seed: i64, daytime: f32 },
     /// A chunk's voxel data. `voxels` is empty for an all-Air chunk.
     Chunk { pos: [i32; 3], empty: bool, voxels: Vec<u8> },
+    /// Several chunks in one frame (response to `ReqChunks`), to cut per-message
+    /// overhead when streaming a region. Mirrors the JS `bundle` message.
+    Bundle { chunks: Vec<ChunkData> },
     /// A voxel edit made by another player (apply locally).
     Edit { pos: [i32; 3], value: u8 },
     /// Positions of nearby actors (other players).
@@ -52,6 +55,14 @@ pub enum ServerMsg {
     ActorRemove { id: u16 },
     /// Current world time of day, 0.0..1.0.
     Time { daytime: f32 },
+}
+
+/// One chunk's data within a [`ServerMsg::Bundle`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkData {
+    pub pos: [i32; 3],
+    pub empty: bool,
+    pub voxels: Vec<u8>,
 }
 
 /// A single actor's networked state.

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use glam::IVec3;
-use soils_protocol::{ActorState, ClientMsg, ServerMsg, decode, encode};
+use soils_protocol::{ActorState, ChunkData, ClientMsg, ServerMsg, decode, encode};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -30,6 +30,8 @@ const ADDR: &str = "127.0.0.1:9001";
 const DAY_SECONDS: f32 = 120.0;
 /// How often to broadcast actor positions.
 const ACTOR_TICK: Duration = Duration::from_millis(100);
+/// Chunks per `Bundle` response. Small because solid chunks are ~32 KB each.
+const BUNDLE_SIZE: usize = 16;
 
 type SharedWorld = Arc<Mutex<World>>;
 /// Outgoing broadcast: `(sender_id, message)`. The sender is excluded so an
@@ -157,6 +159,10 @@ async fn handle_connection(
                 let _ = out_tx.send(ServerMsg::Init { id, spawn, seed, daytime });
             }
             ClientMsg::ReqChunks { positions } => {
+                // Batch chunks into bundles so a region load is a few frames
+                // instead of hundreds. Solid chunks are large, so keep batches
+                // small enough that a single frame stays modest.
+                let mut batch: Vec<ChunkData> = Vec::with_capacity(BUNDLE_SIZE);
                 for p in positions {
                     let cpos = IVec3::new(p[0], p[1], p[2]);
                     let (empty, voxels) = {
@@ -168,7 +174,13 @@ async fn handle_connection(
                             (false, chunk.as_bytes().to_vec())
                         }
                     };
-                    let _ = out_tx.send(ServerMsg::Chunk { pos: p, empty, voxels });
+                    batch.push(ChunkData { pos: p, empty, voxels });
+                    if batch.len() >= BUNDLE_SIZE {
+                        let _ = out_tx.send(ServerMsg::Bundle { chunks: std::mem::take(&mut batch) });
+                    }
+                }
+                if !batch.is_empty() {
+                    let _ = out_tx.send(ServerMsg::Bundle { chunks: batch });
                 }
             }
             ClientMsg::Edit { pos, value } => {

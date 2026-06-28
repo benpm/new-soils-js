@@ -276,7 +276,7 @@ fn net_receive(
     mut materials: ResMut<Assets<ChunkMeshMaterial>>,
     atlas: Res<AtlasAssets>,
     mut world_time: ResMut<WorldTime>,
-    mut player: Query<&mut Transform, With<Player>>,
+    mut player: Query<(&mut Transform, &mut Player)>,
     mut local: ResMut<LocalPlayer>,
     mut actor_ctx: ActorCtx,
     toggles: Res<pause::RenderToggles>,
@@ -294,7 +294,7 @@ fn net_receive(
                 local.id = id;
                 world_time.daytime = daytime;
                 login_state.done = true; // authenticated — drop the login screen
-                if let Ok(mut transform) = player.single_mut() {
+                if let Ok((mut transform, _)) = player.single_mut() {
                     transform.translation = Vec3::from_array(spawn);
                 }
             }
@@ -331,10 +331,18 @@ fn net_receive(
                     commands.entity(entity).despawn();
                 }
                 world_time.daytime = daytime;
-                if let Ok(mut transform) = player.single_mut() {
+                if let Ok((mut transform, mut p)) = player.single_mut() {
                     transform.translation = Vec3::from_array(spawn);
+                    p.velocity = Vec3::ZERO;
                 }
                 streaming.last_chunk = None; // force a fresh stream
+            }
+            ServerMsg::Position { pos } => {
+                // Server rejected our movement — snap back.
+                if let Ok((mut transform, mut p)) = player.single_mut() {
+                    transform.translation = Vec3::from_array(pos);
+                    p.velocity = Vec3::ZERO;
+                }
             }
             ServerMsg::ActorUpdate { actors: states } => {
                 for state in states {

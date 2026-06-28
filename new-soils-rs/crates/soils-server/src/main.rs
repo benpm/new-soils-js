@@ -37,6 +37,10 @@ const ACTOR_TICK: Duration = Duration::from_millis(100);
 const BUNDLE_SIZE: usize = 16;
 /// The world every client starts in.
 const DEFAULT_WORLD: &str = "default";
+/// Max accepted movement between two `Move` updates (world units). Generous —
+/// well above sprint-fly + lag spikes (~32 u/s, sent every 50 ms) — so it only
+/// catches gross teleport/speed hacks, not legitimate play.
+const MAX_STEP: f32 = 64.0;
 
 type SharedWorld = Arc<Mutex<World>>;
 /// Named worlds, created on first use.
@@ -267,9 +271,21 @@ async fn handle_connection(
                 }
             }
             ClientMsg::Move { pos, velocity } => {
-                if let Some(entry) = players.lock().unwrap().get_mut(&id) {
-                    entry.state.pos = pos;
-                    entry.state.velocity = velocity;
+                // Server authority: reject implausible jumps (teleport/speed
+                // hacks) and snap the client back to its last accepted position.
+                let mut g = players.lock().unwrap();
+                if let Some(entry) = g.get_mut(&id) {
+                    let last = entry.state.pos;
+                    let d2 = (pos[0] - last[0]).powi(2)
+                        + (pos[1] - last[1]).powi(2)
+                        + (pos[2] - last[2]).powi(2);
+                    if d2 > MAX_STEP * MAX_STEP {
+                        drop(g);
+                        let _ = out_tx.send(ServerMsg::Position { pos: last });
+                    } else {
+                        entry.state.pos = pos;
+                        entry.state.velocity = velocity;
+                    }
                 }
             }
             ClientMsg::Warp { world: name } => {

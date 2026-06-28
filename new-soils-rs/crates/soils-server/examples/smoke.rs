@@ -105,5 +105,22 @@ async fn main() {
     assert!(wsolid > 0, "expected terrain in the warped world");
     assert_ne!(solid, wsolid, "warped world has identical terrain to default (seed not applied?)");
 
-    println!("SMOKE TEST PASSED (auth + bundle streaming + warp)");
+    // Server authority: a teleport-sized jump is rejected with a correction.
+    let jump = [warp_spawn[0] + 1000.0, warp_spawn[1], warp_spawn[2]];
+    send(&mut tx, ClientMsg::Move { pos: jump, velocity: [0.0; 3] }).await;
+    let mut corrected = None;
+    while let Some(Ok(Message::Binary(b))) = rx.next().await {
+        if let Some(ServerMsg::Position { pos }) = decode(b.as_ref()) {
+            corrected = Some(pos);
+            break;
+        }
+    }
+    let corrected = corrected.expect("expected a Position correction for the teleport jump");
+    println!("position correction: {corrected:?}");
+    assert!(
+        (corrected[0] - warp_spawn[0]).abs() < 1.0,
+        "correction should snap back to the last valid position"
+    );
+
+    println!("SMOKE TEST PASSED (auth + bundle streaming + warp + position correction)");
 }

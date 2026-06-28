@@ -64,6 +64,9 @@ pub enum ServerMsg {
     /// Confirms a `Warp`: the client should drop all chunks/actors, teleport to
     /// `spawn`, and re-stream the new world.
     Warp { spawn: [f32; 3], daytime: f32 },
+    /// Server-authoritative position correction (e.g. after an implausible
+    /// movement jump). The client should snap to `pos`.
+    Position { pos: [f32; 3] },
 }
 
 /// One chunk's data within a [`ServerMsg::Bundle`].

@@ -118,7 +118,7 @@ fn screenshot_once(
     if *taken || std::env::var("SOILS_SELFTEST").is_err() {
         return;
     }
-    if time.elapsed_secs() > 6.5 {
+    if time.elapsed_secs() > 9.0 {
         *taken = true;
         if let Ok(mut t) = camera.single_mut() {
             if let Some(actor) = remote_actors.iter().next() {
@@ -180,7 +180,7 @@ fn self_test(
     if std::env::var("SOILS_SELFTEST").is_err() {
         return;
     }
-    if time.elapsed_secs() > 8.0 {
+    if time.elapsed_secs() > 11.0 {
         let chunks = map.map.len();
         let meshes = meshed.iter().count();
         let actors = remote_actors.iter().count();

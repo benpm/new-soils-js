@@ -4,6 +4,7 @@
 
 mod actor;
 mod chunk;
+mod console;
 mod edit;
 mod gpu_mesh;
 mod hud;
@@ -58,6 +59,7 @@ fn main() {
         .insert_resource(ActorMap::default())
         .insert_resource(edit::Hotbar::default())
         .insert_resource(pause::RenderToggles::default())
+        .init_resource::<console::Console>()
         .insert_resource(net::connect())
         .add_systems(
             Startup,
@@ -68,6 +70,7 @@ fn main() {
                 edit::setup_crosshair,
                 hud::setup_hud,
                 pause::setup_pause_menu,
+                console::setup_console,
                 login,
             ),
         )
@@ -76,12 +79,13 @@ fn main() {
             (
                 net_receive,
                 player::request_chunks,
-                player::mouse_look,
-                player::movement,
+                player::mouse_look.run_if(console::console_closed),
+                player::movement.run_if(console::console_closed),
                 player::cursor_toggle,
-                edit::edit_blocks,
-                edit::hotbar_select,
+                edit::edit_blocks.run_if(console::console_closed),
+                edit::hotbar_select.run_if(console::console_closed),
                 edit::selection_highlight,
+                (console::console_input, console::update_console_text),
                 hud::update_hud,
                 hud::toggle_hud,
                 (

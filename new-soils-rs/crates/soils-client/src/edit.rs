@@ -13,14 +13,99 @@ use crate::net::NetClient;
 use crate::player::Player;
 
 const REACH: i32 = 8;
-/// Block placed on right-click (resolved by name at runtime).
-const PLACE_BLOCK: &str = "Stone";
+
+/// The nine right-click placement blocks, selectable with the 1-9 keys. Mirrors
+/// the JS hotbar (`player.placeBlock`), which defaults to "Stone Bricks".
+#[derive(Resource)]
+pub struct Hotbar {
+    pub slots: [&'static str; 9],
+    pub selected: usize,
+}
+
+impl Default for Hotbar {
+    fn default() -> Self {
+        Self {
+            slots: [
+                "Cobblestone", "Moss Stone", "Stone Bricks", "Dirt", "Grass",
+                "Wooden Crate", "Clay Pot", "Log", "Leaves",
+            ],
+            selected: 2, // Stone Bricks
+        }
+    }
+}
+
+impl Hotbar {
+    /// Name of the currently selected block.
+    pub fn block_name(&self) -> &'static str {
+        self.slots[self.selected]
+    }
+}
+
+/// Select the right-click block with the 1-9 number keys (JS hotbar).
+pub fn hotbar_select(keys: Res<ButtonInput<KeyCode>>, mut hotbar: ResMut<Hotbar>) {
+    const DIGITS: [KeyCode; 9] = [
+        KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4,
+        KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8,
+        KeyCode::Digit9,
+    ];
+    for (i, key) in DIGITS.iter().enumerate() {
+        if keys.just_pressed(*key) {
+            hotbar.selected = i;
+        }
+    }
+}
+
+/// Draw a wireframe box around the voxel the player is aiming at (JS selection
+/// box). Runs every frame while the cursor is grabbed.
+pub fn selection_highlight(
+    cursor: Query<&CursorOptions, With<PrimaryWindow>>,
+    map: Res<ChunkMap>,
+    chunks: Query<&mut VoxelChunk>,
+    camera: Query<&Transform, With<Player>>,
+    mut gizmos: Gizmos,
+) {
+    if let Ok(cursor) = cursor.single() {
+        if cursor.grab_mode == CursorGrabMode::None {
+            return;
+        }
+    }
+    let Ok(transform) = camera.single() else { return };
+    let dir = (transform.rotation * Vec3::NEG_Z).normalize();
+    if let Some(hit) = raycast_voxel(&map, &chunks, transform.translation, dir) {
+        let center = hit.voxel.as_vec3() + Vec3::splat(0.5);
+        // Slightly oversized to sit just outside the block faces (no z-fighting).
+        gizmos.cube(
+            Transform::from_translation(center).with_scale(Vec3::splat(1.002)),
+            Color::srgb(0.02, 0.02, 0.02),
+        );
+    }
+}
+
+/// Spawn a simple screen-centred crosshair (two thin bars forming a `+`).
+pub fn setup_crosshair(mut commands: Commands) {
+    let color = Color::srgba(1.0, 1.0, 1.0, 0.65);
+    for (w, h) in [(Val::Px(2.0), Val::Px(12.0)), (Val::Px(12.0), Val::Px(2.0))] {
+        commands
+            .spawn(Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                position_type: PositionType::Absolute,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|p| {
+                p.spawn((Node { width: w, height: h, ..default() }, BackgroundColor(color)));
+            });
+    }
+}
 
 pub fn edit_blocks(
     buttons: Res<ButtonInput<MouseButton>>,
     cursor: Query<&CursorOptions, With<PrimaryWindow>>,
     net: Res<NetClient>,
     registry: Res<Blocks>,
+    hotbar: Res<Hotbar>,
     map: Res<ChunkMap>,
     mut chunks: Query<&mut VoxelChunk>,
     mut gpu_chunks: Query<&mut GpuChunk>,
@@ -48,7 +133,7 @@ pub fn edit_blocks(
     let (target, value) = if break_block {
         (hit.voxel, 0u8)
     } else {
-        let id = registry.0.id_of(PLACE_BLOCK).unwrap_or(1);
+        let id = registry.0.id_of(hotbar.block_name()).unwrap_or(1);
         (hit.prev, id)
     };
 

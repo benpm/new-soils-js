@@ -119,6 +119,7 @@ pub fn spawn_gpu_chunk(
     atlas: &AtlasAssets,
     cpos: IVec3,
     volume: ChunkVolume,
+    params: AtlasParams,
 ) -> Entity {
     let voxels = buffers.add(ShaderStorageBuffer::new(volume.as_bytes(), RenderAssetUsages::default()));
     let quads =
@@ -126,7 +127,7 @@ pub fn spawn_gpu_chunk(
     let material = materials.add(ChunkMeshMaterial {
         quads: quads.clone(),
         atlas: atlas.texture.clone(),
-        params: AtlasParams { ambient_occlusion: 1.0 },
+        params,
     });
     let origin = (cpos * CHUNK_SIZE).as_vec3();
     commands

@@ -22,8 +22,11 @@ pub struct World {
 }
 
 impl World {
-    pub fn new(seed: u32) -> Self {
-        let regions_dir = PathBuf::from("data/worlds/default/regions");
+    /// Create (or open) a named world. Each world persists to its own region
+    /// directory and generates from its own `seed`, so different names yield
+    /// different terrain.
+    pub fn new(name: &str, seed: u32) -> Self {
+        let regions_dir = PathBuf::from(format!("data/worlds/{name}/regions"));
         Self {
             registry: default_registry(),
             terrain: TerrainGen::new(seed, WorldType::Normal),

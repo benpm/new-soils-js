@@ -10,7 +10,7 @@ pub use coords::{
     CHUNK_BIT, CHUNK_CLIP, CHUNK_CUBED, CHUNK_SIZE, REGION_SIZE, chunk_of, chunk_origin, local_of,
     voxel_index,
 };
-pub use messages::{ActorState, ClientMsg, ServerMsg, decode, encode};
+pub use messages::{ActorState, ChunkData, ClientMsg, ServerMsg, decode, encode};
 pub use voxel::{AIR, ChunkVolume, Voxel};
 
 #[cfg(test)]

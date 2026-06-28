@@ -21,7 +21,7 @@ async fn main() {
     let (ws, _) = tokio_tungstenite::connect_async("ws://127.0.0.1:9001").await.expect("connect");
     let (mut tx, mut rx) = ws.split();
 
-    tx.send(bin(&ClientMsg::Login { name: "editcheck".into() })).await.unwrap();
+    tx.send(bin(&ClientMsg::Login { name: "editcheck".into(), password: String::new(), signup: true })).await.unwrap();
     // Drain until Init.
     while let Some(Ok(Message::Binary(b))) = rx.next().await {
         if matches!(decode::<ServerMsg>(b.as_ref()), Some(ServerMsg::Init { .. })) {

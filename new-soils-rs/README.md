@@ -57,9 +57,16 @@ cargo run -p soils-client          # opens the game window
 > `assets/` folder via `CARGO_MANIFEST_DIR`. To run the binary directly, set
 > `BEVY_ASSET_ROOT=crates/soils-client`.
 
+On launch a **login/signup screen** appears: pick a username (and optional
+password) and Log in or Sign up.
+
 Controls: **WASD** move, **mouse** look, **Shift** sprint, **Space/Ctrl** up/down
-(fly) or jump, **F** toggle fly/walk, **left/right click** break/place, **Esc**
-release cursor.
+(fly) or jump, **F** toggle fly/walk, **left/right click** break/place,
+**1-9** pick the placement block, **F3** toggle the debug overlay, **/** open the
+command console, **Esc** release the cursor (shows the pause/settings menu).
+
+Console commands: `tp x y z`, `warp <world>`, `daytime t`, `loadradius n`,
+`fog on|off`, `ao on|off`.
 
 ### Linux build dependencies
 
@@ -93,9 +100,28 @@ SOILS_SELFTEST=1 cargo run -p soils-client      # writes /tmp/soils-selftest.png
   block and repoints the header, leaking the old block until a future compaction
   pass. Quads are rendered double-sided rather than fixing per-quad winding.
 
+## Rendering & UI
+
+- Physically-based atmosphere sky (Bevy 0.18) on an HDR/tonemapped camera, with
+  a day/night cycle (the sun is rotated and the world dimmed via exposure) and
+  exponential distance fog matched to the horizon haze.
+- HUD: crosshair, F3 debug overlay, a wireframe selection box on the targeted
+  voxel, a 1-9 block hotbar, a pause/settings menu (load radius, AO, fog), and a
+  `/` command console.
+- Chunks stream from the server in batched `Bundle` messages.
+
+## Server
+
+- Account auth: a login/signup screen; the server stores salted-hashed passwords
+  (`data/accounts.bin`) and rejects all traffic until a connection authenticates.
+  This is a lightweight stand-in, **not** production-grade security.
+- Multiple named worlds created on demand, each with its own seed and region
+  files; `/warp <world>` switches worlds (chunks/actors are world-scoped).
+- Authoritative position correction: implausible movement jumps are rejected and
+  the client is snapped back.
+
 ## Planned (later)
 
-- A sky/atmosphere shader and distance fog; nicer actor avatars (nameplates,
-  orientation, animation).
+- Nicer actor avatars (nameplates, orientation, animation).
 - RLE chunk compression and region compaction.
 - Chunk demote/unload timers to cap server memory.

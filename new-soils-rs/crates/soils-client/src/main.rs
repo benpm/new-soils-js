@@ -4,13 +4,22 @@
 
 mod actor;
 mod chunk;
+mod console;
 mod edit;
 mod gpu_mesh;
+mod hud;
+mod login;
 mod material;
 mod net;
+mod pause;
 mod player;
 
 use bevy::prelude::*;
+use bevy::ecs::system::SystemParam;
+use bevy::camera::Exposure;
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::light::{AtmosphereEnvironmentMapLight, light_consts::lux};
+use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 use bevy::render::storage::ShaderStorageBuffer;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use soils_protocol::{ChunkVolume, ClientMsg, ServerMsg};
@@ -27,6 +36,11 @@ use player::{Player, Streaming};
 #[derive(Component)]
 struct Sun;
 
+/// Camera exposure (EV100) at noon and midnight. Lower = brighter image; the
+/// day/night cycle interpolates between them so the whole scene dims at night.
+const EV100_DAY: f32 = 13.0;
+const EV100_NIGHT: f32 = 16.5;
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -37,6 +51,7 @@ fn main() {
             ..default()
         }))
         .add_plugins(GpuMeshPlugin)
+        .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
         .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 1.0)))
         .insert_resource(ChunkMap::default())
         .insert_resource(WorldTime::default())
@@ -44,26 +59,64 @@ fn main() {
         .insert_resource(Blocks(default_registry()))
         .insert_resource(LocalPlayer::default())
         .insert_resource(ActorMap::default())
+        .insert_resource(edit::Hotbar::default())
+        .insert_resource(pause::RenderToggles::default())
+        .init_resource::<console::Console>()
+        .init_resource::<login::LoginState>()
         .insert_resource(net::connect())
         .add_systems(
             Startup,
-            (setup, actor::setup_actor_assets, player::grab_cursor, login),
+            (
+                setup,
+                actor::setup_actor_assets,
+                edit::setup_crosshair,
+                hud::setup_hud,
+                pause::setup_pause_menu,
+                console::setup_console,
+                login::setup_login,
+                selftest_login,
+            ),
         )
+        // Always-on: networking, login flow, day/night, self-test.
         .add_systems(
             Update,
             (
                 net_receive,
-                player::request_chunks,
-                player::mouse_look,
-                player::movement,
-                player::cursor_toggle,
-                edit::edit_blocks,
-                actor::send_move,
+                login::login_keyboard,
+                login::login_buttons,
+                login::update_login_text,
+                login::finish_login,
+                hud::toggle_hud,
                 actor::interpolate_actors,
+                self_test_daytime.after(net_receive).before(day_night),
                 day_night,
                 self_test,
                 screenshot_once,
             ),
+        )
+        // Gameplay: only once authenticated.
+        .add_systems(
+            Update,
+            (
+                player::request_chunks,
+                player::cursor_toggle,
+                edit::selection_highlight,
+                actor::send_move,
+                console::console_input,
+                console::update_console_text,
+                hud::update_hud,
+                pause::pause_menu_visibility,
+                pause::pause_menu_buttons,
+                pause::update_pause_labels,
+            )
+                .run_if(login::logged_in),
+        )
+        // Direct player input: authenticated and console closed.
+        .add_systems(
+            Update,
+            (player::mouse_look, player::movement, edit::edit_blocks, edit::hotbar_select)
+                .run_if(console::console_closed)
+                .run_if(login::logged_in),
         )
         .run();
 }
@@ -82,7 +135,7 @@ fn screenshot_once(
     if *taken || std::env::var("SOILS_SELFTEST").is_err() {
         return;
     }
-    if time.elapsed_secs() > 6.5 {
+    if time.elapsed_secs() > 9.0 {
         *taken = true;
         if let Ok(mut t) = camera.single_mut() {
             if let Some(actor) = remote_actors.iter().next() {
@@ -91,9 +144,17 @@ fn screenshot_once(
                 t.translation = p + Vec3::new(4.0, 1.5, 4.0);
                 t.look_at(p, Vec3::Y);
                 info!("SELFTEST: framing actor at {:?}", p);
+            } else if std::env::var("SOILS_CAM").as_deref() == Ok("ground") {
+                // Player-eye view: at the surface looking out to the horizon, to
+                // judge the chunk-load boundary the way it's actually seen.
+                t.translation = Vec3::new(282.0, 273.0, 268.0);
+                t.look_at(Vec3::new(360.0, 271.0, 300.0), Vec3::Y);
+                info!("SELFTEST: ground camera at {:?}", t.translation);
             } else {
-                t.translation = Vec3::new(282.0, 330.0, 268.0);
-                t.look_at(Vec3::new(300.0, 256.0, 250.0), Vec3::Y);
+                // Natural horizon view: terrain fills the lower frame, sky the
+                // upper, so atmosphere + terrain can be judged together.
+                t.translation = Vec3::new(240.0, 280.0, 268.0);
+                t.look_at(Vec3::new(320.0, 264.0, 290.0), Vec3::Y);
                 info!("SELFTEST: camera at {:?} looking_at terrain", t.translation);
             }
         }
@@ -112,6 +173,17 @@ fn screenshot_once(
     }
 }
 
+/// In self-test mode, pin the time of day so screenshots are deterministic
+/// (the server's clock drifts with wall-time). `SOILS_DAYTIME` overrides the
+/// default noon (0.0); e.g. 0.25 = dawn/dusk, 0.5 = midnight.
+fn self_test_daytime(mut world_time: ResMut<WorldTime>) {
+    if std::env::var("SOILS_SELFTEST").is_err() {
+        return;
+    }
+    let d = std::env::var("SOILS_DAYTIME").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    world_time.daytime = d;
+}
+
 /// When `SOILS_SELFTEST` is set, report how much of the world streamed in and
 /// meshed after a few seconds, then exit. Lets the full client path (connect →
 /// stream → mesh → render) be validated headlessly under xvfb + lavapipe.
@@ -125,7 +197,7 @@ fn self_test(
     if std::env::var("SOILS_SELFTEST").is_err() {
         return;
     }
-    if time.elapsed_secs() > 8.0 {
+    if time.elapsed_secs() > 11.0 {
         let chunks = map.map.len();
         let meshes = meshed.iter().count();
         let actors = remote_actors.iter().count();
@@ -138,12 +210,14 @@ fn self_test(
 }
 
 /// Spawn the camera/player and the sun.
-fn setup(mut commands: Commands) {
+fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) {
     commands.spawn((
         Camera3d::default(),
         Projection::from(PerspectiveProjection {
             fov: 65.0_f32.to_radians(),
-            far: 2_000_000.0,
+            // A sane far plane keeps reverse-Z depth precise; an enormous one
+            // (the old 2e6) crushes near-terrain depth toward 0.
+            far: 8_000.0,
             ..default()
         }),
         // Provisional spawn; corrected by the server's `Init` message. The
@@ -152,20 +226,43 @@ fn setup(mut commands: Commands) {
         Transform::from_xyz(282.0, 285.0, 268.0)
             .with_rotation(Quat::from_axis_angle(Vec3::X, -0.5)),
         Player::default(),
-        // Global ambient fill so shaded faces aren't pure black.
-        AmbientLight { brightness: 350.0, ..default() },
+        // Physically-based sky. `Atmosphere` requires (and auto-inserts) `Hdr`;
+        // pair it with a tonemapper, an exposure the day/night cycle drives, and
+        // sky-derived image-based lighting for the lit actors. 1 world unit ==
+        // 1 block ~= 1 metre, so the default `scene_units_to_m` is correct.
+        //
+        // NOTE: no `Bloom` — with our unlit, manually-exposed terrain the bright
+        // HDR sky bloom washes the whole frame to a flat haze regardless of
+        // prefilter threshold; the atmosphere still draws the sun disc itself.
+        Atmosphere::earthlike(mediums.add(ScatteringMedium::default())),
+        AtmosphereSettings::default(),
+        AtmosphereEnvironmentMapLight::default(),
+        Exposure { ev100: EV100_DAY },
+        Tonemapping::AcesFitted,
     ));
 
     commands.spawn((
         Sun,
-        DirectionalLight { illuminance: 10_000.0, shadows_enabled: false, ..default() },
-        Transform::from_xyz(0.0, 1.0, 0.0).looking_to(Vec3::new(-0.3, -1.0, -0.2), Vec3::Y),
+        // RAW (pre-atmosphere) sunlight is the correct input for the atmosphere
+        // to filter; `day_night` rotates it and dims it toward night.
+        DirectionalLight { illuminance: lux::RAW_SUNLIGHT, shadows_enabled: false, ..default() },
+        Transform::default(),
     ));
 }
 
-/// Announce ourselves to the server.
-fn login(net: Res<NetClient>) {
-    net.send(ClientMsg::Login { name: "player".into() });
+/// In self-test mode there's no login screen, so auto-authenticate as a guest.
+fn selftest_login(net: Res<NetClient>) {
+    if std::env::var("SOILS_SELFTEST").is_ok() && std::env::var("SOILS_LOGINSHOT").is_err() {
+        net.send(ClientMsg::Login { name: "player".into(), password: String::new(), signup: true });
+    }
+}
+
+/// Bundled remote-actor params, so `net_receive` stays under the 16-param limit.
+#[derive(SystemParam)]
+struct ActorCtx<'w, 's> {
+    map: ResMut<'w, ActorMap>,
+    assets: Res<'w, ActorAssets>,
+    actors: Query<'w, 's, &'static mut Actor>,
 }
 
 /// Drain server messages and apply them to the ECS world.
@@ -179,53 +276,43 @@ fn net_receive(
     mut materials: ResMut<Assets<ChunkMeshMaterial>>,
     atlas: Res<AtlasAssets>,
     mut world_time: ResMut<WorldTime>,
-    mut player: Query<&mut Transform, With<Player>>,
+    mut player: Query<(&mut Transform, &mut Player)>,
     mut local: ResMut<LocalPlayer>,
-    mut actor_map: ResMut<ActorMap>,
-    actor_assets: Res<ActorAssets>,
-    mut actors: Query<&mut Actor>,
+    mut actor_ctx: ActorCtx,
+    toggles: Res<pause::RenderToggles>,
+    mut streaming: ResMut<Streaming>,
+    mut login_state: ResMut<login::LoginState>,
 ) {
+    let chunk_params = material::AtlasParams {
+        ambient_occlusion: if toggles.ao { 1.0 } else { 0.0 },
+        fog_density: if toggles.fog { material::FOG_DENSITY } else { 0.0 },
+        ..default()
+    };
     for msg in net.drain() {
         match msg {
             ServerMsg::Init { id, spawn, daytime, .. } => {
                 local.id = id;
                 world_time.daytime = daytime;
-                if let Ok(mut transform) = player.single_mut() {
+                login_state.done = true; // authenticated — drop the login screen
+                if let Ok((mut transform, _)) = player.single_mut() {
                     transform.translation = Vec3::from_array(spawn);
                 }
             }
+            ServerMsg::LoginError { message } => {
+                login_state.status = message;
+            }
             ServerMsg::Chunk { pos, empty, voxels } => {
-                let cpos = IVec3::from_array(pos);
-                let volume = if empty {
-                    ChunkVolume::empty()
-                } else {
-                    ChunkVolume::from_bytes(&voxels)
-                };
-                if let Some(&entity) = map.map.get(&cpos) {
-                    // Existing chunk: update CPU copy + re-upload voxels if it has
-                    // a GPU mesh, else (was empty) leave as-is.
-                    if let Ok(mut vc) = chunks.get_mut(entity) {
-                        vc.volume = volume.clone();
-                    }
-                    if !empty {
-                        if let Ok(mut gc) = gpu_chunks.get_mut(entity) {
-                            gpu_mesh::refresh_gpu_chunk(&mut buffers, &mut gc, &volume);
-                        }
-                    }
-                } else if empty {
-                    // Track empty chunks so they aren't re-requested; no mesh.
-                    let e = commands.spawn(VoxelChunk { pos: cpos, volume }).id();
-                    map.map.insert(cpos, e);
-                } else {
-                    let e = gpu_mesh::spawn_gpu_chunk(
-                        &mut commands,
-                        &mut buffers,
-                        &mut materials,
-                        &atlas,
-                        cpos,
-                        volume,
+                apply_chunk(
+                    &mut commands, &mut map, &mut chunks, &mut gpu_chunks, &mut buffers,
+                    &mut materials, &atlas, &chunk_params, pos, empty, voxels,
+                );
+            }
+            ServerMsg::Bundle { chunks: datas } => {
+                for d in datas {
+                    apply_chunk(
+                        &mut commands, &mut map, &mut chunks, &mut gpu_chunks, &mut buffers,
+                        &mut materials, &atlas, &chunk_params, d.pos, d.empty, d.voxels,
                     );
-                    map.map.insert(cpos, e);
                 }
             }
             ServerMsg::Edit { pos, value } => {
@@ -235,31 +322,53 @@ fn net_receive(
             ServerMsg::Time { daytime } => {
                 world_time.daytime = daytime;
             }
+            ServerMsg::Warp { spawn, daytime } => {
+                // Drop the old world entirely and re-stream the new one.
+                for (_, entity) in map.map.drain() {
+                    commands.entity(entity).despawn();
+                }
+                for (_, entity) in actor_ctx.map.map.drain() {
+                    commands.entity(entity).despawn();
+                }
+                world_time.daytime = daytime;
+                if let Ok((mut transform, mut p)) = player.single_mut() {
+                    transform.translation = Vec3::from_array(spawn);
+                    p.velocity = Vec3::ZERO;
+                }
+                streaming.last_chunk = None; // force a fresh stream
+            }
+            ServerMsg::Position { pos } => {
+                // Server rejected our movement — snap back.
+                if let Ok((mut transform, mut p)) = player.single_mut() {
+                    transform.translation = Vec3::from_array(pos);
+                    p.velocity = Vec3::ZERO;
+                }
+            }
             ServerMsg::ActorUpdate { actors: states } => {
                 for state in states {
                     if state.id == local.id {
                         continue; // don't render ourselves
                     }
                     let target = Vec3::from_array(state.pos);
-                    if let Some(&entity) = actor_map.map.get(&state.id) {
-                        if let Ok(mut actor) = actors.get_mut(entity) {
+                    if let Some(&entity) = actor_ctx.map.map.get(&state.id) {
+                        if let Ok(mut actor) = actor_ctx.actors.get_mut(entity) {
                             actor.target = target;
                         }
                     } else {
                         let entity = commands
                             .spawn((
                                 Actor { target },
-                                Mesh3d(actor_assets.mesh.clone()),
-                                MeshMaterial3d(actor_assets.material.clone()),
+                                Mesh3d(actor_ctx.assets.mesh.clone()),
+                                MeshMaterial3d(actor_ctx.assets.material.clone()),
                                 Transform::from_translation(target - Vec3::Y * 0.9),
                             ))
                             .id();
-                        actor_map.map.insert(state.id, entity);
+                        actor_ctx.map.map.insert(state.id, entity);
                     }
                 }
             }
             ServerMsg::ActorRemove { id } => {
-                if let Some(entity) = actor_map.map.remove(&id) {
+                if let Some(entity) = actor_ctx.map.map.remove(&id) {
                     commands.entity(entity).despawn();
                 }
             }
@@ -267,16 +376,76 @@ fn net_receive(
     }
 }
 
-/// Swing the sun around with the day/night cycle and dim it at night.
+/// Apply one streamed chunk: update an existing chunk's voxels or spawn a new
+/// (meshed or empty-tracked) chunk entity. Shared by `Chunk` and `Bundle`.
+#[allow(clippy::too_many_arguments)]
+fn apply_chunk(
+    commands: &mut Commands,
+    map: &mut ChunkMap,
+    chunks: &mut Query<&mut VoxelChunk>,
+    gpu_chunks: &mut Query<&mut GpuChunk>,
+    buffers: &mut Assets<ShaderStorageBuffer>,
+    materials: &mut Assets<ChunkMeshMaterial>,
+    atlas: &AtlasAssets,
+    params: &material::AtlasParams,
+    pos: [i32; 3],
+    empty: bool,
+    voxels: Vec<u8>,
+) {
+    let cpos = IVec3::from_array(pos);
+    let volume = if empty { ChunkVolume::empty() } else { ChunkVolume::from_bytes(&voxels) };
+    if let Some(&entity) = map.map.get(&cpos) {
+        // Existing chunk: update CPU copy + re-upload voxels if it has a GPU
+        // mesh, else (was empty) leave as-is.
+        if let Ok(mut vc) = chunks.get_mut(entity) {
+            vc.volume = volume.clone();
+        }
+        if !empty {
+            if let Ok(mut gc) = gpu_chunks.get_mut(entity) {
+                gpu_mesh::refresh_gpu_chunk(buffers, &mut gc, &volume);
+            }
+        }
+    } else if empty {
+        // Track empty chunks so they aren't re-requested; no mesh.
+        let e = commands.spawn(VoxelChunk { pos: cpos, volume }).id();
+        map.map.insert(cpos, e);
+    } else {
+        let e = gpu_mesh::spawn_gpu_chunk(commands, buffers, materials, atlas, cpos, volume, params.clone());
+        map.map.insert(cpos, e);
+    }
+}
+
+/// Day-length easing ported from the JS `ease10`: a steep ease-in/out that
+/// holds bright through midday and dark through midnight.
+fn ease10(t: f32) -> f32 {
+    let v = if t < 0.5 {
+        512.0 * t.powi(10)
+    } else {
+        -512.0 * (t - 1.0).powi(10) + 1.0
+    };
+    v.clamp(0.0, 1.0)
+}
+
+/// Swing the sun with the day/night cycle and dim the world toward night.
+/// JS convention: `daytime` 0.0 = noon (sun overhead), 0.5 = midnight.
 fn day_night(
     world_time: Res<WorldTime>,
     mut sun: Query<(&mut Transform, &mut DirectionalLight), With<Sun>>,
+    mut exposure: Query<&mut Exposure, With<Player>>,
 ) {
-    let Ok((mut transform, mut light)) = sun.single_mut() else { return };
-    // daytime 0.0 = noon, 0.5 = midnight (matching the JS convention).
-    let angle = world_time.daytime * std::f32::consts::TAU;
-    let dir = Vec3::new(angle.sin() * 0.6, -angle.cos(), 0.3).normalize();
-    transform.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, dir);
-    // Brightest at noon, dark at midnight.
-    light.illuminance = 10_000.0 * ((-angle.cos()).max(0.0) * 0.9 + 0.1);
+    // JS: theta = PI*(dayTime*2 - 0.5); the sun sweeps the Y-Z plane. The light
+    // travels in `dir` (straight down at noon); a small +X tilt keeps it off the
+    // exact vertical / antiparallel singularities of `look_to`.
+    let theta = std::f32::consts::PI * (world_time.daytime * 2.0 - 0.5);
+    let dir = Vec3::new(0.15, theta.sin(), theta.cos()).normalize();
+    // Daylight factor: 1 at noon, 0 at midnight (JS `ease10(dayTime*2 - 1)`).
+    let day = ease10(world_time.daytime * 2.0 - 1.0);
+
+    if let Ok((mut transform, mut light)) = sun.single_mut() {
+        transform.look_to(dir, Vec3::Y);
+        light.illuminance = lux::RAW_SUNLIGHT * (0.02 + 0.98 * day);
+    }
+    if let Ok(mut exp) = exposure.single_mut() {
+        exp.ev100 = EV100_NIGHT + (EV100_DAY - EV100_NIGHT) * day;
+    }
 }

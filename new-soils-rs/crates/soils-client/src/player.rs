@@ -49,14 +49,6 @@ impl Default for Streaming {
     }
 }
 
-/// Lock the cursor to the window for FPS look.
-pub fn grab_cursor(mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>) {
-    if let Ok(mut cursor) = cursor.single_mut() {
-        cursor.grab_mode = CursorGrabMode::Locked;
-        cursor.visible = false;
-    }
-}
-
 /// Toggle pointer-lock with Escape; re-grab on click.
 pub fn cursor_toggle(
     keys: Res<ButtonInput<KeyCode>>,

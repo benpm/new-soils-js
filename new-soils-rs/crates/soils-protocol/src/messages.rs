@@ -27,8 +27,10 @@ pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Option<T> {
 /// Messages sent client → server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {
-    /// Join with a display name; server replies with `Init`.
-    Login { name: String },
+    /// Authenticate (or, with `signup`, register) and join. The server replies
+    /// with `Init` on success or `LoginError` on failure. `password` may be
+    /// empty (optional-password accounts).
+    Login { name: String, password: String, signup: bool },
     /// Request a batch of chunks by chunk coordinate.
     ReqChunks { positions: Vec<[i32; 3]> },
     /// Player movement update (absolute voxel-space position + velocity).
@@ -42,8 +44,10 @@ pub enum ClientMsg {
 /// Messages sent server → client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMsg {
-    /// Sent once after `Login` with spawn + world info.
+    /// Sent once after a successful `Login` with spawn + world info.
     Init { id: u16, spawn: [f32; 3], seed: i64, daytime: f32 },
+    /// A failed `Login` (bad password, name taken, etc.).
+    LoginError { message: String },
     /// A chunk's voxel data. `voxels` is empty for an all-Air chunk.
     Chunk { pos: [i32; 3], empty: bool, voxels: Vec<u8> },
     /// Several chunks in one frame (response to `ReqChunks`), to cut per-message

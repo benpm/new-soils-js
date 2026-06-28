@@ -18,9 +18,11 @@ async fn main() {
     // Drain and discard everything the server sends us.
     tokio::spawn(async move { while rx.next().await.is_some() {} });
 
-    tx.send(Message::Binary(encode(&ClientMsg::Login { name: "peer".into() }).into()))
-        .await
-        .unwrap();
+    tx.send(Message::Binary(
+        encode(&ClientMsg::Login { name: "peer".into(), password: String::new(), signup: true }).into(),
+    ))
+    .await
+    .unwrap();
     println!("peer logged in, holding position {POS:?}");
 
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));

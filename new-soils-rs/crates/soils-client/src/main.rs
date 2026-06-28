@@ -8,12 +8,14 @@ mod console;
 mod edit;
 mod gpu_mesh;
 mod hud;
+mod login;
 mod material;
 mod net;
 mod pause;
 mod player;
 
 use bevy::prelude::*;
+use bevy::ecs::system::SystemParam;
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{AtmosphereEnvironmentMapLight, light_consts::lux};
@@ -60,46 +62,61 @@ fn main() {
         .insert_resource(edit::Hotbar::default())
         .insert_resource(pause::RenderToggles::default())
         .init_resource::<console::Console>()
+        .init_resource::<login::LoginState>()
         .insert_resource(net::connect())
         .add_systems(
             Startup,
             (
                 setup,
                 actor::setup_actor_assets,
-                player::grab_cursor,
                 edit::setup_crosshair,
                 hud::setup_hud,
                 pause::setup_pause_menu,
                 console::setup_console,
-                login,
+                login::setup_login,
+                selftest_login,
             ),
         )
+        // Always-on: networking, login flow, day/night, self-test.
         .add_systems(
             Update,
             (
                 net_receive,
-                player::request_chunks,
-                player::mouse_look.run_if(console::console_closed),
-                player::movement.run_if(console::console_closed),
-                player::cursor_toggle,
-                edit::edit_blocks.run_if(console::console_closed),
-                edit::hotbar_select.run_if(console::console_closed),
-                edit::selection_highlight,
-                (console::console_input, console::update_console_text),
-                hud::update_hud,
+                login::login_keyboard,
+                login::login_buttons,
+                login::update_login_text,
+                login::finish_login,
                 hud::toggle_hud,
-                (
-                    pause::pause_menu_visibility,
-                    pause::pause_menu_buttons,
-                    pause::update_pause_labels,
-                ),
-                actor::send_move,
                 actor::interpolate_actors,
                 self_test_daytime.after(net_receive).before(day_night),
                 day_night,
                 self_test,
                 screenshot_once,
             ),
+        )
+        // Gameplay: only once authenticated.
+        .add_systems(
+            Update,
+            (
+                player::request_chunks,
+                player::cursor_toggle,
+                edit::selection_highlight,
+                actor::send_move,
+                console::console_input,
+                console::update_console_text,
+                hud::update_hud,
+                pause::pause_menu_visibility,
+                pause::pause_menu_buttons,
+                pause::update_pause_labels,
+            )
+                .run_if(login::logged_in),
+        )
+        // Direct player input: authenticated and console closed.
+        .add_systems(
+            Update,
+            (player::mouse_look, player::movement, edit::edit_blocks, edit::hotbar_select)
+                .run_if(console::console_closed)
+                .run_if(login::logged_in),
         )
         .run();
 }
@@ -233,9 +250,19 @@ fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) 
     ));
 }
 
-/// Announce ourselves to the server.
-fn login(net: Res<NetClient>) {
-    net.send(ClientMsg::Login { name: "player".into() });
+/// In self-test mode there's no login screen, so auto-authenticate as a guest.
+fn selftest_login(net: Res<NetClient>) {
+    if std::env::var("SOILS_SELFTEST").is_ok() && std::env::var("SOILS_LOGINSHOT").is_err() {
+        net.send(ClientMsg::Login { name: "player".into(), password: String::new(), signup: true });
+    }
+}
+
+/// Bundled remote-actor params, so `net_receive` stays under the 16-param limit.
+#[derive(SystemParam)]
+struct ActorCtx<'w, 's> {
+    map: ResMut<'w, ActorMap>,
+    assets: Res<'w, ActorAssets>,
+    actors: Query<'w, 's, &'static mut Actor>,
 }
 
 /// Drain server messages and apply them to the ECS world.
@@ -251,11 +278,10 @@ fn net_receive(
     mut world_time: ResMut<WorldTime>,
     mut player: Query<&mut Transform, With<Player>>,
     mut local: ResMut<LocalPlayer>,
-    mut actor_map: ResMut<ActorMap>,
-    actor_assets: Res<ActorAssets>,
-    mut actors: Query<&mut Actor>,
+    mut actor_ctx: ActorCtx,
     toggles: Res<pause::RenderToggles>,
     mut streaming: ResMut<Streaming>,
+    mut login_state: ResMut<login::LoginState>,
 ) {
     let chunk_params = material::AtlasParams {
         ambient_occlusion: if toggles.ao { 1.0 } else { 0.0 },
@@ -267,9 +293,13 @@ fn net_receive(
             ServerMsg::Init { id, spawn, daytime, .. } => {
                 local.id = id;
                 world_time.daytime = daytime;
+                login_state.done = true; // authenticated — drop the login screen
                 if let Ok(mut transform) = player.single_mut() {
                     transform.translation = Vec3::from_array(spawn);
                 }
+            }
+            ServerMsg::LoginError { message } => {
+                login_state.status = message;
             }
             ServerMsg::Chunk { pos, empty, voxels } => {
                 apply_chunk(
@@ -297,7 +327,7 @@ fn net_receive(
                 for (_, entity) in map.map.drain() {
                     commands.entity(entity).despawn();
                 }
-                for (_, entity) in actor_map.map.drain() {
+                for (_, entity) in actor_ctx.map.map.drain() {
                     commands.entity(entity).despawn();
                 }
                 world_time.daytime = daytime;
@@ -312,25 +342,25 @@ fn net_receive(
                         continue; // don't render ourselves
                     }
                     let target = Vec3::from_array(state.pos);
-                    if let Some(&entity) = actor_map.map.get(&state.id) {
-                        if let Ok(mut actor) = actors.get_mut(entity) {
+                    if let Some(&entity) = actor_ctx.map.map.get(&state.id) {
+                        if let Ok(mut actor) = actor_ctx.actors.get_mut(entity) {
                             actor.target = target;
                         }
                     } else {
                         let entity = commands
                             .spawn((
                                 Actor { target },
-                                Mesh3d(actor_assets.mesh.clone()),
-                                MeshMaterial3d(actor_assets.material.clone()),
+                                Mesh3d(actor_ctx.assets.mesh.clone()),
+                                MeshMaterial3d(actor_ctx.assets.material.clone()),
                                 Transform::from_translation(target - Vec3::Y * 0.9),
                             ))
                             .id();
-                        actor_map.map.insert(state.id, entity);
+                        actor_ctx.map.map.insert(state.id, entity);
                     }
                 }
             }
             ServerMsg::ActorRemove { id } => {
-                if let Some(entity) = actor_map.map.remove(&id) {
+                if let Some(entity) = actor_ctx.map.map.remove(&id) {
                     commands.entity(entity).despawn();
                 }
             }

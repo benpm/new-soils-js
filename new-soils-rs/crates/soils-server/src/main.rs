@@ -5,8 +5,11 @@
 //! named worlds (clients can `Warp` between them). This is the Rust counterpart
 //! to `server.js`, trimmed to what the slice needs (no MySQL, no schemapack).
 
+mod auth;
 mod region;
 mod world;
+
+use auth::Accounts;
 
 use std::collections::HashMap;
 use std::sync::{
@@ -83,6 +86,7 @@ async fn main() {
     let worlds: Worlds = Arc::new(Mutex::new(HashMap::new()));
     // Pre-create the default world so it's ready before the first client.
     get_world(&worlds, DEFAULT_WORLD);
+    let accounts = Arc::new(Accounts::load());
     let (bcast, _) = broadcast::channel::<(u16, String, ServerMsg)>(1024);
     let players: Players = Arc::new(Mutex::new(HashMap::new()));
     let clock: Clock = Arc::new(Mutex::new(0.0));
@@ -135,11 +139,12 @@ async fn main() {
         let bcast = bcast.clone();
         let players = players.clone();
         let clock = clock.clone();
+        let accounts = accounts.clone();
         tokio::spawn(async move {
             let cleanup_bcast = bcast.clone();
             let world_name = {
                 if let Err(e) =
-                    handle_connection(stream, id, worlds, bcast, players.clone(), clock).await
+                    handle_connection(stream, id, worlds, bcast, players.clone(), clock, accounts).await
                 {
                     eprintln!("connection {peer} ({id}) ended: {e}");
                 }
@@ -160,6 +165,7 @@ async fn handle_connection(
     bcast: Broadcast,
     players: Players,
     clock: Clock,
+    accounts: Arc<Accounts>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut ws_tx, mut ws_rx) = ws.split();
@@ -168,6 +174,8 @@ async fn handle_connection(
     // filter messages to the right world.
     let current_world = Arc::new(Mutex::new(DEFAULT_WORLD.to_string()));
     let mut world = get_world(&worlds, DEFAULT_WORLD);
+    // Only authenticated connections may stream/edit/move.
+    let mut authenticated = false;
 
     // Per-connection outgoing queue, drained by a single writer task.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
@@ -203,9 +211,20 @@ async fn handle_connection(
         };
         let Some(msg) = decode::<ClientMsg>(data.as_ref()) else { continue };
 
+        // Reject everything until the connection has authenticated.
+        if !authenticated && !matches!(msg, ClientMsg::Login { .. }) {
+            continue;
+        }
+
         match msg {
-            ClientMsg::Login { name } => {
+            ClientMsg::Login { name, password, signup } => {
+                if let Err(reason) = accounts.authenticate(&name, &password, signup) {
+                    println!("login denied: {name} (id {id}): {reason}");
+                    let _ = out_tx.send(ServerMsg::LoginError { message: reason });
+                    continue;
+                }
                 println!("login: {name} (id {id})");
+                authenticated = true;
                 let spawn = world.lock().unwrap().spawn;
                 let seed = world.lock().unwrap().seed;
                 let daytime = *clock.lock().unwrap();

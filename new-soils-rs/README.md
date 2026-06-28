@@ -58,8 +58,12 @@ cargo run -p soils-client          # opens the game window
 > `BEVY_ASSET_ROOT=crates/soils-client`.
 
 Controls: **WASD** move, **mouse** look, **Shift** sprint, **Space/Ctrl** up/down
-(fly) or jump, **F** toggle fly/walk, **left/right click** break/place, **Esc**
-release cursor.
+(fly) or jump, **F** toggle fly/walk, **left/right click** break/place,
+**1-9** pick the placement block, **F3** toggle the debug overlay, **/** open the
+command console, **Esc** release the cursor (shows the pause/settings menu).
+
+Console commands: `tp x y z`, `daytime t`, `loadradius n`, `fog on|off`,
+`ao on|off`.
 
 ### Linux build dependencies
 
@@ -93,9 +97,20 @@ SOILS_SELFTEST=1 cargo run -p soils-client      # writes /tmp/soils-selftest.png
   block and repoints the header, leaking the old block until a future compaction
   pass. Quads are rendered double-sided rather than fixing per-quad winding.
 
+## Rendering & UI
+
+- Physically-based atmosphere sky (Bevy 0.18) on an HDR/tonemapped camera, with
+  a day/night cycle (the sun is rotated and the world dimmed via exposure) and
+  exponential distance fog matched to the horizon haze.
+- HUD: crosshair, F3 debug overlay, a wireframe selection box on the targeted
+  voxel, a 1-9 block hotbar, a pause/settings menu (load radius, AO, fog), and a
+  `/` command console.
+- Chunks stream from the server in batched `Bundle` messages.
+
 ## Planned (later)
 
-- A sky/atmosphere shader and distance fog; nicer actor avatars (nameplates,
-  orientation, animation).
+- Nicer actor avatars (nameplates, orientation, animation). Server-side auth,
+  multiple worlds (`/warp`), and movement validation were non-secure stubs or
+  absent in the JS original, so they remain unported (net-new systems).
 - RLE chunk compression and region compaction.
 - Chunk demote/unload timers to cap server memory.

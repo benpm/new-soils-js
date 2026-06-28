@@ -6,8 +6,11 @@ use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 
+use soils_protocol::ClientMsg;
+
 use crate::chunk::WorldTime;
 use crate::material::{ChunkMeshMaterial, FOG_DENSITY};
+use crate::net::NetClient;
 use crate::pause::RenderToggles;
 use crate::player::{Player, Streaming};
 
@@ -56,6 +59,7 @@ pub fn console_input(
     mut streaming: ResMut<Streaming>,
     mut toggles: ResMut<RenderToggles>,
     mut materials: ResMut<Assets<ChunkMeshMaterial>>,
+    net: Res<NetClient>,
 ) {
     for ev in events.read() {
         if ev.state != ButtonState::Pressed {
@@ -73,7 +77,10 @@ pub fn console_input(
             Key::Enter => {
                 let cmd = std::mem::take(&mut console.buffer);
                 console.open = false;
-                run_command(&cmd, &mut player, &mut world_time, &mut streaming, &mut toggles, &mut materials);
+                run_command(
+                    &cmd, &mut player, &mut world_time, &mut streaming, &mut toggles,
+                    &mut materials, &net,
+                );
             }
             Key::Escape => {
                 console.open = false;
@@ -112,6 +119,7 @@ fn run_command(
     streaming: &mut Streaming,
     toggles: &mut RenderToggles,
     materials: &mut Assets<ChunkMeshMaterial>,
+    net: &NetClient,
 ) {
     let mut parts = line.split_whitespace();
     let Some(cmd) = parts.next() else { return };
@@ -153,6 +161,10 @@ fn run_command(
             for (_, m) in materials.iter_mut() {
                 m.params.ambient_occlusion = v;
             }
+        }
+        "warp" if !args.is_empty() => {
+            // Server creates the world on demand and replies with `Warp`.
+            net.send(ClientMsg::Warp { world: args[0].to_string() });
         }
         _ => {}
     }

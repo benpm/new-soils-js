@@ -255,6 +255,7 @@ fn net_receive(
     actor_assets: Res<ActorAssets>,
     mut actors: Query<&mut Actor>,
     toggles: Res<pause::RenderToggles>,
+    mut streaming: ResMut<Streaming>,
 ) {
     let chunk_params = material::AtlasParams {
         ambient_occlusion: if toggles.ao { 1.0 } else { 0.0 },
@@ -290,6 +291,20 @@ fn net_receive(
             }
             ServerMsg::Time { daytime } => {
                 world_time.daytime = daytime;
+            }
+            ServerMsg::Warp { spawn, daytime } => {
+                // Drop the old world entirely and re-stream the new one.
+                for (_, entity) in map.map.drain() {
+                    commands.entity(entity).despawn();
+                }
+                for (_, entity) in actor_map.map.drain() {
+                    commands.entity(entity).despawn();
+                }
+                world_time.daytime = daytime;
+                if let Ok(mut transform) = player.single_mut() {
+                    transform.translation = Vec3::from_array(spawn);
+                }
+                streaming.last_chunk = None; // force a fresh stream
             }
             ServerMsg::ActorUpdate { actors: states } => {
                 for state in states {

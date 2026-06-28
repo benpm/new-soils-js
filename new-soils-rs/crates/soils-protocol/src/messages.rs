@@ -35,6 +35,8 @@ pub enum ClientMsg {
     Move { pos: [f32; 3], velocity: [f32; 3] },
     /// Set a voxel at an absolute voxel position.
     Edit { pos: [i32; 3], value: u8 },
+    /// Switch to a (server-created-on-demand) named world.
+    Warp { world: String },
 }
 
 /// Messages sent server → client.
@@ -55,6 +57,9 @@ pub enum ServerMsg {
     ActorRemove { id: u16 },
     /// Current world time of day, 0.0..1.0.
     Time { daytime: f32 },
+    /// Confirms a `Warp`: the client should drop all chunks/actors, teleport to
+    /// `spawn`, and re-stream the new world.
+    Warp { spawn: [f32; 3], daytime: f32 },
 }
 
 /// One chunk's data within a [`ServerMsg::Bundle`].

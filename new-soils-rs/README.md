@@ -57,13 +57,16 @@ cargo run -p soils-client          # opens the game window
 > `assets/` folder via `CARGO_MANIFEST_DIR`. To run the binary directly, set
 > `BEVY_ASSET_ROOT=crates/soils-client`.
 
+On launch a **login/signup screen** appears: pick a username (and optional
+password) and Log in or Sign up.
+
 Controls: **WASD** move, **mouse** look, **Shift** sprint, **Space/Ctrl** up/down
 (fly) or jump, **F** toggle fly/walk, **left/right click** break/place,
 **1-9** pick the placement block, **F3** toggle the debug overlay, **/** open the
 command console, **Esc** release the cursor (shows the pause/settings menu).
 
-Console commands: `tp x y z`, `daytime t`, `loadradius n`, `fog on|off`,
-`ao on|off`.
+Console commands: `tp x y z`, `warp <world>`, `daytime t`, `loadradius n`,
+`fog on|off`, `ao on|off`.
 
 ### Linux build dependencies
 
@@ -107,10 +110,18 @@ SOILS_SELFTEST=1 cargo run -p soils-client      # writes /tmp/soils-selftest.png
   `/` command console.
 - Chunks stream from the server in batched `Bundle` messages.
 
+## Server
+
+- Account auth: a login/signup screen; the server stores salted-hashed passwords
+  (`data/accounts.bin`) and rejects all traffic until a connection authenticates.
+  This is a lightweight stand-in, **not** production-grade security.
+- Multiple named worlds created on demand, each with its own seed and region
+  files; `/warp <world>` switches worlds (chunks/actors are world-scoped).
+- Authoritative position correction: implausible movement jumps are rejected and
+  the client is snapped back.
+
 ## Planned (later)
 
-- Nicer actor avatars (nameplates, orientation, animation). Server-side auth,
-  multiple worlds (`/warp`), and movement validation were non-secure stubs or
-  absent in the JS original, so they remain unported (net-new systems).
+- Nicer actor avatars (nameplates, orientation, animation).
 - RLE chunk compression and region compaction.
 - Chunk demote/unload timers to cap server memory.

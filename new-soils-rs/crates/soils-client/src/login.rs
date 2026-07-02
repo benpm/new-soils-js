@@ -8,23 +8,42 @@ use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use soils_protocol::ClientMsg;
 
+use crate::discovery::DiscoveredServers;
 use crate::net::NetClient;
+
+/// Default server address shown in the address field.
+const DEFAULT_ADDRESS: &str = "127.0.0.1:9001";
 
 #[derive(Default, PartialEq, Clone, Copy)]
 pub enum Field {
+    Address,
     #[default]
     Name,
     Password,
 }
 
 /// Login form state. `done` flips true once the server accepts us (`Init`).
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct LoginState {
+    pub address: String,
     pub name: String,
     pub password: String,
     pub focus: Field,
     pub status: String,
     pub done: bool,
+}
+
+impl Default for LoginState {
+    fn default() -> Self {
+        Self {
+            address: DEFAULT_ADDRESS.into(),
+            name: String::new(),
+            password: String::new(),
+            focus: Field::default(),
+            status: String::new(),
+            done: false,
+        }
+    }
 }
 
 /// Run condition: the game world only runs once logged in.
@@ -36,17 +55,28 @@ pub fn logged_in(login: Res<LoginState>) -> bool {
 pub(crate) struct LoginScreen;
 #[derive(Component, Clone, Copy)]
 pub(crate) enum LoginButton {
+    FocusAddress,
     FocusName,
     FocusPassword,
     Login,
     Signup,
 }
 #[derive(Component)]
+pub(crate) struct AddressText;
+#[derive(Component)]
 pub(crate) struct NameText;
 #[derive(Component)]
 pub(crate) struct PasswordText;
 #[derive(Component)]
 pub(crate) struct StatusText;
+/// Holds one [`ServerButton`] per discovered LAN server.
+#[derive(Component)]
+pub(crate) struct ServerListContainer;
+/// A clickable discovered-server entry; clicking fills the address field.
+#[derive(Component)]
+pub(crate) struct ServerButton {
+    addr: String,
+}
 
 const PANEL_BG: Color = Color::srgba(0.05, 0.06, 0.08, 0.92);
 const FIELD_BG: Color = Color::srgba(0.15, 0.16, 0.20, 1.0);
@@ -89,8 +119,19 @@ pub fn setup_login(mut commands: Commands) {
                     TextFont { font_size: 30.0, ..default() },
                     TextColor(Color::WHITE),
                 ));
+                field(panel, "Server", LoginButton::FocusAddress, AddressText);
                 field(panel, "Username", LoginButton::FocusName, NameText);
                 field(panel, "Password", LoginButton::FocusPassword, PasswordText);
+                // Discovered LAN servers populate here (see `update_server_list`).
+                panel.spawn((
+                    ServerListContainer,
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::Stretch,
+                        row_gap: Val::Px(4.0),
+                        ..default()
+                    },
+                ));
                 panel
                     .spawn(Node {
                         flex_direction: FlexDirection::Row,
@@ -171,12 +212,14 @@ pub fn login_keyboard(
             Key::Tab => {
                 login.focus = match login.focus {
                     Field::Name => Field::Password,
-                    Field::Password => Field::Name,
+                    Field::Password => Field::Address,
+                    Field::Address => Field::Name,
                 };
             }
             Key::Enter => submit(&mut login, &net, false),
             Key::Backspace => {
                 match login.focus {
+                    Field::Address => login.address.pop(),
                     Field::Name => login.name.pop(),
                     Field::Password => login.password.pop(),
                 };
@@ -184,6 +227,7 @@ pub fn login_keyboard(
             Key::Character(s) => {
                 let s = s.clone();
                 match login.focus {
+                    Field::Address => login.address.push_str(&s),
                     Field::Name => login.name.push_str(&s),
                     Field::Password => login.password.push_str(&s),
                 }
@@ -204,6 +248,7 @@ pub fn login_buttons(
             continue;
         }
         match btn {
+            LoginButton::FocusAddress => login.focus = Field::Address,
             LoginButton::FocusName => login.focus = Field::Name,
             LoginButton::FocusPassword => login.focus = Field::Password,
             LoginButton::Login => submit(&mut login, &net, false),
@@ -213,11 +258,19 @@ pub fn login_buttons(
 }
 
 fn submit(login: &mut LoginState, net: &NetClient, signup: bool) {
+    let addr = login.address.trim();
+    if addr.is_empty() {
+        login.status = "enter a server address".into();
+        return;
+    }
     if login.name.trim().is_empty() {
         login.status = "enter a username".into();
         return;
     }
-    login.status = if signup { "signing up…".into() } else { "logging in…".into() };
+    // Accept a bare `host:port` (the common case) or a full `ws://…` URL.
+    let url = if addr.contains("://") { addr.to_string() } else { format!("ws://{addr}") };
+    login.status = "connecting…".into();
+    net.connect(url);
     net.send(ClientMsg::Login {
         name: login.name.clone(),
         password: login.password.clone(),
@@ -228,11 +281,21 @@ fn submit(login: &mut LoginState, net: &NetClient, signup: bool) {
 /// Reflect the form state into the field/status text (password masked).
 pub fn update_login_text(
     login: Res<LoginState>,
-    mut name: Query<&mut Text, (With<NameText>, Without<PasswordText>, Without<StatusText>)>,
-    mut pass: Query<&mut Text, (With<PasswordText>, Without<StatusText>)>,
-    mut status: Query<&mut Text, With<StatusText>>,
+    mut address: Query<
+        &mut Text,
+        (With<AddressText>, Without<NameText>, Without<PasswordText>, Without<StatusText>),
+    >,
+    mut name: Query<
+        &mut Text,
+        (With<NameText>, Without<AddressText>, Without<PasswordText>, Without<StatusText>),
+    >,
+    mut pass: Query<&mut Text, (With<PasswordText>, Without<AddressText>, Without<StatusText>)>,
+    mut status: Query<&mut Text, (With<StatusText>, Without<AddressText>)>,
 ) {
     let cursor = |focused: bool| if focused { "_" } else { "" };
+    if let Ok(mut t) = address.single_mut() {
+        t.0 = format!("{}{}", login.address, cursor(login.focus == Field::Address));
+    }
     if let Ok(mut t) = name.single_mut() {
         t.0 = format!("{}{}", login.name, cursor(login.focus == Field::Name));
     }
@@ -262,4 +325,64 @@ pub fn finish_login(
         }
     }
     *was_done = login.done;
+}
+
+/// Rebuild the discovered-server list whenever it changes: one clickable button
+/// per server, or a placeholder while none are found.
+pub fn update_server_list(
+    servers: Res<DiscoveredServers>,
+    container: Query<(Entity, Option<&Children>), With<ServerListContainer>>,
+    mut commands: Commands,
+) {
+    if !servers.is_changed() {
+        return;
+    }
+    let Ok((container, children)) = container.single() else {
+        return; // login screen torn down (in-game) — nothing to update.
+    };
+    if let Some(children) = children {
+        for &child in children {
+            commands.entity(child).despawn();
+        }
+    }
+    commands.entity(container).with_children(|list| {
+        if servers.list.is_empty() {
+            list.spawn((
+                Text::new("searching for LAN servers…"),
+                TextFont { font_size: 14.0, ..default() },
+                TextColor(Color::srgb(0.55, 0.55, 0.55)),
+            ));
+            return;
+        }
+        for s in &servers.list {
+            let addr = s.addr.to_string();
+            list.spawn((
+                Button,
+                ServerButton { addr: addr.clone() },
+                Node { padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)), ..default() },
+                BackgroundColor(BTN_BG),
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new(format!("{} ({}) — {}", s.name, s.players, addr)),
+                    TextFont { font_size: 14.0, ..default() },
+                    TextColor(Color::WHITE),
+                ));
+            });
+        }
+    });
+}
+
+/// Clicking a discovered server fills the address field (the user then presses
+/// Log in / Sign up).
+pub fn server_buttons(
+    buttons: Query<(&Interaction, &ServerButton), (Changed<Interaction>, With<Button>)>,
+    mut login: ResMut<LoginState>,
+) {
+    for (interaction, btn) in &buttons {
+        if *interaction == Interaction::Pressed {
+            login.address = btn.addr.clone();
+            login.focus = Field::Address;
+        }
+    }
 }

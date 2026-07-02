@@ -20,14 +20,22 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use glam::IVec3;
-use soils_protocol::{ActorState, ChunkData, ClientMsg, ServerMsg, decode, encode};
-use tokio::net::{TcpListener, TcpStream};
+use soils_protocol::{
+    ActorState, ChunkData, ClientMsg, DISCOVERY_PORT, PROBE_MAGIC, ServerInfo, ServerMsg, decode,
+    encode,
+};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 use world::World;
 
-const ADDR: &str = "127.0.0.1:9001";
+/// Default bind address: all interfaces, so the server is reachable over LAN
+/// (and discoverable). Override with `SOILS_BIND` (e.g. `127.0.0.1:9001`).
+const DEFAULT_BIND: &str = "0.0.0.0:9001";
+/// TCP port the game listens on; advertised in discovery replies so clients
+/// know where to dial.
+const GAME_PORT: u16 = 9001;
 /// Real seconds for a full day cycle (JS used ~20 minutes; shortened so the
 /// effect is visible while testing the slice).
 const DAY_SECONDS: f32 = 120.0;
@@ -134,8 +142,16 @@ async fn main() {
         });
     }
 
-    let listener = TcpListener::bind(ADDR).await.expect("bind");
-    println!("new-soils server listening on ws://{ADDR}");
+    // LAN discovery responder: replies to UDP probes so clients can find us.
+    {
+        let players = players.clone();
+        let name = std::env::var("SOILS_NAME").unwrap_or_else(|_| "new-soils".into());
+        tokio::spawn(discovery_responder(GAME_PORT, players, name));
+    }
+
+    let bind = std::env::var("SOILS_BIND").unwrap_or_else(|_| DEFAULT_BIND.into());
+    let listener = TcpListener::bind(&bind).await.expect("bind");
+    println!("new-soils server listening on ws://{bind}");
 
     while let Ok((stream, peer)) = listener.accept().await {
         let id = next_id.fetch_add(1, Ordering::Relaxed);
@@ -159,6 +175,40 @@ async fn main() {
                 let _ = cleanup_bcast.send((id, world, ServerMsg::ActorRemove { id }));
             }
         });
+    }
+}
+
+/// Answer LAN discovery probes. Binds a UDP socket on [`DISCOVERY_PORT`] and,
+/// for each datagram matching [`PROBE_MAGIC`], replies (unicast, to the sender)
+/// with `PROBE_MAGIC` + bincode([`ServerInfo`]). If the port is unavailable
+/// (e.g. a second server on the same host), discovery is simply disabled — the
+/// game listener still runs.
+async fn discovery_responder(game_port: u16, players: Players, name: String) {
+    let sock = match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("discovery disabled (could not bind UDP {DISCOVERY_PORT}): {e}");
+            return;
+        }
+    };
+    println!("discovery responder listening on udp/{DISCOVERY_PORT}");
+    let mut buf = [0u8; 64];
+    loop {
+        let (n, src) = match sock.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if &buf[..n] != PROBE_MAGIC {
+            continue;
+        }
+        let info = ServerInfo {
+            name: name.clone(),
+            game_port,
+            players: players.lock().unwrap().len() as u16,
+        };
+        let mut pkt = PROBE_MAGIC.to_vec();
+        pkt.extend(encode(&info));
+        let _ = sock.send_to(&pkt, src).await;
     }
 }
 

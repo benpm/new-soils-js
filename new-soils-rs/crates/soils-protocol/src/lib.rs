@@ -3,6 +3,7 @@
 //! can be used by both the client and the headless server.
 
 pub mod coords;
+pub mod discovery;
 pub mod messages;
 pub mod voxel;
 
@@ -10,6 +11,7 @@ pub use coords::{
     CHUNK_BIT, CHUNK_CLIP, CHUNK_CUBED, CHUNK_SIZE, REGION_SIZE, chunk_of, chunk_origin, local_of,
     voxel_index,
 };
+pub use discovery::{DISCOVERY_PORT, PROBE_MAGIC, ServerInfo};
 pub use messages::{ActorState, ChunkData, ClientMsg, ServerMsg, decode, encode};
 pub use voxel::{AIR, ChunkVolume, Voxel};
 
@@ -44,6 +46,16 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn server_info_round_trip() {
+        let info = ServerInfo { name: "new-soils".into(), game_port: 9001, players: 3 };
+        let bytes = encode(&info);
+        let back: ServerInfo = decode(&bytes).expect("decode");
+        assert_eq!(back.name, "new-soils");
+        assert_eq!(back.game_port, 9001);
+        assert_eq!(back.players, 3);
     }
 
     #[test]

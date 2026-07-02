@@ -5,6 +5,7 @@
 mod actor;
 mod chunk;
 mod console;
+mod discovery;
 mod edit;
 mod gpu_mesh;
 mod hud;
@@ -29,7 +30,7 @@ use actor::{Actor, ActorAssets, ActorMap, LocalPlayer};
 use chunk::{Blocks, ChunkMap, VoxelChunk, WorldTime};
 use gpu_mesh::{AtlasAssets, GpuChunk, GpuMeshPlugin};
 use material::ChunkMeshMaterial;
-use net::NetClient;
+use net::{NetClient, NetEvent};
 use player::{Player, Streaming};
 
 /// Marks the sun so we can swing it with the day/night cycle.
@@ -64,6 +65,7 @@ fn main() {
         .init_resource::<console::Console>()
         .init_resource::<login::LoginState>()
         .insert_resource(net::connect())
+        .insert_resource(discovery::spawn())
         .add_systems(
             Startup,
             (
@@ -86,6 +88,9 @@ fn main() {
                 login::login_buttons,
                 login::update_login_text,
                 login::finish_login,
+                discovery::discovery_poll,
+                login::update_server_list,
+                login::server_buttons,
                 hud::toggle_hud,
                 actor::interpolate_actors,
                 self_test_daytime.after(net_receive).before(day_night),
@@ -253,6 +258,7 @@ fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) 
 /// In self-test mode there's no login screen, so auto-authenticate as a guest.
 fn selftest_login(net: Res<NetClient>) {
     if std::env::var("SOILS_SELFTEST").is_ok() && std::env::var("SOILS_LOGINSHOT").is_err() {
+        net.connect("ws://127.0.0.1:9001".into());
         net.send(ClientMsg::Login { name: "player".into(), password: String::new(), signup: true });
     }
 }
@@ -288,7 +294,18 @@ fn net_receive(
         fog_density: if toggles.fog { material::FOG_DENSITY } else { 0.0 },
         ..default()
     };
-    for msg in net.drain() {
+    for ev in net.drain() {
+        let msg = match ev {
+            NetEvent::Connected => {
+                login_state.status = "connected".into();
+                continue;
+            }
+            NetEvent::ConnectFailed(e) => {
+                login_state.status = format!("could not reach server: {e}");
+                continue;
+            }
+            NetEvent::Msg(msg) => msg,
+        };
         match msg {
             ServerMsg::Init { id, spawn, daytime, .. } => {
                 local.id = id;

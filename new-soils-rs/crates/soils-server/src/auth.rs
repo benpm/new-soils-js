@@ -6,15 +6,15 @@
 //! screen — it is not meant to protect real credentials.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const ACCOUNTS_FILE: &str = "data/accounts.bin";
 const SALT: u64 = 0x5015_0115_2024_0601;
 
 /// name -> salted password hash, persisted between runs.
 pub struct Accounts {
     map: Mutex<HashMap<String, u64>>,
+    path: PathBuf,
 }
 
 fn hash_password(name: &str, password: &str) -> u64 {
@@ -27,19 +27,20 @@ fn hash_password(name: &str, password: &str) -> u64 {
 }
 
 impl Accounts {
-    pub fn load() -> Self {
-        let map = std::fs::read(ACCOUNTS_FILE)
+    pub fn load(data_dir: &Path) -> Self {
+        let path = data_dir.join("accounts.bin");
+        let map = std::fs::read(&path)
             .ok()
             .and_then(|b| soils_protocol::decode::<HashMap<String, u64>>(&b))
             .unwrap_or_default();
-        Self { map: Mutex::new(map) }
+        Self { map: Mutex::new(map), path }
     }
 
-    fn save(map: &HashMap<String, u64>) {
-        if let Some(parent) = PathBuf::from(ACCOUNTS_FILE).parent() {
+    fn save(path: &Path, map: &HashMap<String, u64>) {
+        if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(ACCOUNTS_FILE, soils_protocol::encode(map));
+        let _ = std::fs::write(path, soils_protocol::encode(map));
     }
 
     /// Validate a login or register a new account. `Ok(())` on success,
@@ -59,7 +60,7 @@ impl Accounts {
                     map.insert(name.to_string(), hash);
                     let snapshot = map.clone();
                     drop(map);
-                    Self::save(&snapshot);
+                    Self::save(&self.path, &snapshot);
                     Ok(())
                 }
             }

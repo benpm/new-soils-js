@@ -15,6 +15,7 @@ license = "MIT"
 [workspace.dependencies]
 soils-protocol = { path = "crates/soils-protocol" }
 soils-worldgen = { path = "crates/soils-worldgen" }
+soils-server = { path = "crates/soils-server" }
 serde = { version = "1", features = ["derive"] }
 bincode = "2"
 glam = "0.29"

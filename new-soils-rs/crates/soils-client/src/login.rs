@@ -10,6 +10,7 @@ use soils_protocol::ClientMsg;
 
 use crate::discovery::DiscoveredServers;
 use crate::net::NetClient;
+use crate::singleplayer::{self, Singleplayer};
 
 /// Default server address shown in the address field.
 const DEFAULT_ADDRESS: &str = "127.0.0.1:9001";
@@ -55,6 +56,7 @@ pub fn logged_in(login: Res<LoginState>) -> bool {
 pub(crate) struct LoginScreen;
 #[derive(Component, Clone, Copy)]
 pub(crate) enum LoginButton {
+    Singleplayer,
     FocusAddress,
     FocusName,
     FocusPassword,
@@ -119,6 +121,8 @@ pub fn setup_login(mut commands: Commands) {
                     TextFont { font_size: 30.0, ..default() },
                     TextColor(Color::WHITE),
                 ));
+                // Local-first path: no server, no account details needed.
+                action(panel, "Singleplayer", LoginButton::Singleplayer);
                 field(panel, "Server", LoginButton::FocusAddress, AddressText);
                 field(panel, "Username", LoginButton::FocusName, NameText);
                 field(panel, "Password", LoginButton::FocusPassword, PasswordText);
@@ -242,12 +246,25 @@ pub fn login_buttons(
     buttons: Query<(&Interaction, &LoginButton), (Changed<Interaction>, With<Button>)>,
     mut login: ResMut<LoginState>,
     net: Res<NetClient>,
+    mut sp: ResMut<Singleplayer>,
 ) {
     for (interaction, btn) in &buttons {
         if *interaction != Interaction::Pressed {
             continue;
         }
         match btn {
+            LoginButton::Singleplayer => match sp.ensure_started() {
+                Ok(port) => {
+                    login.status = "starting single-player…".into();
+                    net.connect(format!("ws://127.0.0.1:{port}"));
+                    net.send(ClientMsg::Login {
+                        name: singleplayer::LOCAL_NAME.into(),
+                        password: String::new(),
+                        signup: true,
+                    });
+                }
+                Err(e) => login.status = format!("could not start server: {e}"),
+            },
             LoginButton::FocusAddress => login.focus = Field::Address,
             LoginButton::FocusName => login.focus = Field::Name,
             LoginButton::FocusPassword => login.focus = Field::Password,

@@ -14,6 +14,7 @@ mod material;
 mod net;
 mod pause;
 mod player;
+mod singleplayer;
 
 use bevy::prelude::*;
 use bevy::ecs::system::SystemParam;
@@ -64,6 +65,7 @@ fn main() {
         .insert_resource(pause::RenderToggles::default())
         .init_resource::<console::Console>()
         .init_resource::<login::LoginState>()
+        .init_resource::<singleplayer::Singleplayer>()
         .insert_resource(net::connect())
         .insert_resource(discovery::spawn())
         .add_systems(

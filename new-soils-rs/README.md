@@ -46,7 +46,13 @@ What works today:
 
 ## Running
 
-Start the server, then the client (each from the workspace root):
+**Single player**: just run the client and click **Singleplayer** on the login
+screen — an internal server instance starts inside the client process (loopback,
+ephemeral port, not LAN-discoverable) and you're logged in automatically. Saves
+live under `data/singleplayer/`, separate from a dedicated server's `data/`.
+
+For multiplayer, start the server, then the client (each from the workspace
+root):
 
 ```sh
 cargo run -p soils-server          # listens on ws://127.0.0.1:9001
@@ -57,8 +63,8 @@ cargo run -p soils-client          # opens the game window
 > `assets/` folder via `CARGO_MANIFEST_DIR`. To run the binary directly, set
 > `BEVY_ASSET_ROOT=crates/soils-client`.
 
-On launch a **login/signup screen** appears: pick a username (and optional
-password) and Log in or Sign up.
+On launch a **login/signup screen** appears: click Singleplayer, or pick a
+username (and optional password) and Log in or Sign up against a server.
 
 Controls: **WASD** move, **mouse** look, **Shift** sprint, **Space/Ctrl** up/down
 (fly) or jump, **F** toggle fly/walk, **left/right click** break/place,

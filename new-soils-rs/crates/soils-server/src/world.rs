@@ -2,7 +2,7 @@
 //! chunk cache, and load/save through `region`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use glam::IVec3;
 use soils_protocol::{CHUNK_BIT, CHUNK_CLIP, ChunkVolume};
@@ -22,11 +22,11 @@ pub struct World {
 }
 
 impl World {
-    /// Create (or open) a named world. Each world persists to its own region
-    /// directory and generates from its own `seed`, so different names yield
-    /// different terrain.
-    pub fn new(name: &str, seed: u32) -> Self {
-        let regions_dir = PathBuf::from(format!("data/worlds/{name}/regions"));
+    /// Create (or open) a named world under `data_dir`. Each world persists to
+    /// its own region directory and generates from its own `seed`, so different
+    /// names yield different terrain.
+    pub fn new(data_dir: &Path, name: &str, seed: u32) -> Self {
+        let regions_dir = data_dir.join("worlds").join(name).join("regions");
         Self {
             registry: default_registry(),
             terrain: TerrainGen::new(seed, WorldType::Normal),

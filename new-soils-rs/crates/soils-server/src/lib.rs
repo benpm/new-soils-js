@@ -75,9 +75,14 @@ pub struct ServerConfig {
     /// Root for all persistence: `<data_dir>/accounts.bin` and
     /// `<data_dir>/worlds/<name>/regions`.
     pub data_dir: PathBuf,
-    /// Answer LAN discovery probes on UDP [`DISCOVERY_PORT`]. Off for embedded
-    /// servers, which should stay invisible.
+    /// Whether the LAN discovery responder starts enabled. Toggle at runtime
+    /// with [`ServerHandle::set_discovery`]. Off for embedded servers by
+    /// default, which should stay invisible unless the player opts in.
     pub enable_discovery: bool,
+    /// UDP port for the discovery responder. Normally [`DISCOVERY_PORT`];
+    /// use `0` in tests for an ephemeral port (read back via
+    /// [`ServerHandle::discovery_port`]).
+    pub discovery_port: u16,
     /// Server name shown in discovery replies.
     pub name: String,
 }
@@ -89,6 +94,7 @@ impl Default for ServerConfig {
             bind: "0.0.0.0:9001".into(),
             data_dir: PathBuf::from("data"),
             enable_discovery: true,
+            discovery_port: DISCOVERY_PORT,
             name: "new-soils".into(),
         }
     }
@@ -100,6 +106,8 @@ impl Default for ServerConfig {
 pub struct ServerHandle {
     addr: SocketAddr,
     shutdown: watch::Sender<bool>,
+    discovery: watch::Sender<bool>,
+    discovery_port: watch::Receiver<Option<u16>>,
 }
 
 impl ServerHandle {
@@ -110,6 +118,24 @@ impl ServerHandle {
 
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    /// Enable or disable the LAN discovery responder at runtime. Enabling
+    /// binds the UDP socket (asynchronously — watch [`discovery_port`]
+    /// (Self::discovery_port) for the result); disabling releases it.
+    pub fn set_discovery(&self, on: bool) {
+        let _ = self.discovery.send(on);
+    }
+
+    /// The *desired* discovery state (what was last requested).
+    pub fn discovery_enabled(&self) -> bool {
+        *self.discovery.borrow()
+    }
+
+    /// The UDP port the discovery responder is actually bound to, or `None`
+    /// while discovery is off, still starting, or failed to bind.
+    pub fn discovery_port(&self) -> Option<u16> {
+        *self.discovery_port.borrow()
     }
 
     /// Ask the accept loop to stop. Existing connections and background tasks
@@ -183,11 +209,15 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     let listener = TcpListener::bind(&config.bind).await?;
     println!("new-soils server listening on ws://{}", config.bind);
     let state = ServerState::new(config.data_dir.clone());
-    // Never-firing shutdown: the sender stays alive in this frame for the whole
-    // await, so `changed()` pends forever and the loop runs until process exit.
+    // Never-firing shutdown/discovery senders: they stay alive in this frame
+    // for the whole await, so `changed()` pends forever and the initial
+    // discovery state holds until process exit.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let result = serve(listener, config, state, shutdown_rx).await;
+    let (discovery_tx, discovery_rx) = watch::channel(config.enable_discovery);
+    let (discovery_port_tx, _discovery_port_rx) = watch::channel(None);
+    let result = serve(listener, config, state, shutdown_rx, discovery_rx, discovery_port_tx).await;
     drop(shutdown_tx);
+    drop(discovery_tx);
     result
 }
 
@@ -197,6 +227,8 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
 pub fn spawn(config: ServerConfig) -> std::io::Result<ServerHandle> {
     let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<SocketAddr>>();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (discovery_tx, discovery_rx) = watch::channel(config.enable_discovery);
+    let (discovery_port_tx, discovery_port_rx) = watch::channel(None);
     std::thread::Builder::new()
         .name("soils-embedded-server".into())
         .spawn(move || {
@@ -218,13 +250,20 @@ pub fn spawn(config: ServerConfig) -> std::io::Result<ServerHandle> {
                 };
                 let _ = tx.send(Ok(addr));
                 let state = ServerState::new(config.data_dir.clone());
-                let _ = serve(listener, config, state, shutdown_rx).await;
+                let _ =
+                    serve(listener, config, state, shutdown_rx, discovery_rx, discovery_port_tx)
+                        .await;
             });
         })?;
     let addr = rx
         .recv()
         .map_err(|_| std::io::Error::other("embedded server thread died before binding"))??;
-    Ok(ServerHandle { addr, shutdown: shutdown_tx })
+    Ok(ServerHandle {
+        addr,
+        shutdown: shutdown_tx,
+        discovery: discovery_tx,
+        discovery_port: discovery_port_rx,
+    })
 }
 
 /// Run the background tasks and the accept loop until `shutdown` fires (or
@@ -234,6 +273,8 @@ async fn serve(
     config: ServerConfig,
     state: Arc<ServerState>,
     mut shutdown: watch::Receiver<bool>,
+    discovery: watch::Receiver<bool>,
+    discovery_port_tx: watch::Sender<Option<u16>>,
 ) -> std::io::Result<()> {
     // Day/night clock: advance and broadcast time of day every second (global).
     {
@@ -273,12 +314,20 @@ async fn serve(
         });
     }
 
-    // LAN discovery responder: replies to UDP probes so clients can find us.
-    // Advertises the actually-bound game port (matters when binding port 0).
-    if config.enable_discovery {
+    // LAN discovery supervisor: runs the UDP probe responder while the
+    // `discovery` watch says on, releases the socket while off. Advertises the
+    // actually-bound game port (matters when binding port 0).
+    {
         let players = state.players.clone();
         let game_port = listener.local_addr()?.port();
-        tokio::spawn(discovery_responder(game_port, players, config.name.clone()));
+        tokio::spawn(discovery_supervisor(
+            config.discovery_port,
+            game_port,
+            players,
+            config.name.clone(),
+            discovery,
+            discovery_port_tx,
+        ));
     }
 
     loop {
@@ -307,37 +356,72 @@ async fn serve(
     Ok(())
 }
 
-/// Answer LAN discovery probes. Binds a UDP socket on [`DISCOVERY_PORT`] and,
-/// for each datagram matching [`PROBE_MAGIC`], replies (unicast, to the sender)
-/// with `PROBE_MAGIC` + bincode([`ServerInfo`]). If the port is unavailable
-/// (e.g. a second server on the same host), discovery is simply disabled — the
-/// game listener still runs.
-async fn discovery_responder(game_port: u16, players: Players, name: String) {
-    let sock = match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("discovery disabled (could not bind UDP {DISCOVERY_PORT}): {e}");
-            return;
-        }
-    };
-    println!("discovery responder listening on udp/{DISCOVERY_PORT}");
-    let mut buf = [0u8; 64];
+/// Answer LAN discovery probes while `enabled` says on. When on, binds a UDP
+/// socket on `udp_port` (normally [`DISCOVERY_PORT`]) and, for each datagram
+/// matching [`PROBE_MAGIC`], replies (unicast, to the sender) with
+/// `PROBE_MAGIC` + bincode([`ServerInfo`]). When toggled off, the socket is
+/// dropped so the host stops answering (and being visible) immediately. The
+/// actually-bound port is published on `port_tx` (`None` while off or if the
+/// bind failed — e.g. a second server on the same host; the game listener
+/// still runs, and a later re-toggle retries the bind).
+async fn discovery_supervisor(
+    udp_port: u16,
+    game_port: u16,
+    players: Players,
+    name: String,
+    mut enabled: watch::Receiver<bool>,
+    port_tx: watch::Sender<Option<u16>>,
+) {
     loop {
-        let (n, src) = match sock.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if &buf[..n] != PROBE_MAGIC {
-            continue;
+        while !*enabled.borrow() {
+            if enabled.changed().await.is_err() {
+                return; // server handle gone; nothing can re-enable us
+            }
         }
-        let info = ServerInfo {
-            name: name.clone(),
-            game_port,
-            players: players.lock().unwrap().len() as u16,
+        let sock = match UdpSocket::bind(("0.0.0.0", udp_port)).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("discovery disabled (could not bind UDP {udp_port}): {e}");
+                let _ = port_tx.send(None);
+                match enabled.changed().await {
+                    Ok(()) => continue, // retry on the next toggle
+                    Err(_) => return,
+                }
+            }
         };
-        let mut pkt = PROBE_MAGIC.to_vec();
-        pkt.extend(encode(&info));
-        let _ = sock.send_to(&pkt, src).await;
+        let bound = match sock.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => udp_port,
+        };
+        println!("discovery responder listening on udp/{bound}");
+        let _ = port_tx.send(Some(bound));
+        let mut buf = [0u8; 64];
+        loop {
+            let (n, src) = tokio::select! {
+                changed = enabled.changed() => match changed {
+                    Ok(()) if *enabled.borrow() => continue,
+                    Ok(()) => break, // toggled off: drop the socket
+                    Err(_) => return,
+                },
+                res = sock.recv_from(&mut buf) => match res {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                },
+            };
+            if &buf[..n] != PROBE_MAGIC {
+                continue;
+            }
+            let info = ServerInfo {
+                name: name.clone(),
+                game_port,
+                players: players.lock().unwrap().len() as u16,
+            };
+            let mut pkt = PROBE_MAGIC.to_vec();
+            pkt.extend(encode(&info));
+            let _ = sock.send_to(&pkt, src).await;
+        }
+        println!("discovery responder stopped");
+        let _ = port_tx.send(None);
     }
 }
 

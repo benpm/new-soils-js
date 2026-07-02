@@ -6,6 +6,7 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::material::{ChunkMeshMaterial, FOG_DENSITY};
 use crate::player::Streaming;
+use crate::singleplayer::Singleplayer;
 
 /// Render settings toggled from the pause menu. New chunks read this; toggling
 /// rewrites every existing chunk material.
@@ -25,11 +26,13 @@ const RADIUS_MIN: i32 = 2;
 const RADIUS_MAX: i32 = 8;
 
 #[derive(Component, Clone, Copy)]
-pub(crate) enum MenuButton {
+pub enum MenuButton {
     RadiusDown,
     RadiusUp,
     ToggleAo,
     ToggleFog,
+    /// Single-player only: advertise the embedded server on the LAN.
+    ToggleDiscovery,
     Resume,
 }
 
@@ -44,6 +47,12 @@ pub(crate) struct RadiusLabel;
 pub(crate) struct AoLabel;
 #[derive(Component)]
 pub(crate) struct FogLabel;
+#[derive(Component)]
+pub(crate) struct DiscoveryLabel;
+
+/// The LAN-discovery button node, hidden unless single-player is running.
+#[derive(Component)]
+pub(crate) struct DiscoveryRow;
 
 const PANEL_BG: Color = Color::srgba(0.05, 0.06, 0.08, 0.86);
 const BTN_BG: Color = Color::srgba(0.20, 0.22, 0.26, 0.95);
@@ -102,6 +111,32 @@ pub fn setup_pause_menu(mut commands: Commands) {
 
                 labelled_button(panel, "Ambient occlusion: ON", MenuButton::ToggleAo, AoLabel);
                 labelled_button(panel, "Fog: ON", MenuButton::ToggleFog, FogLabel);
+
+                // Single-player only (hidden otherwise): open the world to LAN
+                // discovery. Off by default.
+                panel
+                    .spawn((
+                        Button,
+                        MenuButton::ToggleDiscovery,
+                        DiscoveryRow,
+                        Visibility::Hidden,
+                        Node {
+                            padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(BTN_BG),
+                    ))
+                    .with_children(|b| {
+                        b.spawn((
+                            Text::new("LAN discovery: OFF"),
+                            TextFont { font_size: 18.0, ..default() },
+                            TextColor(Color::WHITE),
+                            DiscoveryLabel,
+                        ));
+                    });
+
                 button(panel, "Resume", MenuButton::Resume);
             });
         });
@@ -182,6 +217,7 @@ pub fn pause_menu_buttons(
     mut streaming: ResMut<Streaming>,
     mut toggles: ResMut<RenderToggles>,
     mut materials: ResMut<Assets<ChunkMeshMaterial>>,
+    mut sp: ResMut<Singleplayer>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     for (interaction, kind) in &buttons {
@@ -211,6 +247,9 @@ pub fn pause_menu_buttons(
                     m.params.fog_density = d;
                 }
             }
+            MenuButton::ToggleDiscovery => {
+                sp.toggle_discovery();
+            }
             MenuButton::Resume => {
                 if let Ok(mut cursor) = cursor.single_mut() {
                     cursor.grab_mode = CursorGrabMode::Locked;
@@ -225,9 +264,15 @@ pub fn pause_menu_buttons(
 pub fn update_pause_labels(
     streaming: Res<Streaming>,
     toggles: Res<RenderToggles>,
-    mut radius: Query<&mut Text, (With<RadiusLabel>, Without<AoLabel>, Without<FogLabel>)>,
-    mut ao: Query<&mut Text, (With<AoLabel>, Without<FogLabel>)>,
-    mut fog: Query<&mut Text, With<FogLabel>>,
+    sp: Res<Singleplayer>,
+    mut radius: Query<
+        &mut Text,
+        (With<RadiusLabel>, Without<AoLabel>, Without<FogLabel>, Without<DiscoveryLabel>),
+    >,
+    mut ao: Query<&mut Text, (With<AoLabel>, Without<FogLabel>, Without<DiscoveryLabel>)>,
+    mut fog: Query<&mut Text, (With<FogLabel>, Without<DiscoveryLabel>)>,
+    mut disco: Query<&mut Text, With<DiscoveryLabel>>,
+    mut disco_row: Query<&mut Visibility, With<DiscoveryRow>>,
 ) {
     if let Ok(mut t) = radius.single_mut() {
         t.0 = format!("Load radius: {}", streaming.load_radius);
@@ -237,5 +282,73 @@ pub fn update_pause_labels(
     }
     if let Ok(mut t) = fog.single_mut() {
         t.0 = format!("Fog: {}", if toggles.fog { "ON" } else { "OFF" });
+    }
+    // LAN discovery: only meaningful (and visible) in single-player. The label
+    // reflects the *actual* responder state, so a failed UDP bind shows up.
+    if let Ok(mut t) = disco.single_mut() {
+        t.0 = match sp.discovery_status() {
+            Some((true, Some(port))) => format!("LAN discovery: ON (udp {port})"),
+            Some((true, None)) => "LAN discovery: starting…".into(),
+            _ => "LAN discovery: OFF".into(),
+        };
+    }
+    if let Ok(mut vis) = disco_row.single_mut() {
+        let want = if sp.is_running() { Visibility::Inherited } else { Visibility::Hidden };
+        if *vis != want {
+            *vis = want;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soils_server::ServerConfig;
+
+    /// The pause-menu button must actually flip the embedded server's LAN
+    /// discovery state — the UI wiring a server-side test can't cover. Runs
+    /// `pause_menu_buttons` headlessly in a minimal ECS app against a real
+    /// embedded server (temp data dir, ephemeral ports).
+    #[test]
+    fn discovery_button_toggles_embedded_server() {
+        let data_dir =
+            std::env::temp_dir().join(format!("soils-pause-test-{}", std::process::id()));
+        let mut sp = Singleplayer::default();
+        sp.ensure_started_with(ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            data_dir: data_dir.clone(),
+            enable_discovery: false,
+            discovery_port: 0,
+            name: "pause-test".into(),
+        })
+        .expect("embedded server");
+
+        let mut app = App::new();
+        app.insert_resource(Streaming::default());
+        app.insert_resource(RenderToggles::default());
+        app.insert_resource(Assets::<ChunkMeshMaterial>::default());
+        app.insert_resource(sp);
+        app.add_systems(Update, pause_menu_buttons);
+
+        let desired = |app: &App| {
+            app.world().resource::<Singleplayer>().discovery_status().map(|(on, _)| on)
+        };
+        assert_eq!(desired(&app), Some(false), "discovery must start off");
+
+        let btn = app
+            .world_mut()
+            .spawn((Button, Interaction::Pressed, MenuButton::ToggleDiscovery))
+            .id();
+        app.update();
+        assert_eq!(desired(&app), Some(true), "press must enable discovery");
+
+        // Release, press again: toggles back off.
+        *app.world_mut().get_mut::<Interaction>(btn).unwrap() = Interaction::None;
+        app.update();
+        *app.world_mut().get_mut::<Interaction>(btn).unwrap() = Interaction::Pressed;
+        app.update();
+        assert_eq!(desired(&app), Some(false), "second press must disable discovery");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

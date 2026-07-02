@@ -15,6 +15,7 @@ fn spawn_login_and_stream_chunks() {
         data_dir: data_dir.clone(),
         enable_discovery: false,
         name: "test".into(),
+        ..ServerConfig::default()
     })
     .expect("spawn embedded server");
     assert_ne!(handle.port(), 0, "ephemeral port must be resolved");

@@ -47,9 +47,16 @@ What works today:
 ## Running
 
 **Single player**: just run the client and click **Singleplayer** on the login
-screen — an internal server instance starts inside the client process (loopback,
-ephemeral port, not LAN-discoverable) and you're logged in automatically. Saves
-live under `data/singleplayer/`, separate from a dedicated server's `data/`.
+screen — an internal server instance starts inside the client process (ephemeral
+port) and you're logged in automatically. Saves live under `data/singleplayer/`,
+separate from a dedicated server's `data/`.
+
+A single-player world can be opened to the local network Minecraft-style: the
+pause menu (Esc) has a **LAN discovery** toggle, off by default. Turning it on
+makes the world show up in other clients' server lists (UDP 9002); turning it
+off stops advertising immediately. Note the embedded server listens on all
+interfaces either way (with discovery off it's just unadvertised — anyone
+joining still needs to log in).
 
 For multiplayer, start the server, then the client (each from the workspace
 root):

@@ -1,0 +1,118 @@
+name: Release screenshots
+
+# Renders the Bevy client headlessly on the CI runner (Mesa lavapipe software
+# Vulkan under xvfb) and attaches the resulting screenshots to the published
+# release, embedded inline in the notes. See new-soils-rs/README.md for the
+# self-test env vars. NOTE: the game lives in new-soils-rs/ on the `rust`
+# branch, which must be the repository default branch for `release`/dispatch
+# events to find this workflow.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: new-soils-rs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: new-soils-rs
+
+      - name: Install headless GPU + Bevy system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libasound2-dev libudev-dev \
+            libxkbcommon-x11-0 xvfb mesa-vulkan-drivers libvulkan1 vulkan-tools
+
+      - name: Build client + server (release)
+        run: cargo build --release -p soils-client -p soils-server
+
+      - name: Render screenshots
+        env:
+          # Force Mesa lavapipe (software Vulkan) — CI runners have no GPU.
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          WGPU_BACKEND: vulkan
+          BEVY_ASSET_ROOT: crates/soils-client
+          # Software rendering is slow: give the self-test extra wall-clock
+          # before it screenshots (default 9) and exits/asserts (default 11).
+          SOILS_SHOT_SECS: "22"
+          SOILS_EXIT_SECS: "28"
+        run: |
+          set -u
+          mkdir -p "$GITHUB_WORKSPACE/shots"
+          # $1 = output filename; remaining args = env for the client run.
+          shot() {
+            local out="$1"; shift
+            rm -f /tmp/soils-selftest.png
+            timeout 120 xvfb-run -a -s "-screen 0 1280x720x24" \
+              env "$@" ./target/release/soils-client \
+              || echo "::warning::screenshot $out: client exited nonzero"
+            if [ -f /tmp/soils-selftest.png ]; then
+              cp /tmp/soils-selftest.png "$GITHUB_WORKSPACE/shots/$out"
+              echo "captured $out"
+            else
+              echo "::warning::screenshot $out: no PNG produced"
+            fi
+          }
+
+          # Self-contained GI demo (no server): the showcase shots.
+          shot gi-on.png  SOILS_SELFTEST=1 SOILS_GI_DEMO=1 SOILS_GI=1 SOILS_DAYTIME=0.0
+          shot gi-off.png SOILS_SELFTEST=1 SOILS_GI_DEMO=1 SOILS_GI=0 SOILS_DAYTIME=0.0
+
+          # Login screen (no world; asserts are skipped for LOGINSHOT).
+          shot login.png SOILS_SELFTEST=1 SOILS_LOGINSHOT=1
+
+          # Terrain vista: needs the dedicated server streaming chunks.
+          ./target/release/soils-server &
+          SRV=$!
+          sleep 3
+          shot terrain.png SOILS_SELFTEST=1 SOILS_DAYTIME=0.1
+          kill "$SRV" 2>/dev/null || true
+
+          echo "=== produced screenshots ==="
+          ls -la "$GITHUB_WORKSPACE/shots" || true
+
+      # Always upload so runs are debuggable even outside a release.
+      - name: Upload screenshots as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: shots/*.png
+          if-no-files-found: warn
+
+      - name: Attach to release and embed in notes
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: shots/*.png
+          append_body: true
+          body: |
+            ### Screenshots
+
+            | Global illumination — on | Global illumination — off |
+            |---|---|
+            | ![GI on](https://github.com/benpm/new-soils-js/releases/download/${{ github.event.release.tag_name }}/gi-on.png) | ![GI off](https://github.com/benpm/new-soils-js/releases/download/${{ github.event.release.tag_name }}/gi-off.png) |
+
+            **Terrain**
+
+            ![terrain](https://github.com/benpm/new-soils-js/releases/download/${{ github.event.release.tag_name }}/terrain.png)
+
+            **Login screen**
+
+            ![login](https://github.com/benpm/new-soils-js/releases/download/${{ github.event.release.tag_name }}/login.png)
+
+            _Screenshots rendered automatically by CI (headless Mesa lavapipe)._

@@ -147,7 +147,9 @@ fn screenshot_once(
     if *taken || std::env::var("SOILS_SELFTEST").is_err() {
         return;
     }
-    if time.elapsed_secs() > 9.0 {
+    // Configurable so slow software-GPU CI (lavapipe) can allow more time to
+    // stream/mesh/trace before the shot; defaults preserve local behaviour.
+    if time.elapsed_secs() > env_secs("SOILS_SHOT_SECS", 9.0) {
         *taken = true;
         // In GI-demo mode keep the scene's own framing (see gi_demo.rs).
         if !gi_demo::demo_enabled() {
@@ -212,16 +214,26 @@ fn self_test(
     if std::env::var("SOILS_SELFTEST").is_err() {
         return;
     }
-    if time.elapsed_secs() > 11.0 {
+    if time.elapsed_secs() > env_secs("SOILS_EXIT_SECS", 11.0) {
         let chunks = map.map.len();
         let meshes = meshed.iter().count();
         let actors = remote_actors.iter().count();
         info!("SELFTEST: {chunks} chunks loaded, {meshes} chunk meshes built, {actors} actors");
-        assert!(chunks > 0, "no chunks streamed from server");
-        assert!(meshes > 0, "no chunk meshes were built");
+        // The login-screen shot (`SOILS_LOGINSHOT`) has no world by design, so
+        // skip the world asserts there and just exit cleanly after the shot.
+        if std::env::var("SOILS_LOGINSHOT").is_err() {
+            assert!(chunks > 0, "no chunks streamed from server");
+            assert!(meshes > 0, "no chunk meshes were built");
+        }
         info!("SELFTEST PASSED");
         exit.write(AppExit::Success);
     }
+}
+
+/// Read a float from an env var, or fall back to `default`. Used to let CI
+/// stretch the self-test's screenshot/exit deadlines for slow software GPUs.
+fn env_secs(key: &str, default: f32) -> f32 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 /// Spawn the camera/player and the sun.

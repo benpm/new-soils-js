@@ -1,6 +1,7 @@
 //! A small command console (open with `/`), mirroring the JS command box.
 //! Supported: `tp x y z`, `daytime t`, `loadradius n`, `fog on|off`,
-//! `ao on|off`. While open, gameplay input is suppressed (see `console_closed`).
+//! `ao on|off`, `gi on|off`. While open, gameplay input is suppressed (see
+//! `console_closed`).
 
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
@@ -9,6 +10,7 @@ use bevy::prelude::*;
 use soils_protocol::ClientMsg;
 
 use crate::chunk::WorldTime;
+use crate::gi::GiSettings;
 use crate::material::{ChunkMeshMaterial, FOG_DENSITY};
 use crate::net::NetClient;
 use crate::pause::RenderToggles;
@@ -58,6 +60,7 @@ pub fn console_input(
     mut world_time: ResMut<WorldTime>,
     mut streaming: ResMut<Streaming>,
     mut toggles: ResMut<RenderToggles>,
+    mut gi: ResMut<GiSettings>,
     mut materials: ResMut<Assets<ChunkMeshMaterial>>,
     net: Res<NetClient>,
 ) {
@@ -79,7 +82,7 @@ pub fn console_input(
                 console.open = false;
                 run_command(
                     &cmd, &mut player, &mut world_time, &mut streaming, &mut toggles,
-                    &mut materials, &net,
+                    &mut gi, &mut materials, &net,
                 );
             }
             Key::Escape => {
@@ -118,6 +121,7 @@ fn run_command(
     world_time: &mut WorldTime,
     streaming: &mut Streaming,
     toggles: &mut RenderToggles,
+    gi: &mut GiSettings,
     materials: &mut Assets<ChunkMeshMaterial>,
     net: &NetClient,
 ) {
@@ -161,6 +165,9 @@ fn run_command(
             for (_, m) in materials.iter_mut() {
                 m.params.ambient_occlusion = v;
             }
+        }
+        "gi" => {
+            gi.enabled = on_off(args.first());
         }
         "warp" if !args.is_empty() => {
             // Server creates the world on demand and replies with `Warp`.

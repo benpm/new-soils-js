@@ -4,6 +4,7 @@
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
+use crate::gi::GiSettings;
 use crate::material::{ChunkMeshMaterial, FOG_DENSITY};
 use crate::player::Streaming;
 use crate::singleplayer::Singleplayer;
@@ -31,6 +32,8 @@ pub enum MenuButton {
     RadiusUp,
     ToggleAo,
     ToggleFog,
+    /// Toggle radiance-cascades global illumination.
+    ToggleGi,
     /// Single-player only: advertise the embedded server on the LAN.
     ToggleDiscovery,
     Resume,
@@ -47,6 +50,8 @@ pub(crate) struct RadiusLabel;
 pub(crate) struct AoLabel;
 #[derive(Component)]
 pub(crate) struct FogLabel;
+#[derive(Component)]
+pub(crate) struct GiLabel;
 #[derive(Component)]
 pub(crate) struct DiscoveryLabel;
 
@@ -111,6 +116,7 @@ pub fn setup_pause_menu(mut commands: Commands) {
 
                 labelled_button(panel, "Ambient occlusion: ON", MenuButton::ToggleAo, AoLabel);
                 labelled_button(panel, "Fog: ON", MenuButton::ToggleFog, FogLabel);
+                labelled_button(panel, "Global illumination: OFF", MenuButton::ToggleGi, GiLabel);
 
                 // Single-player only (hidden otherwise): open the world to LAN
                 // discovery. Off by default.
@@ -218,6 +224,7 @@ pub fn pause_menu_buttons(
     mut toggles: ResMut<RenderToggles>,
     mut materials: ResMut<Assets<ChunkMeshMaterial>>,
     mut sp: ResMut<Singleplayer>,
+    mut gi: ResMut<GiSettings>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     for (interaction, kind) in &buttons {
@@ -247,6 +254,9 @@ pub fn pause_menu_buttons(
                     m.params.fog_density = d;
                 }
             }
+            MenuButton::ToggleGi => {
+                gi.enabled = !gi.enabled;
+            }
             MenuButton::ToggleDiscovery => {
                 sp.toggle_discovery();
             }
@@ -265,12 +275,23 @@ pub fn update_pause_labels(
     streaming: Res<Streaming>,
     toggles: Res<RenderToggles>,
     sp: Res<Singleplayer>,
+    gi: Res<GiSettings>,
     mut radius: Query<
         &mut Text,
-        (With<RadiusLabel>, Without<AoLabel>, Without<FogLabel>, Without<DiscoveryLabel>),
+        (
+            With<RadiusLabel>,
+            Without<AoLabel>,
+            Without<FogLabel>,
+            Without<GiLabel>,
+            Without<DiscoveryLabel>,
+        ),
     >,
-    mut ao: Query<&mut Text, (With<AoLabel>, Without<FogLabel>, Without<DiscoveryLabel>)>,
-    mut fog: Query<&mut Text, (With<FogLabel>, Without<DiscoveryLabel>)>,
+    mut ao: Query<
+        &mut Text,
+        (With<AoLabel>, Without<FogLabel>, Without<GiLabel>, Without<DiscoveryLabel>),
+    >,
+    mut fog: Query<&mut Text, (With<FogLabel>, Without<GiLabel>, Without<DiscoveryLabel>)>,
+    mut gi_label: Query<&mut Text, (With<GiLabel>, Without<DiscoveryLabel>)>,
     mut disco: Query<&mut Text, With<DiscoveryLabel>>,
     mut disco_row: Query<&mut Visibility, With<DiscoveryRow>>,
 ) {
@@ -282,6 +303,9 @@ pub fn update_pause_labels(
     }
     if let Ok(mut t) = fog.single_mut() {
         t.0 = format!("Fog: {}", if toggles.fog { "ON" } else { "OFF" });
+    }
+    if let Ok(mut t) = gi_label.single_mut() {
+        t.0 = format!("Global illumination: {}", if gi.enabled { "ON" } else { "OFF" });
     }
     // LAN discovery: only meaningful (and visible) in single-player. The label
     // reflects the *actual* responder state, so a failed UDP bind shows up.
@@ -326,6 +350,7 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(Streaming::default());
         app.insert_resource(RenderToggles::default());
+        app.insert_resource(GiSettings::default());
         app.insert_resource(Assets::<ChunkMeshMaterial>::default());
         app.insert_resource(sp);
         app.add_systems(Update, pause_menu_buttons);

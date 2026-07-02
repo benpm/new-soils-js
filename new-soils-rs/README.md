@@ -25,6 +25,18 @@ What works today:
 - **Ambient occlusion** — per-vertex 3-sample corner occlusion, computed in the
   compute shader; greedy merging is AO-aware (faces merge only when block id *and*
   corner AO match).
+- **GPU radiance-cascades global illumination** — a compute shader
+  (`assets/shaders/radiance.wgsl`) traces a hierarchy of world-space probe
+  cascades against a voxel-occupancy volume around the player and merges them
+  top-down into a single incoming-radiance field, which the terrain material
+  samples to light itself. Emissive blocks (e.g. Diamond/Ruby Ore) and the sky
+  bleed coloured light onto nearby surfaces, and caves fall dark. Fully
+  GPU-resident: only the occupancy volume is uploaded; probes, rays, and merged
+  radiance never leave the GPU. The math has a CPU oracle
+  (`soils-worldgen/src/radiance.rs`) that the shader is validated against.
+  **Experimental and off by default** — the per-frame trace is GPU-heavy and can
+  destabilise some drivers; enable it in the pause menu, with `/gi on`, or at
+  startup with `SOILS_GI=1`.
 - **Region-file persistence** — chunks are zlib-compressed into 16³ region files
   (`data/worlds/default/regions/`) and reloaded on restart; edits are saved.
 - **First-person player** — fly/walk movement with AABB voxel collision,
@@ -79,7 +91,7 @@ Controls: **WASD** move, **mouse** look, **Shift** sprint, **Space/Ctrl** up/dow
 command console, **Esc** release the cursor (shows the pause/settings menu).
 
 Console commands: `tp x y z`, `warp <world>`, `daytime t`, `loadradius n`,
-`fog on|off`, `ao on|off`.
+`fog on|off`, `ao on|off`, `gi on|off`.
 
 ### Linux build dependencies
 
@@ -89,7 +101,13 @@ libasound2-dev libudev-dev` (and `libxkbcommon-x11-0` at runtime for X11).
 ## Tests & headless verification
 
 ```sh
-cargo test --workspace                          # protocol + worldgen unit tests
+cargo test --workspace                          # protocol + worldgen + GI unit tests
+
+# GI is validated three ways: the radiance-cascades math is unit-tested on the
+# CPU (soils-worldgen radiance::tests); the compute shader is run headlessly on
+# a real GPU and its cascade-0 output compared entry-for-entry against that CPU
+# oracle (soils-client tests/gi_gpu.rs, auto-skips if no GPU); and both shaders
+# are naga-validated whenever the client starts.
 
 # End-to-end server check (run the server first):
 cargo run -p soils-server --example smoke       # logs in, requests chunks, asserts terrain
@@ -103,6 +121,12 @@ cargo run -p soils-server --example peer
 
 # Headless client self-test (streams + meshes + renders + screenshots, then exits):
 SOILS_SELFTEST=1 cargo run -p soils-client      # writes /tmp/soils-selftest.png
+
+# GI demo scene: an enclosed dark room lit only by two ore light sources, framed
+# for the camera — the clearest way to see the radiance-cascades bounce. Compare
+# GI off vs on (writes /tmp/soils-selftest.png each run):
+SOILS_SELFTEST=1 SOILS_GI_DEMO=1 SOILS_DAYTIME=0.0 SOILS_GI=0 cargo run -p soils-client  # dark
+SOILS_SELFTEST=1 SOILS_GI_DEMO=1 SOILS_DAYTIME=0.0 SOILS_GI=1 cargo run -p soils-client  # lit by GI
 ```
 
 ## Deliberate simplifications vs. the JS original
@@ -119,8 +143,8 @@ SOILS_SELFTEST=1 cargo run -p soils-client      # writes /tmp/soils-selftest.png
   a day/night cycle (the sun is rotated and the world dimmed via exposure) and
   exponential distance fog matched to the horizon haze.
 - HUD: crosshair, F3 debug overlay, a wireframe selection box on the targeted
-  voxel, a 1-9 block hotbar, a pause/settings menu (load radius, AO, fog), and a
-  `/` command console.
+  voxel, a 1-9 block hotbar, a pause/settings menu (load radius, AO, fog, global
+  illumination, LAN discovery), and a `/` command console.
 - Chunks stream from the server in batched `Bundle` messages.
 
 ## Server

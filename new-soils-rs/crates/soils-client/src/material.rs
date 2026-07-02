@@ -38,6 +38,11 @@ pub struct AtlasParams {
     pub fog_density: f32,
     /// Fog colour in the lux regime (see [`FOG_COLOR`]).
     pub fog_color: Vec3,
+    /// World voxel coords of the GI volume's `(0,0,0)` corner (see `gi.rs`), so
+    /// the shader can locate the cascade-0 probe for a fragment.
+    pub gi_origin: Vec3,
+    /// >0.5 enables the radiance-cascades GI term.
+    pub gi_enabled: f32,
 }
 
 impl Default for AtlasParams {
@@ -47,12 +52,18 @@ impl Default for AtlasParams {
             brightness: TERRAIN_BRIGHTNESS,
             fog_density: FOG_DENSITY,
             fog_color: FOG_COLOR,
+            gi_origin: Vec3::ZERO,
+            gi_enabled: 0.0,
         }
     }
 }
 
 /// One material per chunk: its quad storage buffer (vertex-pulled) plus the
-/// shared atlas texture and params.
+/// shared atlas texture and params. `gi_cascade0` is shared across all chunks
+/// and points at the GI radiance-cascades output (see `gi.rs`): the merged
+/// cascade-0 radiance field, sampled to light terrain. It is written only by
+/// the compute shader (its GPU buffer is never recreated), so this bind group
+/// stays valid; the volume origin/enable flag ride in `params` instead.
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct ChunkMeshMaterial {
     #[storage(0, read_only)]
@@ -62,6 +73,8 @@ pub struct ChunkMeshMaterial {
     pub atlas: Handle<Image>,
     #[uniform(3)]
     pub params: AtlasParams,
+    #[storage(4, read_only)]
+    pub gi_cascade0: Handle<ShaderStorageBuffer>,
 }
 
 impl Material for ChunkMeshMaterial {

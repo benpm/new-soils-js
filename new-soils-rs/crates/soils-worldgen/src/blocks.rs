@@ -17,6 +17,9 @@ pub struct BlockDef {
     /// `Block(id, name, top, sides, bottom)` constructor); `from_yaml`
     /// reorders it into this `[sides, top, bottom]` layout.
     pub faces: [u8; 3],
+    /// Emitted radiance (linear RGB), consumed by the radiance-cascades GI as a
+    /// per-voxel light source. `[0.0; 3]` for ordinary (non-emitting) blocks.
+    pub emission: [f32; 3],
 }
 
 impl BlockDef {
@@ -43,6 +46,9 @@ pub struct BlockRegistry {
 #[derive(Deserialize)]
 struct YamlBlock {
     faces: Vec<u8>,
+    /// Optional linear-RGB emission; absent means non-emitting.
+    #[serde(default)]
+    emission: Option<[f32; 3]>,
 }
 
 impl BlockRegistry {
@@ -64,7 +70,7 @@ impl BlockRegistry {
                 2 => [b.faces[1], b.faces[0], b.faces[0]],
                 _ => [b.faces[1], b.faces[0], b.faces[2]],
             };
-            reg.push(BlockDef { name, faces });
+            reg.push(BlockDef { name, faces, emission: b.emission.unwrap_or([0.0; 3]) });
         }
         Ok(reg)
     }
@@ -85,6 +91,16 @@ impl BlockRegistry {
 
     pub fn len(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Per-block emitted radiance as `[r, g, b, 0]` (linear), indexed by block
+    /// id. Uploaded to the GPU so the radiance-cascades voxelizer can tag
+    /// emissive voxels (std430-friendly `vec4<f32>` rows).
+    pub fn emission_table(&self) -> Vec<[f32; 4]> {
+        self.blocks
+            .iter()
+            .map(|b| [b.emission[0], b.emission[1], b.emission[2], 0.0])
+            .collect()
     }
 
     /// Per-block atlas tiles as `[sides, top, bottom, 0]`, indexed by block id.

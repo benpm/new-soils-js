@@ -3,10 +3,12 @@
 
 pub mod blocks;
 pub mod greedy;
+pub mod radiance;
 pub mod terrain;
 
 pub use blocks::{BlockDef, BlockRegistry};
 pub use greedy::{MeshData, greedy_mesh};
+pub use radiance::{LightGrid, Radiance};
 pub use terrain::{TerrainGen, WorldType};
 
 /// The original block table, embedded so both binaries can build a registry

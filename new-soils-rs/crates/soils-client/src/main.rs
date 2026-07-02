@@ -7,6 +7,8 @@ mod chunk;
 mod console;
 mod discovery;
 mod edit;
+mod gi;
+mod gi_demo;
 mod gpu_mesh;
 mod hud;
 mod login;
@@ -53,6 +55,7 @@ fn main() {
             ..default()
         }))
         .add_plugins(GpuMeshPlugin)
+        .add_plugins(gi::GiPlugin)
         .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
         .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 1.0)))
         .insert_resource(ChunkMap::default())
@@ -99,6 +102,8 @@ fn main() {
                 day_night,
                 self_test,
                 screenshot_once,
+                gi_demo::setup_gi_demo,
+                gi_demo::gi_demo_keep_dirty,
             ),
         )
         // Gameplay: only once authenticated.
@@ -144,6 +149,8 @@ fn screenshot_once(
     }
     if time.elapsed_secs() > 9.0 {
         *taken = true;
+        // In GI-demo mode keep the scene's own framing (see gi_demo.rs).
+        if !gi_demo::demo_enabled() {
         if let Ok(mut t) = camera.single_mut() {
             if let Some(actor) = remote_actors.iter().next() {
                 // Frame a remote actor so its body is visible in the shot.
@@ -164,6 +171,7 @@ fn screenshot_once(
                 t.look_at(Vec3::new(320.0, 264.0, 290.0), Vec3::Y);
                 info!("SELFTEST: camera at {:?} looking_at terrain", t.translation);
             }
+        }
         }
         let mut sample = 0;
         for (chunk, t) in &meshed {
@@ -259,6 +267,9 @@ fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) 
 
 /// In self-test mode there's no login screen, so auto-authenticate as a guest.
 fn selftest_login(net: Res<NetClient>) {
+    if gi_demo::demo_enabled() {
+        return; // demo builds a local scene; no server/login
+    }
     if std::env::var("SOILS_SELFTEST").is_ok() && std::env::var("SOILS_LOGINSHOT").is_err() {
         net.connect("ws://127.0.0.1:9001".into());
         net.send(ClientMsg::Login { name: "player".into(), password: String::new(), signup: true });
@@ -290,10 +301,15 @@ fn net_receive(
     toggles: Res<pause::RenderToggles>,
     mut streaming: ResMut<Streaming>,
     mut login_state: ResMut<login::LoginState>,
+    gi: Res<gi::GiAssets>,
 ) {
+    let gi_cascade0 = gi.cascade0();
+    let (gi_origin, gi_enabled) = gi.apply_params();
     let chunk_params = material::AtlasParams {
         ambient_occlusion: if toggles.ao { 1.0 } else { 0.0 },
         fog_density: if toggles.fog { material::FOG_DENSITY } else { 0.0 },
+        gi_origin,
+        gi_enabled,
         ..default()
     };
     for ev in net.drain() {
@@ -323,14 +339,14 @@ fn net_receive(
             ServerMsg::Chunk { pos, empty, voxels } => {
                 apply_chunk(
                     &mut commands, &mut map, &mut chunks, &mut gpu_chunks, &mut buffers,
-                    &mut materials, &atlas, &chunk_params, pos, empty, voxels,
+                    &mut materials, &atlas, &chunk_params, &gi_cascade0, pos, empty, voxels,
                 );
             }
             ServerMsg::Bundle { chunks: datas } => {
                 for d in datas {
                     apply_chunk(
                         &mut commands, &mut map, &mut chunks, &mut gpu_chunks, &mut buffers,
-                        &mut materials, &atlas, &chunk_params, d.pos, d.empty, d.voxels,
+                        &mut materials, &atlas, &chunk_params, &gi_cascade0, d.pos, d.empty, d.voxels,
                     );
                 }
             }
@@ -407,6 +423,7 @@ fn apply_chunk(
     materials: &mut Assets<ChunkMeshMaterial>,
     atlas: &AtlasAssets,
     params: &material::AtlasParams,
+    gi_cascade0: &Handle<ShaderStorageBuffer>,
     pos: [i32; 3],
     empty: bool,
     voxels: Vec<u8>,
@@ -429,7 +446,9 @@ fn apply_chunk(
         let e = commands.spawn(VoxelChunk { pos: cpos, volume }).id();
         map.map.insert(cpos, e);
     } else {
-        let e = gpu_mesh::spawn_gpu_chunk(commands, buffers, materials, atlas, cpos, volume, params.clone());
+        let e = gpu_mesh::spawn_gpu_chunk(
+            commands, buffers, materials, atlas, cpos, volume, params.clone(), gi_cascade0.clone(),
+        );
         map.map.insert(cpos, e);
     }
 }

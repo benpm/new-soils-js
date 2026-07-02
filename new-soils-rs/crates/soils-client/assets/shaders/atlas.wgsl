@@ -18,6 +18,11 @@ struct AtlasParams {
     // colour in the same lux regime as `brightness` so it dims with exposure.
     fog_density: f32,
     fog_color: vec3<f32>,
+    // Radiance-cascades GI (see gi.rs): world-voxel corner of the volume, and a
+    // >0.5 enable flag. Carried here (not in a shared buffer) so the material
+    // bind group never references a per-frame-recreated buffer.
+    gi_origin: vec3<f32>,
+    gi_enabled: f32,
 };
 
 struct QuadGpu {
@@ -34,10 +39,65 @@ struct QuadBuffer {
     quads: array<QuadGpu>,
 };
 
+// GI radiance-cascades output (see gi.rs / radiance.wgsl): the merged cascade-0
+// field, shared (read-only) across all chunk materials.
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<storage, read> qb: QuadBuffer;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var atlas_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var atlas_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: AtlasParams;
+@group(#{MATERIAL_BIND_GROUP}) @binding(4) var<storage, read> gi_cascade0: array<vec4<f32>>;
+
+// Cascade-0 layout (must match radiance.wgsl / gi.rs).
+const GI_DIM: f32 = 64.0;
+const GI_PROBES0: i32 = 16;
+const GI_SPACING0: f32 = 4.0;
+const GI_DIRRES0: u32 = 4u;
+// Scales GI irradiance into the terrain's lux exposure regime.
+const GI_LUX: f32 = 3500.0;
+
+fn octa_decode(u: f32, v: f32) -> vec3<f32> {
+    let ox = 2.0 * u - 1.0;
+    let oy = 2.0 * v - 1.0;
+    let z = 1.0 - abs(ox) - abs(oy);
+    var x = ox;
+    var y = oy;
+    if (z < 0.0) {
+        x = (1.0 - abs(oy)) * sign(ox);
+        y = (1.0 - abs(ox)) * sign(oy);
+    }
+    return normalize(vec3<f32>(x, y, z));
+}
+
+// Cosine-weighted hemisphere integral of the nearest cascade-0 probe's incoming
+// radiance about normal `n`. Returns linear RGB irradiance (0 outside volume).
+fn gi_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    // Sample one probe-spacing off the surface along the normal: a probe sitting
+    // exactly on the surface is embedded in the solid voxel and traces only that
+    // (black), so nudge into the air where the lit probes are.
+    let local = world_pos + n * GI_SPACING0 - params.gi_origin;
+    let pf = local / GI_SPACING0 - vec3<f32>(0.5);
+    let pi = vec3<i32>(i32(round(pf.x)), i32(round(pf.y)), i32(round(pf.z)));
+    if (pi.x < 0 || pi.y < 0 || pi.z < 0 ||
+        pi.x >= GI_PROBES0 || pi.y >= GI_PROBES0 || pi.z >= GI_PROBES0) {
+        return vec3<f32>(0.0);
+    }
+    let dirs = GI_DIRRES0 * GI_DIRRES0;
+    let pidx = u32((pi.y * GI_PROBES0 + pi.z) * GI_PROBES0 + pi.x);
+    var acc = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var dy = 0u; dy < GI_DIRRES0; dy += 1u) {
+        for (var dx = 0u; dx < GI_DIRRES0; dx += 1u) {
+            let dir = octa_decode((f32(dx) + 0.5) / f32(GI_DIRRES0), (f32(dy) + 0.5) / f32(GI_DIRRES0));
+            let ndl = max(dot(dir, n), 0.0);
+            if (ndl <= 0.0) { continue; }
+            let e = gi_cascade0[pidx * dirs + dy * GI_DIRRES0 + dx];
+            acc += e.rgb * ndl;
+            wsum += ndl;
+        }
+    }
+    if (wsum <= 0.0) { return vec3<f32>(0.0); }
+    return acc / wsum;
+}
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -127,10 +187,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let tint = 1.0 + abs(n.x + n.y) * 0.2;
     color = vec4<f32>(color.rgb * tint, color.a);
 
-    // The terrain is unlit, so lift it into the atmosphere's physical-light
-    // exposure regime: scale by an effective illuminance and the view exposure
-    // (which the day/night cycle drives to dim everything together at night).
-    color = vec4<f32>(color.rgb * params.brightness * view.exposure, color.a);
+    // Lift the terrain into the atmosphere's physical-light exposure regime.
+    // The base `brightness` is the ambient/sun term; the radiance-cascades GI
+    // adds bounced + emissive light (coloured, from nearby light sources and
+    // the sky), so caves darken and lamps bleed colour onto their surroundings.
+    // With GI disabled the added term is zero, reproducing the flat look.
+    var gi = vec3<f32>(0.0);
+    if (params.gi_enabled > 0.5) {
+        gi = gi_irradiance(in.world_position, n) * GI_LUX;
+    }
+    color = vec4<f32>(color.rgb * (vec3<f32>(params.brightness) + gi) * view.exposure, color.a);
 
     // Exponential-squared distance fog toward the (exposure-scaled) horizon
     // colour, blending the chunk-load boundary into the atmosphere haze.

@@ -16,10 +16,12 @@ Copper Ore:
   faces: [8, 8, 8]
 Diamond Ore:
   faces: [9, 9, 9]
+  emission: [0.6, 3.6, 4.8]
 Coal Ore:
   faces: [10, 10, 10]
 Ruby Ore:
   faces: [11, 11, 11]
+  emission: [5.0, 0.4, 0.7]
 Stone Bricks:
   faces: [12, 12, 12]
 Slate:

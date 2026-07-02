@@ -112,6 +112,7 @@ fn tick_gpu_chunks(mut chunks: Query<&mut GpuChunk>) {
 
 /// Spawn a fully-rendered GPU chunk entity (voxel + quad buffers, material,
 /// dummy mesh). Returns the entity so the caller can register it in `ChunkMap`.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_gpu_chunk(
     commands: &mut Commands,
     buffers: &mut Assets<ShaderStorageBuffer>,
@@ -120,6 +121,7 @@ pub fn spawn_gpu_chunk(
     cpos: IVec3,
     volume: ChunkVolume,
     params: AtlasParams,
+    gi_cascade0: Handle<ShaderStorageBuffer>,
 ) -> Entity {
     let voxels = buffers.add(ShaderStorageBuffer::new(volume.as_bytes(), RenderAssetUsages::default()));
     let quads =
@@ -128,6 +130,7 @@ pub fn spawn_gpu_chunk(
         quads: quads.clone(),
         atlas: atlas.texture.clone(),
         params,
+        gi_cascade0,
     });
     let origin = (cpos * CHUNK_SIZE).as_vec3();
     commands

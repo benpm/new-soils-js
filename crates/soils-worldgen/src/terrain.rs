@@ -6,6 +6,7 @@
 //! pair, the terrain is equivalent in character but not byte-identical.
 
 use noise::{NoiseFn, Simplex};
+use rayon::prelude::*;
 use soils_protocol::{CHUNK_SIZE, ChunkVolume, chunk_origin};
 
 use crate::blocks::BlockRegistry;
@@ -64,6 +65,17 @@ impl TerrainGen {
     #[inline]
     fn n3(&self, x: f64, y: f64, z: f64) -> f64 {
         self.noise.get([x, y, z])
+    }
+
+    /// Generate many chunks in parallel. `generate` takes only shared borrows
+    /// (`&self`, `&reg`), so a fresh world's chunk burst fans out across all
+    /// cores instead of running serially. Results are returned in input order.
+    pub fn generate_batch(
+        &self,
+        positions: &[glam::IVec3],
+        reg: &BlockRegistry,
+    ) -> Vec<ChunkVolume> {
+        positions.par_iter().map(|&p| self.generate(p, reg)).collect()
     }
 
     /// Generate one chunk at the given chunk coordinate.
@@ -168,5 +180,24 @@ mod tests {
         let below = tg.generate(glam::IVec3::new(0, 7, 0), &reg);
         assert_ne!(below.get(0, 31, 0), AIR);
         let _ = dirt;
+    }
+
+    #[test]
+    fn generate_batch_matches_sequential() {
+        let reg = registry();
+        let tg = TerrainGen::new(1234, WorldType::Normal);
+        let positions: Vec<glam::IVec3> = (0..6)
+            .map(|i| glam::IVec3::new(i % 3, 8 - (i / 3), i))
+            .collect();
+        let batched = tg.generate_batch(&positions, &reg);
+        assert_eq!(batched.len(), positions.len());
+        for (pos, got) in positions.iter().zip(&batched) {
+            let expected = tg.generate(*pos, &reg);
+            assert_eq!(
+                got.as_bytes(),
+                expected.as_bytes(),
+                "batched chunk {pos:?} differs from sequential generate"
+            );
+        }
     }
 }

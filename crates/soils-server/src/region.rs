@@ -10,6 +10,7 @@
 //! fresh block and repoints the header, which is simple and crash-safe at the
 //! cost of some wasted space until a future compaction pass.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -25,10 +26,10 @@ const REGION_MASK: i32 = REGION_SIZE - 1; // 15
 const HEADER_ENTRIES: usize = (REGION_SIZE * REGION_SIZE * REGION_SIZE) as usize; // 4096
 const HEADER_BYTES: u64 = (HEADER_ENTRIES * 4) as u64; // 16384
 
-const ABSENT: u32 = 0;
-const EMPTY: u32 = 1;
+pub(crate) const ABSENT: u32 = 0;
+pub(crate) const EMPTY: u32 = 1;
 
-fn region_path(dir: &Path, pos: IVec3) -> PathBuf {
+pub(crate) fn region_path(dir: &Path, pos: IVec3) -> PathBuf {
     dir.join(format!(
         "r_{}_{}_{}.bin",
         pos.x >> REGION_BITS,
@@ -45,26 +46,46 @@ fn header_offset(pos: IVec3) -> u64 {
     (((ly + lz * REGION_SIZE as u64) * REGION_SIZE as u64) + lx) * 4
 }
 
-/// Load a chunk from its region file. Returns `Ok(None)` if it has never been
-/// persisted (the caller should then generate it).
-pub fn load(dir: &Path, pos: IVec3) -> io::Result<Option<ChunkVolume>> {
+/// Index of this chunk's header entry within a region's 4096-entry header,
+/// for use with a [`read_header`] snapshot.
+pub(crate) fn header_index(pos: IVec3) -> usize {
+    (header_offset(pos) / 4) as usize
+}
+
+/// Read a region file's full 16 KB header in one shot. Returns `Ok(None)` if the
+/// region file doesn't exist (or is too short to hold a header) — i.e. nothing
+/// in that region has ever been persisted. Callers memoise this so per-chunk
+/// probes become in-memory lookups instead of a file open each.
+pub(crate) fn read_header(dir: &Path, pos: IVec3) -> io::Result<Option<Box<[u32; HEADER_ENTRIES]>>> {
     let path = region_path(dir, pos);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let mut file = File::open(&path)?;
+    let mut file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     if file.metadata()?.len() < HEADER_BYTES {
         return Ok(None);
     }
+    let mut bytes = vec![0u8; HEADER_BYTES as usize];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut bytes)?;
+    let mut header = Box::new([0u32; HEADER_ENTRIES]);
+    for (i, slot) in header.iter_mut().enumerate() {
+        *slot = u32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
+    }
+    Ok(Some(header))
+}
 
-    file.seek(SeekFrom::Start(header_offset(pos)))?;
-    let mut buf = [0u8; 4];
-    file.read_exact(&mut buf)?;
-    match u32::from_le_bytes(buf) {
+/// Resolve a single chunk given its already-known header `entry` (see
+/// [`read_header`]). Only opens the region file for a present, non-empty block.
+pub(crate) fn read_chunk(dir: &Path, pos: IVec3, entry: u32) -> io::Result<Option<ChunkVolume>> {
+    match entry {
         ABSENT => Ok(None),
         EMPTY => Ok(Some(ChunkVolume::empty())),
         offset => {
+            let mut file = File::open(region_path(dir, pos))?;
             file.seek(SeekFrom::Start(offset as u64))?;
+            let mut buf = [0u8; 4];
             file.read_exact(&mut buf)?;
             let len = u32::from_le_bytes(buf) as usize;
             let mut compressed = vec![0u8; len];
@@ -83,34 +104,65 @@ pub fn load(dir: &Path, pos: IVec3) -> io::Result<Option<ChunkVolume>> {
     }
 }
 
-/// Persist a chunk to its region file, creating the file/header if needed.
-pub fn save(dir: &Path, pos: IVec3, volume: &ChunkVolume) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    let path = region_path(dir, pos);
-    let mut file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+/// Load a chunk from its region file. Returns `Ok(None)` if it has never been
+/// persisted (the caller should then generate it). The read path uses the
+/// cached [`read_header`] + [`read_chunk`] split directly; this whole-in-one
+/// helper is kept for tests and one-off callers.
+#[allow(dead_code)]
+pub fn load(dir: &Path, pos: IVec3) -> io::Result<Option<ChunkVolume>> {
+    let Some(header) = read_header(dir, pos)? else { return Ok(None) };
+    read_chunk(dir, pos, header[header_index(pos)])
+}
 
-    // Initialize the header on a freshly created file.
-    if file.metadata()?.len() < HEADER_BYTES {
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&vec![0u8; HEADER_BYTES as usize])?;
+/// Persist a single chunk. Thin wrapper over [`save_many`]; kept for tests.
+#[allow(dead_code)]
+pub fn save(dir: &Path, pos: IVec3, volume: &ChunkVolume) -> io::Result<()> {
+    save_many(dir, &[(pos, volume)])
+}
+
+/// Persist many chunks at once, opening each region file only once and applying
+/// all of that region's updates before moving on. This is what the background
+/// writer uses to coalesce a fresh-world burst (hundreds of chunks spanning a
+/// handful of region files) into a few file writes.
+pub fn save_many(dir: &Path, chunks: &[(IVec3, &ChunkVolume)]) -> io::Result<()> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(dir)?;
+
+    // Group by region file so each is opened/written once.
+    let mut by_region: HashMap<PathBuf, Vec<(IVec3, &ChunkVolume)>> = HashMap::new();
+    for &(pos, vol) in chunks {
+        by_region.entry(region_path(dir, pos)).or_default().push((pos, vol));
     }
 
-    let entry = if volume.is_empty() {
-        EMPTY
-    } else {
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(volume.as_bytes())?;
-        let compressed = encoder.finish()?;
+    for (path, group) in by_region {
+        let mut file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        // Initialize the header on a freshly created file.
+        if file.metadata()?.len() < HEADER_BYTES {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&vec![0u8; HEADER_BYTES as usize])?;
+        }
 
-        let offset = file.seek(SeekFrom::End(0))?;
-        file.write_all(&(compressed.len() as u32).to_le_bytes())?;
-        file.write_all(&compressed)?;
-        offset as u32
-    };
+        for (pos, vol) in group {
+            let entry = if vol.is_empty() {
+                EMPTY
+            } else {
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(vol.as_bytes())?;
+                let compressed = encoder.finish()?;
 
-    file.seek(SeekFrom::Start(header_offset(pos)))?;
-    file.write_all(&entry.to_le_bytes())?;
+                let offset = file.seek(SeekFrom::End(0))?;
+                file.write_all(&(compressed.len() as u32).to_le_bytes())?;
+                file.write_all(&compressed)?;
+                offset as u32
+            };
+            file.seek(SeekFrom::Start(header_offset(pos)))?;
+            file.write_all(&entry.to_le_bytes())?;
+        }
+        file.flush()?;
+    }
     Ok(())
 }
 
@@ -146,6 +198,62 @@ mod tests {
         vol.set(5, 5, 5, 9);
         save(&dir, pos, &vol).unwrap();
         assert_eq!(load(&dir, pos).unwrap().unwrap().get(5, 5, 5), 9);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_many_coalesces_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("soils-region-many-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut a = ChunkVolume::empty();
+        a.set(0, 0, 0, 5);
+        let mut b = ChunkVolume::empty();
+        b.set(31, 31, 31, 6);
+        let empty = ChunkVolume::empty();
+
+        // Two chunks in region (0,0,0), one in a neighbouring region, plus an
+        // empty chunk — all written in one coalesced call.
+        let p_a = IVec3::new(1, 1, 1);
+        let p_b = IVec3::new(2, 1, 1);
+        let p_neighbour = IVec3::new(16, 1, 1); // region (1,0,0)
+        let p_empty = IVec3::new(3, 1, 1);
+        save_many(
+            &dir,
+            &[(p_a, &a), (p_b, &b), (p_neighbour, &b), (p_empty, &empty)],
+        )
+        .unwrap();
+
+        assert_eq!(load(&dir, p_a).unwrap().unwrap().get(0, 0, 0), 5);
+        assert_eq!(load(&dir, p_b).unwrap().unwrap().get(31, 31, 31), 6);
+        assert_eq!(load(&dir, p_neighbour).unwrap().unwrap().get(31, 31, 31), 6);
+        assert!(load(&dir, p_empty).unwrap().unwrap().is_empty());
+        // An untouched chunk in a written region is still absent.
+        assert!(load(&dir, IVec3::new(4, 1, 1)).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_header_and_chunk_match_load() {
+        let dir = std::env::temp_dir().join(format!("soils-region-hdr-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        // Missing region → no header, and `load` agrees.
+        let pos = IVec3::new(1, 2, 3);
+        assert!(read_header(&dir, pos).unwrap().is_none());
+        assert!(load(&dir, pos).unwrap().is_none());
+
+        let mut vol = ChunkVolume::empty();
+        vol.set(7, 8, 9, 3);
+        save(&dir, pos, &vol).unwrap();
+
+        let header = read_header(&dir, pos).unwrap().expect("header present");
+        let via_parts = read_chunk(&dir, pos, header[header_index(pos)]).unwrap();
+        let via_load = load(&dir, pos).unwrap();
+        assert_eq!(via_parts.map(|v| v.get(7, 8, 9)), Some(3));
+        assert_eq!(via_load.map(|v| v.get(7, 8, 9)), Some(3));
 
         let _ = fs::remove_dir_all(&dir);
     }

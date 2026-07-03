@@ -217,6 +217,7 @@ pub fn apply_warp(
             player::teleport(&mut player, &mut transform, Vec3::from_array(msg.spawn));
         }
         streaming.last_chunk = None; // force a fresh stream
+        streaming.pending = 0; // old world's outstanding requests are moot
     }
 }
 
@@ -253,6 +254,7 @@ pub fn apply_chunks(
     atlas: Res<AtlasAssets>,
     toggles: Res<RenderToggles>,
     gi: Res<gi::GiAssets>,
+    mut streaming: ResMut<Streaming>,
 ) {
     if reader.is_empty() {
         return;
@@ -288,6 +290,7 @@ pub fn apply_chunks(
             // Track empty chunks so they aren't re-requested; no mesh.
             let e = commands.spawn(VoxelChunk { pos: cpos, volume }).id();
             map.map.insert(cpos, e);
+            streaming.pending = streaming.pending.saturating_sub(1);
         } else {
             let e = gpu_mesh::spawn_gpu_chunk(
                 &mut commands,
@@ -300,6 +303,7 @@ pub fn apply_chunks(
                 gi_cascade0.clone(),
             );
             map.map.insert(cpos, e);
+            streaming.pending = streaming.pending.saturating_sub(1);
         }
     }
 }

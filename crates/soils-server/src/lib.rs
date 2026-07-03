@@ -9,8 +9,11 @@
 //! to `server.js`, trimmed to what the slice needs (no MySQL, no schemapack).
 
 mod auth;
+mod persist;
 mod region;
 mod world;
+
+use persist::{PersistHandle, Persister};
 
 use auth::Accounts;
 
@@ -42,6 +45,11 @@ const DAY_SECONDS: f32 = 120.0;
 const ACTOR_TICK: Duration = Duration::from_millis(100);
 /// Chunks per `Bundle` response. Small because solid chunks are ~32 KB each.
 const BUNDLE_SIZE: usize = 16;
+/// Chunks generated per wave. A fresh world's first request is up to 9³=729
+/// chunks; splitting it into nearest-first waves (generated in parallel on the
+/// blocking pool, with an `.await` between waves) lets the near ring stream to
+/// the client while the outer rings are still generating.
+const WAVE_SIZE: usize = 48;
 /// The world every client starts in.
 const DEFAULT_WORLD: &str = "default";
 /// Max accepted movement between two `Move` updates (world units). Generous —
@@ -154,10 +162,13 @@ struct ServerState {
     accounts: Arc<Accounts>,
     next_id: AtomicU16,
     data_dir: PathBuf,
+    /// Enqueues chunk saves onto the background writer thread (owned by the
+    /// caller of [`serve`], so it can be flushed/joined on shutdown).
+    persist: PersistHandle,
 }
 
 impl ServerState {
-    fn new(data_dir: PathBuf) -> Arc<Self> {
+    fn new(data_dir: PathBuf, persist: PersistHandle) -> Arc<Self> {
         let (bcast, _) = broadcast::channel::<(u16, String, ServerMsg)>(1024);
         let state = Arc::new(Self {
             worlds: Arc::new(Mutex::new(HashMap::new())),
@@ -167,6 +178,7 @@ impl ServerState {
             accounts: Arc::new(Accounts::load(&data_dir)),
             next_id: AtomicU16::new(1),
             data_dir,
+            persist,
         });
         // Pre-create the default world so it's ready before the first client.
         state.get_world(DEFAULT_WORLD);
@@ -180,7 +192,8 @@ impl ServerState {
             .unwrap()
             .entry(name.to_string())
             .or_insert_with(|| {
-                Arc::new(Mutex::new(World::new(&self.data_dir, name, world_seed(name))))
+                let world = World::new(&self.data_dir, name, world_seed(name), self.persist.clone());
+                Arc::new(Mutex::new(world))
             })
             .clone()
     }
@@ -208,7 +221,8 @@ fn world_seed(name: &str) -> u32 {
 pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     let listener = TcpListener::bind(&config.bind).await?;
     println!("new-soils server listening on ws://{}", config.bind);
-    let state = ServerState::new(config.data_dir.clone());
+    let persister = Persister::new();
+    let state = ServerState::new(config.data_dir.clone(), persister.handle());
     // Never-firing shutdown/discovery senders: they stay alive in this frame
     // for the whole await, so `changed()` pends forever and the initial
     // discovery state holds until process exit.
@@ -216,6 +230,8 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     let (discovery_tx, discovery_rx) = watch::channel(config.enable_discovery);
     let (discovery_port_tx, _discovery_port_rx) = watch::channel(None);
     let result = serve(listener, config, state, shutdown_rx, discovery_rx, discovery_port_tx).await;
+    // Flush any queued chunk writes to disk before returning.
+    persister.shutdown();
     drop(shutdown_tx);
     drop(discovery_tx);
     result
@@ -249,10 +265,13 @@ pub fn spawn(config: ServerConfig) -> std::io::Result<ServerHandle> {
                     }
                 };
                 let _ = tx.send(Ok(addr));
-                let state = ServerState::new(config.data_dir.clone());
+                let persister = Persister::new();
+                let state = ServerState::new(config.data_dir.clone(), persister.handle());
                 let _ =
                     serve(listener, config, state, shutdown_rx, discovery_rx, discovery_port_tx)
                         .await;
+                // Flush queued chunk writes before the runtime thread exits.
+                persister.shutdown();
             });
         })?;
     let addr = rx
@@ -501,25 +520,40 @@ async fn handle_connection(
                 let _ = out_tx.send(ServerMsg::Init { id, spawn, seed, daytime });
             }
             ClientMsg::ReqChunks { positions } => {
-                let mut batch: Vec<ChunkData> = Vec::with_capacity(BUNDLE_SIZE);
-                for p in positions {
-                    let cpos = IVec3::new(p[0], p[1], p[2]);
-                    let (empty, voxels) = {
-                        let mut w = world.lock().unwrap();
-                        let chunk = w.get_or_generate(cpos);
-                        if chunk.is_empty() {
-                            (true, Vec::new())
-                        } else {
-                            (false, chunk.as_bytes().to_vec())
+                // Serve chunks in nearest-first waves (the client already sorts
+                // `positions` nearest-first). Each wave is generated off the
+                // async runtime on the blocking pool — `get_or_generate_batch`
+                // fans the missing chunks across all cores — and the `.await`
+                // between waves lets the writer flush earlier waves while later
+                // ones generate. So the ring around the player appears almost
+                // immediately instead of after the whole (up to 729-chunk) burst.
+                for wave in positions.chunks(WAVE_SIZE) {
+                    let wave: Vec<[i32; 3]> = wave.to_vec();
+                    let world = world.clone();
+                    let results = tokio::task::spawn_blocking(move || {
+                        let cpositions: Vec<IVec3> =
+                            wave.iter().map(|p| IVec3::new(p[0], p[1], p[2])).collect();
+                        world.lock().unwrap().get_or_generate_batch(&cpositions)
+                    })
+                    .await;
+                    let results = match results {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("worldgen task failed: {e}");
+                            continue;
                         }
                     };
-                    batch.push(ChunkData { pos: p, empty, voxels });
-                    if batch.len() >= BUNDLE_SIZE {
-                        let _ = out_tx.send(ServerMsg::Bundle { chunks: std::mem::take(&mut batch) });
+                    let mut batch: Vec<ChunkData> = Vec::with_capacity(BUNDLE_SIZE);
+                    for (cpos, empty, voxels) in results {
+                        batch.push(ChunkData { pos: [cpos.x, cpos.y, cpos.z], empty, voxels });
+                        if batch.len() >= BUNDLE_SIZE {
+                            let _ =
+                                out_tx.send(ServerMsg::Bundle { chunks: std::mem::take(&mut batch) });
+                        }
                     }
-                }
-                if !batch.is_empty() {
-                    let _ = out_tx.send(ServerMsg::Bundle { chunks: batch });
+                    if !batch.is_empty() {
+                        let _ = out_tx.send(ServerMsg::Bundle { chunks: batch });
+                    }
                 }
             }
             ClientMsg::Edit { pos, value } => {

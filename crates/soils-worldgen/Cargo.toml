@@ -8,6 +8,7 @@ license.workspace = true
 soils-protocol = { workspace = true }
 glam = { workspace = true }
 noise = "0.9"
+rayon = "1"
 serde = { workspace = true }
 serde_yaml = "0.9"
 indexmap = { version = "2", features = ["serde"] }

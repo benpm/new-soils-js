@@ -1,5 +1,4 @@
 # Todo
 
-- [x] GPU-accelerated mesh generation: compute shader that generates meshes from voxel data. Meshes are never copied to CPU.
-- [x] GPU-accelerated lighting: compute shader propagates dynamic lighting using 3D sparse radiance cascades. Do extensive research using web search to get an idea for how to do this efficiently, on the GPU.
- 
+- [ ] World generation needs to be instrumented and have its performance greatly improved by acceleratio thru compute shaders. It takes way too long for chunks to appear in single player mode.
+- [ ] Bake lighting on world modification. Lighting need not be computed more than the voxels are modified

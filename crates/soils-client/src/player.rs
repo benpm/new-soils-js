@@ -183,11 +183,14 @@ pub fn mouse_look(
 pub struct Streaming {
     pub last_chunk: Option<IVec3>,
     pub load_radius: i32,
+    /// Chunks requested but not yet received — a live estimate of how much of
+    /// the surrounding world is still generating/streaming (shown on the HUD).
+    pub pending: usize,
 }
 
 impl Default for Streaming {
     fn default() -> Self {
-        Self { last_chunk: None, load_radius: 4 }
+        Self { last_chunk: None, load_radius: 4, pending: 0 }
     }
 }
 
@@ -229,6 +232,7 @@ pub fn request_chunks(
             let d = IVec3::new(c[0], c[1], c[2]) - pc;
             d.x * d.x + d.y * d.y + d.z * d.z
         });
+        streaming.pending += positions.len();
         net.send(ClientMsg::ReqChunks { positions });
     }
 }

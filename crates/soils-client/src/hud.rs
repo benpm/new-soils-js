@@ -59,6 +59,9 @@ pub fn update_hud(
     let pos = player.single().map(|t| t.translation).unwrap_or_default();
     let vox = pos.floor().as_ivec3();
     let chunk = IVec3::new(vox.x >> CHUNK_BIT, vox.y >> CHUNK_BIT, vox.z >> CHUNK_BIT);
+    let loaded = map.map.len();
+    let pending = streaming.pending;
+    let progress = if pending == 0 { 100.0 } else { 100.0 * loaded as f32 / (loaded + pending) as f32 };
     text.0 = format!(
         "new-soils (Rust/Bevy)\n\
          fps {fps:.0}\n\
@@ -66,12 +69,13 @@ pub fn update_hud(
          vox {} {} {}\n\
          chunk {} {} {}\n\
          chunks loaded {}  radius {}\n\
+         generating {pending}  ({progress:.0}%)\n\
          daytime {:.2}\n\
          block [{}] {}",
         pos.x, pos.y, pos.z,
         vox.x, vox.y, vox.z,
         chunk.x, chunk.y, chunk.z,
-        map.map.len(), streaming.load_radius,
+        loaded, streaming.load_radius,
         world_time.daytime,
         hotbar.selected + 1, hotbar.block_name(),
     );

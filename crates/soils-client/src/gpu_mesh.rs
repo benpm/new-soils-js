@@ -39,6 +39,13 @@ const DUMMY_VERTS: usize = MAX_QUADS as usize * 6;
 /// the compute to run; re-meshing is idempotent).
 const PENDING_FRAMES: u8 = 4;
 
+/// Side length of the padded per-chunk light volume (32 + 1 voxel of neighbor
+/// light on each side, so border faces sample correctly). Must match `LPAD`
+/// in atlas.wgsl.
+pub const LIGHT_PAD: i32 = 34;
+/// Bytes in a padded light buffer (one packed light byte per cell).
+pub const LIGHT_BYTES: usize = (LIGHT_PAD * LIGHT_PAD * LIGHT_PAD) as usize;
+
 /// Shared assets for chunk rendering: the atlas texture and the dummy draw mesh.
 #[derive(Resource)]
 pub struct AtlasAssets {
@@ -50,11 +57,13 @@ pub struct AtlasAssets {
 #[derive(Resource, Clone, ExtractResource)]
 pub struct FacesTable(pub Handle<ShaderStorageBuffer>);
 
-/// Per-chunk GPU state: input voxels + output quads + a dirty countdown.
+/// Per-chunk GPU state: input voxels + output quads + the padded L0 light
+/// volume the material samples + a dirty countdown.
 #[derive(Component, Clone, ExtractComponent)]
 pub struct GpuChunk {
     pub voxels: Handle<ShaderStorageBuffer>,
     pub quads: Handle<ShaderStorageBuffer>,
+    pub light: Handle<ShaderStorageBuffer>,
     pub pending: u8,
 }
 
@@ -126,17 +135,20 @@ pub fn spawn_gpu_chunk(
     let voxels = buffers.add(ShaderStorageBuffer::new(volume.as_bytes(), RenderAssetUsages::default()));
     let quads =
         buffers.add(ShaderStorageBuffer::with_size(QUAD_BUFFER_BYTES as usize, RenderAssetUsages::default()));
+    // Starts dark; `light::process_light` fills it once the chunk is lit.
+    let light = buffers.add(ShaderStorageBuffer::with_size(LIGHT_BYTES, RenderAssetUsages::default()));
     let material = materials.add(ChunkMeshMaterial {
         quads: quads.clone(),
         atlas: atlas.texture.clone(),
         params,
         gi_cascade0,
+        light: light.clone(),
     });
     let origin = (cpos * CHUNK_SIZE).as_vec3();
     commands
         .spawn((
-            VoxelChunk { pos: cpos, volume },
-            GpuChunk { voxels, quads, pending: PENDING_FRAMES },
+            VoxelChunk { pos: cpos, volume, light: soils_sim::light::ChunkLight::dark() },
+            GpuChunk { voxels, quads, light, pending: PENDING_FRAMES },
             Mesh3d(atlas.dummy_mesh.clone()),
             MeshMaterial3d(material),
             Transform::from_translation(origin),

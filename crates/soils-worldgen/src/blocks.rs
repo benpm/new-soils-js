@@ -103,6 +103,19 @@ impl BlockRegistry {
             .collect()
     }
 
+    /// Per-block emitted light *level* (0-15) for the baked L0 light grid,
+    /// derived from the emission magnitude. The strongest emitter in
+    /// `blocks.yaml` (Ruby Ore, 5.0) maps to 15.
+    pub fn light_table(&self) -> Vec<u8> {
+        self.blocks
+            .iter()
+            .map(|b| {
+                let m = b.emission[0].max(b.emission[1]).max(b.emission[2]);
+                ((m * 3.0).round() as i32).clamp(0, 15) as u8
+            })
+            .collect()
+    }
+
     /// Per-block atlas tiles as `[sides, top, bottom, 0]`, indexed by block id.
     /// Uploaded to the GPU so the compute mesher can resolve tiles itself
     /// (std430-friendly `vec4<u32>` rows).

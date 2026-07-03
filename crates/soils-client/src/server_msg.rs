@@ -20,6 +20,7 @@ use crate::chunk::{ChunkMap, VoxelChunk, WorldTime};
 use crate::edit;
 use crate::gi;
 use crate::gpu_mesh::{self, AtlasAssets, GpuChunk};
+use crate::light::{LightQueue, SkyTerm};
 use crate::login::LoginState;
 use crate::material::{self, ChunkMeshMaterial};
 use crate::net::{NetClient, NetEvent};
@@ -94,7 +95,9 @@ pub fn register(app: &mut App) {
 }
 
 /// Drain the network bridge and fan out typed messages. `Bundle`s flatten into
-/// per-chunk [`ChunkReceived`]s.
+/// per-chunk [`ChunkReceived`]s. (One writer param per message type — the
+/// param count is the point of this system.)
+#[allow(clippy::too_many_arguments)]
 pub fn route_server_messages(
     net: Res<NetClient>,
     mut epoch: ResMut<WorldEpoch>,
@@ -196,6 +199,7 @@ pub fn apply_net_status(mut reader: MessageReader<NetStatus>, mut login: ResMut<
 }
 
 /// Confirmed `Warp`: drop the old world entirely and re-stream the new one.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_warp(
     mut reader: MessageReader<WarpReceived>,
     mut commands: Commands,
@@ -203,6 +207,7 @@ pub fn apply_warp(
     mut actor_map: ResMut<ActorMap>,
     mut world_time: ResMut<WorldTime>,
     mut streaming: ResMut<Streaming>,
+    mut light_queue: ResMut<LightQueue>,
     mut query: Query<(&mut Player, &mut Transform)>,
 ) {
     for msg in reader.read() {
@@ -212,6 +217,8 @@ pub fn apply_warp(
         for (_, entity) in actor_map.map.drain() {
             commands.entity(entity).despawn();
         }
+        light_queue.chunks.clear();
+        light_queue.edits.clear();
         world_time.daytime = msg.daytime;
         if let Ok((mut player, mut transform)) = query.single_mut() {
             player::teleport(&mut player, &mut transform, Vec3::from_array(msg.spawn));
@@ -253,6 +260,8 @@ pub fn apply_chunks(
     atlas: Res<AtlasAssets>,
     toggles: Res<RenderToggles>,
     gi: Res<gi::GiAssets>,
+    sky: Res<SkyTerm>,
+    mut light_queue: ResMut<LightQueue>,
 ) {
     if reader.is_empty() {
         return;
@@ -264,6 +273,8 @@ pub fn apply_chunks(
         fog_density: if toggles.fog { material::FOG_DENSITY } else { 0.0 },
         gi_origin,
         gi_enabled,
+        sky_term: sky.0,
+        light_enabled: if toggles.light { 1.0 } else { 0.0 },
         ..default()
     };
     for msg in reader.read() {
@@ -279,14 +290,21 @@ pub fn apply_chunks(
             if let Ok(mut vc) = chunks.get_mut(entity) {
                 vc.volume = volume.clone();
             }
-            if !msg.empty {
-                if let Ok(mut gc) = gpu_chunks.get_mut(entity) {
-                    gpu_mesh::refresh_gpu_chunk(&mut buffers, &mut gc, &volume);
-                }
+            if !msg.empty
+                && let Ok(mut gc) = gpu_chunks.get_mut(entity)
+            {
+                gpu_mesh::refresh_gpu_chunk(&mut buffers, &mut gc, &volume);
             }
         } else if msg.empty {
-            // Track empty chunks so they aren't re-requested; no mesh.
-            let e = commands.spawn(VoxelChunk { pos: cpos, volume }).id();
+            // Track empty chunks so they aren't re-requested; no mesh (but
+            // they still carry light — sky crosses them into caves below).
+            let e = commands
+                .spawn(VoxelChunk {
+                    pos: cpos,
+                    volume,
+                    light: soils_sim::light::ChunkLight::dark(),
+                })
+                .id();
             map.map.insert(cpos, e);
         } else {
             let e = gpu_mesh::spawn_gpu_chunk(
@@ -301,6 +319,7 @@ pub fn apply_chunks(
             );
             map.map.insert(cpos, e);
         }
+        light_queue.chunks.push(cpos);
     }
 }
 
@@ -312,6 +331,7 @@ pub fn apply_edits(
     mut chunks: Query<&mut VoxelChunk>,
     mut gpu_chunks: Query<&mut GpuChunk>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut light_queue: ResMut<LightQueue>,
 ) {
     for msg in reader.read() {
         if msg.epoch != epoch.0 {
@@ -319,6 +339,7 @@ pub fn apply_edits(
         }
         let v = IVec3::from_array(msg.pos);
         edit::apply_edit(&map, &mut chunks, &mut gpu_chunks, &mut buffers, v, msg.value);
+        light_queue.edits.push(v);
     }
 }
 

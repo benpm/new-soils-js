@@ -3,13 +3,16 @@
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use soils_protocol::{CHUNK_BIT, CHUNK_CLIP, ChunkVolume};
+use soils_sim::light::ChunkLight;
 use soils_worldgen::BlockRegistry;
 
-/// One streamed chunk: its chunk coordinate and voxel data.
+/// One streamed chunk: its chunk coordinate, voxel data, and baked L0 light
+/// (computed locally by `light::process_light`, not streamed).
 #[derive(Component)]
 pub struct VoxelChunk {
     pub pos: IVec3,
     pub volume: ChunkVolume,
+    pub light: ChunkLight,
 }
 
 /// Maps chunk coordinates to their spawned entity.

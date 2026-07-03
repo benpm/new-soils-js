@@ -7,6 +7,8 @@
 //! per-frame systems (`player.rs`, `edit.rs`) so behavior is unchanged; only
 //! the voxel lookup is abstracted.
 
+pub mod light;
+
 use glam::{IVec3, Quat, Vec2, Vec3};
 use soils_worldgen::BlockRegistry;
 
@@ -240,6 +242,16 @@ pub fn raycast_voxel(origin: Vec3, dir: Vec3, world: &impl VoxelSampler) -> Opti
 pub fn validate_edit(eye: Vec3, target: IVec3, value: u8, registry: &BlockRegistry) -> bool {
     let within = (target - eye.floor().as_ivec3()).abs().max_element() <= REACH;
     within && registry.get(value).is_some()
+}
+
+/// Day-length easing ported from the JS `ease10`: a steep ease-in/out that
+/// holds bright through midday and dark through midnight. Input is
+/// `daytime * 2 - 1` (daytime 0 = noon); output 1 at noon, 0 at midnight.
+/// Shared by rendering (sun/exposure/sky term) and, later, server gameplay
+/// (night spawn gating).
+pub fn ease10(t: f32) -> f32 {
+    let v = if t < 0.5 { 512.0 * t.powi(10) } else { -512.0 * (t - 1.0).powi(10) + 1.0 };
+    v.clamp(0.0, 1.0)
 }
 
 #[cfg(test)]

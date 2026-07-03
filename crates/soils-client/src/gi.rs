@@ -62,12 +62,6 @@ fn shl(v: IVec3, bit: i32) -> IVec3 {
     IVec3::new(v.x << bit, v.y << bit, v.z << bit)
 }
 
-/// Day-length easing, matching `ease10` in main.rs (steep hold at noon/night).
-fn ease10(t: f32) -> f32 {
-    let v = if t < 0.5 { 512.0 * t.powi(10) } else { -512.0 * (t - 1.0).powi(10) + 1.0 };
-    v.clamp(0.0, 1.0)
-}
-
 /// Little-endian bytes of an f32 slice, for storage-buffer uploads.
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
     let mut b = Vec::with_capacity(v.len() * 4);
@@ -243,7 +237,7 @@ fn update_gi_volume(
 
     // Daylight factor: same curve as `day_night` in main.rs (daytime 0 = noon =
     // bright, 0.5 = midnight = dark), floored so nights keep a little sky bounce.
-    let day = ease10(world_time.daytime * 2.0 - 1.0).max(0.03);
+    let day = soils_sim::ease10(world_time.daytime * 2.0 - 1.0).max(0.03);
 
     let Ok(pt) = player.single() else { return };
     let player_vox = pt.translation.floor().as_ivec3();

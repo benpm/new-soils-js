@@ -169,6 +169,13 @@ fn run_command(
                 m.params.ambient_occlusion = v;
             }
         }
+        "light" => {
+            toggles.light = on_off(args.first());
+            let v = if toggles.light { 1.0 } else { 0.0 };
+            for (_, m) in materials.iter_mut() {
+                m.params.light_enabled = v;
+            }
+        }
         "gi" => {
             gi.enabled = on_off(args.first());
         }

@@ -111,11 +111,14 @@ pub fn setup_gi_demo(
     let params = AtlasParams {
         ambient_occlusion: 1.0,
         // Low flat ambient so the room reads as dark without GI; the ores' GI
-        // bounce then stands out. Fog off for a crisp close-up.
+        // bounce then stands out. Fog off for a crisp close-up. The L0 baked
+        // light is bypassed (this chunk is never queued for lighting, and its
+        // warm blocklight would confound the GI A/B comparison).
         brightness: 300.0,
         fog_density: 0.0,
         gi_origin,
         gi_enabled,
+        light_enabled: 0.0,
         ..default()
     };
     let e = spawn_gpu_chunk(

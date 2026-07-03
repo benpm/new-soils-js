@@ -6,9 +6,10 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
 - [x] 1. **Extract `soils-sim`** — shared movement/collision/raycast/edit-rule functions; client
       physics moves to `FixedUpdate` on it; split the `net_receive` god-system into per-message
       event systems. (game-systems M1)
-- [ ] 2. **Baked light grid (L0)** — skylight+blocklight nibble grid in `soils-sim` with
-      full-relight oracle + incremental flood, persisted with chunks, baked only on world
-      modification; client meshes/shades with it so caves darken with GI off. (rendering §1, §4.1)
+- [x] 2. **Baked light grid (L0)** — skylight+blocklight nibble grid in `soils-sim` with
+      full-relight oracle + incremental flood, baked only on world modification; client shades
+      with it so caves darken with GI off. (rendering §1, §4.1; region-file persistence of light
+      deferred to phase 9 when the server adopts the grid)
 - [ ] 3. **Renderer hygiene** — indirect draws from the GPU quad count, per-chunk AABB frustum
       culling, quad-overflow clamp + fallback, mesher workgroup occupancy, correct winding +
       backface culling. (rendering §2)

@@ -23,6 +23,11 @@ struct AtlasParams {
     // bind group never references a per-frame-recreated buffer.
     gi_origin: vec3<f32>,
     gi_enabled: f32,
+    // Baked L0 light grid (see light.rs): day-scaled illuminance of a fully
+    // sky-lit surface, and a >0.5 enable flag (off = flat `brightness`, the
+    // pre-L0 look the GI demo uses).
+    sky_term: f32,
+    light_enabled: f32,
 };
 
 struct QuadGpu {
@@ -46,6 +51,27 @@ struct QuadBuffer {
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var atlas_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: AtlasParams;
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var<storage, read> gi_cascade0: array<vec4<f32>>;
+// Per-chunk padded L0 light volume: LPAD^3 packed bytes (sky nibble hi, block
+// nibble lo) — the chunk's 32^3 plus one voxel of neighbor light per side.
+@group(#{MATERIAL_BIND_GROUP}) @binding(5) var<storage, read> chunk_light: array<u32>;
+
+// Must match `gpu_mesh::LIGHT_PAD`.
+const LPAD: i32 = 34;
+// Illuminance of a level-15 blocklight surface (lux regime), warm-tinted.
+const BLOCK_LUX: f32 = 35000.0;
+const BLOCK_TINT: vec3<f32> = vec3<f32>(1.0, 0.82, 0.6);
+
+// Packed L0 light byte for the air voxel just in front of a fragment's face.
+fn light_at(local_pos: vec3<f32>, n: vec3<f32>) -> u32 {
+    let c = clamp(
+        vec3<i32>(floor(local_pos + n * 0.5)) + vec3<i32>(1),
+        vec3<i32>(0),
+        vec3<i32>(LPAD - 1),
+    );
+    let idx = u32((c.y + c.z * LPAD) * LPAD + c.x);
+    let w = chunk_light[idx >> 2u];
+    return (w >> ((idx & 3u) * 8u)) & 0xffu;
+}
 
 // Cascade-0 layout (must match radiance.wgsl / gi.rs).
 const GI_DIM: f32 = 64.0;
@@ -188,15 +214,25 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     color = vec4<f32>(color.rgb * tint, color.a);
 
     // Lift the terrain into the atmosphere's physical-light exposure regime.
-    // The base `brightness` is the ambient/sun term; the radiance-cascades GI
-    // adds bounced + emissive light (coloured, from nearby light sources and
-    // the sky), so caves darken and lamps bleed colour onto their surroundings.
-    // With GI disabled the added term is zero, reproducing the flat look.
+    // The base term comes from the baked L0 grid: skylight (day-scaled
+    // `sky_term`, squared falloff so caves darken quickly) plus warm blocklight
+    // from emissive blocks, over a small floor so nothing reads pure black.
+    // With the grid disabled it falls back to the flat `brightness` (GI demo).
+    // The radiance-cascades GI then adds coloured bounce on top.
+    var lit = vec3<f32>(params.brightness);
+    if (params.light_enabled > 0.5) {
+        let l = light_at(in.local_position, n);
+        let skyf = f32(l >> 4u) / 15.0;
+        let blockf = f32(l & 15u) / 15.0;
+        let sky_l = params.sky_term * skyf * skyf;
+        let block_l = BLOCK_TINT * (BLOCK_LUX * pow(blockf, 1.4));
+        lit = vec3<f32>(sky_l + params.brightness * 0.015) + block_l;
+    }
     var gi = vec3<f32>(0.0);
     if (params.gi_enabled > 0.5) {
         gi = gi_irradiance(in.world_position, n) * GI_LUX;
     }
-    color = vec4<f32>(color.rgb * (vec3<f32>(params.brightness) + gi) * view.exposure, color.a);
+    color = vec4<f32>(color.rgb * (lit + gi) * view.exposure, color.a);
 
     // Exponential-squared distance fog toward the (exposure-scaled) horizon
     // colour, blending the chunk-load boundary into the atmosphere haze.

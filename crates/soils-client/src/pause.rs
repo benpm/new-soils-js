@@ -15,11 +15,13 @@ use crate::singleplayer::Singleplayer;
 pub struct RenderToggles {
     pub ao: bool,
     pub fog: bool,
+    /// Baked L0 light-grid shading (console `/light on|off`; off = flat brightness).
+    pub light: bool,
 }
 
 impl Default for RenderToggles {
     fn default() -> Self {
-        Self { ao: true, fog: true }
+        Self { ao: true, fog: true, light: true }
     }
 }
 

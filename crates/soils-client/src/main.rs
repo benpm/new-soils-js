@@ -15,6 +15,7 @@ mod gi;
 mod gi_demo;
 mod gpu_mesh;
 mod hud;
+mod light;
 mod login;
 mod material;
 mod net;
@@ -77,6 +78,8 @@ fn main() {
     .init_resource::<login::LoginState>()
     .init_resource::<singleplayer::Singleplayer>()
     .init_resource::<player::PendingInput>()
+    .init_resource::<light::LightQueue>()
+    .init_resource::<light::SkyTerm>()
     .insert_resource(net::connect())
     .insert_resource(discovery::spawn());
 
@@ -119,6 +122,12 @@ fn main() {
                 .after(server_msg::apply_init)
                 .after(server_msg::apply_warp),
             server_msg::apply_actor_removes.after(server_msg::apply_actor_updates),
+            // Baked lighting runs once all voxel changes for the frame landed.
+            light::process_light
+                .after(server_msg::apply_chunks)
+                .after(server_msg::apply_edits)
+                .after(edit::edit_blocks),
+            light::update_sky_term.after(server_msg::apply_time),
         ),
     )
     // Always-on: login flow, day/night, camera interpolation, self-test.
@@ -340,17 +349,6 @@ fn selftest_login(net: Res<NetClient>) {
     }
 }
 
-/// Day-length easing ported from the JS `ease10`: a steep ease-in/out that
-/// holds bright through midday and dark through midnight.
-fn ease10(t: f32) -> f32 {
-    let v = if t < 0.5 {
-        512.0 * t.powi(10)
-    } else {
-        -512.0 * (t - 1.0).powi(10) + 1.0
-    };
-    v.clamp(0.0, 1.0)
-}
-
 /// Swing the sun with the day/night cycle and dim the world toward night.
 /// JS convention: `daytime` 0.0 = noon (sun overhead), 0.5 = midnight.
 fn day_night(
@@ -364,7 +362,7 @@ fn day_night(
     let theta = std::f32::consts::PI * (world_time.daytime * 2.0 - 0.5);
     let dir = Vec3::new(0.15, theta.sin(), theta.cos()).normalize();
     // Daylight factor: 1 at noon, 0 at midnight (JS `ease10(dayTime*2 - 1)`).
-    let day = ease10(world_time.daytime * 2.0 - 1.0);
+    let day = soils_sim::ease10(world_time.daytime * 2.0 - 1.0);
 
     if let Ok((mut transform, mut light)) = sun.single_mut() {
         transform.look_to(dir, Vec3::Y);

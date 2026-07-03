@@ -11,6 +11,7 @@ use soils_sim::{raycast_voxel, validate_edit};
 
 use crate::chunk::{Blocks, ChunkMap, VoxelChunk, voxel_at};
 use crate::gpu_mesh::{self, GpuChunk};
+use crate::light::LightQueue;
 use crate::net::NetClient;
 use crate::player::Player;
 
@@ -101,6 +102,7 @@ pub fn setup_crosshair(mut commands: Commands) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn edit_blocks(
     buttons: Res<ButtonInput<MouseButton>>,
     cursor: Query<&CursorOptions, With<PrimaryWindow>>,
@@ -111,6 +113,7 @@ pub fn edit_blocks(
     mut chunks: Query<&mut VoxelChunk>,
     mut gpu_chunks: Query<&mut GpuChunk>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut light_queue: ResMut<LightQueue>,
     camera: Query<&Transform, With<Player>>,
 ) {
     // Ignore clicks while the cursor isn't grabbed (UI/escape state).
@@ -150,6 +153,7 @@ pub fn edit_blocks(
     }
 
     apply_edit(&map, &mut chunks, &mut gpu_chunks, &mut buffers, target, value);
+    light_queue.edits.push(target);
     net.send(ClientMsg::Edit { pos: [target.x, target.y, target.z], value });
 }
 

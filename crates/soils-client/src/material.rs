@@ -43,6 +43,13 @@ pub struct AtlasParams {
     pub gi_origin: Vec3,
     /// >0.5 enables the radiance-cascades GI term.
     pub gi_enabled: f32,
+    /// Day-scaled skylight illuminance (lux regime): what a fully sky-lit
+    /// (level 15) surface receives. Synced across materials by
+    /// `light::update_sky_term`.
+    pub sky_term: f32,
+    /// >0.5 shades from the baked L0 light grid; otherwise the flat
+    /// `brightness` (the pre-L0 look; the GI demo uses this path).
+    pub light_enabled: f32,
 }
 
 impl Default for AtlasParams {
@@ -54,6 +61,8 @@ impl Default for AtlasParams {
             fog_color: FOG_COLOR,
             gi_origin: Vec3::ZERO,
             gi_enabled: 0.0,
+            sky_term: TERRAIN_BRIGHTNESS,
+            light_enabled: 1.0,
         }
     }
 }
@@ -75,6 +84,11 @@ pub struct ChunkMeshMaterial {
     pub params: AtlasParams,
     #[storage(4, read_only)]
     pub gi_cascade0: Handle<ShaderStorageBuffer>,
+    /// Padded per-chunk L0 light volume (see `gpu_mesh::LIGHT_PAD`). The CPU
+    /// recreates this buffer's data on light changes, so `light::process_light`
+    /// touches the material afterwards to rebuild the cached bind group.
+    #[storage(5, read_only)]
+    pub light: Handle<ShaderStorageBuffer>,
 }
 
 impl Material for ChunkMeshMaterial {

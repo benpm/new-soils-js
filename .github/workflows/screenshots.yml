@@ -27,17 +27,30 @@ jobs:
       - name: Install headless GPU + Bevy system deps
         run: |
           sudo apt-get update
+          # Bevy windowing/audio libs (recommends not needed).
           sudo apt-get install -y --no-install-recommends \
             libwayland-dev libxkbcommon-dev libasound2-dev libudev-dev \
-            libxkbcommon-x11-0 xvfb mesa-vulkan-drivers libvulkan1 vulkan-tools
+            libxkbcommon-x11-0 xvfb
+          # GPU stack: install WITH recommends so Mesa lavapipe (software Vulkan)
+          # and its runtime .so are complete — a missing driver dep is why an
+          # ICD-present run can still report "no GPU".
+          sudo apt-get install -y \
+            mesa-vulkan-drivers libvulkan1 vulkan-tools libgl1-mesa-dri
+
+      - name: Vulkan diagnostics
+        run: |
+          echo "== /usr/share/vulkan/icd.d =="
+          ls -la /usr/share/vulkan/icd.d/ 2>/dev/null || echo "(none)"
+          echo "== lavapipe ICD glob =="
+          ls -la /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null || echo "(no lavapipe ICD)"
+          echo "== vulkaninfo --summary (under xvfb) =="
+          xvfb-run -a vulkaninfo --summary 2>&1 | head -50 || echo "vulkaninfo failed"
 
       - name: Build client + server (release)
         run: cargo build --release -p soils-client -p soils-server
 
       - name: Render screenshots
         env:
-          # Force Mesa lavapipe (software Vulkan) — CI runners have no GPU.
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
           WGPU_BACKEND: vulkan
           BEVY_ASSET_ROOT: crates/soils-client
           # Software rendering is slow: give the self-test extra wall-clock
@@ -46,6 +59,15 @@ jobs:
           SOILS_EXIT_SECS: "28"
         run: |
           set -u
+          # Point the Vulkan loader at Mesa lavapipe (software rasteriser) if the
+          # ICD is present — resolved by glob so we never hardcode a wrong path
+          # (an explicit-but-missing VK_ICD_FILENAMES makes the loader find zero
+          # drivers). If absent, fall through to loader auto-discovery.
+          LVP="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1 || true)"
+          if [ -n "$LVP" ]; then
+            export VK_ICD_FILENAMES="$LVP" VK_DRIVER_FILES="$LVP"
+          fi
+          echo "VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-<loader auto-discovery>}"
           mkdir -p "$GITHUB_WORKSPACE/shots"
           # $1 = output filename; remaining args = env for the client run.
           shot() {

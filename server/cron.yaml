@@ -1,5 +1,0 @@
-version: 1
-cron: 
-  - name: "voxel_js_task1"
-    url: "/scheduled"
-    schedule: "* * * * *"

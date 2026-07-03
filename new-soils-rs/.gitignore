@@ -1,5 +1,0 @@
-/target
-**/target
-Cargo.lock
-/crates/soils-server/data
-data/

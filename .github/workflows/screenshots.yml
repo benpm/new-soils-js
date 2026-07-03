@@ -2,10 +2,9 @@ name: Release screenshots
 
 # Renders the Bevy client headlessly on the CI runner (Mesa lavapipe software
 # Vulkan under xvfb) and attaches the resulting screenshots to the published
-# release, embedded inline in the notes. See new-soils-rs/README.md for the
-# self-test env vars. NOTE: the game lives in new-soils-rs/ on the `rust`
-# branch, which must be the repository default branch for `release`/dispatch
-# events to find this workflow.
+# release, embedded inline in the notes. See README.md for the self-test env
+# vars. This workflow must live on the repository default branch for
+# `release`/dispatch events to find it.
 
 on:
   release:
@@ -18,17 +17,12 @@ permissions:
 jobs:
   screenshots:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: new-soils-rs
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: new-soils-rs
 
       - name: Install headless GPU + Bevy system deps
         run: |

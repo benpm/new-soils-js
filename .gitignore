@@ -1,2 +1,5 @@
-server/node_modules
-server/data
+/target
+**/target
+Cargo.lock
+/crates/soils-server/data
+data/

@@ -11,6 +11,8 @@
 //! routed, the epoch bumps when a `Warp` routes, and consumers drop stale
 //! stamps.
 
+use std::collections::{HashSet, VecDeque};
+
 use bevy::prelude::*;
 use bevy::render::storage::ShaderStorageBuffer;
 use soils_protocol::{ActorState, ChunkVolume, ServerMsg};
@@ -32,12 +34,29 @@ use crate::player::{self, Player, Streaming};
 #[derive(Resource, Default)]
 pub struct WorldEpoch(pub u32);
 
-#[derive(Message)]
+#[derive(Message, Clone)]
 pub struct ChunkReceived {
     pub pos: [i32; 3],
     pub empty: bool,
     pub voxels: Vec<u8>,
     pub epoch: u32,
+}
+
+/// How many chunks may be turned into GPU resources per frame. A fresh world
+/// floods ~729 chunks in ~1s; applying them all at once allocates hundreds of
+/// MB of SSBOs and dispatches hundreds of compute jobs in one frame, which hangs
+/// (and loses) an integrated GPU. Draining at this budget spreads the work:
+/// ~8/frame ≈ 480 chunks/s → a full world fills in ~1.5s with no device loss.
+const CHUNK_APPLY_BUDGET: usize = 8;
+
+/// Chunks that have arrived but not yet been meshed, drained at
+/// [`CHUNK_APPLY_BUDGET`] per frame by [`apply_chunks`]. `queued` mirrors the
+/// queue's positions so [`player::request_chunks`] doesn't re-request a chunk
+/// that's already in flight.
+#[derive(Resource, Default)]
+pub struct ChunkApplyQueue {
+    pub queue: VecDeque<ChunkReceived>,
+    pub queued: HashSet<IVec3>,
 }
 
 #[derive(Message)]
@@ -82,6 +101,7 @@ pub struct NetStatus(pub String);
 /// Register every message type plus the epoch resource.
 pub fn register(app: &mut App) {
     app.init_resource::<WorldEpoch>()
+        .init_resource::<ChunkApplyQueue>()
         .add_message::<ChunkReceived>()
         .add_message::<EditReceived>()
         .add_message::<ActorsUpdated>()
@@ -208,6 +228,7 @@ pub fn apply_warp(
     mut world_time: ResMut<WorldTime>,
     mut streaming: ResMut<Streaming>,
     mut light_queue: ResMut<LightQueue>,
+    mut queue: ResMut<ChunkApplyQueue>,
     mut query: Query<(&mut Player, &mut Transform)>,
 ) {
     for msg in reader.read() {
@@ -225,6 +246,10 @@ pub fn apply_warp(
         }
         streaming.last_chunk = None; // force a fresh stream
         streaming.pending = 0; // old world's outstanding requests are moot
+        // Drop any queued chunks from the old world (the epoch bump also makes
+        // them safe, but this frees their buffers immediately).
+        queue.queue.clear();
+        queue.queued.clear();
     }
 }
 
@@ -264,8 +289,20 @@ pub fn apply_chunks(
     sky: Res<SkyTerm>,
     mut light_queue: ResMut<LightQueue>,
     mut streaming: ResMut<Streaming>,
+    mut queue: ResMut<ChunkApplyQueue>,
 ) {
-    if reader.is_empty() {
+    // (A) Move this frame's arrivals into the persistent queue. Bevy messages are
+    // double-buffered and dropped after ~2 frames, so we must capture them now
+    // even though only a few are applied per frame. Stale chunks (a world we've
+    // since warped out of) are dropped here, cheaply.
+    for msg in reader.read() {
+        if msg.epoch != epoch.0 {
+            continue;
+        }
+        queue.queued.insert(IVec3::from_array(msg.pos));
+        queue.queue.push_back(msg.clone());
+    }
+    if queue.queue.is_empty() {
         return;
     }
     let gi_cascade0 = gi.cascade0();
@@ -279,11 +316,18 @@ pub fn apply_chunks(
         light_enabled: if toggles.light { 1.0 } else { 0.0 },
         ..default()
     };
-    for msg in reader.read() {
-        if msg.epoch != epoch.0 {
-            continue; // stale: streamed for a world we've since warped out of
-        }
+
+    // (B) Apply at most CHUNK_APPLY_BUDGET chunks this frame. Turning a chunk into
+    // GPU resources allocates a ~655 KB quad SSBO and queues a compute dispatch;
+    // doing hundreds at once on a burst loses the device, so we spread the work.
+    let mut applied = 0;
+    while applied < CHUNK_APPLY_BUDGET {
+        let Some(msg) = queue.queue.pop_front() else { break };
         let cpos = IVec3::from_array(msg.pos);
+        queue.queued.remove(&cpos);
+        if msg.epoch != epoch.0 {
+            continue; // warped away since it was queued; drop without spending budget
+        }
         let volume =
             if msg.empty { ChunkVolume::empty() } else { ChunkVolume::from_bytes(&msg.voxels) };
         if let Some(&entity) = map.map.get(&cpos) {
@@ -324,6 +368,7 @@ pub fn apply_chunks(
             streaming.pending = streaming.pending.saturating_sub(1);
         }
         light_queue.chunks.push(cpos);
+        applied += 1;
     }
 }
 

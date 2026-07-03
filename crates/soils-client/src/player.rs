@@ -198,6 +198,7 @@ impl Default for Streaming {
 pub fn request_chunks(
     net: Res<NetClient>,
     map: Res<ChunkMap>,
+    queue: Res<crate::server_msg::ChunkApplyQueue>,
     mut streaming: ResMut<Streaming>,
     query: Query<&Transform, With<Player>>,
 ) {
@@ -220,7 +221,10 @@ pub fn request_chunks(
         for dy in -r..=r {
             for dz in -r..=r {
                 let cpos = pc + IVec3::new(dx, dy, dz);
-                if !map.map.contains_key(&cpos) {
+                // Skip chunks we already have, and chunks already received and
+                // waiting in the apply queue, so we don't re-request in-flight
+                // work (which would double-count the streaming-progress counter).
+                if !map.map.contains_key(&cpos) && !queue.queued.contains(&cpos) {
                     positions.push([cpos.x, cpos.y, cpos.z]);
                 }
             }

@@ -16,7 +16,7 @@ use crate::gi::GiAssets;
 use crate::gpu_mesh::{spawn_gpu_chunk, AtlasAssets, GpuChunk};
 use crate::login::LoginState;
 use crate::material::{AtlasParams, ChunkMeshMaterial};
-use crate::player::Player;
+use crate::player::{self, Player};
 
 /// The demo's single chunk entity, so we can keep it dirty until it meshes.
 #[derive(Resource)]
@@ -58,14 +58,14 @@ pub fn setup_gi_demo(
     mut materials: ResMut<Assets<ChunkMeshMaterial>>,
     mut map: ResMut<ChunkMap>,
     mut login: ResMut<LoginState>,
-    mut player: Query<&mut Transform, With<Player>>,
+    mut player: Query<(&mut Player, &mut Transform)>,
     mut done: Local<bool>,
 ) {
     if *done || !demo_enabled() {
         return;
     }
     let (Some(atlas), Some(mut gi)) = (atlas, gi) else { return };
-    let Ok(mut cam) = player.single_mut() else { return };
+    let Ok((mut p, mut cam)) = player.single_mut() else { return };
     *done = true;
 
     // Skip the login screen — there's no server in demo mode.
@@ -138,7 +138,9 @@ pub fn setup_gi_demo(
 
     // Frame the camera at the front of the room, looking down at the floor
     // between the two ore lights (the downward view renders reliably here).
-    cam.translation = Vec3::new(272.0, 278.0, 261.0);
+    // Position goes through the sim teleport (Transform is interpolation-derived);
+    // rotation via look_at is fine, mouse_look owns it.
+    player::teleport(&mut p, &mut cam, Vec3::new(272.0, 278.0, 261.0));
     cam.look_at(Vec3::new(272.0, 270.0, 274.0), Vec3::Y);
 
     info!("SOILS_GI_DEMO: built demo scene (chunk {cpos:?}); GI enabled={gi_enabled}");

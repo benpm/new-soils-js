@@ -70,7 +70,7 @@ pub fn send_move(
     if let Ok((transform, player)) = query.single() {
         net.send(ClientMsg::Move {
             pos: transform.translation.to_array(),
-            velocity: player.velocity.to_array(),
+            velocity: player.sim.vel.to_array(),
         });
     }
 }

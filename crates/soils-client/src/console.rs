@@ -14,7 +14,7 @@ use crate::gi::GiSettings;
 use crate::material::{ChunkMeshMaterial, FOG_DENSITY};
 use crate::net::NetClient;
 use crate::pause::RenderToggles;
-use crate::player::{Player, Streaming};
+use crate::player::{self, PendingInput, Player, Streaming};
 
 /// Console open-state and current input buffer.
 #[derive(Resource, Default)]
@@ -56,7 +56,8 @@ pub fn setup_console(mut commands: Commands) {
 pub fn console_input(
     mut events: MessageReader<KeyboardInput>,
     mut console: ResMut<Console>,
-    mut player: Query<&mut Transform, With<Player>>,
+    mut pending: ResMut<PendingInput>,
+    mut player: Query<(&mut Player, &mut Transform)>,
     mut world_time: ResMut<WorldTime>,
     mut streaming: ResMut<Streaming>,
     mut toggles: ResMut<RenderToggles>,
@@ -73,6 +74,8 @@ pub fn console_input(
             if ev.key_code == KeyCode::Slash {
                 console.open = true;
                 console.buffer.clear();
+                // A jump/fly-toggle queued this frame must not fire on close.
+                pending.clear_latches();
             }
             continue;
         }
@@ -117,7 +120,7 @@ pub fn update_console_text(
 /// Parse and apply a single console command line.
 fn run_command(
     line: &str,
-    player: &mut Query<&mut Transform, With<Player>>,
+    player: &mut Query<(&mut Player, &mut Transform)>,
     world_time: &mut WorldTime,
     streaming: &mut Streaming,
     toggles: &mut RenderToggles,
@@ -135,8 +138,8 @@ fn run_command(
             if let (Ok(x), Ok(y), Ok(z)) =
                 (args[0].parse::<f32>(), args[1].parse::<f32>(), args[2].parse::<f32>())
             {
-                if let Ok(mut t) = player.single_mut() {
-                    t.translation = Vec3::new(x, y, z);
+                if let Ok((mut p, mut t)) = player.single_mut() {
+                    player::teleport(&mut p, &mut t, Vec3::new(x, y, z));
                 }
                 streaming.last_chunk = None; // re-stream around the new position
             }

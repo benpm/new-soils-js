@@ -1,0 +1,9 @@
+[package]
+name = "soils-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+soils-worldgen = { workspace = true }
+glam = { workspace = true }

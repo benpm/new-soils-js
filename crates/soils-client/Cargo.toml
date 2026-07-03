@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 soils-protocol = { workspace = true }
+soils-sim = { workspace = true }
 soils-worldgen = { workspace = true }
 soils-server = { workspace = true }
 bevy = "0.18"

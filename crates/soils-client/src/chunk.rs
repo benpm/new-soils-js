@@ -29,15 +29,10 @@ pub struct WorldTime {
 }
 
 /// Read a voxel at an absolute voxel position, or 0 (Air) if its chunk is not
-/// loaded. Shared by physics (solidity) and editing.
+/// loaded. The `soils-sim` sampler closures (physics, raycasts) wrap this.
 pub fn voxel_at(map: &ChunkMap, chunks: &Query<&VoxelChunk>, v: IVec3) -> u8 {
     let cpos = IVec3::new(v.x >> CHUNK_BIT, v.y >> CHUNK_BIT, v.z >> CHUNK_BIT);
     let Some(&e) = map.map.get(&cpos) else { return 0 };
     let Ok(chunk) = chunks.get(e) else { return 0 };
     chunk.volume.get(v.x & CHUNK_CLIP, v.y & CHUNK_CLIP, v.z & CHUNK_CLIP)
-}
-
-#[inline]
-pub fn is_solid(map: &ChunkMap, chunks: &Query<&VoxelChunk>, v: IVec3) -> bool {
-    voxel_at(map, chunks, v) != 0
 }

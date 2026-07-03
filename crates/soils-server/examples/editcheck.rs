@@ -59,9 +59,21 @@ async fn recv_chunk<S>(rx: &mut S) -> ChunkVolume
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
+    // `ReqChunks` is answered with a `Bundle`; accept a bare `Chunk` too.
     while let Some(Ok(Message::Binary(b))) = rx.next().await {
-        if let Some(ServerMsg::Chunk { empty, voxels, .. }) = decode::<ServerMsg>(b.as_ref()) {
-            return if empty { ChunkVolume::empty() } else { ChunkVolume::from_bytes(&voxels) };
+        match decode::<ServerMsg>(b.as_ref()) {
+            Some(ServerMsg::Chunk { empty, voxels, .. }) => {
+                return if empty { ChunkVolume::empty() } else { ChunkVolume::from_bytes(&voxels) };
+            }
+            Some(ServerMsg::Bundle { chunks }) => {
+                let d = chunks.into_iter().next().expect("bundle with the requested chunk");
+                return if d.empty {
+                    ChunkVolume::empty()
+                } else {
+                    ChunkVolume::from_bytes(&d.voxels)
+                };
+            }
+            _ => {}
         }
     }
     panic!("server closed before sending the chunk");

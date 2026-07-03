@@ -3,7 +3,7 @@
 Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-game-systems.md`,
 `plan-rendering.md`). Each phase is intended to be shippable and test-gated before the next.
 
-- [ ] 1. **Extract `soils-sim`** — shared movement/collision/raycast/edit-rule functions; client
+- [x] 1. **Extract `soils-sim`** — shared movement/collision/raycast/edit-rule functions; client
       physics moves to `FixedUpdate` on it; split the `net_receive` god-system into per-message
       event systems. (game-systems M1)
 - [ ] 2. **Baked light grid (L0)** — skylight+blocklight nibble grid in `soils-sim` with

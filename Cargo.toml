@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/soils-protocol",
+    "crates/soils-sim",
     "crates/soils-worldgen",
     "crates/soils-server",
     "crates/soils-client",
@@ -14,11 +15,14 @@ license = "MIT"
 
 [workspace.dependencies]
 soils-protocol = { path = "crates/soils-protocol" }
+soils-sim = { path = "crates/soils-sim" }
 soils-worldgen = { path = "crates/soils-worldgen" }
 soils-server = { path = "crates/soils-server" }
 serde = { version = "1", features = ["derive"] }
 bincode = "2"
-glam = "0.29"
+# Kept in lockstep with the glam version Bevy re-exports, so sim/protocol math
+# types flow into client code without array bridging.
+glam = "0.30"
 
 # Keep debug builds snappy for the deep dependency graph (bevy).
 [profile.dev]

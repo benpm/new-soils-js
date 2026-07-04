@@ -1,5 +1,5 @@
 //! Diagnostic: connect to a running server, log in, and count message types
-//! per second (an idle client still receives the join burst, ActorUpdate at
+//! per second (an idle client still receives the join burst, EntityUpdate at
 //! 10 Hz, and Time at 1 Hz).
 //!
 //!   cargo run -p soils-server --example msgcount
@@ -31,8 +31,9 @@ async fn main() {
         let name = match decode::<ServerMsg>(b.as_ref()) {
             Some(ServerMsg::Init { .. }) => "Init",
             Some(ServerMsg::Time { .. }) => "Time",
-            Some(ServerMsg::ActorUpdate { .. }) => "ActorUpdate",
-            Some(ServerMsg::ActorRemove { .. }) => "ActorRemove",
+            Some(ServerMsg::EntitySpawn { .. }) => "EntitySpawn",
+            Some(ServerMsg::EntityUpdate { .. }) => "EntityUpdate",
+            Some(ServerMsg::EntityDespawn { .. }) => "EntityDespawn",
             Some(ServerMsg::EditAccepted { .. }) => "EditAccepted",
             Some(ServerMsg::EditRejected { .. }) => "EditRejected",
             Some(ServerMsg::Bundle { .. }) => "Bundle",

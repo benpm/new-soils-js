@@ -14,7 +14,7 @@ pub use coords::{
     voxel_index,
 };
 pub use discovery::{DISCOVERY_PORT, PROBE_MAGIC, ServerInfo};
-pub use messages::{ActorState, ChunkData, ClientMsg, InputFrame, ServerMsg, decode, encode};
+pub use messages::{ChunkData, ClientMsg, EntityState, InputFrame, ServerMsg, decode, encode};
 pub use voxel::{AIR, ChunkVolume, Voxel};
 
 #[cfg(test)]

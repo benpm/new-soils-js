@@ -76,6 +76,10 @@ pub struct ServerConfig {
     pub discovery_port: u16,
     /// Server name shown in discovery replies.
     pub name: String,
+    /// Ambient test critters spawned near each world's spawn on first login
+    /// (0 = none). Exercises entity replication; `SOILS_CRITTERS` on the
+    /// dedicated binary.
+    pub critters: u16,
 }
 
 impl Default for ServerConfig {
@@ -87,6 +91,7 @@ impl Default for ServerConfig {
             enable_discovery: true,
             discovery_port: DISCOVERY_PORT,
             name: "new-soils".into(),
+            critters: 0,
         }
     }
 }
@@ -259,8 +264,9 @@ async fn serve(
         let data_dir = config.data_dir.clone();
         let accounts = accounts.clone();
         let player_count = player_count.clone();
+        let critters = config.critters;
         std::thread::Builder::new().name("soils-ecs".into()).spawn(move || {
-            app::run_app(conns_rx, shutdown, data_dir, persist, accounts, player_count);
+            app::run_app(conns_rx, shutdown, data_dir, persist, accounts, player_count, critters);
         })?
     };
 

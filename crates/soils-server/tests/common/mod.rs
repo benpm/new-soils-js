@@ -29,10 +29,15 @@ impl TestServer {
     /// Fresh scratch data dir. `tag` keeps parallel tests in the same binary
     /// from sharing one.
     pub fn start(tag: &str) -> Self {
+        Self::start_with(tag, |_| {})
+    }
+
+    /// Fresh scratch data dir with config tweaks (e.g. test critters).
+    pub fn start_with(tag: &str, tweak: impl FnOnce(&mut ServerConfig)) -> Self {
         let data_dir =
             std::env::temp_dir().join(format!("soils-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
-        let mut server = Self::start_at(data_dir, tag);
+        let mut server = Self::start_at_with(data_dir, tag, tweak);
         server.owns_dir = true;
         server
     }
@@ -40,14 +45,23 @@ impl TestServer {
     /// Open (or reuse) an explicit data dir — for restart/persistence
     /// scenarios. The caller owns the dir's lifetime.
     pub fn start_at(data_dir: PathBuf, tag: &str) -> Self {
-        let handle = soils_server::spawn(ServerConfig {
+        Self::start_at_with(data_dir, tag, |_| {})
+    }
+
+    fn start_at_with(
+        data_dir: PathBuf,
+        tag: &str,
+        tweak: impl FnOnce(&mut ServerConfig),
+    ) -> Self {
+        let mut config = ServerConfig {
             bind: "127.0.0.1:0".into(),
             data_dir: data_dir.clone(),
             enable_discovery: false,
             name: format!("test-{tag}"),
             ..ServerConfig::default()
-        })
-        .expect("spawn embedded server");
+        };
+        tweak(&mut config);
+        let handle = soils_server::spawn(config).expect("spawn embedded server");
         Self { handle, data_dir, owns_dir: false }
     }
 
@@ -73,6 +87,8 @@ pub struct Client {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     /// Player id from `Init` (0 until logged in).
     pub id: u16,
+    /// NetId of our own player entity, from `Init`.
+    pub self_entity: u32,
     /// Spawn position from `Init`.
     pub spawn: [f32; 3],
     /// Movement input sequence (one per simulated tick).
@@ -86,7 +102,7 @@ impl Client {
     pub async fn connect(addr: SocketAddr) -> Self {
         let (ws, _) =
             tokio_tungstenite::connect_async(format!("ws://{addr}")).await.expect("connect");
-        Self { ws, id: 0, spawn: [0.0; 3], input_seq: 0, edit_seq: 0 }
+        Self { ws, id: 0, self_entity: 0, spawn: [0.0; 3], input_seq: 0, edit_seq: 0 }
     }
 
     /// Connect and log in as a guest, returning once `Init` arrives.
@@ -100,14 +116,17 @@ impl Client {
     pub async fn login(&mut self, name: &str) {
         self.send(&ClientMsg::Login { name: name.into(), password: String::new(), signup: true })
             .await;
-        let (id, spawn) = self
+        let (id, self_entity, spawn) = self
             .recv_until(|msg| match msg {
-                ServerMsg::Init { id, spawn, .. } => Some((id, spawn)),
+                ServerMsg::Init { id, self_entity, spawn, .. } => {
+                    Some((id, self_entity, spawn))
+                }
                 ServerMsg::LoginError { message } => panic!("login failed: {message}"),
                 _ => None,
             })
             .await;
         self.id = id;
+        self.self_entity = self_entity;
         self.spawn = spawn;
     }
 
@@ -178,12 +197,12 @@ impl Client {
         seq
     }
 
-    /// The next server-echoed position of this client's own actor.
+    /// The next server-echoed position of this client's own player entity.
     pub async fn await_self_pos(&mut self) -> [f32; 3] {
-        let id = self.id;
+        let net = self.self_entity;
         self.recv_until(|msg| match msg {
-            ServerMsg::ActorUpdate { actors } => {
-                actors.into_iter().find(|s| s.id == id).map(|s| s.pos)
+            ServerMsg::EntityUpdate { entities } => {
+                entities.into_iter().find(|s| s.id == net).map(|s| s.pos)
             }
             _ => None,
         })

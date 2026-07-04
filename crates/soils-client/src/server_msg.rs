@@ -15,7 +15,7 @@ use std::collections::{HashSet, VecDeque};
 
 use bevy::prelude::*;
 use bevy::render::storage::ShaderStorageBuffer;
-use soils_protocol::{ActorState, ServerMsg};
+use soils_protocol::{EntityState, ServerMsg};
 
 use crate::actor::{Actor, ActorAssets, ActorMap, LocalPlayer};
 use crate::chunk::{ChunkMap, VoxelChunk, WorldTime};
@@ -80,10 +80,17 @@ pub struct EditReceived {
 }
 
 #[derive(Message)]
-pub struct ActorsUpdated(pub Vec<ActorState>);
+pub struct EntitySpawned {
+    pub id: u32,
+    pub kind: u16,
+    pub pos: [f32; 3],
+}
 
 #[derive(Message)]
-pub struct ActorRemoved(pub u16);
+pub struct EntitiesUpdated(pub Vec<EntityState>);
+
+#[derive(Message)]
+pub struct EntityDespawned(pub u32);
 
 #[derive(Message)]
 pub struct TimeReceived(pub f32);
@@ -91,6 +98,7 @@ pub struct TimeReceived(pub f32);
 #[derive(Message)]
 pub struct InitReceived {
     pub id: u16,
+    pub self_entity: u32,
     pub spawn: [f32; 3],
     pub daytime: f32,
 }
@@ -121,8 +129,9 @@ pub fn register(app: &mut App) {
         .init_resource::<ChunkApplyQueue>()
         .add_message::<ChunkStream>()
         .add_message::<EditReceived>()
-        .add_message::<ActorsUpdated>()
-        .add_message::<ActorRemoved>()
+        .add_message::<EntitySpawned>()
+        .add_message::<EntitiesUpdated>()
+        .add_message::<EntityDespawned>()
         .add_message::<TimeReceived>()
         .add_message::<InitReceived>()
         .add_message::<WarpReceived>()
@@ -140,8 +149,9 @@ pub fn route_server_messages(
     mut epoch: ResMut<WorldEpoch>,
     mut chunks: MessageWriter<ChunkStream>,
     mut edits: MessageWriter<EditReceived>,
-    mut actors: MessageWriter<ActorsUpdated>,
-    mut removes: MessageWriter<ActorRemoved>,
+    mut spawns: MessageWriter<EntitySpawned>,
+    mut entities: MessageWriter<EntitiesUpdated>,
+    mut despawns: MessageWriter<EntityDespawned>,
     mut times: MessageWriter<TimeReceived>,
     mut inits: MessageWriter<InitReceived>,
     mut warps: MessageWriter<WarpReceived>,
@@ -162,8 +172,8 @@ pub fn route_server_messages(
             NetEvent::Msg(msg) => msg,
         };
         match msg {
-            ServerMsg::Init { id, spawn, daytime, .. } => {
-                inits.write(InitReceived { id, spawn, daytime });
+            ServerMsg::Init { id, self_entity, spawn, daytime, .. } => {
+                inits.write(InitReceived { id, self_entity, spawn, daytime });
             }
             ServerMsg::LoginError { message } => {
                 login_fails.write(LoginFailed(message));
@@ -199,11 +209,14 @@ pub fn route_server_messages(
             ServerMsg::EditRejected { seq } => {
                 edit_acks.write(EditAck { seq, accepted: false });
             }
-            ServerMsg::ActorUpdate { actors: states } => {
-                actors.write(ActorsUpdated(states));
+            ServerMsg::EntitySpawn { id, kind, pos } => {
+                spawns.write(EntitySpawned { id, kind, pos });
             }
-            ServerMsg::ActorRemove { id } => {
-                removes.write(ActorRemoved(id));
+            ServerMsg::EntityUpdate { entities: states } => {
+                entities.write(EntitiesUpdated(states));
+            }
+            ServerMsg::EntityDespawn { id } => {
+                despawns.write(EntityDespawned(id));
             }
         }
     }
@@ -221,6 +234,7 @@ pub fn apply_init(
 ) {
     for msg in reader.read() {
         local.id = msg.id;
+        local.self_entity = msg.self_entity;
         world_time.daytime = msg.daytime;
         login.done = true; // authenticated — drop the login screen
         // A (re)login may be a fresh connection whose server-side radius reset
@@ -436,23 +450,48 @@ pub fn apply_edits(
     }
 }
 
-/// Positions of nearby actors: move existing bodies, spawn new ones. Must run
-/// before [`apply_actor_removes`] — the reverse order turns an update+remove
-/// sharing a frame into a permanent ghost body.
-pub fn apply_actor_updates(
-    mut reader: MessageReader<ActorsUpdated>,
+/// An entity entered interest: spawn its body (shaped by its registry kind).
+/// Our own player entity gets no body — its updates drive the camera.
+pub fn apply_entity_spawns(
+    mut reader: MessageReader<EntitySpawned>,
     mut commands: Commands,
     local: Res<LocalPlayer>,
     mut map: ResMut<ActorMap>,
     assets: Res<ActorAssets>,
+) {
+    for msg in reader.read() {
+        if msg.id == local.self_entity || map.map.contains_key(&msg.id) {
+            continue;
+        }
+        let target = Vec3::from_array(msg.pos);
+        let Some(kind) = assets.kinds.get(msg.kind as usize) else { continue };
+        let entity = commands
+            .spawn((
+                Actor { target, kind: msg.kind },
+                Mesh3d(kind.mesh.clone()),
+                MeshMaterial3d(kind.material.clone()),
+                Transform::from_translation(target - Vec3::Y * kind.body_drop),
+            ))
+            .id();
+        map.map.insert(msg.id, entity);
+    }
+}
+
+/// Full-state updates for entities in interest: retarget bodies; our own
+/// entity's echo eases the camera (interpolation-only self until phase 11).
+/// Must run after [`apply_entity_spawns`] and before
+/// [`apply_entity_despawns`] — the reverse order turns an update+despawn
+/// sharing a frame into a permanent ghost body.
+pub fn apply_entity_updates(
+    mut reader: MessageReader<EntitiesUpdated>,
+    local: Res<LocalPlayer>,
+    map: Res<ActorMap>,
     mut actors: Query<&mut Actor>,
     mut player_q: Query<&mut Player>,
 ) {
     for msg in reader.read() {
         for state in &msg.0 {
-            if state.id == local.id {
-                // Our own server-authoritative position: no body, the camera
-                // eases toward it (interpolation-only self, M4).
+            if state.id == local.self_entity {
                 if let Ok(mut player) = player_q.single_mut() {
                     player.net_target = Some(Vec3::from_array(state.pos));
                     player.sim.pos = Vec3::from_array(state.pos);
@@ -460,29 +499,18 @@ pub fn apply_actor_updates(
                 }
                 continue;
             }
-            let target = Vec3::from_array(state.pos);
-            if let Some(&entity) = map.map.get(&state.id) {
-                if let Ok(mut actor) = actors.get_mut(entity) {
-                    actor.target = target;
-                }
-            } else {
-                let entity = commands
-                    .spawn((
-                        Actor { target },
-                        Mesh3d(assets.mesh.clone()),
-                        MeshMaterial3d(assets.material.clone()),
-                        Transform::from_translation(target - Vec3::Y * 0.9),
-                    ))
-                    .id();
-                map.map.insert(state.id, entity);
+            if let Some(&entity) = map.map.get(&state.id)
+                && let Ok(mut actor) = actors.get_mut(entity)
+            {
+                actor.target = Vec3::from_array(state.pos);
             }
         }
     }
 }
 
-/// An actor left view / disconnected.
-pub fn apply_actor_removes(
-    mut reader: MessageReader<ActorRemoved>,
+/// An entity left interest (or despawned): drop its body.
+pub fn apply_entity_despawns(
+    mut reader: MessageReader<EntityDespawned>,
     mut commands: Commands,
     mut map: ResMut<ActorMap>,
 ) {

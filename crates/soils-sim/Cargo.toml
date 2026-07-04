@@ -8,3 +8,5 @@ license.workspace = true
 soils-protocol = { workspace = true }
 soils-worldgen = { workspace = true }
 glam = { workspace = true }
+serde = { workspace = true }
+serde_yaml = "0.9"

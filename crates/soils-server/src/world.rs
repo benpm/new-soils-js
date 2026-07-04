@@ -150,6 +150,11 @@ impl World {
         (self.terrain.clone(), self.registry.clone())
     }
 
+    /// Whether a chunk is resident (used to freeze AI on unloaded terrain).
+    pub fn has_chunk(&self, cpos: IVec3) -> bool {
+        self.chunks.contains_key(&cpos)
+    }
+
     /// Read one voxel at an absolute position. Unloaded space is Air (id 0) —
     /// the shared `soils-sim` sampler contract, used for server-side player
     /// stepping and edit validation.

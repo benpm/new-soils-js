@@ -121,11 +121,12 @@ fn main() {
                 server_msg::apply_edits,
                 server_msg::apply_time,
                 edit::apply_edit_acks,
-                server_msg::apply_actor_updates,
+                server_msg::apply_entity_spawns,
             )
                 .after(server_msg::apply_init)
                 .after(server_msg::apply_warp),
-            server_msg::apply_actor_removes.after(server_msg::apply_actor_updates),
+            server_msg::apply_entity_updates.after(server_msg::apply_entity_spawns),
+            server_msg::apply_entity_despawns.after(server_msg::apply_entity_updates),
             // Baked lighting runs once all voxel changes for the frame landed.
             light::process_light
                 .after(server_msg::apply_chunks)

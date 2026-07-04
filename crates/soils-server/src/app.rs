@@ -23,10 +23,13 @@ use std::time::{Duration, Instant};
 
 use bevy_app::{App, AppExit, FixedUpdate, ScheduleRunnerPlugin, Update};
 use bevy_ecs::message::MessageWriter;
-use bevy_ecs::prelude::{IntoScheduleConfigs, Local, Res, ResMut, Resource};
+use bevy_ecs::prelude::{
+    Commands, Component, Entity, IntoScheduleConfigs, Local, Query, Res, ResMut, Resource,
+};
 use bevy_time::{Fixed, Time, TimePlugin};
-use glam::IVec3;
-use soils_protocol::{ActorState, CHUNK_BIT, ChunkData, ClientMsg, ChunkVolume, ServerMsg};
+use glam::{IVec2, IVec3, Vec3};
+use soils_protocol::{CHUNK_BIT, ChunkData, ClientMsg, ChunkVolume, EntityState, ServerMsg};
+use soils_sim::{KIND_CRITTER, KIND_PLAYER};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError};
 use tokio::sync::watch;
 
@@ -72,9 +75,12 @@ pub(crate) struct Client {
     outbox: UnboundedSender<ServerMsg>,
     authenticated: bool,
     world: String,
-    state: ActorState,
-    /// Server-side player simulation (authoritative; stepped by input frames).
-    sim: soils_sim::PlayerState,
+    /// This client's player entity (spawned on login) and its NetId.
+    entity: Option<Entity>,
+    self_net: u32,
+    /// NetIds currently replicated to this client (its interest set); diffed
+    /// each replication pass into EntitySpawn/EntityDespawn.
+    known: HashSet<u32>,
     /// Highest input `seq` applied (frames at or below it are duplicates from
     /// the loss-robustness bundling).
     last_seq: u32,
@@ -91,6 +97,40 @@ pub(crate) struct Client {
     /// Queued streaming jobs (subscription enters), served FIFO in waves.
     jobs: VecDeque<ChunkJob>,
 }
+
+/// Server-allocated replication id; never reused within a session.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Hash)]
+struct NetId(u32);
+/// Entity kind (index into the shared `entities.yaml` registry).
+#[derive(Component, Clone, Copy)]
+struct Kind(u16);
+/// Simulation state (position/velocity/fly/grounded via `soils_sim`).
+#[derive(Component)]
+struct SimState(soils_sim::PlayerState);
+/// Facing yaw in radians.
+#[derive(Component)]
+struct Yaw(f32);
+/// Which named world the entity lives in (one ECS world hosts all of them).
+#[derive(Component, Clone)]
+struct InWorld(String);
+/// Marks a player entity as driven by a connection's input stream.
+#[derive(Component)]
+#[allow(dead_code)] // client id: read when gameplay systems need "who did it"
+struct PlayerControlled(u16);
+/// Trivial wander AI for test critters: hold a heading for a while, then turn.
+#[derive(Component)]
+struct Wander {
+    next_turn: u64,
+}
+
+#[derive(Resource)]
+struct NextNetId(u32);
+/// Ambient test critters per world (from `ServerConfig::critters`).
+#[derive(Resource)]
+struct CritterCount(u16);
+/// Worlds that already got their critters.
+#[derive(Resource, Default)]
+struct CrittersSpawned(HashSet<String>);
 
 struct ChunkJob {
     remaining: VecDeque<IVec3>,
@@ -156,6 +196,7 @@ pub(crate) fn run_app(
     persist: PersistHandle,
     accounts: Arc<Accounts>,
     player_count: Arc<AtomicU16>,
+    critters: u16,
 ) {
     let mut worlds = Worlds { map: HashMap::new(), data_dir, persist };
     // Pre-create the default world so it's ready before the first client.
@@ -175,6 +216,9 @@ pub(crate) fn run_app(
         .insert_resource(PlayerCount(player_count))
         .insert_resource(Clients(HashMap::new()))
         .insert_resource(worlds)
+        .insert_resource(NextNetId(1))
+        .insert_resource(CritterCount(critters))
+        .init_resource::<CrittersSpawned>()
         .init_resource::<TickCount>()
         .init_resource::<Clock>()
         .add_systems(Update, check_shutdown)
@@ -183,8 +227,9 @@ pub(crate) fn run_app(
             (
                 accept_connections,
                 drain_inboxes,
+                wander_critters,
                 pump_chunk_jobs,
-                broadcast_actors,
+                replicate_entities,
                 tick_clock,
                 world_lifecycle,
             )
@@ -239,8 +284,9 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 outbox: conn.outbox,
                 authenticated: false,
                 world: DEFAULT_WORLD.to_string(),
-                state: ActorState { id: conn.id, pos: [0.0; 3], velocity: [0.0; 3] },
-                sim: soils_sim::PlayerState::default(),
+                entity: None,
+                self_net: 0,
+                known: HashSet::new(),
                 last_seq: 0,
                 input_tokens: INPUT_BURST,
                 edit_tokens: EDIT_RATE,
@@ -265,13 +311,19 @@ fn send_world(clients: &Clients, world: &str, except: u16, msg: &ServerMsg) {
 
 /// Drain every client's inbox and apply the messages. A closed inbox means the
 /// connection task ended; the client is removed and its actor despawned.
+#[allow(clippy::too_many_arguments)]
 fn drain_inboxes(
     time: Res<Time>,
+    mut commands: Commands,
     mut clients: ResMut<Clients>,
     mut worlds: ResMut<Worlds>,
     clock: Res<Clock>,
     accounts: Res<AccountsRes>,
     player_count: Res<PlayerCount>,
+    mut next_net: ResMut<NextNetId>,
+    critter_count: Res<CritterCount>,
+    mut critters_spawned: ResMut<CrittersSpawned>,
+    mut sims: Query<(&mut SimState, &mut Yaw, &mut InWorld)>,
 ) {
     // Phase 1: refill rate buckets and pull everything out of the inboxes.
     let dt = time.delta_secs();
@@ -309,17 +361,37 @@ fn drain_inboxes(
                             player_count.0.fetch_add(1, Ordering::Relaxed);
                         }
                         c.authenticated = true;
-                        let world = worlds.get_or_create(&c.world.clone());
+                        let world_name = c.world.clone();
+                        let world = worlds.get_or_create(&world_name);
                         let (spawn, seed) = (world.spawn, world.seed);
                         let c = clients.0.get_mut(&id).unwrap();
-                        c.state = ActorState { id, pos: spawn, velocity: [0.0; 3] };
-                        c.sim = soils_sim::PlayerState {
-                            pos: glam::Vec3::from_array(spawn),
+                        // (Re)spawn this connection's player entity.
+                        if let Some(old) = c.entity.take() {
+                            commands.entity(old).despawn();
+                        }
+                        let net = next_net.0;
+                        next_net.0 += 1;
+                        let sim = soils_sim::PlayerState {
+                            pos: Vec3::from_array(spawn),
                             ..Default::default()
                         };
+                        c.entity = Some(
+                            commands
+                                .spawn((
+                                    NetId(net),
+                                    Kind(KIND_PLAYER),
+                                    SimState(sim),
+                                    Yaw(0.0),
+                                    InWorld(world_name.clone()),
+                                    PlayerControlled(id),
+                                ))
+                                .id(),
+                        );
+                        c.self_net = net;
                         c.last_seq = 0;
                         let _ = c.outbox.send(ServerMsg::Init {
                             id,
+                            self_entity: net,
                             spawn,
                             seed,
                             daytime: clock.daytime,
@@ -328,6 +400,31 @@ fn drain_inboxes(
                         // point starts the join burst — no client request.
                         c.center = Some(chunk_at(spawn));
                         resubscribe(c, world);
+                        // First login into a world seeds its ambient test
+                        // critters. They start at spawn height (guaranteed
+                        // open air) and fall to the surface once their
+                        // terrain is resident — starting lower risks spawning
+                        // embedded inside a hillside, immobile.
+                        if critter_count.0 > 0 && critters_spawned.0.insert(world_name.clone()) {
+                            for i in 0..critter_count.0 {
+                                let net = next_net.0;
+                                next_net.0 += 1;
+                                let offset =
+                                    Vec3::new(2.0 + i as f32 * 1.5, 0.0, 2.0 + i as f32);
+                                commands.spawn((
+                                    NetId(net),
+                                    Kind(KIND_CRITTER),
+                                    SimState(soils_sim::PlayerState {
+                                        pos: Vec3::from_array(spawn) + offset,
+                                        flying: false,
+                                        ..Default::default()
+                                    }),
+                                    Yaw(0.0),
+                                    InWorld(world_name.clone()),
+                                    Wander { next_turn: 0 },
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -347,7 +444,10 @@ fn drain_inboxes(
                 // mid-join — rejected, and the client rolls back cleanly).
                 let c = clients.0.get_mut(&id).unwrap();
                 let world_name = c.world.clone();
-                let eye = c.sim.pos;
+                let eye = match c.entity.and_then(|e| sims.get(e).ok()) {
+                    Some((sim, ..)) => sim.0.pos,
+                    None => continue,
+                };
                 let rate_ok = c.edit_tokens >= 1.0;
                 if rate_ok {
                     c.edit_tokens -= 1.0;
@@ -373,6 +473,8 @@ fn drain_inboxes(
                 // input flooding from becoming a speed hack. Frames at or
                 // below `last_seq` are duplicates from loss bundling.
                 let c = clients.0.get_mut(&id).unwrap();
+                let Some(entity) = c.entity else { continue };
+                let Ok((mut sim, mut yaw, _)) = sims.get_mut(entity) else { continue };
                 let world = worlds.get_or_create(&c.world.clone());
                 let sim_dt = 1.0 / soils_sim::TICK_HZ as f32;
                 for f in frames {
@@ -382,12 +484,11 @@ fn drain_inboxes(
                     c.input_tokens -= 1.0;
                     c.last_seq = f.seq;
                     let input = soils_sim::unpack_input(f.buttons, f.flags, f.yaw);
-                    soils_sim::step_player(&mut c.sim, &input, sim_dt, &|v| world.voxel(v));
+                    yaw.0 = input.yaw;
+                    soils_sim::step_player(&mut sim.0, &input, sim_dt, &|v| world.voxel(v));
                 }
-                c.state.pos = c.sim.pos.to_array();
-                c.state.velocity = c.sim.vel.to_array();
                 // Crossing a chunk boundary moves the subscription window.
-                let pc = chunk_at(c.state.pos);
+                let pc = chunk_at(sim.0.pos.to_array());
                 if c.center != Some(pc) {
                     c.center = Some(pc);
                     resubscribe(c, world);
@@ -395,24 +496,29 @@ fn drain_inboxes(
             }
             ClientMsg::Warp { world: name } => {
                 println!("warp: id {id} -> {name}");
-                // Leaving the old world: release its chunk refs, drop any jobs
-                // still streaming it, and tell its clients the actor is gone.
-                // No ChunkUnloads — the client drops everything on Warp.
+                // Leaving the old world: release its chunk refs and drop any
+                // jobs still streaming it. Other clients learn via the interest
+                // diff (the entity's world changes → EntityDespawn); this
+                // client drops everything itself on Warp.
                 let c = clients.0.get_mut(&id).unwrap();
                 let old = std::mem::replace(&mut c.world, name.clone());
                 c.jobs.clear();
+                c.known.clear();
                 let old_world = worlds.get_or_create(&old);
                 for pos in c.subs.drain() {
                     old_world.dec_ref(pos);
                 }
-                send_world(&clients, &old, id, &ServerMsg::ActorRemove { id });
 
                 let world = worlds.get_or_create(&name);
                 let spawn = world.spawn;
                 let c = clients.0.get_mut(&id).unwrap();
-                c.state.pos = spawn;
-                c.sim.pos = glam::Vec3::from_array(spawn);
-                c.sim.vel = glam::Vec3::ZERO;
+                if let Some(entity) = c.entity
+                    && let Ok((mut sim, _, mut in_world)) = sims.get_mut(entity)
+                {
+                    sim.0.pos = Vec3::from_array(spawn);
+                    sim.0.vel = Vec3::ZERO;
+                    in_world.0 = name.clone();
+                }
                 let _ = c.outbox.send(ServerMsg::Warp { spawn, daytime: clock.daytime });
                 c.center = Some(chunk_at(spawn));
                 resubscribe(c, world);
@@ -421,16 +527,19 @@ fn drain_inboxes(
     }
 
     // Phase 3: disconnects (any final messages above were already applied).
+    // Peers learn via the interest diff once the entity despawns.
     for id in gone {
-        if let Some(c) = clients.0.remove(&id)
-            && c.authenticated
-        {
-            player_count.0.fetch_sub(1, Ordering::Relaxed);
-            let world = worlds.get_or_create(&c.world);
-            for pos in c.subs {
-                world.dec_ref(pos);
+        if let Some(c) = clients.0.remove(&id) {
+            if let Some(entity) = c.entity {
+                commands.entity(entity).despawn();
             }
-            send_world(&clients, &c.world, id, &ServerMsg::ActorRemove { id });
+            if c.authenticated {
+                player_count.0.fetch_sub(1, Ordering::Relaxed);
+                let world = worlds.get_or_create(&c.world);
+                for pos in c.subs {
+                    world.dec_ref(pos);
+                }
+            }
         }
     }
 }
@@ -601,26 +710,109 @@ fn send_wave(world: &World, positions: &[IVec3], out: &UnboundedSender<ServerMsg
     }
 }
 
-/// Broadcast actor positions a few times a second, grouped by world so players
-/// only see others in the same world (the list includes the receiver; the
-/// client filters itself by id).
-fn broadcast_actors(mut ticks: ResMut<TickCount>, clients: Res<Clients>) {
+/// Step the ambient test critters: hold a heading for a couple of seconds,
+/// then turn (deterministically, from NetId and tick — no wall-clock or RNG).
+/// Frozen while their terrain isn't resident, so they can't fall through
+/// unloaded space. Also owns the tick counter increment.
+fn wander_critters(
+    mut ticks: ResMut<TickCount>,
+    worlds: Res<Worlds>,
+    mut critters: Query<(&NetId, &InWorld, &mut SimState, &mut Yaw, &mut Wander)>,
+) {
     ticks.0 += 1;
+    let dt = 1.0 / soils_sim::SERVER_TICK_HZ as f32;
+    for (net, in_world, mut sim, mut yaw, mut wander) in &mut critters {
+        let Some(world) = worlds.map.get(&in_world.0) else { continue };
+        if !world.has_chunk(chunk_at(sim.0.pos.to_array())) {
+            continue;
+        }
+        if ticks.0 >= wander.next_turn {
+            let h = (net.0 as u64)
+                .wrapping_mul(0x9E3779B97F4A7C15)
+                .wrapping_add(ticks.0.wrapping_mul(0xD1B54A32D192ED03));
+            yaw.0 = (h % 6283) as f32 / 1000.0;
+            wander.next_turn = ticks.0 + 30 + (h >> 32) % 40;
+        }
+        let input = soils_sim::PlayerInput {
+            move_axes: glam::Vec2::new(0.0, 1.0),
+            yaw: yaw.0,
+            ..Default::default()
+        };
+        soils_sim::step_player(&mut sim.0, &input, dt, &|v| world.voxel(v));
+    }
+}
+
+/// Replicate entities a few times a second: per client, interest = entities in
+/// the same world within the subscription radius (by chunk column, plan §7);
+/// entering entities get EntitySpawn, leaving ones EntityDespawn, everything
+/// current a full-state EntityUpdate (delta snapshots are a later phase). The
+/// column buckets are rebuilt per pass — trivial at current entity counts;
+/// switch to incremental maintenance when they grow.
+fn replicate_entities(
+    ticks: Res<TickCount>,
+    mut clients: ResMut<Clients>,
+    entities: Query<(&NetId, &Kind, &InWorld, &SimState, &Yaw)>,
+) {
     if !ticks.0.is_multiple_of(ACTOR_EVERY_N_TICKS) {
         return;
     }
-    let mut by_world: HashMap<&str, Vec<ActorState>> = HashMap::new();
-    for c in clients.0.values() {
-        if c.authenticated {
-            by_world.entry(c.world.as_str()).or_default().push(c.state.clone());
-        }
+    struct Snap {
+        net: u32,
+        kind: u16,
+        pos: [f32; 3],
+        vel: [f32; 3],
+        yaw: u16,
     }
-    for c in clients.0.values() {
+    let mut by_col: HashMap<(&str, IVec2), Vec<Snap>> = HashMap::new();
+    for (net, kind, in_world, sim, yaw) in &entities {
+        let col = IVec2::new(
+            (sim.0.pos.x.floor() as i32) >> CHUNK_BIT,
+            (sim.0.pos.z.floor() as i32) >> CHUNK_BIT,
+        );
+        by_col.entry((in_world.0.as_str(), col)).or_default().push(Snap {
+            net: net.0,
+            kind: kind.0,
+            pos: sim.0.pos.to_array(),
+            vel: sim.0.vel.to_array(),
+            yaw: soils_sim::pack_yaw(yaw.0),
+        });
+    }
+
+    for c in clients.0.values_mut() {
         if !c.authenticated {
             continue;
         }
-        if let Some(actors) = by_world.get(c.world.as_str()) {
-            let _ = c.outbox.send(ServerMsg::ActorUpdate { actors: actors.clone() });
+        let Some(center) = c.center else { continue };
+        let ccol = IVec2::new(center.x, center.z);
+        let r = c.radius;
+        let mut interest: Vec<&Snap> = Vec::new();
+        for dx in -r..=r {
+            for dz in -r..=r {
+                if let Some(bucket) = by_col.get(&(c.world.as_str(), ccol + IVec2::new(dx, dz))) {
+                    interest.extend(bucket.iter());
+                }
+            }
+        }
+        let current: HashSet<u32> = interest.iter().map(|s| s.net).collect();
+        for snap in &interest {
+            if !c.known.contains(&snap.net) {
+                let _ = c.outbox.send(ServerMsg::EntitySpawn {
+                    id: snap.net,
+                    kind: snap.kind,
+                    pos: snap.pos,
+                });
+            }
+        }
+        for &gone in c.known.difference(&current) {
+            let _ = c.outbox.send(ServerMsg::EntityDespawn { id: gone });
+        }
+        c.known = current;
+        if !interest.is_empty() {
+            let states = interest
+                .iter()
+                .map(|s| EntityState { id: s.net, pos: s.pos, velocity: s.vel, yaw: s.yaw })
+                .collect();
+            let _ = c.outbox.send(ServerMsg::EntityUpdate { entities: states });
         }
     }
 }

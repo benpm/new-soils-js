@@ -7,7 +7,12 @@
 //! per-frame systems (`player.rs`, `edit.rs`) so behavior is unchanged; only
 //! the voxel lookup is abstracted.
 
+pub mod entities;
 pub mod light;
+
+pub use entities::{
+    ENTITIES_YAML, EntityDef, EntityRegistry, KIND_CRITTER, KIND_PLAYER, default_entity_registry,
+};
 
 use glam::{IVec3, Quat, Vec2, Vec3};
 use soils_worldgen::BlockRegistry;
@@ -101,6 +106,16 @@ pub const BTN_DOWN: u8 = 1 << 7;
 /// Edge event: toggle fly mode (in `flags`, not `buttons`).
 pub const FLAG_TOGGLE_FLY: u8 = 1 << 0;
 
+/// Quantize a yaw (radians) to a u16 fraction of a turn.
+pub fn pack_yaw(yaw: f32) -> u16 {
+    ((yaw / std::f32::consts::TAU).rem_euclid(1.0) * 65536.0) as u16
+}
+
+/// Inverse of [`pack_yaw`]; returns an equivalent angle in `[0, τ)`.
+pub fn unpack_yaw(q: u16) -> f32 {
+    q as f32 / 65536.0 * std::f32::consts::TAU
+}
+
 /// Pack an input for the wire as `(buttons, flags, yaw)`. Analog `move_axes`
 /// collapse to sign bits — the keyboard only ever produces ±1/0.
 pub fn pack_input(input: &PlayerInput) -> (u8, u8, u16) {
@@ -130,8 +145,7 @@ pub fn pack_input(input: &PlayerInput) -> (u8, u8, u16) {
         buttons |= BTN_DOWN;
     }
     let flags = if input.toggle_fly { FLAG_TOGGLE_FLY } else { 0 };
-    let turn = (input.yaw / std::f32::consts::TAU).rem_euclid(1.0);
-    (buttons, flags, (turn * 65536.0) as u16)
+    (buttons, flags, pack_yaw(input.yaw))
 }
 
 /// Inverse of [`pack_input`] (yaw comes back in `[0, τ)`, an equivalent angle).
@@ -141,7 +155,7 @@ pub fn unpack_input(buttons: u8, flags: u8, yaw: u16) -> PlayerInput {
     };
     PlayerInput {
         move_axes: Vec2::new(axis(BTN_RIGHT, BTN_LEFT), axis(BTN_FORWARD, BTN_BACK)),
-        yaw: yaw as f32 / 65536.0 * std::f32::consts::TAU,
+        yaw: unpack_yaw(yaw),
         sprint: buttons & BTN_SPRINT != 0,
         jump: buttons & BTN_JUMP != 0,
         up: buttons & BTN_UP != 0,

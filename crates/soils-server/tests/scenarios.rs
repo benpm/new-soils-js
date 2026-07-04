@@ -17,16 +17,19 @@ const NEAR_VOXEL: [i32; 3] = [282, 280, 268];
 const NEAR_LOCAL: (i32, i32, i32) = (26, 24, 12);
 
 #[tokio::test]
-async fn actors_move_by_inputs_and_are_removed_on_disconnect() {
+async fn entities_move_by_inputs_and_despawn_on_disconnect() {
     let server = TestServer::start("actors");
     let mut a = Client::join(server.addr(), "alice").await;
     let mut b = Client::join(server.addr(), "bob").await;
-    let (a_id, spawn) = (a.id, a.spawn);
+    let (a_net, spawn) = (a.self_entity, a.spawn);
 
-    // B sees A at spawn without A doing anything (server owns positions).
+    // B sees A's player entity spawn without A doing anything (server owns
+    // entities; kind comes from the shared registry).
     b.recv_until(|msg| match msg {
-        ServerMsg::ActorUpdate { actors } => {
-            actors.into_iter().find(|s| s.id == a_id).map(|_| ())
+        ServerMsg::EntitySpawn { id, kind, .. }
+            if id == a_net && kind == soils_sim::KIND_PLAYER =>
+        {
+            Some(())
         }
         _ => None,
     })
@@ -37,9 +40,9 @@ async fn actors_move_by_inputs_and_are_removed_on_disconnect() {
     a.fly(16, 0.0, false).await;
     let moved = b
         .recv_until(|msg| match msg {
-            ServerMsg::ActorUpdate { actors } => actors
+            ServerMsg::EntityUpdate { entities } => entities
                 .into_iter()
-                .find(|s| s.id == a_id && s.pos[2] < spawn[2] - 1.5),
+                .find(|s| s.id == a_net && s.pos[2] < spawn[2] - 1.5),
             _ => None,
         })
         .await;
@@ -51,10 +54,58 @@ async fn actors_move_by_inputs_and_are_removed_on_disconnect() {
         moved.pos
     );
 
-    // A disconnects; B must be told the actor is gone.
+    // A disconnects; B must see the entity despawn.
     drop(a);
     b.recv_until(|msg| match msg {
-        ServerMsg::ActorRemove { id } if id == a_id => Some(()),
+        ServerMsg::EntityDespawn { id } if id == a_net => Some(()),
+        _ => None,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn critters_replicate_and_wander() {
+    let server = TestServer::start_with("critters", |cfg| cfg.critters = 3);
+    let mut a = Client::join(server.addr(), "alice").await;
+
+    // All three ambient critters spawn into our interest, with registry kind.
+    let mut critters = std::collections::HashSet::new();
+    while critters.len() < 3 {
+        let id = a
+            .recv_until(|msg| match msg {
+                ServerMsg::EntitySpawn { id, kind, .. }
+                    if kind == soils_sim::KIND_CRITTER =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .await;
+        critters.insert(id);
+    }
+
+    // They are simulated server-side: one of them measurably moves (they walk
+    // and fall under gravity once their terrain is resident).
+    let watch = *critters.iter().next().unwrap();
+    let first = a
+        .recv_until(|msg| match msg {
+            ServerMsg::EntityUpdate { entities } => {
+                entities.into_iter().find(|s| s.id == watch).map(|s| s.pos)
+            }
+            _ => None,
+        })
+        .await;
+    a.recv_until(|msg| match msg {
+        ServerMsg::EntityUpdate { entities } => entities
+            .into_iter()
+            .find(|s| {
+                s.id == watch
+                    && (s.pos[0] - first[0]).abs()
+                        + (s.pos[1] - first[1]).abs()
+                        + (s.pos[2] - first[2]).abs()
+                        > 0.5
+            })
+            .map(|_| ()),
         _ => None,
     })
     .await;
@@ -166,16 +217,16 @@ async fn warp_isolates_edits_and_actors_by_world() {
 
     a.await_chunk(SPAWN_CHUNK).await;
 
-    // B warps away; same-world clients are told B's actor left.
+    // B warps away; same-world clients see B's entity leave interest.
     b.send(&ClientMsg::Warp { world: "elsewhere".into() }).await;
     b.recv_until(|msg| match msg {
         ServerMsg::Warp { .. } => Some(()),
         _ => None,
     })
     .await;
-    let b_id = b.id;
+    let b_net = b.self_entity;
     a.recv_until(|msg| match msg {
-        ServerMsg::ActorRemove { id } if id == b_id => Some(()),
+        ServerMsg::EntityDespawn { id } if id == b_net => Some(()),
         _ => None,
     })
     .await;

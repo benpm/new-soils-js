@@ -74,7 +74,7 @@ async fn main() {
     let mut spawn = [0.0f32; 3];
     while let Some(Ok(Message::Binary(b))) = rx.next().await {
         match decode(b.as_ref()) {
-            Some(ServerMsg::Init { id, spawn: s, seed, daytime }) => {
+            Some(ServerMsg::Init { id, spawn: s, seed, daytime, .. }) => {
                 println!("Init: id={id} spawn={s:?} seed={seed} daytime={daytime}");
                 spawn = s;
                 break;

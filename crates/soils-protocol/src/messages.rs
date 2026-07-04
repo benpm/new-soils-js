@@ -61,7 +61,9 @@ pub struct InputFrame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMsg {
     /// Sent once after a successful `Login` with spawn + world info.
-    Init { id: u16, spawn: [f32; 3], seed: i64, daytime: f32 },
+    /// `self_entity` is the NetId of this client's own player entity — its
+    /// updates drive the local camera rather than spawning a body.
+    Init { id: u16, self_entity: u32, spawn: [f32; 3], seed: i64, daytime: f32 },
     /// A failed `Login` (bad password, name taken, etc.).
     LoginError { message: String },
     /// A chunk's voxel data as a [`chunk_codec`](crate::chunk_codec) payload
@@ -80,10 +82,14 @@ pub enum ServerMsg {
     /// The server refused edit `seq` (reach, unknown block, rate, unloaded
     /// chunk); the editor must roll its optimistic application back.
     EditRejected { seq: u32 },
-    /// Positions of nearby actors (other players).
-    ActorUpdate { actors: Vec<ActorState> },
-    /// An actor left view / disconnected.
-    ActorRemove { id: u16 },
+    /// An entity entered this client's interest set: create it. Kind ids
+    /// index the shared `entities.yaml` registry.
+    EntitySpawn { id: u32, kind: u16, pos: [f32; 3] },
+    /// An entity left interest (or despawned): drop it.
+    EntityDespawn { id: u32 },
+    /// Full-state updates for entities in interest (delta snapshots land in
+    /// a later phase). Includes the receiver's own player entity.
+    EntityUpdate { entities: Vec<EntityState> },
     /// Current world time of day, 0.0..1.0.
     Time { daytime: f32 },
     /// Confirms a `Warp`: the client should drop all chunks/actors, teleport to
@@ -99,10 +105,13 @@ pub struct ChunkData {
     pub payload: Vec<u8>,
 }
 
-/// A single actor's networked state.
+/// One entity's replicated state (full-state form; the delta pipeline of a
+/// later phase replaces this on the wire). `yaw` is a u16 turn fraction
+/// (`soils_sim::pack_input` convention).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActorState {
-    pub id: u16,
+pub struct EntityState {
+    pub id: u32,
     pub pos: [f32; 3],
     pub velocity: [f32; 3],
+    pub yaw: u16,
 }

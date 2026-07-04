@@ -55,6 +55,10 @@ struct QuadBuffer {
 // nibble lo) — the chunk's 32^3 plus one voxel of neighbor light per side.
 @group(#{MATERIAL_BIND_GROUP}) @binding(5) var<storage, read> chunk_light: array<u32>;
 
+// Must match `gpu_mesh::MAX_QUADS` / voxel_mesh.wgsl. The mesher's atomic
+// count keeps incrementing past this when a chunk overflows (writes are
+// dropped), so readers must clamp or they index past the allocation.
+const MAX_QUADS: u32 = 8192u;
 // Must match `gpu_mesh::LIGHT_PAD`.
 const LPAD: i32 = 34;
 // Illuminance of a level-15 blocklight surface (lux regime), warm-tinted.
@@ -147,7 +151,7 @@ fn vertex(
     let corner = CORNERS[vertex_index % 6u];
 
     // Collapse surplus vertices (past the generated quad count) to a clipped point.
-    if (q >= qb.count) {
+    if (q >= min(qb.count, MAX_QUADS)) {
         out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         return out;
     }

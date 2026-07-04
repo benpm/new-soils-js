@@ -101,7 +101,19 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       integrated GPU here to validate the win against watchdog limits) and the default-on flip
       (single-GPU + lavapipe evidence doesn't meet "where stable"; still opt-in via
       `SOILS_GI=1` / `/gi on`). (rendering §1 L2)
-- [ ] 13. **Pathfinding** — walkability grid → budgeted local A* → HPA* chunk-portal graph →
-      flow fields for crowds; chunk-version invalidation throughout. (game-systems §10)
+- [x] 13. **Pathfinding** — `soils-sim/nav.rs`, pure over `VoxelSampler` with oracle tests:
+      per-chunk `WalkGrid` bit-set (borders sample vertical neighbors; unloaded = unwalkable);
+      budgeted A* (lateral / 1-up jump with takeoff clearance / drops ≤ 3, Path|NoPath|Budget)
+      plus `resolve_walkable` endpoint snapping (bodies hover and stand on block edges);
+      HPA*: step-connected regions per chunk (drops deliberately absent — under-connects only)
+      → border-sweep portal edges → abstract A* refined leg-by-leg by the flat search; flow
+      fields (reverse Dijkstra, one-way drops point the right way, shared per goal). Server:
+      nav cache keyed by (own, below, above) edit-version triple (neighbor bumps would break
+      the light write-back guard), pruned on eviction; critters seek players via A* with an
+      HPA* fallback on Budget, waypoints validated against live voxels each tick (scenario:
+      converges to the player's column in ~2 s). Deferred: async task-pool pathing (synchronous
+      budgeted repaths are staggered and fine at current critter counts) and a flow-field
+      consumer (the named one is the mob spawner, which doesn't exist yet;
+      `darkest_walkable_near` and `flow_field` are both ready for it). (game-systems §10)
 - [ ] 14. **Transport upgrade** — WebTransport/QUIC datagrams (or UDP) behind the transport
       trait; snapshot channel goes truly unreliable/sequenced. (game-systems §3, M8)

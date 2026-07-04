@@ -406,6 +406,103 @@ pub fn hpa_path<'a>(
     PathResult::Path(path)
 }
 
+// ---------------- Stage 4: flow fields ----------------
+
+/// A shared "everyone walk toward this goal" field (plan §10.4): Dijkstra
+/// integration outward from the goal over the same move set as [`find_path`]
+/// (edges reversed, so one-way drops point the right way), storing each
+/// reachable cell's next step. Build once per goal, share across any number
+/// of agents — the per-agent cost is a hash lookup per tick.
+pub struct FlowField {
+    next: HashMap<IVec3, IVec3>,
+    pub goal: IVec3,
+}
+
+impl FlowField {
+    /// The next cell on the way to the goal from `cell` (`None` when the cell
+    /// is outside the field or can't reach the goal).
+    pub fn toward(&self, cell: IVec3) -> Option<IVec3> {
+        self.next.get(&cell).copied()
+    }
+
+    /// Reachable cells in the field (excluding the goal itself).
+    pub fn len(&self) -> usize {
+        self.next.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.next.is_empty()
+    }
+}
+
+/// Build a flow field toward `goal` covering at most `max_cells` walkable
+/// cells within `radius` (Chebyshev, voxels). `goal` must be walkable or the
+/// field is empty.
+pub fn flow_field(
+    world: &impl VoxelSampler,
+    goal: IVec3,
+    radius: i32,
+    max_cells: usize,
+) -> FlowField {
+    let mut field = FlowField { next: HashMap::new(), goal };
+    if !walkable(world, goal) {
+        return field;
+    }
+    let mut open: BinaryHeap<Reverse<(u32, IVec3ToKey)>> = BinaryHeap::new();
+    let mut dist: HashMap<IVec3, u32> = HashMap::new();
+    dist.insert(goal, 0);
+    open.push(Reverse((0, IVec3ToKey(goal))));
+
+    // Relax a predecessor `p` (an agent at `p` stepping to `c` costs `cost`).
+    while let Some(Reverse((g, IVec3ToKey(c)))) = open.pop() {
+        if g > dist[&c] || field.next.len() >= max_cells {
+            continue;
+        }
+        let mut relax = |p: IVec3, cost: u32, open: &mut BinaryHeap<Reverse<(u32, IVec3ToKey)>>| {
+            if (p - goal).abs().max_element() > radius {
+                return;
+            }
+            let ng = g + cost;
+            if dist.get(&p).is_none_or(|&old| ng < old) {
+                dist.insert(p, ng);
+                field.next.insert(p, c);
+                open.push(Reverse((ng, IVec3ToKey(p))));
+            }
+        };
+        for d in LATERAL {
+            // Same-level step p -> c.
+            let p = c + d;
+            if walkable(world, p) {
+                relax(p, COST_WALK, &mut open);
+            }
+            // Jump p -> c (c is one above p's column): p = c - d - UP.
+            let pj = c + d - UP; // reversed: agent at pj jumps toward -d
+            if walkable(world, pj) && !world.is_solid(pj + UP * 2) {
+                relax(pj, COST_JUMP, &mut open);
+            }
+            // Fall p -> c of depth k: p = c + d + k*UP, transit passable.
+            for k in 1..=MAX_FALL {
+                let p = c + d + UP * k;
+                // The agent steps laterally into c's column at its own level,
+                // then falls: every transited cell must be passable and the
+                // landing must be exactly c (no earlier floor).
+                let step_in = c + UP * k;
+                if !passable(world, step_in) {
+                    break; // taller predecessors transit this cell too
+                }
+                let clear = (1..k).all(|j| passable(world, c + UP * j)) && passable(world, c);
+                if clear
+                    && walkable(world, p)
+                    && (1..=k).all(|j| !walkable(world, c + UP * j))
+                {
+                    relax(p, COST_WALK + k as u32 * COST_FALL_PER_VOXEL, &mut open);
+                }
+            }
+        }
+    }
+    field
+}
+
 /// Inverse of `voxel_index` for packed u16 keys.
 fn unpack_index(key: u16) -> IVec3 {
     let i = key as i32;
@@ -697,6 +794,44 @@ mod tests {
         let navs = build_navs(&flat, &chunks);
         let lookup = |c: IVec3| navs.get(&c).map(|(g, n)| (g, n));
         assert_eq!(hpa_path(&flat, &lookup, start, far, 4000), PathResult::NoPath);
+    }
+
+    #[test]
+    fn flow_field_guides_agents_to_the_goal() {
+        let world = bounded(|v: IVec3| u8::from(v.y == 0), 20);
+        let goal = IVec3::new(0, 1, 0);
+        let f = flow_field(&world, goal, 16, 10_000);
+        // Follow the field from a corner: it must reach the goal in exactly
+        // the manhattan distance (uniform costs on a flat floor).
+        let mut c = IVec3::new(10, 1, -8);
+        let mut steps = 0;
+        while c != goal {
+            c = f.toward(c).expect("in-field cell flows toward the goal");
+            steps += 1;
+            assert!(steps <= 18, "flow chain exceeds the shortest path");
+            assert!(walkable(&world, c));
+        }
+        assert_eq!(steps, 18);
+        // Cells outside the radius aren't in the field.
+        assert!(f.toward(IVec3::new(19, 1, 0)).is_none());
+    }
+
+    #[test]
+    fn flow_field_respects_one_way_drops() {
+        // A plateau (x < 0, top at y = 3) over a floor (y = 1 walkable): the
+        // 2-drop is one-way.
+        let world = bounded(|v: IVec3| u8::from((v.x < 0 && v.y <= 2) || v.y == 0), 15);
+        let goal = IVec3::new(5, 1, 0);
+        let f = flow_field(&world, goal, 14, 10_000);
+        assert!(
+            f.toward(IVec3::new(-3, 3, 0)).is_some(),
+            "plateau cells flow down over the drop"
+        );
+        // Goal up on the plateau: floor cells can't jump 2 and stay out.
+        let goal_top = IVec3::new(-3, 3, 0);
+        let f2 = flow_field(&world, goal_top, 14, 10_000);
+        assert!(f2.toward(IVec3::new(5, 1, 0)).is_none(), "no 2-up jump into the field");
+        assert!(f2.toward(IVec3::new(-6, 3, 0)).is_some(), "plateau cells still flow");
     }
 
     #[test]

@@ -60,9 +60,14 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       `ServerConfig::critters` seeds deterministic wander-AI test critters (frozen off resident
       terrain). Scenarios: spawn/kind, integrated movement, despawn on disconnect/warp,
       critter wander; selftest framed a wandering critter. (game-systems M5, §2, §7)
-- [ ] 9. **Server-side lighting queries** — server runs the shared L0 flood + per-chunk darkness
-      summaries (dark-cell counts, reservoir samples, column heightmap); spawn-query API for
-      "darkest walkable spot near player". Nothing per-voxel on the wire. (rendering §3)
+- [x] 9. **Server-side lighting queries** — server runs the shared soils-sim L0 flood
+      (queue-on-residency, top-first, 4 ms/tick budget; edits relight inline) with per-chunk
+      summaries: dark walkable-air counts at both sun extremes + ≤8 sampled cells;
+      `World::darkest_walkable_near` validates samples against live voxels. Nothing per-voxel
+      on the wire; light persistence skipped (derived, rebuilt on residency). Consistency
+      property pinned: incremental == fresh full relight after an edit storm. Deferred: column
+      heightmap summary (no consumer yet). (rendering §3; also closes the phase-2 note on
+      light persistence)
 - [ ] 10. **Delta snapshot pipeline** — per-client quantized baselines in a 64-tick ring,
       zigzag-varint/bit-packed deltas, priority accumulator under a byte budget, LZ4 over
       threshold, acks piggybacked on inputs. (game-systems M6, §4)

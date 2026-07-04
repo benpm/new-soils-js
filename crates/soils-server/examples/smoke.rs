@@ -46,14 +46,14 @@ async fn stream_around(tx: &mut Tx, rx: &mut Rx, spawn: [f32; 3]) -> (usize, usi
             Some(ServerMsg::Bundle { chunks }) => {
                 for c in chunks {
                     received += 1;
-                    solid += c.voxels.iter().filter(|&&v| v != 0).count();
+                    let vol = soils_protocol::decode_chunk(&c.payload).expect("payload decodes");
+                    solid += vol.as_bytes().iter().filter(|&&v| v != 0).count();
                 }
             }
-            Some(ServerMsg::Chunk { empty, voxels, .. }) => {
+            Some(ServerMsg::Chunk { payload, .. }) => {
                 received += 1;
-                if !empty {
-                    solid += voxels.iter().filter(|&&v| v != 0).count();
-                }
+                let vol = soils_protocol::decode_chunk(&payload).expect("payload decodes");
+                solid += vol.as_bytes().iter().filter(|&&v| v != 0).count();
             }
             _ => {} // ignore Time / ActorUpdate while streaming
         }

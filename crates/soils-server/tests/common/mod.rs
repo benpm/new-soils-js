@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use soils_protocol::{ClientMsg, ServerMsg, decode, encode};
+use soils_protocol::{ChunkVolume, ClientMsg, ServerMsg, decode, decode_chunk, encode};
 use soils_server::{ServerConfig, ServerHandle};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
@@ -121,36 +121,38 @@ impl Client {
         }
     }
 
-    /// Request a single chunk and wait for its data (`Bundle` or `Chunk`).
-    pub async fn req_chunk(&mut self, pos: [i32; 3]) -> (bool, Vec<u8>) {
+    /// Request a single chunk and wait for it (`Bundle` or `Chunk`), decoded.
+    pub async fn req_chunk(&mut self, pos: [i32; 3]) -> ChunkVolume {
         self.send(&ClientMsg::ReqChunks { positions: vec![pos] }).await;
-        self.recv_until(|msg| match msg {
-            ServerMsg::Bundle { chunks } => {
-                chunks.into_iter().find(|c| c.pos == pos).map(|c| (c.empty, c.voxels))
-            }
-            ServerMsg::Chunk { pos: p, empty, voxels } if p == pos => Some((empty, voxels)),
-            _ => None,
-        })
-        .await
+        let payload = self
+            .recv_until(|msg| match msg {
+                ServerMsg::Bundle { chunks } => {
+                    chunks.into_iter().find(|c| c.pos == pos).map(|c| c.payload)
+                }
+                ServerMsg::Chunk { pos: p, payload } if p == pos => Some(payload),
+                _ => None,
+            })
+            .await;
+        decode_chunk(&payload).expect("chunk payload decodes")
     }
 
     /// Request `positions` in one message and drain bundles until every one has
-    /// arrived. Returns them keyed by position.
+    /// arrived. Returns raw payloads keyed by position (byte-comparable).
     pub async fn collect_chunks(
         &mut self,
         positions: &[[i32; 3]],
-    ) -> std::collections::HashMap<[i32; 3], (bool, Vec<u8>)> {
+    ) -> std::collections::HashMap<[i32; 3], Vec<u8>> {
         self.send(&ClientMsg::ReqChunks { positions: positions.to_vec() }).await;
         let mut got = std::collections::HashMap::new();
         while got.len() < positions.len() {
             match self.next_msg().await {
                 ServerMsg::Bundle { chunks } => {
                     for c in chunks {
-                        got.insert(c.pos, (c.empty, c.voxels));
+                        got.insert(c.pos, c.payload);
                     }
                 }
-                ServerMsg::Chunk { pos, empty, voxels } => {
-                    got.insert(pos, (empty, voxels));
+                ServerMsg::Chunk { pos, payload } => {
+                    got.insert(pos, payload);
                 }
                 _ => {}
             }

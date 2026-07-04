@@ -19,8 +19,8 @@ async fn spawn_login_and_stream_chunks() {
     c.login("Player").await;
 
     // Chunk streaming works: a below-surface chunk comes back with voxels.
-    let (empty, _voxels) = c.req_chunk([8, 7, 8]).await;
-    assert!(!empty, "below-surface chunk should have voxels");
+    let vol = c.req_chunk([8, 7, 8]).await;
+    assert!(!vol.is_empty(), "below-surface chunk should have voxels");
 
     // Edit a voxel in the now-loaded chunk; the edit is enqueued for
     // background persistence. Round-trip another request to keep the

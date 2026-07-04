@@ -61,20 +61,14 @@ where
 {
     // `ReqChunks` is answered with a `Bundle`; accept a bare `Chunk` too.
     while let Some(Ok(Message::Binary(b))) = rx.next().await {
-        match decode::<ServerMsg>(b.as_ref()) {
-            Some(ServerMsg::Chunk { empty, voxels, .. }) => {
-                return if empty { ChunkVolume::empty() } else { ChunkVolume::from_bytes(&voxels) };
-            }
+        let payload = match decode::<ServerMsg>(b.as_ref()) {
+            Some(ServerMsg::Chunk { payload, .. }) => payload,
             Some(ServerMsg::Bundle { chunks }) => {
-                let d = chunks.into_iter().next().expect("bundle with the requested chunk");
-                return if d.empty {
-                    ChunkVolume::empty()
-                } else {
-                    ChunkVolume::from_bytes(&d.voxels)
-                };
+                chunks.into_iter().next().expect("bundle with the requested chunk").payload
             }
-            _ => {}
-        }
+            _ => continue,
+        };
+        return soils_protocol::decode_chunk(&payload).expect("chunk payload decodes");
     }
     panic!("server closed before sending the chunk");
 }

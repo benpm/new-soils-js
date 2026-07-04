@@ -44,6 +44,12 @@ impl ChunkVolume {
         &self.data
     }
 
+    /// Mutable raw buffer (bulk fills in codecs/tests).
+    #[inline]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     /// True if every voxel is Air.
     pub fn is_empty(&self) -> bool {
         self.data.iter().all(|&v| v == AIR)

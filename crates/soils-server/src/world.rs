@@ -102,11 +102,10 @@ impl World {
         }
     }
 
-    /// Serialize a resident chunk for the wire: `(is_empty, bytes)`, with
-    /// `bytes` empty for an all-Air chunk. `None` if not resident.
-    pub fn serve(&self, pos: IVec3) -> Option<(bool, Vec<u8>)> {
-        let vol = self.chunks.get(&pos)?;
-        Some(if vol.is_empty() { (true, Vec::new()) } else { (false, vol.as_bytes().to_vec()) })
+    /// Serialize a resident chunk for the wire as a `chunk_codec` payload
+    /// (palette + LZ4). `None` if not resident.
+    pub fn serve(&self, pos: IVec3) -> Option<Vec<u8>> {
+        Some(soils_protocol::encode_chunk(self.chunks.get(&pos)?))
     }
 
     /// Handles for generating chunks off-thread (generation is pure).
@@ -150,24 +149,25 @@ mod tests {
             let mut world = World::new(&dir, "default", 0, persister.handle());
             assert!(!world.ensure_resident(pos), "fresh world: nothing on disk yet");
             world.adopt(pos, generate_one(&world, pos));
-            let (empty, bytes) = world.serve(pos).expect("adopted chunk is resident");
-            assert!(!empty, "below-surface chunk should be non-empty");
+            let payload = world.serve(pos).expect("adopted chunk is resident");
+            let vol = soils_protocol::decode_chunk(&payload).expect("payload decodes");
+            assert!(!vol.is_empty(), "below-surface chunk should be non-empty");
             persister.shutdown(); // flush the writer
-            bytes
+            (payload, vol)
         };
 
         // The region file now exists and holds exactly the generated voxels.
         let regions = dir.join("worlds").join("default").join("regions");
         assert!(regions.is_dir(), "region dir should exist after flush");
         let loaded = region::load(&regions, pos).unwrap().expect("chunk persisted");
-        assert_eq!(loaded.as_bytes(), generated.as_slice());
+        assert_eq!(loaded.as_bytes(), generated.1.as_bytes());
 
         // A fresh world loads the chunk from disk (identical bytes) rather than
         // regenerating it.
         let persister2 = Persister::new();
         let mut world2 = World::new(&dir, "default", 0, persister2.handle());
         assert!(world2.ensure_resident(pos), "chunk should load from disk");
-        assert_eq!(world2.serve(pos).unwrap().1, generated);
+        assert_eq!(world2.serve(pos).unwrap(), generated.0);
         persister2.shutdown();
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -188,8 +188,8 @@ mod tests {
         // arrives: the edited chunk must survive.
         assert!(world.edit(pos.x * 32, pos.y * 32, pos.z * 32, 9));
         world.adopt(pos, fresh);
-        let (_, bytes) = world.serve(pos).unwrap();
-        assert_eq!(bytes[0], 9, "adopt must not overwrite the edited chunk");
+        let vol = soils_protocol::decode_chunk(&world.serve(pos).unwrap()).unwrap();
+        assert_eq!(vol.get(0, 0, 0), 9, "adopt must not overwrite the edited chunk");
 
         persister.shutdown();
         let _ = std::fs::remove_dir_all(&dir);

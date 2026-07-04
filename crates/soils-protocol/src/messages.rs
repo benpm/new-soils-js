@@ -48,8 +48,9 @@ pub enum ServerMsg {
     Init { id: u16, spawn: [f32; 3], seed: i64, daytime: f32 },
     /// A failed `Login` (bad password, name taken, etc.).
     LoginError { message: String },
-    /// A chunk's voxel data. `voxels` is empty for an all-Air chunk.
-    Chunk { pos: [i32; 3], empty: bool, voxels: Vec<u8> },
+    /// A chunk's voxel data as a [`chunk_codec`](crate::chunk_codec) payload
+    /// (palette + LZ4; an all-air chunk is the 2-byte Uniform payload).
+    Chunk { pos: [i32; 3], payload: Vec<u8> },
     /// Several chunks in one frame (response to `ReqChunks`), to cut per-message
     /// overhead when streaming a region. Mirrors the JS `bundle` message.
     Bundle { chunks: Vec<ChunkData> },
@@ -69,12 +70,12 @@ pub enum ServerMsg {
     Position { pos: [f32; 3] },
 }
 
-/// One chunk's data within a [`ServerMsg::Bundle`].
+/// One chunk's data within a [`ServerMsg::Bundle`]. `payload` is a
+/// [`chunk_codec`](crate::chunk_codec) encoding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkData {
     pub pos: [i32; 3],
-    pub empty: bool,
-    pub voxels: Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 /// A single actor's networked state.

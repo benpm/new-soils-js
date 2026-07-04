@@ -15,7 +15,7 @@ use std::collections::{HashSet, VecDeque};
 
 use bevy::prelude::*;
 use bevy::render::storage::ShaderStorageBuffer;
-use soils_protocol::{ActorState, ChunkVolume, ServerMsg};
+use soils_protocol::{ActorState, ServerMsg};
 
 use crate::actor::{Actor, ActorAssets, ActorMap, LocalPlayer};
 use crate::chunk::{ChunkMap, VoxelChunk, WorldTime};
@@ -37,8 +37,8 @@ pub struct WorldEpoch(pub u32);
 #[derive(Message, Clone)]
 pub struct ChunkReceived {
     pub pos: [i32; 3],
-    pub empty: bool,
-    pub voxels: Vec<u8>,
+    /// `chunk_codec` payload (palette + LZ4), decoded at apply time.
+    pub payload: Vec<u8>,
     pub epoch: u32,
 }
 
@@ -151,17 +151,12 @@ pub fn route_server_messages(
             ServerMsg::LoginError { message } => {
                 login_fails.write(LoginFailed(message));
             }
-            ServerMsg::Chunk { pos, empty, voxels } => {
-                chunks.write(ChunkReceived { pos, empty, voxels, epoch: epoch.0 });
+            ServerMsg::Chunk { pos, payload } => {
+                chunks.write(ChunkReceived { pos, payload, epoch: epoch.0 });
             }
             ServerMsg::Bundle { chunks: datas } => {
                 for d in datas {
-                    chunks.write(ChunkReceived {
-                        pos: d.pos,
-                        empty: d.empty,
-                        voxels: d.voxels,
-                        epoch: epoch.0,
-                    });
+                    chunks.write(ChunkReceived { pos: d.pos, payload: d.payload, epoch: epoch.0 });
                 }
             }
             ServerMsg::Edit { pos, value } => {
@@ -328,20 +323,23 @@ pub fn apply_chunks(
         if msg.epoch != epoch.0 {
             continue; // warped away since it was queued; drop without spending budget
         }
-        let volume =
-            if msg.empty { ChunkVolume::empty() } else { ChunkVolume::from_bytes(&msg.voxels) };
+        let is_air = soils_protocol::payload_is_air(&msg.payload);
+        let Some(volume) = soils_protocol::decode_chunk(&msg.payload) else {
+            warn!("dropping undecodable chunk payload at {cpos}");
+            continue;
+        };
         if let Some(&entity) = map.map.get(&cpos) {
             // Existing chunk: update CPU copy + re-upload voxels if it has a
             // GPU mesh, else (was empty) leave as-is.
             if let Ok(mut vc) = chunks.get_mut(entity) {
                 vc.volume = volume.clone();
             }
-            if !msg.empty
+            if !is_air
                 && let Ok(mut gc) = gpu_chunks.get_mut(entity)
             {
                 gpu_mesh::refresh_gpu_chunk(&mut buffers, &mut gc, &volume);
             }
-        } else if msg.empty {
+        } else if is_air {
             // Track empty chunks so they aren't re-requested; no mesh (but
             // they still carry light — sky crosses them into caves below).
             let e = commands

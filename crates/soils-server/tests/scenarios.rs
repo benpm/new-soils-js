@@ -50,8 +50,8 @@ async fn edits_replicate_to_peers_without_echo() {
     let mut b = Client::join(server.addr(), "bob").await;
 
     // Load the target chunk server-side (edits to unloaded chunks are dropped).
-    let (empty, _) = a.req_chunk(DEEP_CHUNK).await;
-    assert!(!empty, "deep chunk should be solid");
+    let vol = a.req_chunk(DEEP_CHUNK).await;
+    assert!(!vol.is_empty(), "deep chunk should be solid");
 
     // A's edit reaches B.
     a.send(&ClientMsg::Edit { pos: DEEP_VOXEL, value: 5 }).await;

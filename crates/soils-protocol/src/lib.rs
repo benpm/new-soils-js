@@ -2,11 +2,13 @@
 //! the client/server wire protocol. Deliberately free of Bevy and tokio so it
 //! can be used by both the client and the headless server.
 
+pub mod chunk_codec;
 pub mod coords;
 pub mod discovery;
 pub mod messages;
 pub mod voxel;
 
+pub use chunk_codec::{decode_chunk, encode_chunk, payload_is_air};
 pub use coords::{
     CHUNK_BIT, CHUNK_CLIP, CHUNK_CUBED, CHUNK_SIZE, REGION_SIZE, chunk_of, chunk_origin, local_of,
     voxel_index,
@@ -35,14 +37,17 @@ mod tests {
 
     #[test]
     fn chunk_message_round_trip() {
-        let msg = ServerMsg::Chunk { pos: [1, 2, 3], empty: false, voxels: vec![1, 2, 3, 0, 5] };
+        let mut vol = ChunkVolume::empty();
+        vol.set(1, 2, 3, 7);
+        let msg = ServerMsg::Chunk { pos: [1, 2, 3], payload: encode_chunk(&vol) };
         let bytes = encode(&msg);
         let back: ServerMsg = decode(&bytes).expect("decode");
         match back {
-            ServerMsg::Chunk { pos, empty, voxels } => {
+            ServerMsg::Chunk { pos, payload } => {
                 assert_eq!(pos, [1, 2, 3]);
-                assert!(!empty);
-                assert_eq!(voxels, vec![1, 2, 3, 0, 5]);
+                let dec = decode_chunk(&payload).expect("payload decodes");
+                assert_eq!(dec.get(1, 2, 3), 7);
+                assert!(!payload_is_air(&payload));
             }
             _ => panic!("wrong variant"),
         }

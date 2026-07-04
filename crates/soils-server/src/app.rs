@@ -389,8 +389,8 @@ fn send_wave(world: &World, positions: &[IVec3], out: &UnboundedSender<ServerMsg
     for &pos in positions {
         // Every position is resident by now (cached at dispatch or adopted
         // above); a miss would mean a logic bug, not a recoverable state.
-        let Some((empty, voxels)) = world.serve(pos) else { continue };
-        batch.push(ChunkData { pos: [pos.x, pos.y, pos.z], empty, voxels });
+        let Some(payload) = world.serve(pos) else { continue };
+        batch.push(ChunkData { pos: [pos.x, pos.y, pos.z], payload });
         if batch.len() >= BUNDLE_SIZE {
             let _ = out.send(ServerMsg::Bundle { chunks: std::mem::take(&mut batch) });
         }

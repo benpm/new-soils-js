@@ -30,4 +30,11 @@ async fn fresh_world_burst_streams_promptly() {
         elapsed.as_secs_f32() < 3.0,
         "fresh 729-chunk burst took {elapsed:?}; the chunk pipeline is pacing waves too slowly"
     );
+
+    // Bandwidth regression gate (plan-game-systems §5): the palette+LZ4 codec
+    // must keep the whole join burst far under the old dense encoding
+    // (729 × 32 KB ≈ 23 MB). Threshold has ~2× headroom over measured.
+    let total: usize = got.values().map(Vec::len).sum();
+    println!("729-chunk burst encodes to {} KB", total / 1024);
+    assert!(total < 2 * 1024 * 1024, "join burst grew to {} bytes — codec regression?", total);
 }

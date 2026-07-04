@@ -70,6 +70,9 @@ impl World {
     /// names yield different terrain.
     pub fn new(data_dir: &Path, name: &str, seed: u32, persist: PersistHandle) -> Self {
         let regions_dir = data_dir.join("worlds").join(name).join("regions");
+        // Reclaim space leaked by append-only chunk rewrites. Best-effort and
+        // bounded by the leak thresholds; runs before any header is memoised.
+        region::compact_dir(&regions_dir);
         Self {
             registry: Arc::new(default_registry()),
             terrain: Arc::new(TerrainGen::new(seed, WorldType::Normal)),

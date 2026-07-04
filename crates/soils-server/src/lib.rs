@@ -293,7 +293,18 @@ async fn serve(
         ));
     }
 
-    let next_id = AtomicU16::new(1);
+    let next_id = Arc::new(AtomicU16::new(1));
+
+    // WebTransport endpoint (phase 14 step 2) on the same port over UDP: the
+    // snapshot lane rides real datagrams there (no TCP head-of-line blocking).
+    // Best-effort — a bind or TLS failure logs and leaves the server WS-only.
+    tokio::spawn(webtransport_endpoint(
+        listener.local_addr()?.port(),
+        conns_tx.clone(),
+        next_id.clone(),
+        shutdown.clone(),
+    ));
+
     loop {
         let (stream, peer) = tokio::select! {
             _ = shutdown.changed() => break,
@@ -387,6 +398,158 @@ async fn pump_connection(
     // `in_tx` drops here; the app notices the closed inbox and despawns the
     // player next tick.
     result
+}
+
+/// Accept WebTransport sessions on UDP `port` and hand each to the app as an
+/// ordinary [`NewConn`] — the app never knows which transport a client rides.
+/// Lanes: the client opens one bidirectional stream as the reliable ordered
+/// channel (4-byte-LE length-framed bincode both ways); snapshots go out as
+/// datagrams (truly unreliable/sequenced — send errors are dropped), and
+/// datagram arrivals feed the same inbox as stream messages (for the input
+/// hot path). Uses a per-boot self-signed certificate: native clients skip
+/// verification for LAN play (the WS path remains for everything else).
+async fn webtransport_endpoint(
+    port: u16,
+    conns: mpsc::UnboundedSender<NewConn>,
+    next_id: Arc<AtomicU16>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let identity = match wtransport::Identity::self_signed(["localhost", "127.0.0.1", "::1"]) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("webtransport disabled (self-signed identity failed: {e})");
+            return;
+        }
+    };
+    let config = wtransport::ServerConfig::builder()
+        .with_bind_default(port)
+        .with_identity(identity)
+        .build();
+    let server = match wtransport::Endpoint::server(config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("webtransport disabled (udp/{port} bind failed: {e})");
+            return;
+        }
+    };
+    loop {
+        let incoming = tokio::select! {
+            _ = shutdown.changed() => break,
+            s = server.accept() => s,
+        };
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        let conns = conns.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pump_wt_connection(incoming, id, conns).await {
+                eprintln!("wt connection ({id}) ended: {e}");
+            }
+        });
+    }
+}
+
+/// Per-WebTransport-connection pump; mirrors [`pump_connection`] but with the
+/// snapshot lane on datagrams.
+async fn pump_wt_connection(
+    incoming: wtransport::endpoint::IncomingSession,
+    id: u16,
+    conns: mpsc::UnboundedSender<NewConn>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = incoming.await?.accept().await?;
+    // The client opens the reliable stream immediately after the session.
+    let (mut stream_tx, mut stream_rx) = conn.accept_bi().await?;
+
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let (in_tx, in_rx) = mpsc::unbounded_channel::<ClientMsg>();
+    let (snap_tx, mut snap_rx) = watch::channel::<Option<ServerMsg>>(None);
+    if conns.send(NewConn { id, inbox: in_rx, outbox: out_tx, snapshot: snap_tx }).is_err() {
+        return Ok(()); // server is shutting down
+    }
+
+    let writer_conn = conn.clone();
+    let writer = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                m = out_rx.recv() => {
+                    let Some(msg) = m else { break };
+                    let bytes = encode(&msg);
+                    let mut framed = (bytes.len() as u32).to_le_bytes().to_vec();
+                    framed.extend_from_slice(&bytes);
+                    if stream_tx.write_all(&framed).await.is_err() {
+                        break;
+                    }
+                }
+                c = snap_rx.changed() => {
+                    if c.is_err() {
+                        break;
+                    }
+                    let msg = snap_rx.borrow_and_update().clone();
+                    if let Some(msg) = msg {
+                        // Unreliable by design; a dropped datagram is just a
+                        // snapshot the client never acks.
+                        let _ = writer_conn.send_datagram(encode(&msg));
+                    }
+                }
+            }
+        }
+    });
+
+    // Datagram arrivals (the input hot path) feed the same inbox.
+    let dgram_in = in_tx.clone();
+    let dgram_conn = conn.clone();
+    let dgrams = tokio::spawn(async move {
+        while let Ok(d) = dgram_conn.receive_datagram().await {
+            if let Some(msg) = decode::<ClientMsg>(d.payload().as_ref())
+                && dgram_in.send(msg).is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Reliable inbox: length-framed ClientMsg frames until the stream closes.
+    let mut result = Ok(());
+    let mut len = [0u8; 4];
+    loop {
+        if read_exact(&mut stream_rx, &mut len).await.is_err() {
+            break; // closed
+        }
+        let n = u32::from_le_bytes(len) as usize;
+        if n > MAX_WT_FRAME {
+            result = Err(format!("oversized frame ({n} B)").into());
+            break;
+        }
+        let mut buf = vec![0u8; n];
+        if read_exact(&mut stream_rx, &mut buf).await.is_err() {
+            break;
+        }
+        if let Some(msg) = decode::<ClientMsg>(&buf)
+            && in_tx.send(msg).is_err()
+        {
+            break;
+        }
+    }
+    writer.abort();
+    dgrams.abort();
+    result
+}
+
+/// Largest accepted length-framed message on the reliable WT stream (client
+/// messages are small; this is a decode-bomb guard, not a tuning knob).
+const MAX_WT_FRAME: usize = 1 << 20;
+
+/// Fill `buf` from a WT receive stream (`read` returns partial chunks).
+async fn read_exact(
+    rx: &mut wtransport::RecvStream,
+    buf: &mut [u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match rx.read(&mut buf[filled..]).await? {
+            Some(0) | None => return Err("stream closed mid-frame".into()),
+            Some(n) => filled += n,
+        }
+    }
+    Ok(())
 }
 
 /// Answer LAN discovery probes while `enabled` says on. When on, binds a UDP

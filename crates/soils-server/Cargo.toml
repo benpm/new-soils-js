@@ -18,3 +18,6 @@ bevy_app = "0.18"
 bevy_ecs = "0.18"
 bevy_time = "0.18"
 rayon = "1"
+# dangerous-configuration: `with_no_cert_validation` for the LAN/test client
+# path (the server side uses a per-boot self-signed identity).
+wtransport = { version = "0.7.1", features = ["dangerous-configuration"] }

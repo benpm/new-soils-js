@@ -24,11 +24,20 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       simplex range, pinned by a density-band test). Server now generates outside the world
       lock (concurrent edits/loads during waves) and logs wave timings; fresh-world burst of
       810 chunks ≈ 65 ms total gen time, verified via selftest screenshot.
-- [ ] 5. **Server as headless Bevy ECS app** — 20 Hz fixed tick, connection tasks feed per-client
-      inboxes drained at tick start, mutex webs dissolve into ECS state. (game-systems M2)
+- [x] 5. **Server as headless Bevy ECS app** — 20 Hz fixed tick (`SERVER_TICK_HZ` in `soils-sim`),
+      connection tasks are pure inbox/outbox pumps, mutex web → ECS resources (`app.rs`).
+      Chunk pipeline: waves probe cache/disk on the tick, generate on rayon off it, ≤8 waves
+      in flight per client, delivery in request order. Fresh 729-chunk burst: 187 ms
+      (tick-quantized; old per-connection loop 85 ms — invisible behind client apply pacing,
+      path redone in phase 6). Gated by tests/{scenarios,streaming,embedded,discovery}.rs +
+      examples/msgcount.rs; client A/B old-vs-new server: identical selftest results.
+      (game-systems M2)
 - [ ] 6. **Chunk streaming v2** — server-driven subscribe/unload with hysteresis, palette+LZ4
       encoding (~32 KB → 1–4 KB), server chunk refcount/evict, coalesced dirty-chunk saves +
-      region compaction. (game-systems M3, §5)
+      region compaction. (game-systems M3, §5) NOTE: the client's chunk-apply budget is
+      count-based (8/frame, `CHUNK_APPLY_BUDGET`) and collapses when burst frames run long
+      (~60 chunks/s observed at ~8 fps → fresh-world fill takes >10 s regardless of server);
+      make it time-budgeted (or cheapen per-apply cost) as part of this phase.
 - [ ] 7. **Server authority** — `InputMsg` replaces `Move`, server simulates players via
       `soils-sim`; edits validated server-side with seq/ack/rollback (fixes the unloaded-chunk
       edit desync). (game-systems M4, §6)

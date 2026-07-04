@@ -42,9 +42,15 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       uploads became wall-time-boxed (count budgets collapsed on slow frame clocks). New
       scenarios: move-driven restream+unload, edit persistence across restart. (game-systems
       M3, §5, §6, §8)
-- [ ] 7. **Server authority** — `InputMsg` replaces `Move`, server simulates players via
-      `soils-sim`; edits validated server-side with seq/ack/rollback (fixes the unloaded-chunk
-      edit desync). (game-systems M4, §6)
+- [x] 7. **Server authority** — `ClientMsg::Inputs` (packed frames, seq-deduped, last-3 bundled)
+      replaces `Move`; the server steps players via shared `soils_sim::step_player` at the
+      client dt, with a TICK_HZ token bucket so input flooding can't speed-hack (scenario-
+      verified: flood moves <8 u vs 80 if trusted; legal input integrates exactly). MAX_STEP +
+      `Position` snap-back deleted; self renders from interpolated ActorUpdate echoes until
+      phase 11 prediction. Edits: seq + server validation (rate bucket, reach from server pos,
+      block id, residency) → EditAccepted/EditRejected; client keeps optimistic apply with
+      rollback via pending list. Deferred: per-chunk edit aggregation per tick. (game-systems
+      M4, §6)
 - [ ] 8. **Entity model** — `NetId`, `entities.yaml` registry, spawn/despawn replication,
       interest management via chunk-column buckets; decision point: hand-rolled vs
       `bevy_replicon`. (game-systems M5, §2, §7)

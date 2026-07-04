@@ -77,9 +77,17 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       410 B/tick. Bandwidth pinned: self+3 critters average <150 B/tick (scenario assert).
       Remote-body buffer interpolation deferred to phase 11 per §9 adoption order.
       (game-systems M6, §4)
-- [ ] 11. **Prediction & reconciliation** — own-entity rewind/replay, remote snapshot-buffer
-      interpolation + capped extrapolation, optimistic-edit rollback, lag-compensated
-      interactions; validated on a simulated 150 ms / 2 % loss link. (game-systems M7, §9)
+- [x] 11. **Prediction & reconciliation** — client predicts via shared sim with a (seq, input,
+      state) history ring; on each snapshot: rewind to server state at last_input_seq + replay
+      pending inputs (anchor rebased, fly/grounded from recorded state). Remote bodies:
+      per-entity snapshot buffers at a 2-tick delay + capped extrapolation on a re-synced
+      render clock. Validated headless through a 75 ms-each-way proxy with 2% input loss:
+      straight flight reconciles bit-exact; an unseen terrain change forces divergence and
+      converges (tests/prediction.rs). Fallout fixed along the way: Snapshot gained the §4
+      baseline_tick (deltas previously applied against latest state → +60% speed at RTT);
+      server light floods moved off-thread onto dense cloned regions (300 ms/column stalls);
+      per-chunk edit versions added; hot member crates opt-level 3 in dev. Deferred to later
+      work: lag-compensated hit interactions (no combat consumers yet). (game-systems M7, §9)
 - [ ] 12. **Radiance-cascades GI upgrades** — GPU-side occupancy fill (kill the CPU refill), seed
       from L0, 3D-texture + DDA marching, per-probe SH/ambient-cube irradiance; flip default-on
       where stable. (rendering §1 L2)

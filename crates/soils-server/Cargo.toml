@@ -6,9 +6,15 @@ license.workspace = true
 
 [dependencies]
 soils-protocol = { workspace = true }
+soils-sim = { workspace = true }
 soils-worldgen = { workspace = true }
 glam = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 flate2 = "1"
+# Headless ECS app (TODO phase 5): narrow bevy subcrates, no renderer.
+bevy_app = "0.18"
+bevy_ecs = "0.18"
+bevy_time = "0.18"
+rayon = "1"

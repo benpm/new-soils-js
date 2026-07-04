@@ -13,11 +13,15 @@ use glam::{IVec3, Quat, Vec2, Vec3};
 use soils_worldgen::BlockRegistry;
 
 /// Simulation tick rate (Hz) for fixed-step gameplay logic. The client's
-/// `FixedUpdate` runs at this rate. When the server gains its own fixed tick
-/// (plan M2, nominally 20 Hz) the two must be reconciled: either the server
-/// steps players at this rate while replicating slower, or this constant
-/// changes for both sides.
+/// `FixedUpdate` runs at this rate.
 pub const TICK_HZ: f64 = 64.0;
+
+/// The server's fixed tick rate (Hz): net-message drain, replication cadence,
+/// and (from plan M4) server-side player stepping. Lower than [`TICK_HZ`]
+/// because the server replicates rather than renders; when M4 makes the server
+/// step players via `soils-sim`, it will run multiple sim steps per server
+/// tick (or these two get unified) so both sides integrate at the same dt.
+pub const SERVER_TICK_HZ: f64 = 20.0;
 
 // Movement tuning.
 pub const MOVE_SPEED: f32 = 8.0;

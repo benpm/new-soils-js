@@ -137,7 +137,9 @@ pub fn save_many(dir: &Path, chunks: &[(IVec3, &ChunkVolume)]) -> io::Result<()>
     }
 
     for (path, group) in by_region {
-        let mut file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        // Never truncate: region files are updated in place.
+        let mut file =
+            OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
         // Initialize the header on a freshly created file.
         if file.metadata()?.len() < HEADER_BYTES {
             file.set_len(0)?;

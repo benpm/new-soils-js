@@ -106,22 +106,19 @@ async fn main() {
     assert!(wsolid > 0, "expected terrain in the warped world");
     assert_ne!(solid, wsolid, "warped world has identical terrain to default (seed not applied?)");
 
-    // Server authority: a teleport-sized jump is rejected with a correction.
-    let jump = [warp_spawn[0] + 1000.0, warp_spawn[1], warp_spawn[2]];
-    send(&mut tx, ClientMsg::Move { pos: jump, velocity: [0.0; 3] }).await;
-    let mut corrected = None;
+    // Server authority: positions can't be sent at all anymore — an
+    // out-of-reach edit is the cheapest way to watch validation reject us.
+    let far = [warp_spawn[0] as i32, warp_spawn[1] as i32 - 100, warp_spawn[2] as i32];
+    send(&mut tx, ClientMsg::Edit { seq: 1, pos: far, value: 1 }).await;
+    let mut rejected = false;
     while let Some(Ok(Message::Binary(b))) = rx.next().await {
-        if let Some(ServerMsg::Position { pos }) = decode(b.as_ref()) {
-            corrected = Some(pos);
+        if let Some(ServerMsg::EditRejected { seq: 1 }) = decode(b.as_ref()) {
+            rejected = true;
             break;
         }
     }
-    let corrected = corrected.expect("expected a Position correction for the teleport jump");
-    println!("position correction: {corrected:?}");
-    assert!(
-        (corrected[0] - warp_spawn[0]).abs() < 1.0,
-        "correction should snap back to the last valid position"
-    );
+    assert!(rejected, "expected the out-of-reach edit to be rejected");
+    println!("out-of-reach edit rejected (authority holds)");
 
-    println!("SMOKE TEST PASSED (auth + bundle streaming + warp + position correction)");
+    println!("SMOKE TEST PASSED (auth + bundle streaming + warp + edit authority)");
 }

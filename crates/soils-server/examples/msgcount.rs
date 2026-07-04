@@ -1,5 +1,6 @@
-//! Diagnostic: connect to a running server, log in, send Move at the client's
-//! real cadence, and count message types per second.
+//! Diagnostic: connect to a running server, log in, and count message types
+//! per second (an idle client still receives the join burst, ActorUpdate at
+//! 10 Hz, and Time at 1 Hz).
 //!
 //!   cargo run -p soils-server --example msgcount
 
@@ -19,17 +20,6 @@ async fn main() {
     .await
     .unwrap();
 
-    let mover = tokio::spawn(async move {
-        let mut iv = tokio::time::interval(std::time::Duration::from_millis(50));
-        loop {
-            iv.tick().await;
-            let m = ClientMsg::Move { pos: [282.0, 285.0, 268.0], velocity: [0.0; 3] };
-            if tx.send(Message::Binary(encode(&m))).await.is_err() {
-                break;
-            }
-        }
-    });
-
     let mut counts: std::collections::HashMap<&'static str, u32> = Default::default();
     let t0 = std::time::Instant::now();
     while t0.elapsed().as_secs_f32() < 3.0 {
@@ -43,7 +33,8 @@ async fn main() {
             Some(ServerMsg::Time { .. }) => "Time",
             Some(ServerMsg::ActorUpdate { .. }) => "ActorUpdate",
             Some(ServerMsg::ActorRemove { .. }) => "ActorRemove",
-            Some(ServerMsg::Position { .. }) => "Position",
+            Some(ServerMsg::EditAccepted { .. }) => "EditAccepted",
+            Some(ServerMsg::EditRejected { .. }) => "EditRejected",
             Some(ServerMsg::Bundle { .. }) => "Bundle",
             Some(ServerMsg::Chunk { .. }) => "Chunk",
             Some(ServerMsg::Edit { .. }) => "Edit",
@@ -51,6 +42,5 @@ async fn main() {
         };
         *counts.entry(name).or_default() += 1;
     }
-    mover.abort();
     println!("over 3 s: {counts:?}");
 }

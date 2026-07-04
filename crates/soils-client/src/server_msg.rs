@@ -101,8 +101,12 @@ pub struct WarpReceived {
     pub daytime: f32,
 }
 
+/// The server's verdict on one of our own edits (see `edit::PendingEdits`).
 #[derive(Message)]
-pub struct PositionCorrected(pub [f32; 3]);
+pub struct EditAck {
+    pub seq: u32,
+    pub accepted: bool,
+}
 
 #[derive(Message)]
 pub struct LoginFailed(pub String);
@@ -122,7 +126,7 @@ pub fn register(app: &mut App) {
         .add_message::<TimeReceived>()
         .add_message::<InitReceived>()
         .add_message::<WarpReceived>()
-        .add_message::<PositionCorrected>()
+        .add_message::<EditAck>()
         .add_message::<LoginFailed>()
         .add_message::<NetStatus>();
 }
@@ -141,7 +145,7 @@ pub fn route_server_messages(
     mut times: MessageWriter<TimeReceived>,
     mut inits: MessageWriter<InitReceived>,
     mut warps: MessageWriter<WarpReceived>,
-    mut positions: MessageWriter<PositionCorrected>,
+    mut edit_acks: MessageWriter<EditAck>,
     mut login_fails: MessageWriter<LoginFailed>,
     mut statuses: MessageWriter<NetStatus>,
 ) {
@@ -189,8 +193,11 @@ pub fn route_server_messages(
                 epoch.0 += 1;
                 warps.write(WarpReceived { spawn, daytime });
             }
-            ServerMsg::Position { pos } => {
-                positions.write(PositionCorrected(pos));
+            ServerMsg::EditAccepted { seq, .. } => {
+                edit_acks.write(EditAck { seq, accepted: true });
+            }
+            ServerMsg::EditRejected { seq } => {
+                edit_acks.write(EditAck { seq, accepted: false });
             }
             ServerMsg::ActorUpdate { actors: states } => {
                 actors.write(ActorsUpdated(states));
@@ -248,9 +255,11 @@ pub fn apply_warp(
     mut streaming: ResMut<Streaming>,
     mut light_queue: ResMut<LightQueue>,
     mut queue: ResMut<ChunkApplyQueue>,
+    mut pending_edits: ResMut<crate::edit::PendingEdits>,
     mut query: Query<(&mut Player, &mut Transform)>,
 ) {
     for msg in reader.read() {
+        pending_edits.clear(); // old-world verdicts are moot
         for (_, entity) in map.map.drain() {
             commands.entity(entity).despawn();
         }
@@ -268,18 +277,6 @@ pub fn apply_warp(
         // them safe, but this frees their buffers immediately).
         queue.queue.clear();
         queue.queued.clear();
-    }
-}
-
-/// Server rejected our movement — snap back.
-pub fn apply_position_correction(
-    mut reader: MessageReader<PositionCorrected>,
-    mut query: Query<(&mut Player, &mut Transform)>,
-) {
-    for msg in reader.read() {
-        if let Ok((mut player, mut transform)) = query.single_mut() {
-            player::teleport(&mut player, &mut transform, Vec3::from_array(msg.0));
-        }
     }
 }
 
@@ -449,11 +446,19 @@ pub fn apply_actor_updates(
     mut map: ResMut<ActorMap>,
     assets: Res<ActorAssets>,
     mut actors: Query<&mut Actor>,
+    mut player_q: Query<&mut Player>,
 ) {
     for msg in reader.read() {
         for state in &msg.0 {
             if state.id == local.id {
-                continue; // don't render ourselves
+                // Our own server-authoritative position: no body, the camera
+                // eases toward it (interpolation-only self, M4).
+                if let Ok(mut player) = player_q.single_mut() {
+                    player.net_target = Some(Vec3::from_array(state.pos));
+                    player.sim.pos = Vec3::from_array(state.pos);
+                    player.sim.vel = Vec3::from_array(state.velocity);
+                }
+                continue;
             }
             let target = Vec3::from_array(state.pos);
             if let Some(&entity) = map.map.get(&state.id) {

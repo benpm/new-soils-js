@@ -45,10 +45,6 @@ pub(crate) const BUNDLE_SIZE: usize = 16;
 pub(crate) const WAVE_SIZE: usize = 48;
 /// The world every client starts in.
 pub(crate) const DEFAULT_WORLD: &str = "default";
-/// Max accepted movement between two `Move` updates (world units). Generous —
-/// well above sprint-fly + lag spikes (~32 u/s, sent every 50 ms) — so it only
-/// catches gross teleport/speed hacks, not legitimate play.
-pub(crate) const MAX_STEP: f32 = 64.0;
 
 /// A freshly handshaken connection, handed from the tokio accept loop to the
 /// ECS app. The app owns the inbox/outbox ends; the connection task is a pure

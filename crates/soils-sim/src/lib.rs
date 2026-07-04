@@ -87,6 +87,69 @@ pub struct PlayerInput {
     pub toggle_fly: bool,
 }
 
+// Wire packing for [`PlayerInput`] (game-systems §3): 8 button bits, an edge
+// flag, and yaw quantized to a u16 fraction of a turn. Client and server both
+// use these, so the server steps exactly what the client stepped.
+pub const BTN_FORWARD: u8 = 1 << 0;
+pub const BTN_BACK: u8 = 1 << 1;
+pub const BTN_RIGHT: u8 = 1 << 2;
+pub const BTN_LEFT: u8 = 1 << 3;
+pub const BTN_JUMP: u8 = 1 << 4;
+pub const BTN_SPRINT: u8 = 1 << 5;
+pub const BTN_UP: u8 = 1 << 6;
+pub const BTN_DOWN: u8 = 1 << 7;
+/// Edge event: toggle fly mode (in `flags`, not `buttons`).
+pub const FLAG_TOGGLE_FLY: u8 = 1 << 0;
+
+/// Pack an input for the wire as `(buttons, flags, yaw)`. Analog `move_axes`
+/// collapse to sign bits — the keyboard only ever produces ±1/0.
+pub fn pack_input(input: &PlayerInput) -> (u8, u8, u16) {
+    let mut buttons = 0u8;
+    if input.move_axes.y > 0.0 {
+        buttons |= BTN_FORWARD;
+    }
+    if input.move_axes.y < 0.0 {
+        buttons |= BTN_BACK;
+    }
+    if input.move_axes.x > 0.0 {
+        buttons |= BTN_RIGHT;
+    }
+    if input.move_axes.x < 0.0 {
+        buttons |= BTN_LEFT;
+    }
+    if input.jump {
+        buttons |= BTN_JUMP;
+    }
+    if input.sprint {
+        buttons |= BTN_SPRINT;
+    }
+    if input.up {
+        buttons |= BTN_UP;
+    }
+    if input.down {
+        buttons |= BTN_DOWN;
+    }
+    let flags = if input.toggle_fly { FLAG_TOGGLE_FLY } else { 0 };
+    let turn = (input.yaw / std::f32::consts::TAU).rem_euclid(1.0);
+    (buttons, flags, (turn * 65536.0) as u16)
+}
+
+/// Inverse of [`pack_input`] (yaw comes back in `[0, τ)`, an equivalent angle).
+pub fn unpack_input(buttons: u8, flags: u8, yaw: u16) -> PlayerInput {
+    let axis = |pos, neg| {
+        (if buttons & pos != 0 { 1.0 } else { 0.0 }) - if buttons & neg != 0 { 1.0 } else { 0.0 }
+    };
+    PlayerInput {
+        move_axes: Vec2::new(axis(BTN_RIGHT, BTN_LEFT), axis(BTN_FORWARD, BTN_BACK)),
+        yaw: yaw as f32 / 65536.0 * std::f32::consts::TAU,
+        sprint: buttons & BTN_SPRINT != 0,
+        jump: buttons & BTN_JUMP != 0,
+        up: buttons & BTN_UP != 0,
+        down: buttons & BTN_DOWN != 0,
+        toggle_fly: flags & FLAG_TOGGLE_FLY != 0,
+    }
+}
+
 /// Advance a player by `dt`. Fly mode is free 6-DOF; walk mode applies gravity
 /// and axis-separated AABB voxel collision, stopping on contact.
 pub fn step_player(
@@ -262,6 +325,36 @@ pub fn ease10(t: f32) -> f32 {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn input_pack_round_trips() {
+        let cases = [
+            PlayerInput::default(),
+            PlayerInput {
+                move_axes: Vec2::new(1.0, -1.0),
+                yaw: 1.5,
+                sprint: true,
+                jump: true,
+                up: false,
+                down: true,
+                toggle_fly: true,
+            },
+            PlayerInput { move_axes: Vec2::new(-1.0, 1.0), yaw: -2.5, ..Default::default() },
+        ];
+        for c in &cases {
+            let (b, f, y) = pack_input(c);
+            let u = unpack_input(b, f, y);
+            assert_eq!(u.move_axes, c.move_axes);
+            assert_eq!(
+                (u.sprint, u.jump, u.up, u.down, u.toggle_fly),
+                (c.sprint, c.jump, c.up, c.down, c.toggle_fly)
+            );
+            // Yaw survives modulo a turn, within one quantization step.
+            let tau = std::f32::consts::TAU;
+            let d = (u.yaw - c.yaw).rem_euclid(tau);
+            assert!(d.min(tau - d) < 2.0 * tau / 65536.0, "yaw drifted: {} vs {}", u.yaw, c.yaw);
+        }
+    }
 
     /// Sparse voxel map: anything absent is Air, like unloaded chunks.
     struct SparseWorld(HashMap<IVec3, u8>);

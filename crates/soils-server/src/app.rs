@@ -33,7 +33,7 @@ use tokio::sync::watch;
 use crate::auth::Accounts;
 use crate::persist::PersistHandle;
 use crate::world::World;
-use crate::{BUNDLE_SIZE, DAY_SECONDS, DEFAULT_WORLD, MAX_STEP, NewConn, WAVE_SIZE, world_seed};
+use crate::{BUNDLE_SIZE, DAY_SECONDS, DEFAULT_WORLD, NewConn, WAVE_SIZE, world_seed};
 
 /// Broadcast actor positions every Nth tick (matches the old 100 ms cadence
 /// at 20 Hz).
@@ -59,6 +59,13 @@ const UNLOAD_TTL: Duration = Duration::from_secs(60);
 /// Dirty (edited) chunks flush to the background writer on this interval;
 /// they also flush on eviction and shutdown.
 const FLUSH_SECS: f32 = 30.0;
+/// Input-frame token bucket: refilled at the client sim rate, capped at this
+/// burst. Long-term a client can't get more sim steps than real time allows
+/// (flooding inputs would otherwise be a speed hack); the burst absorbs
+/// tick-alignment jitter and short stalls.
+const INPUT_BURST: f32 = 16.0;
+/// Per-client edit rate cap (edits per second, bucketed like inputs).
+const EDIT_RATE: f32 = 32.0;
 
 pub(crate) struct Client {
     inbox: UnboundedReceiver<ClientMsg>,
@@ -66,6 +73,15 @@ pub(crate) struct Client {
     authenticated: bool,
     world: String,
     state: ActorState,
+    /// Server-side player simulation (authoritative; stepped by input frames).
+    sim: soils_sim::PlayerState,
+    /// Highest input `seq` applied (frames at or below it are duplicates from
+    /// the loss-robustness bundling).
+    last_seq: u32,
+    /// Remaining input steps allowed (token bucket, see [`INPUT_BURST`]).
+    input_tokens: f32,
+    /// Remaining edits allowed (token bucket, see [`EDIT_RATE`]).
+    edit_tokens: f32,
     /// View radius in chunks (client-requested via `ViewRadius`, clamped).
     radius: i32,
     /// The chunk the subscription was last computed around.
@@ -224,6 +240,10 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 authenticated: false,
                 world: DEFAULT_WORLD.to_string(),
                 state: ActorState { id: conn.id, pos: [0.0; 3], velocity: [0.0; 3] },
+                sim: soils_sim::PlayerState::default(),
+                last_seq: 0,
+                input_tokens: INPUT_BURST,
+                edit_tokens: EDIT_RATE,
                 radius: DEFAULT_RADIUS,
                 center: None,
                 subs: HashSet::new(),
@@ -246,16 +266,20 @@ fn send_world(clients: &Clients, world: &str, except: u16, msg: &ServerMsg) {
 /// Drain every client's inbox and apply the messages. A closed inbox means the
 /// connection task ended; the client is removed and its actor despawned.
 fn drain_inboxes(
+    time: Res<Time>,
     mut clients: ResMut<Clients>,
     mut worlds: ResMut<Worlds>,
     clock: Res<Clock>,
     accounts: Res<AccountsRes>,
     player_count: Res<PlayerCount>,
 ) {
-    // Phase 1: pull everything out of the inboxes (needs &mut per client).
+    // Phase 1: refill rate buckets and pull everything out of the inboxes.
+    let dt = time.delta_secs();
     let mut msgs: Vec<(u16, ClientMsg)> = Vec::new();
     let mut gone: Vec<u16> = Vec::new();
     for (&id, c) in clients.0.iter_mut() {
+        c.input_tokens = (c.input_tokens + dt * soils_sim::TICK_HZ as f32).min(INPUT_BURST);
+        c.edit_tokens = (c.edit_tokens + dt * EDIT_RATE).min(EDIT_RATE);
         loop {
             match c.inbox.try_recv() {
                 Ok(m) => msgs.push((id, m)),
@@ -289,6 +313,11 @@ fn drain_inboxes(
                         let (spawn, seed) = (world.spawn, world.seed);
                         let c = clients.0.get_mut(&id).unwrap();
                         c.state = ActorState { id, pos: spawn, velocity: [0.0; 3] };
+                        c.sim = soils_sim::PlayerState {
+                            pos: glam::Vec3::from_array(spawn),
+                            ..Default::default()
+                        };
+                        c.last_seq = 0;
                         let _ = c.outbox.send(ServerMsg::Init {
                             id,
                             spawn,
@@ -311,34 +340,57 @@ fn drain_inboxes(
                 let world = worlds.get_or_create(&c.world.clone());
                 resubscribe(c, world);
             }
-            ClientMsg::Edit { pos, value } => {
-                let world_name = clients.0[&id].world.clone();
-                let applied =
-                    worlds.get_or_create(&world_name).edit(pos[0], pos[1], pos[2], value);
+            ClientMsg::Edit { seq, pos, value } => {
+                // Authority (plan §6): rate cap, reach from the *server-side*
+                // player position, known block id, chunk resident (within
+                // reach it's inside the subscription, so a miss only happens
+                // mid-join — rejected, and the client rolls back cleanly).
+                let c = clients.0.get_mut(&id).unwrap();
+                let world_name = c.world.clone();
+                let eye = c.sim.pos;
+                let rate_ok = c.edit_tokens >= 1.0;
+                if rate_ok {
+                    c.edit_tokens -= 1.0;
+                }
+                let target = IVec3::new(pos[0], pos[1], pos[2]);
+                let world = worlds.get_or_create(&world_name);
+                let applied = rate_ok
+                    && soils_sim::validate_edit(eye, target, value, &world.registry)
+                    && world.ensure_resident(soils_protocol::chunk_of(target))
+                    && world.edit(pos[0], pos[1], pos[2], value);
+                let c = &clients.0[&id];
                 if applied {
+                    let _ = c.outbox.send(ServerMsg::EditAccepted { seq, pos, value });
                     send_world(&clients, &world_name, id, &ServerMsg::Edit { pos, value });
+                } else {
+                    let _ = c.outbox.send(ServerMsg::EditRejected { seq });
                 }
             }
-            ClientMsg::Move { pos, velocity } => {
-                // Server authority: reject implausible jumps (teleport/speed
-                // hacks) and snap the client back to its last accepted position.
+            ClientMsg::Inputs { frames } => {
+                // Server authority: the client sends *inputs*, the server
+                // integrates them through the shared sim at the client's fixed
+                // dt. Positions can't be forged, and the token bucket stops
+                // input flooding from becoming a speed hack. Frames at or
+                // below `last_seq` are duplicates from loss bundling.
                 let c = clients.0.get_mut(&id).unwrap();
-                let last = c.state.pos;
-                let d2 = (pos[0] - last[0]).powi(2)
-                    + (pos[1] - last[1]).powi(2)
-                    + (pos[2] - last[2]).powi(2);
-                if d2 > MAX_STEP * MAX_STEP {
-                    let _ = c.outbox.send(ServerMsg::Position { pos: last });
-                } else {
-                    c.state.pos = pos;
-                    c.state.velocity = velocity;
-                    // Crossing a chunk boundary moves the subscription window.
-                    let pc = chunk_at(pos);
-                    if c.center != Some(pc) {
-                        c.center = Some(pc);
-                        let world = worlds.get_or_create(&c.world.clone());
-                        resubscribe(c, world);
+                let world = worlds.get_or_create(&c.world.clone());
+                let sim_dt = 1.0 / soils_sim::TICK_HZ as f32;
+                for f in frames {
+                    if f.seq <= c.last_seq || c.input_tokens < 1.0 {
+                        continue;
                     }
+                    c.input_tokens -= 1.0;
+                    c.last_seq = f.seq;
+                    let input = soils_sim::unpack_input(f.buttons, f.flags, f.yaw);
+                    soils_sim::step_player(&mut c.sim, &input, sim_dt, &|v| world.voxel(v));
+                }
+                c.state.pos = c.sim.pos.to_array();
+                c.state.velocity = c.sim.vel.to_array();
+                // Crossing a chunk boundary moves the subscription window.
+                let pc = chunk_at(c.state.pos);
+                if c.center != Some(pc) {
+                    c.center = Some(pc);
+                    resubscribe(c, world);
                 }
             }
             ClientMsg::Warp { world: name } => {
@@ -359,6 +411,8 @@ fn drain_inboxes(
                 let spawn = world.spawn;
                 let c = clients.0.get_mut(&id).unwrap();
                 c.state.pos = spawn;
+                c.sim.pos = glam::Vec3::from_array(spawn);
+                c.sim.vel = glam::Vec3::ZERO;
                 let _ = c.outbox.send(ServerMsg::Warp { spawn, daytime: clock.daytime });
                 c.center = Some(chunk_at(spawn));
                 resubscribe(c, world);

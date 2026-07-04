@@ -9,10 +9,11 @@ use futures_util::{SinkExt, StreamExt};
 use soils_protocol::{ChunkVolume, ClientMsg, ServerMsg, decode, encode};
 use tokio_tungstenite::tungstenite::Message;
 
-// A voxel well below the surface (reliably solid), and the block we stamp there.
-const VOXEL: [i32; 3] = [282, 200, 268];
-const CHUNK: [i32; 3] = [8, 6, 8]; // VOXEL >> 5 per axis
-const LOCAL: (i32, i32, i32) = (26, 8, 12); // VOXEL & 31 per axis
+// A voxel within edit reach of the spawn eye (server authority validates
+// reach), and the block we stamp there.
+const VOXEL: [i32; 3] = [282, 280, 268];
+const CHUNK: [i32; 3] = [8, 8, 8]; // VOXEL >> 5 per axis
+const LOCAL: (i32, i32, i32) = (26, 24, 12); // VOXEL & 31 per axis
 const STAMP: u8 = 5;
 
 #[tokio::main]
@@ -36,7 +37,7 @@ async fn main() {
     match mode.as_str() {
         "write" => {
             assert_eq!(chunk.get(LOCAL.0, LOCAL.1, LOCAL.2) != STAMP, true, "stamp already present?");
-            tx.send(bin(&ClientMsg::Edit { pos: VOXEL, value: STAMP })).await.unwrap();
+            tx.send(bin(&ClientMsg::Edit { seq: 1, pos: VOXEL, value: STAMP })).await.unwrap();
             // Give the server a moment to apply + persist before we disconnect.
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             println!("WROTE stamp {STAMP} at {VOXEL:?}");

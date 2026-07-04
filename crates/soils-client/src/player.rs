@@ -14,10 +14,10 @@
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
-use soils_protocol::{CHUNK_BIT, ClientMsg};
+use soils_protocol::{CHUNK_BIT, ClientMsg, InputFrame};
 use soils_sim::{PlayerInput, PlayerState};
 
-use crate::chunk::{ChunkMap, VoxelChunk, voxel_at};
+use crate::chunk::ChunkMap;
 use crate::net::NetClient;
 
 const MOUSE_SENS: f32 = 0.0022;
@@ -26,10 +26,12 @@ const MOUSE_SENS: f32 = 0.0022;
 pub struct Player {
     pub yaw: f32,
     pub pitch: f32,
-    /// Fixed-tick simulation state (eye position, velocity, fly/grounded).
+    /// Local mirror of the (server-authoritative) simulation state. Since M4
+    /// the server integrates movement; this holds the last known state for
+    /// teleports and future prediction (phase 11).
     pub sim: PlayerState,
-    /// Sim position at the previous fixed tick, for render interpolation.
-    pub prev_pos: Vec3,
+    /// Latest server-echoed eye position; [`sync_camera`] eases toward it.
+    pub net_target: Option<Vec3>,
 }
 
 impl Player {
@@ -40,18 +42,18 @@ impl Player {
             yaw: 0.0,
             pitch: -0.5,
             sim: PlayerState { pos, ..PlayerState::default() },
-            prev_pos: pos,
+            net_target: None,
         }
     }
 }
 
-/// Move the player instantly: sets the sim position and the interpolation
-/// baseline (no smear across the jump), zeroes velocity, and writes the
-/// Transform immediately so same-frame readers see the new position.
+/// Move the player instantly: sets the local state and the network target (no
+/// smear across the jump) and writes the Transform immediately so same-frame
+/// readers see the new position.
 pub fn teleport(player: &mut Player, transform: &mut Transform, pos: Vec3) {
     player.sim.pos = pos;
-    player.prev_pos = pos;
     player.sim.vel = Vec3::ZERO;
+    player.net_target = Some(pos);
     transform.translation = pos;
 }
 
@@ -107,32 +109,59 @@ pub fn collect_input(
     }
 }
 
-/// Advance the simulation one fixed tick (inside `FixedUpdate`, `Res<Time>` is
-/// the fixed clock).
-pub fn step(
-    time: Res<Time>,
-    mut pending: ResMut<PendingInput>,
-    map: Res<ChunkMap>,
-    chunks: Query<&VoxelChunk>,
-    mut query: Query<&mut Player>,
-) {
-    let Ok(mut player) = query.single_mut() else { return };
-    let input = pending.input;
-    pending.clear_latches();
-    let player = &mut *player;
-    player.prev_pos = player.sim.pos;
-    let sampler = |v: IVec3| voxel_at(&map, &chunks, v);
-    soils_sim::step_player(&mut player.sim, &input, time.delta_secs(), &sampler);
+/// The outgoing input stream: one frame per fixed tick, the last few bundled
+/// per send for loss robustness on future unreliable transports (the server
+/// dedupes by `seq`).
+#[derive(Resource, Default)]
+pub struct InputRing {
+    seq: u32,
+    frames: Vec<InputFrame>,
 }
 
-/// Derive the rendered camera position by interpolating the last two ticks.
-/// Translation only — rotation belongs to [`mouse_look`].
+/// One fixed tick: pack this tick's input and send the frame bundle. The
+/// server integrates it through the shared sim (server authority, M4) — the
+/// client no longer steps its own position; it renders the echoed state.
+pub fn send_input(
+    net: Res<NetClient>,
+    mut pending: ResMut<PendingInput>,
+    mut ring: ResMut<InputRing>,
+    query: Query<&Player>,
+) {
+    if query.single().is_err() {
+        return;
+    }
+    let input = pending.input;
+    pending.clear_latches();
+    ring.seq += 1;
+    let (buttons, flags, yaw) = soils_sim::pack_input(&input);
+    let seq = ring.seq;
+    ring.frames.push(InputFrame { seq, buttons, flags, yaw });
+    if ring.frames.len() > 3 {
+        ring.frames.remove(0);
+    }
+    net.send(ClientMsg::Inputs { frames: ring.frames.clone() });
+}
+
+/// When set, the camera transform is under manual control (self-test framing)
+/// and server position echoes must not move it.
+#[derive(Resource, Default)]
+pub struct CameraHold(pub bool);
+
+/// Ease the camera toward the latest server-echoed position (interpolation-
+/// only self-rendering until prediction lands in phase 11). Translation only —
+/// rotation belongs to [`mouse_look`].
 pub fn sync_camera(
-    fixed_time: Res<Time<Fixed>>,
+    time: Res<Time>,
+    hold: Res<CameraHold>,
     mut query: Query<(&Player, &mut Transform)>,
 ) {
+    if hold.0 {
+        return;
+    }
     let Ok((player, mut transform)) = query.single_mut() else { return };
-    transform.translation = player.prev_pos.lerp(player.sim.pos, fixed_time.overstep_fraction());
+    let Some(target) = player.net_target else { return };
+    let t = (time.delta_secs() * 12.0).min(1.0);
+    transform.translation = transform.translation.lerp(target, t);
 }
 
 /// Toggle pointer-lock with Escape; re-grab on click.

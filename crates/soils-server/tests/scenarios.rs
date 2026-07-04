@@ -1,38 +1,55 @@
 //! Scripted multi-client network scenarios against the embedded server: actor
-//! visibility, edit replication, movement authority, world isolation, and
-//! concurrent chunk generation. These pin the current protocol semantics so
-//! the server rework phases (TODO 5–11) can refactor against them.
+//! visibility, movement authority (inputs, not positions), edit authority
+//! (seq/ack), world isolation, subscriptions, and persistence. These pin the
+//! protocol semantics so later phases can refactor against them.
 
 mod common;
 
 use common::{Client, TestServer};
-use soils_protocol::{ClientMsg, ServerMsg};
+use soils_protocol::{ClientMsg, InputFrame, ServerMsg};
 
-/// A chunk well below the surface (~y=256): reliably solid, so edits apply.
-const DEEP_CHUNK: [i32; 3] = [8, 6, 8];
-/// A voxel inside [`DEEP_CHUNK`].
-const DEEP_VOXEL: [i32; 3] = [8 * 32, 6 * 32, 8 * 32];
+/// The chunk containing the spawn point (players spawn ~29 voxels above the
+/// surface, so nearby editable space is air — placements work, reach holds).
+const SPAWN_CHUNK: [i32; 3] = [8, 8, 8];
+/// A voxel within edit reach (Chebyshev ≤ 8) of the spawn eye position.
+const NEAR_VOXEL: [i32; 3] = [282, 280, 268];
+/// `NEAR_VOXEL`'s coordinates within `SPAWN_CHUNK`.
+const NEAR_LOCAL: (i32, i32, i32) = (26, 24, 12);
 
 #[tokio::test]
-async fn actors_are_visible_and_removed_on_disconnect() {
+async fn actors_move_by_inputs_and_are_removed_on_disconnect() {
     let server = TestServer::start("actors");
     let mut a = Client::join(server.addr(), "alice").await;
     let mut b = Client::join(server.addr(), "bob").await;
+    let (a_id, spawn) = (a.id, a.spawn);
 
-    // A moves; B must observe A at the new position (with velocity) via the
-    // periodic ActorUpdate broadcast.
-    let target = [a.spawn[0] + 10.0, a.spawn[1], a.spawn[2]];
-    a.send(&ClientMsg::Move { pos: target, velocity: [1.0, 0.0, 0.0] }).await;
-    let a_id = a.id;
-    let seen = b
+    // B sees A at spawn without A doing anything (server owns positions).
+    b.recv_until(|msg| match msg {
+        ServerMsg::ActorUpdate { actors } => {
+            actors.into_iter().find(|s| s.id == a_id).map(|_| ())
+        }
+        _ => None,
+    })
+    .await;
+
+    // A holds forward for 16 ticks facing -Z: the *server* integrates this to
+    // 16/64 s × 8 u/s = 2.0 units, and B observes exactly that.
+    a.fly(16, 0.0, false).await;
+    let moved = b
         .recv_until(|msg| match msg {
-            ServerMsg::ActorUpdate { actors } => {
-                actors.into_iter().find(|s| s.id == a_id && s.pos == target)
-            }
+            ServerMsg::ActorUpdate { actors } => actors
+                .into_iter()
+                .find(|s| s.id == a_id && s.pos[2] < spawn[2] - 1.5),
             _ => None,
         })
         .await;
-    assert_eq!(seen.velocity, [1.0, 0.0, 0.0]);
+    assert!(
+        (moved.pos[2] - (spawn[2] - 2.0)).abs() < 0.5
+            && (moved.pos[0] - spawn[0]).abs() < 0.1
+            && (moved.pos[1] - spawn[1]).abs() < 0.1,
+        "server-integrated position should be ~2 units -Z from spawn, got {:?}",
+        moved.pos
+    );
 
     // A disconnects; B must be told the actor is gone.
     drop(a);
@@ -44,30 +61,69 @@ async fn actors_are_visible_and_removed_on_disconnect() {
 }
 
 #[tokio::test]
-async fn edits_replicate_to_peers_without_echo() {
+async fn input_flooding_cannot_speed_hack() {
+    let server = TestServer::start("flood");
+    let mut a = Client::join(server.addr(), "alice").await;
+    let spawn = a.spawn;
+
+    // 640 forward frames in one message = 10 s of movement (80 units) if the
+    // server trusted them. The input token bucket admits only a small burst;
+    // the rest are dropped, not queued.
+    let frames: Vec<InputFrame> = (1..=640)
+        .map(|seq| {
+            let input = soils_sim::PlayerInput {
+                move_axes: glam::Vec2::new(0.0, 1.0),
+                yaw: 0.0,
+                ..Default::default()
+            };
+            let (buttons, flags, yaw) = soils_sim::pack_input(&input);
+            InputFrame { seq, buttons, flags, yaw }
+        })
+        .collect();
+    a.send(&ClientMsg::Inputs { frames }).await;
+
+    // A Time broadcast (1 Hz) guarantees the flood was processed ticks ago;
+    // the next self-position echo is post-flood.
+    a.recv_until(|msg| match msg {
+        ServerMsg::Time { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+    let pos = a.await_self_pos().await;
+    let moved = (pos[2] - spawn[2]).abs();
+    assert!(
+        moved < 8.0,
+        "flooded inputs moved the player {moved} units — rate cap failed (80 if fully trusted)"
+    );
+}
+
+#[tokio::test]
+async fn edits_are_acked_and_replicate_without_echo() {
     let server = TestServer::start("edits");
     let mut a = Client::join(server.addr(), "alice").await;
     let mut b = Client::join(server.addr(), "bob").await;
+    a.await_chunk(SPAWN_CHUNK).await;
 
-    // Load the target chunk server-side (edits to unloaded chunks are dropped).
-    let vol = a.await_chunk(DEEP_CHUNK).await;
-    assert!(!vol.is_empty(), "deep chunk should be solid");
-
-    // A's edit reaches B.
-    a.send(&ClientMsg::Edit { pos: DEEP_VOXEL, value: 5 }).await;
+    // A's in-reach edit is accepted (seq round-trip) and reaches B as a plain
+    // Edit broadcast.
+    let seq = a.edit(NEAR_VOXEL, 5).await;
+    a.recv_until(|msg| match msg {
+        ServerMsg::EditAccepted { seq: s, .. } if s == seq => Some(()),
+        _ => None,
+    })
+    .await;
     let got = b
         .recv_until(|msg| match msg {
             ServerMsg::Edit { pos, value } => Some((pos, value)),
             _ => None,
         })
         .await;
-    assert_eq!(got, (DEEP_VOXEL, 5));
+    assert_eq!(got, (NEAR_VOXEL, 5));
 
-    // B replies with its own edit. Per-connection message order means the
-    // FIRST edit A ever receives must be B's — proving A got no echo of its
-    // own edit (the server excludes the sender from the broadcast).
-    let pb = [DEEP_VOXEL[0] + 1, DEEP_VOXEL[1], DEEP_VOXEL[2]];
-    b.send(&ClientMsg::Edit { pos: pb, value: 7 }).await;
+    // B replies with its own edit. Per-connection order means the FIRST plain
+    // edit A receives must be B's — no echo of A's own.
+    let pb = [NEAR_VOXEL[0] + 1, NEAR_VOXEL[1], NEAR_VOXEL[2]];
+    b.edit(pb, 7).await;
     let got = a
         .recv_until(|msg| match msg {
             ServerMsg::Edit { pos, value } => Some((pos, value)),
@@ -78,44 +134,26 @@ async fn edits_replicate_to_peers_without_echo() {
 }
 
 #[tokio::test]
-async fn implausible_moves_are_rejected_and_corrected() {
-    let server = TestServer::start("moves");
+async fn out_of_reach_edits_are_rejected() {
+    let server = TestServer::start("reach");
     let mut a = Client::join(server.addr(), "alice").await;
-    let mut b = Client::join(server.addr(), "bob").await;
+    a.await_chunk(SPAWN_CHUNK).await;
 
-    // A legal step is accepted and becomes visible to B.
-    let legal = [a.spawn[0] + 20.0, a.spawn[1], a.spawn[2]];
-    a.send(&ClientMsg::Move { pos: legal, velocity: [0.0; 3] }).await;
-    let a_id = a.id;
-    b.recv_until(|msg| match msg {
-        ServerMsg::ActorUpdate { actors } => {
-            actors.into_iter().find(|s| s.id == a_id && s.pos == legal).map(|_| ())
-        }
+    // ~60 voxels below the player: resident, but far outside REACH=8.
+    let seq = a.edit([282, 224, 268], 5).await;
+    a.recv_until(|msg| match msg {
+        ServerMsg::EditRejected { seq: s } if s == seq => Some(()),
         _ => None,
     })
     .await;
 
-    // A teleport far beyond MAX_STEP is rejected: the server snaps A back to
-    // the last accepted position...
-    let teleport = [legal[0] + 1000.0, legal[1], legal[2]];
-    a.send(&ClientMsg::Move { pos: teleport, velocity: [0.0; 3] }).await;
-    let corrected = a
-        .recv_until(|msg| match msg {
-            ServerMsg::Position { pos } => Some(pos),
-            _ => None,
-        })
-        .await;
-    assert_eq!(corrected, legal);
-
-    // ...and the teleported position never enters the actor state: whatever
-    // update B sees next still reports the last accepted position.
-    let seen = b
-        .recv_until(|msg| match msg {
-            ServerMsg::ActorUpdate { actors } => actors.into_iter().find(|s| s.id == a_id),
-            _ => None,
-        })
-        .await;
-    assert_eq!(seen.pos, legal, "rejected teleport must not leak into actor broadcasts");
+    // Unknown block ids are rejected too, even in reach.
+    let seq = a.edit(NEAR_VOXEL, 250).await;
+    a.recv_until(|msg| match msg {
+        ServerMsg::EditRejected { seq: s } if s == seq => Some(()),
+        _ => None,
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -126,7 +164,7 @@ async fn warp_isolates_edits_and_actors_by_world() {
     // C stays in "default" as the observer that confirms broadcasts fired.
     let mut c = Client::join(server.addr(), "carol").await;
 
-    a.await_chunk(DEEP_CHUNK).await;
+    a.await_chunk(SPAWN_CHUNK).await;
 
     // B warps away; same-world clients are told B's actor left.
     b.send(&ClientMsg::Warp { world: "elsewhere".into() }).await;
@@ -144,9 +182,9 @@ async fn warp_isolates_edits_and_actors_by_world() {
 
     // A edits in "default" while B is elsewhere. C (same world) receiving it
     // proves the broadcast fired; B must not get it.
-    a.send(&ClientMsg::Edit { pos: DEEP_VOXEL, value: 5 }).await;
+    a.edit(NEAR_VOXEL, 5).await;
     c.recv_until(|msg| match msg {
-        ServerMsg::Edit { pos, value } if pos == DEEP_VOXEL && value == 5 => Some(()),
+        ServerMsg::Edit { pos, value } if pos == NEAR_VOXEL && value == 5 => Some(()),
         _ => None,
     })
     .await;
@@ -176,8 +214,8 @@ async fn warp_isolates_edits_and_actors_by_world() {
         _ => None,
     })
     .await;
-    let pb = [DEEP_VOXEL[0] + 1, DEEP_VOXEL[1], DEEP_VOXEL[2]];
-    a.send(&ClientMsg::Edit { pos: pb, value: 7 }).await;
+    let pb = [NEAR_VOXEL[0] + 1, NEAR_VOXEL[1], NEAR_VOXEL[2]];
+    a.edit(pb, 7).await;
     let got = b
         .recv_until(|msg| match msg {
             ServerMsg::Edit { pos, value } => Some((pos, value)),
@@ -213,27 +251,32 @@ async fn concurrent_requests_serve_identical_chunks() {
 async fn moving_restreams_ahead_and_unloads_behind() {
     let server = TestServer::start("subs");
     let mut a = Client::join(server.addr(), "alice").await;
+    a.await_chunk(SPAWN_CHUNK).await;
 
-    // Let part of the join burst land, then march east well past the
-    // hysteresis margin (each step stays under the anti-teleport MAX_STEP).
-    a.await_chunk([8, 8, 8]).await;
-    for i in 1..=8 {
-        let pos = [282.0 + 60.0 * i as f32, 285.0, 268.0];
-        a.send(&ClientMsg::Move { pos, velocity: [0.0; 3] }).await;
-    }
-
-    // 480 voxels east = 15 chunks: the spawn-side column (x <= 8) is far
-    // outside radius+1 of the new center, so it must unload...
+    // Shrinking the view radius unloads the shell beyond radius+1 on its own.
+    a.send(&ClientMsg::ViewRadius { radius: 2 }).await;
     a.recv_until(|msg| match msg {
-        ServerMsg::ChunkUnload { pos } if pos[0] <= 8 => Some(()),
+        ServerMsg::ChunkUnload { pos }
+            if (pos[0] - 8).abs().max((pos[1] - 8).abs()).max((pos[2] - 8).abs()) > 3 =>
+        {
+            Some(())
+        }
         _ => None,
     })
     .await;
-    // ...and terrain around the destination (x = 282+480 >> 5 = 23) streams
-    // in without any client request.
+
+    // Sprint-fly east for 128 ticks = 2 s × 32 u/s = 64 units = 2 chunks: the
+    // window recenters, streaming terrain ahead...
+    a.fly(128, -std::f32::consts::FRAC_PI_2, true).await;
     a.recv_until(|msg| match msg {
-        ServerMsg::Bundle { chunks } if chunks.iter().any(|c| c.pos[0] >= 22) => Some(()),
-        ServerMsg::Chunk { pos, .. } if pos[0] >= 22 => Some(()),
+        ServerMsg::Bundle { chunks } if chunks.iter().any(|c| c.pos[0] >= 11) => Some(()),
+        ServerMsg::Chunk { pos, .. } if pos[0] >= 11 => Some(()),
+        _ => None,
+    })
+    .await;
+    // ...and dropping the west edge.
+    a.recv_until(|msg| match msg {
+        ServerMsg::ChunkUnload { pos } if pos[0] <= 6 => Some(()),
         _ => None,
     })
     .await;
@@ -250,29 +293,25 @@ async fn edits_survive_server_restart_via_dirty_flush() {
     {
         let server = TestServer::start_at(dir.clone(), "restart");
         let mut a = Client::join(server.addr(), "alice").await;
-        a.await_chunk(DEEP_CHUNK).await;
-        a.send(&ClientMsg::Edit { pos: DEEP_VOXEL, value: 5 }).await;
-        // Round-trip: our own edit isn't echoed, so use a second client's edit
-        // as the fence that the server processed ours.
-        let mut b = Client::join(server.addr(), "bob").await;
-        b.send(&ClientMsg::Edit {
-            pos: [DEEP_VOXEL[0] + 1, DEEP_VOXEL[1], DEEP_VOXEL[2]],
-            value: 6,
-        })
-        .await;
+        a.await_chunk(SPAWN_CHUNK).await;
+        let seq = a.edit(NEAR_VOXEL, 5).await;
         a.recv_until(|msg| match msg {
-            ServerMsg::Edit { value: 6, .. } => Some(()),
+            ServerMsg::EditAccepted { seq: s, .. } if s == seq => Some(()),
             _ => None,
         })
         .await;
-        // TestServer::drop shuts down and waits for the flush.
+        // TestServer::drop shuts down synchronously and waits for the flush.
     }
 
     // Session 2: a fresh server on the same data dir must serve the edit.
     let server = TestServer::start_at(dir.clone(), "restart2");
     let mut c = Client::join(server.addr(), "carol").await;
-    let vol = c.await_chunk(DEEP_CHUNK).await;
-    assert_eq!(vol.get(0, 0, 0), 5, "edit lost across restart");
+    let vol = c.await_chunk(SPAWN_CHUNK).await;
+    assert_eq!(
+        vol.get(NEAR_LOCAL.0, NEAR_LOCAL.1, NEAR_LOCAL.2),
+        5,
+        "edit lost across restart"
+    );
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
 }

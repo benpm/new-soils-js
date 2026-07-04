@@ -1,13 +1,9 @@
-//! Other-player (actor) rendering. We report our position to the server a few
-//! times a second; the server broadcasts everyone's positions back, and we spawn
-//! a body per remote actor and smoothly interpolate it toward its latest target.
+//! Other-player (actor) rendering. The server simulates everyone from their
+//! inputs and broadcasts positions; we spawn a body per remote actor and
+//! smoothly interpolate it toward its latest target.
 
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
-use soils_protocol::ClientMsg;
-
-use crate::net::NetClient;
-use crate::player::Player;
 
 /// Our own network id (set from the server's `Init`); used to skip rendering
 /// ourselves as an actor.
@@ -37,8 +33,6 @@ pub struct Actor {
 
 /// Vertical offset from the eye position to the body center.
 const BODY_DROP: f32 = 0.9;
-/// Network send rate for our own position.
-const MOVE_INTERVAL: f32 = 0.05;
 
 /// Build the shared actor body mesh + material.
 pub fn setup_actor_assets(
@@ -53,26 +47,6 @@ pub fn setup_actor_assets(
         ..default()
     });
     commands.insert_resource(ActorAssets { mesh, material });
-}
-
-/// Report our position/velocity to the server at a fixed rate.
-pub fn send_move(
-    time: Res<Time>,
-    mut acc: Local<f32>,
-    net: Res<NetClient>,
-    query: Query<(&Transform, &Player)>,
-) {
-    *acc += time.delta_secs();
-    if *acc < MOVE_INTERVAL {
-        return;
-    }
-    *acc = 0.0;
-    if let Ok((transform, player)) = query.single() {
-        net.send(ClientMsg::Move {
-            pos: transform.translation.to_array(),
-            velocity: player.sim.vel.to_array(),
-        });
-    }
 }
 
 /// Smoothly move actor bodies toward their networked target each frame.

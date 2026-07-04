@@ -150,6 +150,17 @@ impl World {
         (self.terrain.clone(), self.registry.clone())
     }
 
+    /// Read one voxel at an absolute position. Unloaded space is Air (id 0) —
+    /// the shared `soils-sim` sampler contract, used for server-side player
+    /// stepping and edit validation.
+    pub fn voxel(&self, v: IVec3) -> u8 {
+        let cpos = IVec3::new(v.x >> CHUNK_BIT, v.y >> CHUNK_BIT, v.z >> CHUNK_BIT);
+        match self.chunks.get(&cpos) {
+            Some(entry) => entry.volume.get(v.x & CHUNK_CLIP, v.y & CHUNK_CLIP, v.z & CHUNK_CLIP),
+            None => 0,
+        }
+    }
+
     /// Apply a voxel edit at an absolute voxel position, marking the chunk
     /// dirty for the next flush. Returns false if the containing chunk has not
     /// been loaded yet.

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use soils_protocol::{ChunkVolume, ClientMsg, ServerMsg, decode, decode_chunk, encode};
+use soils_protocol::{ChunkVolume, ClientMsg, InputFrame, ServerMsg, decode, decode_chunk, encode};
 use soils_server::{ServerConfig, ServerHandle};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
@@ -75,6 +75,10 @@ pub struct Client {
     pub id: u16,
     /// Spawn position from `Init`.
     pub spawn: [f32; 3],
+    /// Movement input sequence (one per simulated tick).
+    input_seq: u32,
+    /// Edit sequence for `ClientMsg::Edit`.
+    pub edit_seq: u32,
 }
 
 impl Client {
@@ -82,7 +86,7 @@ impl Client {
     pub async fn connect(addr: SocketAddr) -> Self {
         let (ws, _) =
             tokio_tungstenite::connect_async(format!("ws://{addr}")).await.expect("connect");
-        Self { ws, id: 0, spawn: [0.0; 3] }
+        Self { ws, id: 0, spawn: [0.0; 3], input_seq: 0, edit_seq: 0 }
     }
 
     /// Connect and log in as a guest, returning once `Init` arrives.
@@ -135,6 +139,55 @@ impl Client {
                 return v;
             }
         }
+    }
+
+    /// Fly for `ticks` fixed ticks with forward held, facing `yaw` (0 = -Z,
+    /// -π/2 = +X). Paced in bursts matched to the server's input token refill
+    /// (64/s) so no frame is dropped; players spawn in fly mode, so this moves
+    /// at 8 u/s (32 u/s with `sprint`).
+    pub async fn fly(&mut self, ticks: u32, yaw: f32, sprint: bool) {
+        let mut sent = 0;
+        while sent < ticks {
+            let batch = (ticks - sent).min(16);
+            let frames: Vec<InputFrame> = (0..batch)
+                .map(|_| {
+                    self.input_seq += 1;
+                    let input = soils_sim::PlayerInput {
+                        move_axes: glam::Vec2::new(0.0, 1.0),
+                        yaw,
+                        sprint,
+                        ..Default::default()
+                    };
+                    let (buttons, flags, yaw_q) = soils_sim::pack_input(&input);
+                    InputFrame { seq: self.input_seq, buttons, flags, yaw: yaw_q }
+                })
+                .collect();
+            self.send(&ClientMsg::Inputs { frames }).await;
+            sent += batch;
+            if sent < ticks {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+
+    /// Send one edit with the next sequence number; returns that `seq`.
+    pub async fn edit(&mut self, pos: [i32; 3], value: u8) -> u32 {
+        self.edit_seq += 1;
+        let seq = self.edit_seq;
+        self.send(&ClientMsg::Edit { seq, pos, value }).await;
+        seq
+    }
+
+    /// The next server-echoed position of this client's own actor.
+    pub async fn await_self_pos(&mut self) -> [f32; 3] {
+        let id = self.id;
+        self.recv_until(|msg| match msg {
+            ServerMsg::ActorUpdate { actors } => {
+                actors.into_iter().find(|s| s.id == id).map(|s| s.pos)
+            }
+            _ => None,
+        })
+        .await
     }
 
     /// Wait for the server to push a specific chunk (the server owns the

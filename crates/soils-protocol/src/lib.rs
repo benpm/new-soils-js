@@ -14,7 +14,7 @@ pub use coords::{
     voxel_index,
 };
 pub use discovery::{DISCOVERY_PORT, PROBE_MAGIC, ServerInfo};
-pub use messages::{ActorState, ChunkData, ClientMsg, ServerMsg, decode, encode};
+pub use messages::{ActorState, ChunkData, ClientMsg, InputFrame, ServerMsg, decode, encode};
 pub use voxel::{AIR, ChunkVolume, Voxel};
 
 #[cfg(test)]
@@ -23,11 +23,12 @@ mod tests {
 
     #[test]
     fn message_round_trip() {
-        let msg = ClientMsg::Edit { pos: [10, -3, 42], value: 7 };
+        let msg = ClientMsg::Edit { seq: 3, pos: [10, -3, 42], value: 7 };
         let bytes = encode(&msg);
         let back: ClientMsg = decode(&bytes).expect("decode");
         match back {
-            ClientMsg::Edit { pos, value } => {
+            ClientMsg::Edit { seq, pos, value } => {
+                assert_eq!(seq, 3);
                 assert_eq!(pos, [10, -3, 42]);
                 assert_eq!(value, 7);
             }

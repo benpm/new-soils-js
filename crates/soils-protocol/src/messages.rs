@@ -34,12 +34,27 @@ pub enum ClientMsg {
     /// The client's chunk view radius. The server owns the subscription set
     /// (which chunks stream in and when they unload); this only sizes it.
     ViewRadius { radius: u8 },
-    /// Player movement update (absolute voxel-space position + velocity).
-    Move { pos: [f32; 3], velocity: [f32; 3] },
-    /// Set a voxel at an absolute voxel position.
-    Edit { pos: [i32; 3], value: u8 },
+    /// Movement inputs (server authority: the server simulates the player via
+    /// `soils-sim`, so positions can't be forged). One frame per client fixed
+    /// tick; the last few frames are bundled for loss/ordering robustness on
+    /// future unreliable transports, deduped server-side by `seq`.
+    Inputs { frames: Vec<InputFrame> },
+    /// Set a voxel at an absolute voxel position. Applied optimistically
+    /// client-side; the server answers `EditAccepted`/`EditRejected` by `seq`
+    /// and the client rolls back on rejection.
+    Edit { seq: u32, pos: [i32; 3], value: u8 },
     /// Switch to a (server-created-on-demand) named world.
     Warp { world: String },
+}
+
+/// One fixed tick of movement input (see `soils_sim::pack_input`). `seq`
+/// increments per client tick — it doubles as the client tick counter.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct InputFrame {
+    pub seq: u32,
+    pub buttons: u8,
+    pub flags: u8,
+    pub yaw: u16,
 }
 
 /// Messages sent server → client.
@@ -60,6 +75,11 @@ pub enum ServerMsg {
     ChunkUnload { pos: [i32; 3] },
     /// A voxel edit made by another player (apply locally).
     Edit { pos: [i32; 3], value: u8 },
+    /// The server validated and applied the editor's own edit `seq`.
+    EditAccepted { seq: u32, pos: [i32; 3], value: u8 },
+    /// The server refused edit `seq` (reach, unknown block, rate, unloaded
+    /// chunk); the editor must roll its optimistic application back.
+    EditRejected { seq: u32 },
     /// Positions of nearby actors (other players).
     ActorUpdate { actors: Vec<ActorState> },
     /// An actor left view / disconnected.
@@ -69,9 +89,6 @@ pub enum ServerMsg {
     /// Confirms a `Warp`: the client should drop all chunks/actors, teleport to
     /// `spawn`, and re-stream the new world.
     Warp { spawn: [f32; 3], daytime: f32 },
-    /// Server-authoritative position correction (e.g. after an implausible
-    /// movement jump). The client should snap to `pos`.
-    Position { pos: [f32; 3] },
 }
 
 /// One chunk's data within a [`ServerMsg::Bundle`]. `payload` is a

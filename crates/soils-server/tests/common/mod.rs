@@ -9,7 +9,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use soils_protocol::{ChunkVolume, ClientMsg, InputFrame, ServerMsg, decode, decode_chunk, encode};
+use soils_protocol::{
+    ChunkVolume, ClientMsg, EntityState, InputFrame, ServerMsg, SnapshotTracker, decode,
+    decode_chunk, encode,
+};
 use soils_server::{ServerConfig, ServerHandle};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
@@ -95,6 +98,8 @@ pub struct Client {
     input_seq: u32,
     /// Edit sequence for `ClientMsg::Edit`.
     pub edit_seq: u32,
+    /// Snapshot decode state (baselines + latest tick, acked on `fly`).
+    pub tracker: SnapshotTracker,
 }
 
 impl Client {
@@ -102,7 +107,15 @@ impl Client {
     pub async fn connect(addr: SocketAddr) -> Self {
         let (ws, _) =
             tokio_tungstenite::connect_async(format!("ws://{addr}")).await.expect("connect");
-        Self { ws, id: 0, self_entity: 0, spawn: [0.0; 3], input_seq: 0, edit_seq: 0 }
+        Self {
+            ws,
+            id: 0,
+            self_entity: 0,
+            spawn: [0.0; 3],
+            input_seq: 0,
+            edit_seq: 0,
+            tracker: SnapshotTracker::default(),
+        }
     }
 
     /// Connect and log in as a guest, returning once `Init` arrives.
@@ -181,7 +194,7 @@ impl Client {
                     InputFrame { seq: self.input_seq, buttons, flags, yaw: yaw_q }
                 })
                 .collect();
-            self.send(&ClientMsg::Inputs { frames }).await;
+            self.send(&ClientMsg::Inputs { ack_tick: self.tracker.latest_tick, frames }).await;
             sent += batch;
             if sent < ticks {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -197,16 +210,40 @@ impl Client {
         seq
     }
 
+    /// Apply the next snapshot and return the entities it updated.
+    pub async fn next_snapshot(&mut self) -> Vec<EntityState> {
+        loop {
+            if let ServerMsg::Snapshot { tick, payload, .. } = self.next_msg().await
+                && let Some(updated) = self.tracker.apply(tick, &payload)
+            {
+                return updated;
+            }
+        }
+    }
+
     /// The next server-echoed position of this client's own player entity.
     pub async fn await_self_pos(&mut self) -> [f32; 3] {
         let net = self.self_entity;
-        self.recv_until(|msg| match msg {
-            ServerMsg::EntityUpdate { entities } => {
-                entities.into_iter().find(|s| s.id == net).map(|s| s.pos)
+        loop {
+            if let Some(s) = self.next_snapshot().await.into_iter().find(|s| s.id == net) {
+                return s.pos;
             }
-            _ => None,
-        })
-        .await
+        }
+    }
+
+    /// Wait until an entity's snapshot state satisfies `pred`; returns it.
+    pub async fn await_entity(
+        &mut self,
+        net: u32,
+        mut pred: impl FnMut(&EntityState) -> bool,
+    ) -> EntityState {
+        loop {
+            if let Some(s) =
+                self.next_snapshot().await.into_iter().find(|s| s.id == net && pred(s))
+            {
+                return s;
+            }
+        }
     }
 
     /// Wait for the server to push a specific chunk (the server owns the

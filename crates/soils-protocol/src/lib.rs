@@ -6,6 +6,7 @@ pub mod chunk_codec;
 pub mod coords;
 pub mod discovery;
 pub mod messages;
+pub mod snapshot;
 pub mod voxel;
 
 pub use chunk_codec::{decode_chunk, encode_chunk, payload_is_air};
@@ -15,6 +16,7 @@ pub use coords::{
 };
 pub use discovery::{DISCOVERY_PORT, PROBE_MAGIC, ServerInfo};
 pub use messages::{ChunkData, ClientMsg, EntityState, InputFrame, ServerMsg, decode, encode};
+pub use snapshot::{QuantState, SnapshotTracker, encode_snapshot};
 pub use voxel::{AIR, ChunkVolume, Voxel};
 
 #[cfg(test)]

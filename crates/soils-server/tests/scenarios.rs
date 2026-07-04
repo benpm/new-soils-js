@@ -36,16 +36,10 @@ async fn entities_move_by_inputs_and_despawn_on_disconnect() {
     .await;
 
     // A holds forward for 16 ticks facing -Z: the *server* integrates this to
-    // 16/64 s × 8 u/s = 2.0 units, and B observes exactly that.
+    // 16/64 s × 8 u/s = 2.0 units, and B observes exactly that through the
+    // delta-snapshot stream.
     a.fly(16, 0.0, false).await;
-    let moved = b
-        .recv_until(|msg| match msg {
-            ServerMsg::EntityUpdate { entities } => entities
-                .into_iter()
-                .find(|s| s.id == a_net && s.pos[2] < spawn[2] - 1.5),
-            _ => None,
-        })
-        .await;
+    let moved = b.await_entity(a_net, |s| s.pos[2] < spawn[2] - 1.5).await;
     assert!(
         (moved.pos[2] - (spawn[2] - 2.0)).abs() < 0.5
             && (moved.pos[0] - spawn[0]).abs() < 0.1
@@ -87,28 +81,40 @@ async fn critters_replicate_and_wander() {
     // They are simulated server-side: one of them measurably moves (they walk
     // and fall under gravity once their terrain is resident).
     let watch = *critters.iter().next().unwrap();
-    let first = a
-        .recv_until(|msg| match msg {
-            ServerMsg::EntityUpdate { entities } => {
-                entities.into_iter().find(|s| s.id == watch).map(|s| s.pos)
-            }
-            _ => None,
-        })
-        .await;
-    a.recv_until(|msg| match msg {
-        ServerMsg::EntityUpdate { entities } => entities
-            .into_iter()
-            .find(|s| {
-                s.id == watch
-                    && (s.pos[0] - first[0]).abs()
-                        + (s.pos[1] - first[1]).abs()
-                        + (s.pos[2] - first[2]).abs()
-                        > 0.5
-            })
-            .map(|_| ()),
-        _ => None,
+    let first = a.await_entity(watch, |_| true).await.pos;
+    a.await_entity(watch, |s| {
+        (s.pos[0] - first[0]).abs()
+            + (s.pos[1] - first[1]).abs()
+            + (s.pos[2] - first[2]).abs()
+            > 0.5
     })
     .await;
+}
+
+#[tokio::test]
+async fn snapshot_bandwidth_stays_in_budget() {
+    let server = TestServer::start_with("bandwidth", |cfg| cfg.critters = 3);
+    let mut a = Client::join(server.addr(), "alice").await;
+
+    // Let the join burst and first snapshots settle, then measure steady state
+    // (self + 3 wandering critters).
+    a.await_self_pos().await;
+    let (mut bytes, mut packets) = (0usize, 0u32);
+    while packets < 40 {
+        if let ServerMsg::Snapshot { tick, payload, .. } = a.next_msg().await {
+            bytes += payload.len();
+            packets += 1;
+            let _ = a.tracker.apply(tick, &payload);
+        }
+    }
+    let per_packet = bytes / packets as usize;
+    // Envelope (plan §4): a handful of moving entities ≈ tens of bytes per
+    // tick; the budget cap is 410. Assert with slack so wander variance never
+    // flakes, while still catching a fall-back-to-full-state regression.
+    assert!(
+        per_packet < 150,
+        "steady-state snapshots average {per_packet} B/tick — delta encoding regressed?"
+    );
 }
 
 #[tokio::test]
@@ -131,7 +137,7 @@ async fn input_flooding_cannot_speed_hack() {
             InputFrame { seq, buttons, flags, yaw }
         })
         .collect();
-    a.send(&ClientMsg::Inputs { frames }).await;
+    a.send(&ClientMsg::Inputs { ack_tick: 0, frames }).await;
 
     // A Time broadcast (1 Hz) guarantees the flood was processed ticks ago;
     // the next self-position echo is post-flood.

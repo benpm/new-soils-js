@@ -315,6 +315,7 @@ impl World {
     }
 
     /// Whether all resident chunks have been flooded (tests).
+    #[cfg(test)]
     pub fn light_settled(&self) -> bool {
         self.light_queue.is_empty()
     }
@@ -358,6 +359,8 @@ impl World {
     /// walkable cell within `radius` chunks of `center`, judged at sun level
     /// `sun` (0 = midnight, 1 = noon; effective light = max(block, sky·sun)).
     /// O(chunk summaries), no voxel scans beyond validating sampled cells.
+    /// The first gameplay consumer is the mob spawner (pathfinding phase).
+    #[allow(dead_code)]
     pub fn darkest_walkable_near(&self, center: IVec3, radius: i32, sun: f32) -> Option<IVec3> {
         let ccenter =
             IVec3::new(center.x >> CHUNK_BIT, center.y >> CHUNK_BIT, center.z >> CHUNK_BIT);

@@ -32,7 +32,7 @@ async fn main() {
             Some(ServerMsg::Init { .. }) => "Init",
             Some(ServerMsg::Time { .. }) => "Time",
             Some(ServerMsg::EntitySpawn { .. }) => "EntitySpawn",
-            Some(ServerMsg::EntityUpdate { .. }) => "EntityUpdate",
+            Some(ServerMsg::Snapshot { .. }) => "Snapshot",
             Some(ServerMsg::EntityDespawn { .. }) => "EntityDespawn",
             Some(ServerMsg::EditAccepted { .. }) => "EditAccepted",
             Some(ServerMsg::EditRejected { .. }) => "EditRejected",

@@ -37,8 +37,10 @@ pub enum ClientMsg {
     /// Movement inputs (server authority: the server simulates the player via
     /// `soils-sim`, so positions can't be forged). One frame per client fixed
     /// tick; the last few frames are bundled for loss/ordering robustness on
-    /// future unreliable transports, deduped server-side by `seq`.
-    Inputs { frames: Vec<InputFrame> },
+    /// future unreliable transports, deduped server-side by `seq`. `ack_tick`
+    /// piggybacks the snapshot ack: the highest snapshot tick applied — the
+    /// server may then use any state sent at or before it as a delta baseline.
+    Inputs { ack_tick: u32, frames: Vec<InputFrame> },
     /// Set a voxel at an absolute voxel position. Applied optimistically
     /// client-side; the server answers `EditAccepted`/`EditRejected` by `seq`
     /// and the client rolls back on rejection.
@@ -87,9 +89,11 @@ pub enum ServerMsg {
     EntitySpawn { id: u32, kind: u16, pos: [f32; 3] },
     /// An entity left interest (or despawned): drop it.
     EntityDespawn { id: u32 },
-    /// Full-state updates for entities in interest (delta snapshots land in
-    /// a later phase). Includes the receiver's own player entity.
-    EntityUpdate { entities: Vec<EntityState> },
+    /// Per-tick delta snapshot of entities in interest (see
+    /// [`snapshot`](crate::snapshot) for the payload codec). Includes the
+    /// receiver's own player entity; `last_input_seq` is the reconciliation
+    /// anchor for it (highest input the server had applied at `tick`).
+    Snapshot { tick: u32, last_input_seq: u32, payload: Vec<u8> },
     /// Current world time of day, 0.0..1.0.
     Time { daytime: f32 },
     /// Confirms a `Warp`: the client should drop all chunks/actors, teleport to

@@ -15,7 +15,7 @@ use std::collections::{HashSet, VecDeque};
 
 use bevy::prelude::*;
 use bevy::render::storage::ShaderStorageBuffer;
-use soils_protocol::{EntityState, ServerMsg};
+use soils_protocol::{EntityState, ServerMsg, SnapshotTracker};
 
 use crate::actor::{Actor, ActorAssets, ActorMap, LocalPlayer};
 use crate::chunk::{ChunkMap, VoxelChunk, WorldTime};
@@ -89,6 +89,12 @@ pub struct EntitySpawned {
 #[derive(Message)]
 pub struct EntitiesUpdated(pub Vec<EntityState>);
 
+/// Client-side snapshot state: per-entity quantized baselines (the shared
+/// `soils-protocol` decode path) plus the latest applied tick, echoed to the
+/// server as `ack_tick` on every `Inputs` send.
+#[derive(Resource, Default)]
+pub struct SnapTracker(pub SnapshotTracker);
+
 #[derive(Message)]
 pub struct EntityDespawned(pub u32);
 
@@ -127,6 +133,7 @@ pub struct NetStatus(pub String);
 pub fn register(app: &mut App) {
     app.init_resource::<WorldEpoch>()
         .init_resource::<ChunkApplyQueue>()
+        .init_resource::<SnapTracker>()
         .add_message::<ChunkStream>()
         .add_message::<EditReceived>()
         .add_message::<EntitySpawned>()
@@ -147,6 +154,7 @@ pub fn register(app: &mut App) {
 pub fn route_server_messages(
     net: Res<NetClient>,
     mut epoch: ResMut<WorldEpoch>,
+    mut tracker: ResMut<SnapTracker>,
     mut chunks: MessageWriter<ChunkStream>,
     mut edits: MessageWriter<EditReceived>,
     mut spawns: MessageWriter<EntitySpawned>,
@@ -201,6 +209,7 @@ pub fn route_server_messages(
             }
             ServerMsg::Warp { spawn, daytime } => {
                 epoch.0 += 1;
+                tracker.0.clear();
                 warps.write(WarpReceived { spawn, daytime });
             }
             ServerMsg::EditAccepted { seq, .. } => {
@@ -212,10 +221,14 @@ pub fn route_server_messages(
             ServerMsg::EntitySpawn { id, kind, pos } => {
                 spawns.write(EntitySpawned { id, kind, pos });
             }
-            ServerMsg::EntityUpdate { entities: states } => {
-                entities.write(EntitiesUpdated(states));
+            ServerMsg::Snapshot { tick, payload, .. } => {
+                // last_input_seq is the phase-11 reconciliation anchor.
+                if let Some(updated) = tracker.0.apply(tick, &payload) {
+                    entities.write(EntitiesUpdated(updated));
+                }
             }
             ServerMsg::EntityDespawn { id } => {
+                tracker.0.forget(id);
                 despawns.write(EntityDespawned(id));
             }
         }

@@ -28,7 +28,9 @@ use bevy_ecs::prelude::{
 };
 use bevy_time::{Fixed, Time, TimePlugin};
 use glam::{IVec2, IVec3, Vec3};
-use soils_protocol::{CHUNK_BIT, ChunkData, ClientMsg, ChunkVolume, EntityState, ServerMsg};
+use soils_protocol::{
+    CHUNK_BIT, ChunkData, ClientMsg, ChunkVolume, QuantState, ServerMsg, encode_snapshot,
+};
 use soils_sim::{KIND_CRITTER, KIND_PLAYER};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError};
 use tokio::sync::watch;
@@ -67,6 +69,11 @@ const FLUSH_SECS: f32 = 30.0;
 /// (flooding inputs would otherwise be a speed hack); the burst absorbs
 /// tick-alignment jitter and short stalls.
 const INPUT_BURST: f32 = 16.0;
+/// Per-client snapshot byte budget per tick (~8 KB/s at 20 Hz). Entities are
+/// packed in priority order; the starved catch up via the accumulator.
+const SNAPSHOT_BUDGET: usize = 410;
+/// Send-history entries kept per (client, entity) for delta baselines.
+const BASELINE_RING: usize = 64;
 /// Per-client edit rate cap (edits per second, bucketed like inputs).
 const EDIT_RATE: f32 = 32.0;
 
@@ -81,6 +88,14 @@ pub(crate) struct Client {
     /// NetIds currently replicated to this client (its interest set); diffed
     /// each replication pass into EntitySpawn/EntityDespawn.
     known: HashSet<u32>,
+    /// Highest snapshot tick the client has acked (piggybacked on `Inputs`).
+    ack_tick: u32,
+    /// Per-entity send history for delta baselines: (tick, state) pairs, the
+    /// newest entry at or below `ack_tick` is safe to delta against (the
+    /// transport is ordered, so an ack covers everything sent before it).
+    sent: HashMap<u32, VecDeque<(u32, QuantState)>>,
+    /// Priority accumulators (grow by base/distance², reset on send).
+    priority: HashMap<u32, f32>,
     /// Highest input `seq` applied (frames at or below it are duplicates from
     /// the loss-robustness bundling).
     last_seq: u32,
@@ -291,6 +306,9 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 entity: None,
                 self_net: 0,
                 known: HashSet::new(),
+                ack_tick: 0,
+                sent: HashMap::new(),
+                priority: HashMap::new(),
                 last_seq: 0,
                 input_tokens: INPUT_BURST,
                 edit_tokens: EDIT_RATE,
@@ -470,13 +488,14 @@ fn drain_inboxes(
                     let _ = c.outbox.send(ServerMsg::EditRejected { seq });
                 }
             }
-            ClientMsg::Inputs { frames } => {
+            ClientMsg::Inputs { ack_tick, frames } => {
                 // Server authority: the client sends *inputs*, the server
                 // integrates them through the shared sim at the client's fixed
                 // dt. Positions can't be forged, and the token bucket stops
                 // input flooding from becoming a speed hack. Frames at or
                 // below `last_seq` are duplicates from loss bundling.
                 let c = clients.0.get_mut(&id).unwrap();
+                c.ack_tick = c.ack_tick.max(ack_tick);
                 let Some(entity) = c.entity else { continue };
                 let Ok((mut sim, mut yaw, _)) = sims.get_mut(entity) else { continue };
                 let world = worlds.get_or_create(&c.world.clone());
@@ -746,26 +765,23 @@ fn wander_critters(
     }
 }
 
-/// Replicate entities a few times a second: per client, interest = entities in
-/// the same world within the subscription radius (by chunk column, plan §7);
-/// entering entities get EntitySpawn, leaving ones EntityDespawn, everything
-/// current a full-state EntityUpdate (delta snapshots are a later phase). The
-/// column buckets are rebuilt per pass — trivial at current entity counts;
-/// switch to incremental maintenance when they grow.
+/// Replicate entities (plan §4/§7): per client, interest = entities in the
+/// same world within the subscription radius by chunk column (buckets rebuilt
+/// per pass — trivial at current counts). The interest set diffs into
+/// EntitySpawn/EntityDespawn a few times a second; *state* goes out every
+/// tick as a delta snapshot: entities packed in priority order (base/dist²,
+/// accumulator reset on send) under a per-tick byte budget, encoded against
+/// the newest baseline the client has acked.
 fn replicate_entities(
     ticks: Res<TickCount>,
     mut clients: ResMut<Clients>,
     entities: Query<(&NetId, &Kind, &InWorld, &SimState, &Yaw)>,
 ) {
-    if !ticks.0.is_multiple_of(ACTOR_EVERY_N_TICKS) {
-        return;
-    }
     struct Snap {
         net: u32,
         kind: u16,
         pos: [f32; 3],
-        vel: [f32; 3],
-        yaw: u16,
+        quant: QuantState,
     }
     let mut by_col: HashMap<(&str, IVec2), Vec<Snap>> = HashMap::new();
     for (net, kind, in_world, sim, yaw) in &entities {
@@ -773,14 +789,16 @@ fn replicate_entities(
             (sim.0.pos.x.floor() as i32) >> CHUNK_BIT,
             (sim.0.pos.z.floor() as i32) >> CHUNK_BIT,
         );
+        let yaw_q = soils_sim::pack_yaw(yaw.0);
         by_col.entry((in_world.0.as_str(), col)).or_default().push(Snap {
             net: net.0,
             kind: kind.0,
             pos: sim.0.pos.to_array(),
-            vel: sim.0.vel.to_array(),
-            yaw: soils_sim::pack_yaw(yaw.0),
+            quant: QuantState::quantize(sim.0.pos.to_array(), sim.0.vel.to_array(), yaw_q),
         });
     }
+    let tick = ticks.0 as u32;
+    let diff_pass = ticks.0.is_multiple_of(ACTOR_EVERY_N_TICKS);
 
     for c in clients.0.values_mut() {
         if !c.authenticated {
@@ -797,27 +815,88 @@ fn replicate_entities(
                 }
             }
         }
-        let current: HashSet<u32> = interest.iter().map(|s| s.net).collect();
+
+        if diff_pass {
+            let current: HashSet<u32> = interest.iter().map(|s| s.net).collect();
+            for snap in &interest {
+                if !c.known.contains(&snap.net) {
+                    let _ = c.outbox.send(ServerMsg::EntitySpawn {
+                        id: snap.net,
+                        kind: snap.kind,
+                        pos: snap.pos,
+                    });
+                }
+            }
+            for &gone in c.known.difference(&current) {
+                let _ = c.outbox.send(ServerMsg::EntityDespawn { id: gone });
+                c.sent.remove(&gone);
+                c.priority.remove(&gone);
+            }
+            c.known = current;
+        }
+
+        // Accumulate priorities for everything in interest (players over
+        // critters, near over far; own entity is distance ~0 → always first).
+        let center_pos = (center * 32 + IVec3::splat(16)).as_vec3();
         for snap in &interest {
             if !c.known.contains(&snap.net) {
-                let _ = c.outbox.send(ServerMsg::EntitySpawn {
-                    id: snap.net,
-                    kind: snap.kind,
-                    pos: snap.pos,
-                });
+                continue; // spawns not announced yet (between diff passes)
             }
+            let base = if snap.kind == KIND_PLAYER { 2.0 } else { 1.0 };
+            let d2 = (Vec3::from_array(snap.pos) - center_pos).length_squared().max(1.0);
+            *c.priority.entry(snap.net).or_insert(0.0) += base * 1024.0 / d2;
         }
-        for &gone in c.known.difference(&current) {
-            let _ = c.outbox.send(ServerMsg::EntityDespawn { id: gone });
+
+        // Fill the packet in priority order until the byte budget. Costs are
+        // conservative estimates (FULL ≈ 20 B, delta ≈ 12 B); the encoder's
+        // real output is what ships.
+        let mut candidates: Vec<&Snap> =
+            interest.iter().copied().filter(|s| c.known.contains(&s.net)).collect();
+        candidates.sort_by(|a, b| {
+            let pa = c.priority.get(&a.net).copied().unwrap_or(0.0);
+            let pb = c.priority.get(&b.net).copied().unwrap_or(0.0);
+            pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal).then(a.net.cmp(&b.net))
+        });
+        let ack = c.ack_tick;
+        let mut picked: Vec<(u32, QuantState)> = Vec::new();
+        let mut cost = 0usize;
+        for snap in candidates {
+            let has_baseline = c
+                .sent
+                .get(&snap.net)
+                .is_some_and(|ring| ring.iter().any(|(t, _)| *t <= ack));
+            cost += if has_baseline { 12 } else { 20 };
+            if cost > SNAPSHOT_BUDGET && !picked.is_empty() {
+                break;
+            }
+            picked.push((snap.net, snap.quant));
         }
-        c.known = current;
-        if !interest.is_empty() {
-            let states = interest
-                .iter()
-                .map(|s| EntityState { id: s.net, pos: s.pos, velocity: s.vel, yaw: s.yaw })
-                .collect();
-            let _ = c.outbox.send(ServerMsg::EntityUpdate { entities: states });
+        if picked.is_empty() {
+            continue;
         }
+        picked.sort_by_key(|(id, _)| *id);
+
+        let sent = &mut c.sent;
+        let payload = encode_snapshot(&picked, |id| {
+            sent.get(&id)?.iter().rev().find(|(t, _)| *t <= ack).map(|(_, s)| *s)
+        });
+        for (id, state) in &picked {
+            let ring = sent.entry(*id).or_default();
+            ring.push_back((tick, *state));
+            if ring.len() > BASELINE_RING {
+                ring.pop_front();
+            }
+            // Baselines older than the newest acked one can never be used.
+            while ring.len() > 1 && ring[1].0 <= ack {
+                ring.pop_front();
+            }
+            c.priority.insert(*id, 0.0);
+        }
+        let _ = c.outbox.send(ServerMsg::Snapshot {
+            tick,
+            last_input_seq: c.last_seq,
+            payload,
+        });
     }
 }
 

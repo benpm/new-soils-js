@@ -125,6 +125,7 @@ pub fn send_input(
     net: Res<NetClient>,
     mut pending: ResMut<PendingInput>,
     mut ring: ResMut<InputRing>,
+    tracker: Res<crate::server_msg::SnapTracker>,
     query: Query<&Player>,
 ) {
     if query.single().is_err() {
@@ -139,7 +140,10 @@ pub fn send_input(
     if ring.frames.len() > 3 {
         ring.frames.remove(0);
     }
-    net.send(ClientMsg::Inputs { frames: ring.frames.clone() });
+    net.send(ClientMsg::Inputs {
+        ack_tick: tracker.0.latest_tick,
+        frames: ring.frames.clone(),
+    });
 }
 
 /// When set, the camera transform is under manual control (self-test framing)

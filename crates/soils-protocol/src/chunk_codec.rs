@@ -213,7 +213,7 @@ mod tests {
                         16 => 1,
                         _ => 0,
                     };
-                    v.set(x, y as i32, z, id);
+                    v.set(x, y, z, id);
                 }
             }
         }

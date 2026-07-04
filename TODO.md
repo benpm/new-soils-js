@@ -32,12 +32,16 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       path redone in phase 6). Gated by tests/{scenarios,streaming,embedded,discovery}.rs +
       examples/msgcount.rs; client A/B old-vs-new server: identical selftest results.
       (game-systems M2)
-- [ ] 6. **Chunk streaming v2** — server-driven subscribe/unload with hysteresis, palette+LZ4
-      encoding (~32 KB → 1–4 KB), server chunk refcount/evict, coalesced dirty-chunk saves +
-      region compaction. (game-systems M3, §5) NOTE: the client's chunk-apply budget is
-      count-based (8/frame, `CHUNK_APPLY_BUDGET`) and collapses when burst frames run long
-      (~60 chunks/s observed at ~8 fps → fresh-world fill takes >10 s regardless of server);
-      make it time-budgeted (or cheapen per-apply cost) as part of this phase.
+- [x] 6. **Chunk streaming v2** — palette+LZ4 chunk codec (`soils-protocol/chunk_codec.rs`,
+      join burst 23 MB → 498 KB measured, 2 MB regression gate + fuzzed panic-free decode);
+      server-driven subscribe/unload (`ViewRadius`/`ChunkUnload`, +1-chunk hysteresis,
+      deliveries filtered against the live sub set, data+unloads share one ordered stream
+      client-side; `ReqChunks` deleted); chunk refcount → 60 s zero-ref evict (save-if-dirty);
+      edits mark dirty with 30 s/evict/shutdown coalesced flushes (`shutdown_and_wait` for
+      tests); region compaction on world open past a 25% leak ratio. Client applies/floods/pad
+      uploads became wall-time-boxed (count budgets collapsed on slow frame clocks). New
+      scenarios: move-driven restream+unload, edit persistence across restart. (game-systems
+      M3, §5, §6, §8)
 - [ ] 7. **Server authority** — `InputMsg` replaces `Move`, server simulates players via
       `soils-sim`; edits validated server-side with seq/ack/rollback (fixes the unloaded-chunk
       edit desync). (game-systems M4, §6)

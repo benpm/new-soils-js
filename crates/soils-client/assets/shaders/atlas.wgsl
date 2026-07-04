@@ -4,7 +4,6 @@
 // buffer / Bevy Mesh attributes are used.
 
 #import bevy_pbr::{
-    mesh_functions,
     mesh_view_bindings::view,
     view_transformations::position_world_to_clip,
 }
@@ -28,6 +27,9 @@ struct AtlasParams {
     // pre-L0 look the GI demo uses).
     sky_term: f32,
     light_enabled: f32,
+    // World position of the chunk's (0,0,0) corner; replaces the per-instance
+    // mesh transform, which indirect draws can't index.
+    chunk_origin: vec3<f32>,
 };
 
 struct QuadGpu {
@@ -142,15 +144,13 @@ struct VertexOutput {
 const CORNERS = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
 
 @vertex
-fn vertex(
-    @builtin(instance_index) instance_index: u32,
-    @builtin(vertex_index) vertex_index: u32,
-) -> VertexOutput {
+fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     var out: VertexOutput;
     let q = vertex_index / 6u;
     let corner = CORNERS[vertex_index % 6u];
 
-    // Collapse surplus vertices (past the generated quad count) to a clipped point.
+    // Defense-in-depth: the indirect args already stop at count*6, and the
+    // finalize pass clamps count to MAX_QUADS.
     if (q >= min(qb.count, MAX_QUADS)) {
         out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         return out;
@@ -164,14 +164,10 @@ fn vertex(
 
     let normal = vec3<f32>(quad.nx, quad.ny, quad.nz);
 
-    let world_from_local = mesh_functions::get_world_from_local(instance_index);
-    let world_position = mesh_functions::mesh_position_local_to_world(
-        world_from_local,
-        vec4<f32>(p, 1.0),
-    );
-    out.clip_position = position_world_to_clip(world_position.xyz);
+    let world_position = params.chunk_origin + p;
+    out.clip_position = position_world_to_clip(world_position);
     out.local_position = p;
-    out.world_position = world_position.xyz;
+    out.world_position = world_position;
     out.normal = normal;
     out.tile = quad.tile;
     out.ao = quad.ao[corner];

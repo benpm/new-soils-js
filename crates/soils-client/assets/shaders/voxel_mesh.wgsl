@@ -22,9 +22,18 @@ struct QuadBuffer {
     quads: array<QuadGpu>,
 };
 
+// Matches wgpu's DrawIndirectArgs; consumed by the chunk's draw_indirect call.
+struct IndirectArgs {
+    vertex_count: u32,
+    instance_count: u32,
+    first_vertex: u32,
+    first_instance: u32,
+};
+
 @group(0) @binding(0) var<storage, read>       voxels: array<u32>;
 @group(0) @binding(1) var<storage, read_write> out_buf: QuadBuffer;
 @group(0) @binding(2) var<storage, read>       block_faces: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read_write> indirect: IndirectArgs;
 
 // Per-slice scratch (one thread per workgroup, so effectively private).
 var<workgroup> mask: array<i32, 1024>;
@@ -105,6 +114,19 @@ fn emit(base: array<i32, 3>, du: array<i32, 3>, dv: array<i32, 3>, norm: array<i
 @compute @workgroup_size(1)
 fn clear_counter() {
     atomicStore(&out_buf.count, 0u);
+}
+
+// Runs after mesh_slice (dispatches in one compute pass are ordered): clamps
+// the overflowed count and publishes the draw args, so the render pass draws
+// exactly count*6 vertices instead of a fixed worst-case dummy mesh.
+@compute @workgroup_size(1)
+fn finalize_mesh() {
+    let n = min(atomicLoad(&out_buf.count), MAX_QUADS);
+    atomicStore(&out_buf.count, n);
+    indirect.vertex_count = n * 6u;
+    indirect.instance_count = 1u;
+    indirect.first_vertex = 0u;
+    indirect.first_instance = 0u;
 }
 
 @compute @workgroup_size(1)

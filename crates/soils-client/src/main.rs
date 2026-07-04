@@ -15,6 +15,7 @@ mod gi;
 mod gi_demo;
 mod gpu_mesh;
 mod hud;
+mod indirect_draw;
 mod light;
 mod login;
 mod material;

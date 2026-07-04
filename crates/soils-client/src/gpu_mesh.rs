@@ -13,8 +13,9 @@ use bevy::render::render_graph::{self, RenderGraph, RenderLabel};
 use bevy::render::render_resource::binding_types::{
     storage_buffer_read_only_sized, storage_buffer_sized,
 };
+use bevy::render::batching::NoAutomaticBatching;
 use bevy::render::render_resource::{
-    BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
+    BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, BufferUsages,
     CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
     ShaderStages,
 };
@@ -34,8 +35,12 @@ pub const MAX_QUADS: u32 = 8192;
 const QUAD_BYTES: u64 = 80;
 /// Output buffer = 16-byte header + MAX_QUADS quads.
 const QUAD_BUFFER_BYTES: u64 = 16 + MAX_QUADS as u64 * QUAD_BYTES;
-/// Vertices the dummy mesh issues per chunk (6 per quad).
-const DUMMY_VERTS: usize = MAX_QUADS as usize * 6;
+/// Vertices in the shared placeholder mesh. Chunks draw via `draw_indirect`
+/// (see `indirect_draw.rs`), never through this mesh — it only keeps the entity
+/// a valid `Mesh3d` instance for visibility, extraction, and queueing.
+const DUMMY_VERTS: usize = 6;
+/// Bytes in a `DrawIndirectArgs` (4 x u32).
+const INDIRECT_BYTES: usize = 16;
 /// Frames a chunk stays dirty after a change (gives buffers time to upload and
 /// the compute to run; re-meshing is idempotent).
 const PENDING_FRAMES: u8 = 4;
@@ -65,6 +70,9 @@ pub struct GpuChunk {
     pub voxels: Handle<ShaderStorageBuffer>,
     pub quads: Handle<ShaderStorageBuffer>,
     pub light: Handle<ShaderStorageBuffer>,
+    /// `DrawIndirectArgs` the mesher's finalize pass fills (`count*6` verts);
+    /// the chunk's custom draw command feeds it to `draw_indirect`.
+    pub indirect: Handle<ShaderStorageBuffer>,
     pub pending: u8,
 }
 
@@ -73,6 +81,7 @@ pub struct GpuMeshPlugin;
 impl Plugin for GpuMeshPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MaterialPlugin::<ChunkMeshMaterial>::default())
+            .add_plugins(crate::indirect_draw::IndirectDrawPlugin)
             .add_plugins(ExtractComponentPlugin::<GpuChunk>::default())
             .add_plugins(ExtractResourcePlugin::<FacesTable>::default())
             .add_systems(Startup, setup_gpu_assets)
@@ -130,7 +139,7 @@ pub fn spawn_gpu_chunk(
     atlas: &AtlasAssets,
     cpos: IVec3,
     volume: ChunkVolume,
-    params: AtlasParams,
+    mut params: AtlasParams,
     gi_cascade0: Handle<ShaderStorageBuffer>,
 ) -> Entity {
     let voxels = buffers.add(ShaderStorageBuffer::new(volume.as_bytes(), RenderAssetUsages::default()));
@@ -138,6 +147,15 @@ pub fn spawn_gpu_chunk(
         buffers.add(ShaderStorageBuffer::with_size(QUAD_BUFFER_BYTES as usize, RenderAssetUsages::default()));
     // Starts dark; `light::process_light` fills it once the chunk is lit.
     let light = buffers.add(ShaderStorageBuffer::with_size(LIGHT_BYTES, RenderAssetUsages::default()));
+    // wgpu zero-initializes buffers, so the chunk draws 0 vertices until the
+    // mesher's finalize pass publishes the real count.
+    let mut ind = ShaderStorageBuffer::with_size(INDIRECT_BYTES, RenderAssetUsages::default());
+    ind.buffer_description.usage = BufferUsages::STORAGE | BufferUsages::INDIRECT;
+    let indirect = buffers.add(ind);
+    let origin = (cpos * CHUNK_SIZE).as_vec3();
+    // The vertex shader offsets quads by this instead of the mesh transform:
+    // indirect draws can't carry Bevy's per-instance mesh-uniform index.
+    params.chunk_origin = origin;
     let material = materials.add(ChunkMeshMaterial {
         quads: quads.clone(),
         atlas: atlas.texture.clone(),
@@ -145,11 +163,10 @@ pub fn spawn_gpu_chunk(
         gi_cascade0,
         light: light.clone(),
     });
-    let origin = (cpos * CHUNK_SIZE).as_vec3();
     commands
         .spawn((
             VoxelChunk { pos: cpos, volume, light: soils_sim::light::ChunkLight::dark() },
-            GpuChunk { voxels, quads, light, pending: PENDING_FRAMES },
+            GpuChunk { voxels, quads, light, indirect, pending: PENDING_FRAMES },
             Mesh3d(atlas.dummy_mesh.clone()),
             MeshMaterial3d(material),
             Transform::from_translation(origin),
@@ -159,6 +176,9 @@ pub fn spawn_gpu_chunk(
             // degenerate all-zero Aabb.
             Aabb::from_min_max(Vec3::ZERO, Vec3::splat(CHUNK_SIZE as f32)),
             NoAutoAabb,
+            // Each chunk is its own draw (unique material bind group anyway);
+            // keep it unbatched so the draw command sees the chunk entity.
+            NoAutomaticBatching,
         ))
         .id()
 }
@@ -183,6 +203,7 @@ struct VoxelMeshPipeline {
     layout: BindGroupLayoutDescriptor,
     clear: CachedComputePipelineId,
     mesh: CachedComputePipelineId,
+    finalize: CachedComputePipelineId,
 }
 
 #[derive(Resource, Default)]
@@ -204,6 +225,7 @@ fn init_pipeline(
                 storage_buffer_read_only_sized(false, None), // voxels
                 storage_buffer_sized(false, None),           // quads (read_write)
                 storage_buffer_read_only_sized(false, None), // block faces
+                storage_buffer_sized(false, None),           // indirect args (read_write)
             ),
         ),
     );
@@ -218,11 +240,18 @@ fn init_pipeline(
     let mesh = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("voxel_mesh".into()),
         layout: vec![layout.clone()],
-        shader,
+        shader: shader.clone(),
         entry_point: Some("mesh_slice".into()),
         ..default()
     });
-    commands.insert_resource(VoxelMeshPipeline { layout, clear, mesh });
+    let finalize = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("voxel_finalize".into()),
+        layout: vec![layout.clone()],
+        shader,
+        entry_point: Some("finalize_mesh".into()),
+        ..default()
+    });
+    commands.insert_resource(VoxelMeshPipeline { layout, clear, mesh, finalize });
     commands.insert_resource(VoxelMeshJobs::default());
 }
 
@@ -250,7 +279,9 @@ fn prepare_jobs(
         if gc.pending == 0 {
             continue;
         }
-        let (Some(vox), Some(quad)) = (buffers.get(&gc.voxels), buffers.get(&gc.quads)) else {
+        let (Some(vox), Some(quad), Some(ind)) =
+            (buffers.get(&gc.voxels), buffers.get(&gc.quads), buffers.get(&gc.indirect))
+        else {
             continue;
         };
         let bind_group = render_device.create_bind_group(
@@ -260,6 +291,7 @@ fn prepare_jobs(
                 vox.buffer.as_entire_buffer_binding(),
                 quad.buffer.as_entire_buffer_binding(),
                 faces_buf.buffer.as_entire_buffer_binding(),
+                ind.buffer.as_entire_buffer_binding(),
             )),
         );
         jobs.0.push(bind_group);
@@ -283,9 +315,10 @@ impl render_graph::Node for VoxelMeshNode {
         if jobs.0.is_empty() {
             return Ok(());
         }
-        let (Some(clear), Some(mesh)) = (
+        let (Some(clear), Some(mesh), Some(finalize)) = (
             pipeline_cache.get_compute_pipeline(pipeline.clear),
             pipeline_cache.get_compute_pipeline(pipeline.mesh),
+            pipeline_cache.get_compute_pipeline(pipeline.finalize),
         ) else {
             return Ok(());
         };
@@ -299,6 +332,8 @@ impl render_graph::Node for VoxelMeshNode {
             pass.dispatch_workgroups(1, 1, 1);
             pass.set_pipeline(mesh);
             pass.dispatch_workgroups(3, 33, 1);
+            pass.set_pipeline(finalize);
+            pass.dispatch_workgroups(1, 1, 1);
         }
         Ok(())
     }

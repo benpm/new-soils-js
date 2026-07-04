@@ -4,9 +4,10 @@
 
 use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey};
 use bevy::prelude::*;
-use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::mesh::{MeshVertexBufferLayoutRef, VertexBufferLayout};
 use bevy::render::render_resource::{
     AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
+    VertexStepMode,
 };
 use bevy::render::storage::ShaderStorageBuffer;
 use bevy::shader::ShaderRef;
@@ -50,6 +51,10 @@ pub struct AtlasParams {
     /// >0.5 shades from the baked L0 light grid; otherwise the flat
     /// `brightness` (the pre-L0 look; the GI demo uses this path).
     pub light_enabled: f32,
+    /// World position of the chunk's (0,0,0) corner. The vertex shader adds
+    /// this to quad positions instead of using Bevy's per-instance mesh
+    /// transform, which indirect draws can't index (set by `spawn_gpu_chunk`).
+    pub chunk_origin: Vec3,
 }
 
 impl Default for AtlasParams {
@@ -63,6 +68,7 @@ impl Default for AtlasParams {
             gi_enabled: 0.0,
             sky_term: TERRAIN_BRIGHTNESS,
             light_enabled: 1.0,
+            chunk_origin: Vec3::ZERO,
         }
     }
 }
@@ -100,17 +106,33 @@ impl Material for ChunkMeshMaterial {
         "shaders/atlas.wgsl".into()
     }
 
+    // Chunks are drawn only in the main opaque pass via draw_indirect (see
+    // indirect_draw.rs); the prepass/shadow passes would draw the placeholder
+    // mesh instead, so keep them off.
+    fn enable_prepass() -> bool {
+        false
+    }
+
+    fn enable_shadows() -> bool {
+        false
+    }
+
     fn specialize(
         _pipeline: &MaterialPipeline,
         descriptor: &mut RenderPipelineDescriptor,
-        layout: &MeshVertexBufferLayoutRef,
+        _layout: &MeshVertexBufferLayoutRef,
         _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
-        // The dummy mesh only carries POSITION (ignored by the vertex shader,
-        // which pulls from storage); declaring it keeps the bound vertex buffer
-        // slot valid.
-        let vertex_layout = layout.0.get_layout(&[Mesh::ATTRIBUTE_POSITION.at_shader_location(0)])?;
-        descriptor.vertex.buffers = vec![vertex_layout];
+        // The vertex shader pulls quads from storage and consumes no vertex
+        // attributes. Bevy's specialized-pipeline cache still keys on
+        // vertex.buffers[0] (it panics when empty), so declare a stride-0
+        // attribute-less layout: any vertex count is valid for it, whatever
+        // stub buffer the indirect draw binds at slot 0.
+        descriptor.vertex.buffers = vec![VertexBufferLayout {
+            array_stride: 0,
+            step_mode: VertexStepMode::Vertex,
+            attributes: vec![],
+        }];
         // The mesher's per-sign du/dv swap makes cross(du, dv) == face normal,
         // and the fixed corner order [0,1,2, 0,2,3] keeps both triangles CCW
         // viewed from outside (pinned by greedy.rs::winding_matches_normal and

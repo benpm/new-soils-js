@@ -9,6 +9,7 @@
 
 pub mod entities;
 pub mod light;
+pub mod nav;
 
 pub use entities::{
     ENTITIES_YAML, EntityDef, EntityRegistry, KIND_CRITTER, KIND_PLAYER, default_entity_registry,

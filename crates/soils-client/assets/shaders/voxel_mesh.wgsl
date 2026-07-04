@@ -1,9 +1,10 @@
 // GPU greedy voxel mesher (compute). Port of crates/soils-worldgen/src/greedy.rs.
 //
 // Dispatched as one workgroup per (axis d in 0..3, plane in 0..32) = (3, 33, 1)
-// workgroups of size 1. Each invocation runs the serial 32x32 signed-mask +
-// AO-aware greedy sweep for its slice and appends merged quads to a shared
-// output buffer via an atomic counter, reproducing the CPU output.
+// workgroups of 32 lanes. Lanes cooperate on the slice's mask and AO passes
+// (one 32-cell row each, barrier-separated); lane 0 then runs the serial
+// AO-aware greedy sweep and appends merged quads to a shared output buffer via
+// an atomic counter, reproducing the CPU output.
 
 const CHUNK: i32 = 32;
 const MAX_QUADS: u32 = 8192u;
@@ -35,7 +36,7 @@ struct IndirectArgs {
 @group(0) @binding(2) var<storage, read>       block_faces: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read_write> indirect: IndirectArgs;
 
-// Per-slice scratch (one thread per workgroup, so effectively private).
+// Per-slice scratch, filled cooperatively (one row per lane, see mesh_slice).
 var<workgroup> mask: array<i32, 1024>;
 var<workgroup> aokey: array<u32, 1024>; // 4 corner occlusion levels packed 8 bits each
 
@@ -129,12 +130,14 @@ fn finalize_mesh() {
     indirect.first_instance = 0u;
 }
 
-@compute @workgroup_size(1)
-fn mesh_slice(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let d = i32(gid.x);
-    if (d > 2) { return; }
-    let plane = i32(gid.y); // 0..32 inclusive
-    if (plane > CHUNK) { return; }
+@compute @workgroup_size(32)
+fn mesh_slice(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let d = i32(wg.x);
+    let plane = i32(wg.y); // 0..32 inclusive
+    let lane = i32(lid.x); // this lane's mask row (jv)
     let xd = plane - 1; // CPU iterates x[d] from -1..31, then increments to `plane`
     let u = (d + 1) % 3;
     let v = (d + 2) % 3;
@@ -146,9 +149,10 @@ fn mesh_slice(@builtin(global_invocation_id) gid: vec3<u32>) {
         vec2<i32>(-1, 0), vec2<i32>(-1, -1), vec2<i32>(0, -1), vec2<i32>(0, 0),
     );
 
-    // --- Build the signed mask for this slice. ---
-    var n = 0;
-    for (var jv = 0; jv < CHUNK; jv = jv + 1) {
+    // --- Build the signed mask for this slice: one row per lane. ---
+    {
+        let jv = lane;
+        var n = jv * CHUNK;
         for (var iu = 0; iu < CHUNK; iu = iu + 1) {
             var xa = array<i32, 3>(0, 0, 0);
             xa[d] = xd; xa[u] = iu; xa[v] = jv;
@@ -166,10 +170,13 @@ fn mesh_slice(@builtin(global_invocation_id) gid: vec3<u32>) {
             n = n + 1;
         }
     }
+    workgroupBarrier();
 
-    // --- Per-cell ambient occlusion (4 corner levels packed into aokey). ---
-    n = 0;
-    for (var jv = 0; jv < CHUNK; jv = jv + 1) {
+    // --- Per-cell ambient occlusion (4 corner levels packed into aokey), the
+    // hot pass (12 solid() probes per face cell): one row per lane. ---
+    {
+        let jv = lane;
+        var n = jv * CHUNK;
         for (var iu = 0; iu < CHUNK; iu = iu + 1) {
             let c = mask[n];
             if (c != 0) {
@@ -202,8 +209,11 @@ fn mesh_slice(@builtin(global_invocation_id) gid: vec3<u32>) {
             n = n + 1;
         }
     }
+    workgroupBarrier();
 
-    // --- Greedy merge + emit (AO-aware). ---
+    // --- Greedy merge + emit (AO-aware): serial scan, lane 0 only (the merge
+    // is an inherently sequential sweep; the passes above are the hot part). ---
+    if (lane != 0) { return; }
     var j = 0;
     loop {
         if (j >= CHUNK) { break; }

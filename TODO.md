@@ -51,9 +51,15 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       block id, residency) → EditAccepted/EditRejected; client keeps optimistic apply with
       rollback via pending list. Deferred: per-chunk edit aggregation per tick. (game-systems
       M4, §6)
-- [ ] 8. **Entity model** — `NetId`, `entities.yaml` registry, spawn/despawn replication,
-      interest management via chunk-column buckets; decision point: hand-rolled vs
-      `bevy_replicon`. (game-systems M5, §2, §7)
+- [x] 8. **Entity model** — `NetId(u32)`, compile-time `entities.yaml` → `EntityRegistry`
+      (soils-sim, kinds: Player/Critter), server entities are real ECS entities
+      (Kind/SimState/Yaw/InWorld/PlayerControlled); actor protocol replaced by
+      EntitySpawn/EntityDespawn/EntityUpdate diffed per client from chunk-column interest
+      buckets at the subscription radius. Decision point resolved: hand-rolled (replicon
+      would supplant the M2 transport/message stack; revisit at M6 if delta plumbing balloons).
+      `ServerConfig::critters` seeds deterministic wander-AI test critters (frozen off resident
+      terrain). Scenarios: spawn/kind, integrated movement, despawn on disconnect/warp,
+      critter wander; selftest framed a wandering critter. (game-systems M5, §2, §7)
 - [ ] 9. **Server-side lighting queries** — server runs the shared L0 flood + per-chunk darkness
       summaries (dark-cell counts, reservoir samples, column heightmap); spawn-query API for
       "darkest walkable spot near player". Nothing per-voxel on the wire. (rendering §3)

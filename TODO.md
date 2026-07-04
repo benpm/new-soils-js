@@ -115,5 +115,19 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       budgeted repaths are staggered and fine at current critter counts) and a flow-field
       consumer (the named one is the mob spawner, which doesn't exist yet;
       `darkest_walkable_near` and `flow_field` are both ready for it). (game-systems §10)
-- [ ] 14. **Transport upgrade** — WebTransport/QUIC datagrams (or UDP) behind the transport
-      trait; snapshot channel goes truly unreliable/sequenced. (game-systems §3, M8)
+- [x] 14. **Transport upgrade** — two-lane semantics first: snapshots moved to a latest-wins
+      lane (backed-up links replace unsent snapshots, never queue them — correct because
+      deltas encode against *acked* baselines). Then a WebTransport/QUIC endpoint (wtransport)
+      on UDP at the game port, producing the same app-side connection shape as a websocket:
+      reliable ordered lane = one client-opened bi stream of length-framed bincode (login,
+      chunks, edits, control; decode-bomb frame caps both sides), unreliable lane = real QUIC
+      datagrams for snapshots (server→client) and inputs (client→server; loss-tolerant since
+      every `Inputs` bundles the last 3 frames). Client picks the transport by URL scheme
+      (`wt://` vs `ws://`, bare addresses via `SOILS_WT=1`); TLS is a per-boot self-signed
+      identity with client verification skipped (LAN-play trust, same as `ws://`; the
+      cert-hash pinning path exists for a future wasm client). Gated by a WT scenario driving
+      login → datagram inputs → datagram snapshots → server-integrated movement, the whole
+      WS suite unchanged, and a full fresh-world selftest over `SOILS_WT=1` (729 chunks, 62
+      fps steady, pixel-consistent with the WS reference shots). Deferred: WS remains the
+      default while WT soaks; no formal transport trait (the two-lane `NewConn` shape *is*
+      the seam — a third backend implements the same two channels). (game-systems §3, M8)

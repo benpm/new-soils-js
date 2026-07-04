@@ -355,7 +355,7 @@ fn selftest_login(net: Res<NetClient>) {
         return; // demo builds a local scene; no server/login
     }
     if std::env::var("SOILS_SELFTEST").is_ok() && std::env::var("SOILS_LOGINSHOT").is_err() {
-        net.connect("ws://127.0.0.1:9001".into());
+        net.connect(format!("{}://127.0.0.1:9001", net::default_scheme()));
         net.send(ClientMsg::Login { name: "player".into(), password: String::new(), signup: true });
     }
 }

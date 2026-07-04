@@ -256,7 +256,7 @@ pub fn login_buttons(
             LoginButton::Singleplayer => match sp.ensure_started() {
                 Ok(port) => {
                     login.status = "starting single-player…".into();
-                    net.connect(format!("ws://127.0.0.1:{port}"));
+                    net.connect(format!("{}://127.0.0.1:{port}", crate::net::default_scheme()));
                     net.send(ClientMsg::Login {
                         name: singleplayer::LOCAL_NAME.into(),
                         password: String::new(),
@@ -284,8 +284,13 @@ fn submit(login: &mut LoginState, net: &NetClient, signup: bool) {
         login.status = "enter a username".into();
         return;
     }
-    // Accept a bare `host:port` (the common case) or a full `ws://…` URL.
-    let url = if addr.contains("://") { addr.to_string() } else { format!("ws://{addr}") };
+    // Accept a bare `host:port` (the common case) or a full `ws://…`/`wt://…`
+    // URL; bare addresses use the SOILS_WT-selected default transport.
+    let url = if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("{}://{addr}", crate::net::default_scheme())
+    };
     login.status = "connecting…".into();
     net.connect(url);
     net.send(ClientMsg::Login {

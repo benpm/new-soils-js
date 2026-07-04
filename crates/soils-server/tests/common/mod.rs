@@ -14,20 +14,32 @@ use soils_server::{ServerConfig, ServerHandle};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
-/// An embedded server on an ephemeral loopback port with its own scratch data
-/// dir. Dropped: shut down and the dir removed (best-effort — the background
-/// persister may still be flushing).
+/// An embedded server on an ephemeral loopback port. Dropping it shuts the
+/// server down *synchronously* (edits flushed to disk) and removes the data
+/// dir if this instance owns it.
 pub struct TestServer {
     pub handle: ServerHandle,
     pub data_dir: PathBuf,
+    /// Whether `Drop` deletes `data_dir` (false for [`start_at`]
+    /// (Self::start_at), whose caller manages the dir across restarts).
+    owns_dir: bool,
 }
 
 impl TestServer {
-    /// `tag` keeps parallel tests in the same binary from sharing a data dir.
+    /// Fresh scratch data dir. `tag` keeps parallel tests in the same binary
+    /// from sharing one.
     pub fn start(tag: &str) -> Self {
         let data_dir =
             std::env::temp_dir().join(format!("soils-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
+        let mut server = Self::start_at(data_dir, tag);
+        server.owns_dir = true;
+        server
+    }
+
+    /// Open (or reuse) an explicit data dir — for restart/persistence
+    /// scenarios. The caller owns the dir's lifetime.
+    pub fn start_at(data_dir: PathBuf, tag: &str) -> Self {
         let handle = soils_server::spawn(ServerConfig {
             bind: "127.0.0.1:0".into(),
             data_dir: data_dir.clone(),
@@ -36,7 +48,7 @@ impl TestServer {
             ..ServerConfig::default()
         })
         .expect("spawn embedded server");
-        Self { handle, data_dir }
+        Self { handle, data_dir, owns_dir: false }
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -46,8 +58,12 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        self.handle.shutdown();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
+        // Synchronous: on return the dirty flush + writer drain are complete,
+        // so restart scenarios can reopen the dir immediately.
+        self.handle.shutdown_and_wait();
+        if self.owns_dir {
+            let _ = std::fs::remove_dir_all(&self.data_dir);
+        }
     }
 }
 
@@ -121,9 +137,10 @@ impl Client {
         }
     }
 
-    /// Request a single chunk and wait for it (`Bundle` or `Chunk`), decoded.
-    pub async fn req_chunk(&mut self, pos: [i32; 3]) -> ChunkVolume {
-        self.send(&ClientMsg::ReqChunks { positions: vec![pos] }).await;
+    /// Wait for the server to push a specific chunk (the server owns the
+    /// subscription — chunks stream in after login/moves without a request).
+    /// Returns it decoded.
+    pub async fn await_chunk(&mut self, pos: [i32; 3]) -> ChunkVolume {
         let payload = self
             .recv_until(|msg| match msg {
                 ServerMsg::Bundle { chunks } => {
@@ -136,22 +153,24 @@ impl Client {
         decode_chunk(&payload).expect("chunk payload decodes")
     }
 
-    /// Request `positions` in one message and drain bundles until every one has
-    /// arrived. Returns raw payloads keyed by position (byte-comparable).
+    /// Drain pushed chunks until every position in `positions` has arrived.
+    /// Returns raw payloads keyed by position (byte-comparable).
     pub async fn collect_chunks(
         &mut self,
         positions: &[[i32; 3]],
     ) -> std::collections::HashMap<[i32; 3], Vec<u8>> {
-        self.send(&ClientMsg::ReqChunks { positions: positions.to_vec() }).await;
+        let want: std::collections::HashSet<[i32; 3]> = positions.iter().copied().collect();
         let mut got = std::collections::HashMap::new();
-        while got.len() < positions.len() {
+        while got.len() < want.len() {
             match self.next_msg().await {
                 ServerMsg::Bundle { chunks } => {
                     for c in chunks {
-                        got.insert(c.pos, c.payload);
+                        if want.contains(&c.pos) {
+                            got.insert(c.pos, c.payload);
+                        }
                     }
                 }
-                ServerMsg::Chunk { pos, payload } => {
+                ServerMsg::Chunk { pos, payload } if want.contains(&pos) => {
                     got.insert(pos, payload);
                 }
                 _ => {}

@@ -103,6 +103,8 @@ pub struct ServerHandle {
     shutdown: watch::Sender<bool>,
     discovery: watch::Sender<bool>,
     discovery_port: watch::Receiver<Option<u16>>,
+    /// The embedded server thread, joinable for a synchronous shutdown.
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ServerHandle {
@@ -137,6 +139,16 @@ impl ServerHandle {
     /// (flushing queued chunk writes on the way down).
     pub fn shutdown(&self) {
         let _ = self.shutdown.send(true);
+    }
+
+    /// [`shutdown`](Self::shutdown), then block until the server thread has
+    /// fully exited — including the dirty-chunk flush and the persistence
+    /// writer drain — so on return every edit is on disk.
+    pub fn shutdown_and_wait(&self) {
+        self.shutdown();
+        if let Some(thread) = self.thread.lock().unwrap().take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -182,7 +194,7 @@ pub fn spawn(config: ServerConfig) -> std::io::Result<ServerHandle> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (discovery_tx, discovery_rx) = watch::channel(config.enable_discovery);
     let (discovery_port_tx, discovery_port_rx) = watch::channel(None);
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("soils-embedded-server".into())
         .spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -225,6 +237,7 @@ pub fn spawn(config: ServerConfig) -> std::io::Result<ServerHandle> {
         shutdown: shutdown_tx,
         discovery: discovery_tx,
         discovery_port: discovery_port_rx,
+        thread: std::sync::Mutex::new(Some(thread)),
     })
 }
 

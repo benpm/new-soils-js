@@ -157,7 +157,7 @@ fn main() {
     .add_systems(
         Update,
         (
-            player::request_chunks,
+            player::track_streaming,
             player::cursor_toggle,
             edit::selection_highlight,
             actor::send_move,

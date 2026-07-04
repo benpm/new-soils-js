@@ -1,6 +1,6 @@
-//! End-to-end smoke test against a running server: signs up / logs in, requests
-//! the chunks around spawn, verifies real terrain, then warps to another world
-//! and checks it streams a different (still solid) world.
+//! End-to-end smoke test against a running server: signs up / logs in, waits
+//! for the pushed chunks around spawn, verifies real terrain, then warps to
+//! another world and checks it streams a different (still solid) world.
 //!
 //! Run the server first (`cargo run -p soils-server`), then:
 //!   cargo run -p soils-server --example smoke
@@ -19,41 +19,42 @@ async fn send(tx: &mut Tx, msg: ClientMsg) {
     tx.send(Message::Binary(encode(&msg).into())).await.unwrap();
 }
 
-/// Request the 3x3x3 cube of chunks around a spawn and count solid voxels,
-/// accepting both `Bundle` and single `Chunk` responses.
-async fn stream_around(tx: &mut Tx, rx: &mut Rx, spawn: [f32; 3]) -> (usize, usize) {
+/// Wait for the server-pushed 3x3x3 cube of chunks around a spawn and count
+/// solid voxels (the subscription streams on its own — no request).
+async fn stream_around(_tx: &mut Tx, rx: &mut Rx, spawn: [f32; 3]) -> (usize, usize) {
     let sc = [
         (spawn[0] as i32) >> CHUNK_BIT,
         (spawn[1] as i32) >> CHUNK_BIT,
         (spawn[2] as i32) >> CHUNK_BIT,
     ];
-    let mut positions = Vec::new();
+    let mut want = std::collections::HashSet::new();
     for dx in -1..=1 {
         for dy in -1..=1 {
             for dz in -1..=1 {
-                positions.push([sc[0] + dx, sc[1] + dy, sc[2] + dz]);
+                want.insert([sc[0] + dx, sc[1] + dy, sc[2] + dz]);
             }
         }
     }
-    let want = positions.len();
-    send(tx, ClientMsg::ReqChunks { positions }).await;
 
     let mut received = 0;
     let mut solid = 0usize;
-    while received < want {
+    let mut count = |c: soils_protocol::ChunkData, want: &mut std::collections::HashSet<_>| {
+        if want.remove(&c.pos) {
+            received += 1;
+            let vol = soils_protocol::decode_chunk(&c.payload).expect("payload decodes");
+            solid += vol.as_bytes().iter().filter(|&&v| v != 0).count();
+        }
+    };
+    while !want.is_empty() {
         let Some(Ok(Message::Binary(b))) = rx.next().await else { break };
         match decode(b.as_ref()) {
             Some(ServerMsg::Bundle { chunks }) => {
                 for c in chunks {
-                    received += 1;
-                    let vol = soils_protocol::decode_chunk(&c.payload).expect("payload decodes");
-                    solid += vol.as_bytes().iter().filter(|&&v| v != 0).count();
+                    count(c, &mut want);
                 }
             }
-            Some(ServerMsg::Chunk { payload, .. }) => {
-                received += 1;
-                let vol = soils_protocol::decode_chunk(&payload).expect("payload decodes");
-                solid += vol.as_bytes().iter().filter(|&&v| v != 0).count();
+            Some(ServerMsg::Chunk { pos, payload }) => {
+                count(soils_protocol::ChunkData { pos, payload }, &mut want);
             }
             _ => {} // ignore Time / ActorUpdate while streaming
         }

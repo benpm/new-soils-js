@@ -50,7 +50,7 @@ async fn edits_replicate_to_peers_without_echo() {
     let mut b = Client::join(server.addr(), "bob").await;
 
     // Load the target chunk server-side (edits to unloaded chunks are dropped).
-    let vol = a.req_chunk(DEEP_CHUNK).await;
+    let vol = a.await_chunk(DEEP_CHUNK).await;
     assert!(!vol.is_empty(), "deep chunk should be solid");
 
     // A's edit reaches B.
@@ -126,7 +126,7 @@ async fn warp_isolates_edits_and_actors_by_world() {
     // C stays in "default" as the observer that confirms broadcasts fired.
     let mut c = Client::join(server.addr(), "carol").await;
 
-    a.req_chunk(DEEP_CHUNK).await;
+    a.await_chunk(DEEP_CHUNK).await;
 
     // B warps away; same-world clients are told B's actor left.
     b.send(&ClientMsg::Warp { world: "elsewhere".into() }).await;
@@ -193,9 +193,9 @@ async fn concurrent_requests_serve_identical_chunks() {
     let mut a = Client::join(server.addr(), "alice").await;
     let mut b = Client::join(server.addr(), "bob").await;
 
-    // Both clients request the same fresh region at once. Generation runs
-    // outside the world lock (phase 4), so the adoption guard must dedupe:
-    // both clients get byte-identical chunks for every position.
+    // Both clients' join bursts race over the same fresh region. Generation
+    // runs off the tick, so the adoption guard must dedupe: both clients get
+    // byte-identical chunks for every position.
     let wave: Vec<[i32; 3]> =
         (4..8).flat_map(|x| (6..9).map(move |y| [x, y, 8])).collect();
     let (got_a, got_b) =
@@ -207,4 +207,72 @@ async fn concurrent_requests_serve_identical_chunks() {
             "chunk {pos:?} differs between concurrent clients"
         );
     }
+}
+
+#[tokio::test]
+async fn moving_restreams_ahead_and_unloads_behind() {
+    let server = TestServer::start("subs");
+    let mut a = Client::join(server.addr(), "alice").await;
+
+    // Let part of the join burst land, then march east well past the
+    // hysteresis margin (each step stays under the anti-teleport MAX_STEP).
+    a.await_chunk([8, 8, 8]).await;
+    for i in 1..=8 {
+        let pos = [282.0 + 60.0 * i as f32, 285.0, 268.0];
+        a.send(&ClientMsg::Move { pos, velocity: [0.0; 3] }).await;
+    }
+
+    // 480 voxels east = 15 chunks: the spawn-side column (x <= 8) is far
+    // outside radius+1 of the new center, so it must unload...
+    a.recv_until(|msg| match msg {
+        ServerMsg::ChunkUnload { pos } if pos[0] <= 8 => Some(()),
+        _ => None,
+    })
+    .await;
+    // ...and terrain around the destination (x = 282+480 >> 5 = 23) streams
+    // in without any client request.
+    a.recv_until(|msg| match msg {
+        ServerMsg::Bundle { chunks } if chunks.iter().any(|c| c.pos[0] >= 22) => Some(()),
+        ServerMsg::Chunk { pos, .. } if pos[0] >= 22 => Some(()),
+        _ => None,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn edits_survive_server_restart_via_dirty_flush() {
+    let dir =
+        std::env::temp_dir().join(format!("soils-test-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Session 1: edit a voxel, then shut down. Edits only mark chunks dirty
+    // (no per-edit persistence); the shutdown flush must save them.
+    {
+        let server = TestServer::start_at(dir.clone(), "restart");
+        let mut a = Client::join(server.addr(), "alice").await;
+        a.await_chunk(DEEP_CHUNK).await;
+        a.send(&ClientMsg::Edit { pos: DEEP_VOXEL, value: 5 }).await;
+        // Round-trip: our own edit isn't echoed, so use a second client's edit
+        // as the fence that the server processed ours.
+        let mut b = Client::join(server.addr(), "bob").await;
+        b.send(&ClientMsg::Edit {
+            pos: [DEEP_VOXEL[0] + 1, DEEP_VOXEL[1], DEEP_VOXEL[2]],
+            value: 6,
+        })
+        .await;
+        a.recv_until(|msg| match msg {
+            ServerMsg::Edit { value: 6, .. } => Some(()),
+            _ => None,
+        })
+        .await;
+        // TestServer::drop shuts down and waits for the flush.
+    }
+
+    // Session 2: a fresh server on the same data dir must serve the edit.
+    let server = TestServer::start_at(dir.clone(), "restart2");
+    let mut c = Client::join(server.addr(), "carol").await;
+    let vol = c.await_chunk(DEEP_CHUNK).await;
+    assert_eq!(vol.get(0, 0, 0), 5, "edit lost across restart");
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
 }

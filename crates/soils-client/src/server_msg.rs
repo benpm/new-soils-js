@@ -34,12 +34,22 @@ use crate::player::{self, Player, Streaming};
 #[derive(Resource, Default)]
 pub struct WorldEpoch(pub u32);
 
-#[derive(Message, Clone)]
+#[derive(Clone)]
 pub struct ChunkReceived {
     pub pos: [i32; 3],
     /// `chunk_codec` payload (palette + LZ4), decoded at apply time.
     pub payload: Vec<u8>,
     pub epoch: u32,
+}
+
+/// The ordered chunk stream from the server. Data and unloads share one
+/// message type (and one apply queue) because their *relative order* is the
+/// contract: a chunk that leaves and re-enters the subscription arrives as
+/// `Unload` then `Data`, and applying them out of order would drop the chunk.
+#[derive(Message, Clone)]
+pub enum ChunkStream {
+    Data(ChunkReceived),
+    Unload { pos: [i32; 3], epoch: u32 },
 }
 
 /// Hard cap on chunks turned into GPU resources per frame. A fresh world
@@ -53,13 +63,12 @@ const CHUNK_APPLY_MAX: usize = 32;
 /// apply more, slow frames back off but always make progress.
 const CHUNK_APPLY_MS: f32 = 3.0;
 
-/// Chunks that have arrived but not yet been meshed, drained at
-/// [`CHUNK_APPLY_BUDGET`] per frame by [`apply_chunks`]. `queued` mirrors the
-/// queue's positions so [`player::request_chunks`] doesn't re-request a chunk
-/// that's already in flight.
+/// The ordered chunk stream awaiting application, drained under a time budget
+/// by [`apply_chunks`]. `queued` mirrors the positions of queued *data*
+/// entries so [`player::track_streaming`] can estimate outstanding work.
 #[derive(Resource, Default)]
 pub struct ChunkApplyQueue {
-    pub queue: VecDeque<ChunkReceived>,
+    pub queue: VecDeque<ChunkStream>,
     pub queued: HashSet<IVec3>,
 }
 
@@ -106,7 +115,7 @@ pub struct NetStatus(pub String);
 pub fn register(app: &mut App) {
     app.init_resource::<WorldEpoch>()
         .init_resource::<ChunkApplyQueue>()
-        .add_message::<ChunkReceived>()
+        .add_message::<ChunkStream>()
         .add_message::<EditReceived>()
         .add_message::<ActorsUpdated>()
         .add_message::<ActorRemoved>()
@@ -125,7 +134,7 @@ pub fn register(app: &mut App) {
 pub fn route_server_messages(
     net: Res<NetClient>,
     mut epoch: ResMut<WorldEpoch>,
-    mut chunks: MessageWriter<ChunkReceived>,
+    mut chunks: MessageWriter<ChunkStream>,
     mut edits: MessageWriter<EditReceived>,
     mut actors: MessageWriter<ActorsUpdated>,
     mut removes: MessageWriter<ActorRemoved>,
@@ -156,12 +165,19 @@ pub fn route_server_messages(
                 login_fails.write(LoginFailed(message));
             }
             ServerMsg::Chunk { pos, payload } => {
-                chunks.write(ChunkReceived { pos, payload, epoch: epoch.0 });
+                chunks.write(ChunkStream::Data(ChunkReceived { pos, payload, epoch: epoch.0 }));
             }
             ServerMsg::Bundle { chunks: datas } => {
                 for d in datas {
-                    chunks.write(ChunkReceived { pos: d.pos, payload: d.payload, epoch: epoch.0 });
+                    chunks.write(ChunkStream::Data(ChunkReceived {
+                        pos: d.pos,
+                        payload: d.payload,
+                        epoch: epoch.0,
+                    }));
                 }
+            }
+            ServerMsg::ChunkUnload { pos } => {
+                chunks.write(ChunkStream::Unload { pos, epoch: epoch.0 });
             }
             ServerMsg::Edit { pos, value } => {
                 edits.write(EditReceived { pos, value, epoch: epoch.0 });
@@ -193,12 +209,16 @@ pub fn apply_init(
     mut local: ResMut<LocalPlayer>,
     mut world_time: ResMut<WorldTime>,
     mut login: ResMut<LoginState>,
+    mut streaming: ResMut<Streaming>,
     mut query: Query<(&mut Player, &mut Transform)>,
 ) {
     for msg in reader.read() {
         local.id = msg.id;
         world_time.daytime = msg.daytime;
         login.done = true; // authenticated — drop the login screen
+        // A (re)login may be a fresh connection whose server-side radius reset
+        // to the default; re-send ours (idempotent on the same connection).
+        streaming.sent_radius = None;
         if let Ok((mut player, mut transform)) = query.single_mut() {
             player::teleport(&mut player, &mut transform, Vec3::from_array(msg.spawn));
         }
@@ -237,8 +257,7 @@ pub fn apply_warp(
         for (_, entity) in actor_map.map.drain() {
             commands.entity(entity).despawn();
         }
-        light_queue.chunks.clear();
-        light_queue.edits.clear();
+        light_queue.clear();
         world_time.daytime = msg.daytime;
         if let Ok((mut player, mut transform)) = query.single_mut() {
             player::teleport(&mut player, &mut transform, Vec3::from_array(msg.spawn));
@@ -274,7 +293,7 @@ pub fn apply_time(mut reader: MessageReader<TimeReceived>, mut world_time: ResMu
 /// (meshed or empty-tracked) chunk entity.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_chunks(
-    mut reader: MessageReader<ChunkReceived>,
+    mut reader: MessageReader<ChunkStream>,
     epoch: Res<WorldEpoch>,
     mut commands: Commands,
     mut map: ResMut<ChunkMap>,
@@ -292,14 +311,20 @@ pub fn apply_chunks(
 ) {
     // (A) Move this frame's arrivals into the persistent queue. Bevy messages are
     // double-buffered and dropped after ~2 frames, so we must capture them now
-    // even though only a few are applied per frame. Stale chunks (a world we've
-    // since warped out of) are dropped here, cheaply.
+    // even though only a few are applied per frame. Stale entries (a world we've
+    // since warped out of) are dropped here, cheaply. Data and unloads stay in
+    // one queue: their relative order is part of the protocol.
     for msg in reader.read() {
-        if msg.epoch != epoch.0 {
-            continue;
+        match msg {
+            ChunkStream::Data(d) if d.epoch == epoch.0 => {
+                queue.queued.insert(IVec3::from_array(d.pos));
+                queue.queue.push_back(msg.clone());
+            }
+            ChunkStream::Unload { epoch: e, .. } if *e == epoch.0 => {
+                queue.queue.push_back(msg.clone());
+            }
+            _ => {}
         }
-        queue.queued.insert(IVec3::from_array(msg.pos));
-        queue.queue.push_back(msg.clone());
     }
     if queue.queue.is_empty() {
         return;
@@ -325,7 +350,23 @@ pub fn apply_chunks(
     while applied < CHUNK_APPLY_MAX
         && (applied < 2 || t0.elapsed().as_secs_f32() * 1000.0 < CHUNK_APPLY_MS)
     {
-        let Some(msg) = queue.queue.pop_front() else { break };
+        let Some(entry) = queue.queue.pop_front() else { break };
+        let msg = match entry {
+            ChunkStream::Data(d) => d,
+            ChunkStream::Unload { pos, epoch: e } => {
+                // Left the server-side subscription: drop our copy (entity,
+                // GPU buffers via asset handles, pending light work). Cheap —
+                // doesn't spend the apply budget.
+                if e == epoch.0 {
+                    let cpos = IVec3::from_array(pos);
+                    if let Some(entity) = map.map.remove(&cpos) {
+                        commands.entity(entity).despawn();
+                    }
+                    light_queue.unload(cpos);
+                }
+                continue;
+            }
+        };
         let cpos = IVec3::from_array(msg.pos);
         queue.queued.remove(&cpos);
         if msg.epoch != epoch.0 {

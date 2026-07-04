@@ -31,6 +31,22 @@ pub struct LightQueue {
     pending_pads: HashSet<IVec3>,
 }
 
+impl LightQueue {
+    /// Drop all queued work (warp: the whole world went away).
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+        self.edits.clear();
+        self.pending_pads.clear();
+    }
+
+    /// Drop work queued for one chunk (it left the subscription). Queued
+    /// voxel-edit relights are safe to keep: they no-op on unloaded space.
+    pub fn unload(&mut self, pos: IVec3) {
+        self.chunks.retain(|c| *c != pos);
+        self.pending_pads.remove(&pos);
+    }
+}
+
 /// Backstop on chunks (re)lit per frame; [`FLOOD_MS`] is the real limiter.
 /// High enough that a vsync-limited frame clock (e.g. a ~10 Hz USB display)
 /// still floods a join burst in a few seconds.

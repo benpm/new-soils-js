@@ -29,8 +29,8 @@ async fn main() {
         }
     }
 
-    // Ensure the target chunk is loaded server-side.
-    tx.send(bin(&ClientMsg::ReqChunks { positions: vec![CHUNK] })).await.unwrap();
+    // The join burst pushes the subscription around the spawn — the target
+    // chunk is inside it, so just wait for it to stream in.
     let chunk = recv_chunk(&mut rx).await;
 
     match mode.as_str() {
@@ -59,12 +59,15 @@ async fn recv_chunk<S>(rx: &mut S) -> ChunkVolume
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    // `ReqChunks` is answered with a `Bundle`; accept a bare `Chunk` too.
+    // Drain the pushed stream until the target chunk appears.
     while let Some(Ok(Message::Binary(b))) = rx.next().await {
         let payload = match decode::<ServerMsg>(b.as_ref()) {
-            Some(ServerMsg::Chunk { payload, .. }) => payload,
+            Some(ServerMsg::Chunk { pos, payload }) if pos == CHUNK => payload,
             Some(ServerMsg::Bundle { chunks }) => {
-                chunks.into_iter().next().expect("bundle with the requested chunk").payload
+                match chunks.into_iter().find(|c| c.pos == CHUNK) {
+                    Some(c) => c.payload,
+                    None => continue,
+                }
             }
             _ => continue,
         };

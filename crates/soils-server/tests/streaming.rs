@@ -11,8 +11,8 @@ async fn fresh_world_burst_streams_promptly() {
     let server = TestServer::start("burst");
     let mut c = Client::join(server.addr(), "burst").await;
 
-    // The client's real first request: radius-4 cube around the spawn chunk,
-    // nearest-first order not required for this measurement.
+    // The join burst: the server subscribes the default radius-4 cube around
+    // the spawn chunk on login and pushes it — no request is sent.
     let mut wave = Vec::new();
     for x in 4..=12 {
         for y in 4..=12 {

@@ -15,18 +15,17 @@ async fn spawn_login_and_stream_chunks() {
 
     // Pre-auth messages must be ignored, then Login (signup) must Init.
     let mut c = Client::connect(server.addr()).await;
-    c.send(&ClientMsg::ReqChunks { positions: vec![[8, 7, 8]] }).await;
+    c.send(&ClientMsg::Edit { pos: [8 * 32, 7 * 32, 8 * 32], value: 0 }).await;
     c.login("Player").await;
 
-    // Chunk streaming works: a below-surface chunk comes back with voxels.
-    let vol = c.req_chunk([8, 7, 8]).await;
+    // Chunk streaming works: the join burst pushes the subscription around
+    // the spawn without any request; a below-surface chunk has voxels.
+    let vol = c.await_chunk([8, 7, 8]).await;
     assert!(!vol.is_empty(), "below-surface chunk should have voxels");
 
-    // Edit a voxel in the now-loaded chunk; the edit is enqueued for
-    // background persistence. Round-trip another request to keep the
-    // connection lively while the writer flushes.
+    // Edit a voxel in the now-loaded chunk (persisted via the periodic dirty
+    // flush / shutdown; the join burst's generated chunks persist right away).
     c.send(&ClientMsg::Edit { pos: [8 * 32, 7 * 32, 8 * 32], value: 0 }).await;
-    c.req_chunk([8, 7, 8]).await;
 
     assert!(server.data_dir.join("accounts.bin").is_file());
     // Generated + edited chunks persist ASYNCHRONOUSLY on the background

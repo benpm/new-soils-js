@@ -31,8 +31,9 @@ pub enum ClientMsg {
     /// with `Init` on success or `LoginError` on failure. `password` may be
     /// empty (optional-password accounts).
     Login { name: String, password: String, signup: bool },
-    /// Request a batch of chunks by chunk coordinate.
-    ReqChunks { positions: Vec<[i32; 3]> },
+    /// The client's chunk view radius. The server owns the subscription set
+    /// (which chunks stream in and when they unload); this only sizes it.
+    ViewRadius { radius: u8 },
     /// Player movement update (absolute voxel-space position + velocity).
     Move { pos: [f32; 3], velocity: [f32; 3] },
     /// Set a voxel at an absolute voxel position.
@@ -51,9 +52,12 @@ pub enum ServerMsg {
     /// A chunk's voxel data as a [`chunk_codec`](crate::chunk_codec) payload
     /// (palette + LZ4; an all-air chunk is the 2-byte Uniform payload).
     Chunk { pos: [i32; 3], payload: Vec<u8> },
-    /// Several chunks in one frame (response to `ReqChunks`), to cut per-message
-    /// overhead when streaming a region. Mirrors the JS `bundle` message.
+    /// Several chunks in one frame, to cut per-message overhead when streaming
+    /// a region. Pushed by the server as the subscription set grows.
     Bundle { chunks: Vec<ChunkData> },
+    /// The chunk left the client's subscription (moved out of radius +
+    /// hysteresis). The client drops its copy and frees GPU resources.
+    ChunkUnload { pos: [i32; 3] },
     /// A voxel edit made by another player (apply locally).
     Edit { pos: [i32; 3], value: u8 },
     /// Positions of nearby actors (other players).

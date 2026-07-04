@@ -178,30 +178,43 @@ pub fn mouse_look(
     }
 }
 
-/// Tracks which chunk the player was last in, to drive streaming.
+/// Tracks which chunk the player was last in, to drive the HUD streaming
+/// estimate (the *server* owns the subscription since chunk streaming v2 —
+/// the client never requests chunks).
 #[derive(Resource)]
 pub struct Streaming {
     pub last_chunk: Option<IVec3>,
     pub load_radius: i32,
-    /// Chunks requested but not yet received — a live estimate of how much of
-    /// the surrounding world is still generating/streaming (shown on the HUD).
+    /// The view radius last told to the server, so a change (console, pause
+    /// menu) sends exactly one `ViewRadius`.
+    pub sent_radius: Option<i32>,
+    /// Chunks inside the local view box not yet applied — a live estimate of
+    /// how much of the surrounding world is still streaming in (HUD).
     pub pending: usize,
 }
 
 impl Default for Streaming {
     fn default() -> Self {
-        Self { last_chunk: None, load_radius: 4, pending: 0 }
+        Self { last_chunk: None, load_radius: 4, sent_radius: None, pending: 0 }
     }
 }
 
-/// Request chunks around the player whenever they cross a chunk boundary.
-pub fn request_chunks(
+/// Keep the server's view of our radius current, and recompute the HUD
+/// streaming estimate when the player crosses a chunk boundary. The server
+/// pushes/unloads chunks on its own; this mirrors the same box locally so the
+/// HUD can show progress without extra protocol.
+pub fn track_streaming(
     net: Res<NetClient>,
     map: Res<ChunkMap>,
     queue: Res<crate::server_msg::ChunkApplyQueue>,
     mut streaming: ResMut<Streaming>,
     query: Query<&Transform, With<Player>>,
 ) {
+    if streaming.sent_radius != Some(streaming.load_radius) {
+        streaming.sent_radius = Some(streaming.load_radius);
+        net.send(ClientMsg::ViewRadius { radius: streaming.load_radius as u8 });
+    }
+
     let Ok(transform) = query.single() else { return };
     let p = transform.translation;
     let pc = IVec3::new(
@@ -209,34 +222,22 @@ pub fn request_chunks(
         (p.y.floor() as i32) >> CHUNK_BIT,
         (p.z.floor() as i32) >> CHUNK_BIT,
     );
-
     if streaming.last_chunk == Some(pc) {
         return;
     }
     streaming.last_chunk = Some(pc);
 
     let r = streaming.load_radius;
-    let mut positions = Vec::new();
+    let mut pending = 0;
     for dx in -r..=r {
         for dy in -r..=r {
             for dz in -r..=r {
                 let cpos = pc + IVec3::new(dx, dy, dz);
-                // Skip chunks we already have, and chunks already received and
-                // waiting in the apply queue, so we don't re-request in-flight
-                // work (which would double-count the streaming-progress counter).
                 if !map.map.contains_key(&cpos) && !queue.queued.contains(&cpos) {
-                    positions.push([cpos.x, cpos.y, cpos.z]);
+                    pending += 1;
                 }
             }
         }
     }
-    if !positions.is_empty() {
-        // Nearest-first so the area around the player fills in first.
-        positions.sort_by_key(|c| {
-            let d = IVec3::new(c[0], c[1], c[2]) - pc;
-            d.x * d.x + d.y * d.y + d.z * d.z
-        });
-        streaming.pending += positions.len();
-        net.send(ClientMsg::ReqChunks { positions });
-    }
+    streaming.pending = pending;
 }

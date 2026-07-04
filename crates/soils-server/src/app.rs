@@ -15,7 +15,7 @@
 //! adopted the tick it completes, so a fresh world's 729-chunk burst never
 //! stalls a tick.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -23,10 +23,10 @@ use std::time::{Duration, Instant};
 
 use bevy_app::{App, AppExit, FixedUpdate, ScheduleRunnerPlugin, Update};
 use bevy_ecs::message::MessageWriter;
-use bevy_ecs::prelude::{IntoScheduleConfigs, Res, ResMut, Resource};
+use bevy_ecs::prelude::{IntoScheduleConfigs, Local, Res, ResMut, Resource};
 use bevy_time::{Fixed, Time, TimePlugin};
 use glam::IVec3;
-use soils_protocol::{ActorState, ChunkData, ClientMsg, ChunkVolume, ServerMsg};
+use soils_protocol::{ActorState, CHUNK_BIT, ChunkData, ClientMsg, ChunkVolume, ServerMsg};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError};
 use tokio::sync::watch;
 
@@ -47,6 +47,18 @@ const CACHED_WAVES_PER_TICK: u32 = 8;
 /// keeps the rayon pool fed so the burst lands in a few ticks, while delivery
 /// stays in request (nearest-first) order.
 const GEN_WAVES_INFLIGHT: usize = 8;
+/// Default and maximum client view radii (chunks). The client's `ViewRadius`
+/// only *sizes* its subscription; the server owns membership.
+const DEFAULT_RADIUS: i32 = 4;
+const MAX_RADIUS: i32 = 8;
+/// Chunks stay subscribed until they leave radius + this margin, so hovering
+/// on a chunk border doesn't thrash load/unload.
+const SUB_HYSTERESIS: i32 = 1;
+/// Zero-subscriber chunks evict (save-if-dirty) after this long.
+const UNLOAD_TTL: Duration = Duration::from_secs(60);
+/// Dirty (edited) chunks flush to the background writer on this interval;
+/// they also flush on eviction and shutdown.
+const FLUSH_SECS: f32 = 30.0;
 
 pub(crate) struct Client {
     inbox: UnboundedReceiver<ClientMsg>,
@@ -54,7 +66,13 @@ pub(crate) struct Client {
     authenticated: bool,
     world: String,
     state: ActorState,
-    /// Queued chunk requests, served FIFO one wave at a time.
+    /// View radius in chunks (client-requested via `ViewRadius`, clamped).
+    radius: i32,
+    /// The chunk the subscription was last computed around.
+    center: Option<IVec3>,
+    /// The chunks this client is subscribed to (holds a ref on each).
+    subs: HashSet<IVec3>,
+    /// Queued streaming jobs (subscription enters), served FIFO in waves.
     jobs: VecDeque<ChunkJob>,
 }
 
@@ -146,15 +164,52 @@ pub(crate) fn run_app(
         .add_systems(Update, check_shutdown)
         .add_systems(
             FixedUpdate,
-            (accept_connections, drain_inboxes, pump_chunk_jobs, broadcast_actors, tick_clock)
+            (
+                accept_connections,
+                drain_inboxes,
+                pump_chunk_jobs,
+                broadcast_actors,
+                tick_clock,
+                world_lifecycle,
+            )
                 .chain(),
         )
         .run();
 }
 
-fn check_shutdown(shutdown: Res<ShutdownRx>, mut exit: MessageWriter<AppExit>) {
-    if *shutdown.0.borrow() {
+fn check_shutdown(
+    shutdown: Res<ShutdownRx>,
+    mut worlds: ResMut<Worlds>,
+    mut exit: MessageWriter<AppExit>,
+    mut flushed: Local<bool>,
+) {
+    if *shutdown.0.borrow() && !*flushed {
+        *flushed = true;
+        // Last chance to enqueue unsaved edits; the caller drains the writer
+        // after joining this app's thread.
+        for w in worlds.map.values_mut() {
+            w.flush_dirty();
+        }
         exit.write(AppExit::Success);
+    }
+}
+
+/// Evict expired zero-ref chunks (hourly-scale memory bound) and flush dirty
+/// (edited) chunks to the background writer on their intervals.
+fn world_lifecycle(time: Res<Time>, mut worlds: ResMut<Worlds>, mut acc: Local<(f32, f32)>) {
+    acc.0 += time.delta_secs();
+    acc.1 += time.delta_secs();
+    if acc.0 >= 1.0 {
+        acc.0 = 0.0;
+        for w in worlds.map.values_mut() {
+            w.tick_lifecycle(UNLOAD_TTL);
+        }
+    }
+    if acc.1 >= FLUSH_SECS {
+        acc.1 = 0.0;
+        for w in worlds.map.values_mut() {
+            w.flush_dirty();
+        }
     }
 }
 
@@ -169,6 +224,9 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 authenticated: false,
                 world: DEFAULT_WORLD.to_string(),
                 state: ActorState { id: conn.id, pos: [0.0; 3], velocity: [0.0; 3] },
+                radius: DEFAULT_RADIUS,
+                center: None,
+                subs: HashSet::new(),
                 jobs: VecDeque::new(),
             },
         );
@@ -237,19 +295,21 @@ fn drain_inboxes(
                             seed,
                             daytime: clock.daytime,
                         });
+                        // Server-driven streaming: subscribing around the spawn
+                        // point starts the join burst — no client request.
+                        c.center = Some(chunk_at(spawn));
+                        resubscribe(c, world);
                     }
                 }
             }
             // Everything below requires authentication; silently drop otherwise
             // (same as the old pre-auth gate).
             _ if !clients.0[&id].authenticated => {}
-            ClientMsg::ReqChunks { positions } => {
-                let remaining =
-                    positions.iter().map(|p| IVec3::new(p[0], p[1], p[2])).collect::<VecDeque<_>>();
-                clients.0.get_mut(&id).unwrap().jobs.push_back(ChunkJob {
-                    remaining,
-                    inflight: VecDeque::new(),
-                });
+            ClientMsg::ViewRadius { radius } => {
+                let c = clients.0.get_mut(&id).unwrap();
+                c.radius = (radius as i32).clamp(1, MAX_RADIUS);
+                let world = worlds.get_or_create(&c.world.clone());
+                resubscribe(c, world);
             }
             ClientMsg::Edit { pos, value } => {
                 let world_name = clients.0[&id].world.clone();
@@ -272,21 +332,36 @@ fn drain_inboxes(
                 } else {
                     c.state.pos = pos;
                     c.state.velocity = velocity;
+                    // Crossing a chunk boundary moves the subscription window.
+                    let pc = chunk_at(pos);
+                    if c.center != Some(pc) {
+                        c.center = Some(pc);
+                        let world = worlds.get_or_create(&c.world.clone());
+                        resubscribe(c, world);
+                    }
                 }
             }
             ClientMsg::Warp { world: name } => {
                 println!("warp: id {id} -> {name}");
-                // Leaving the old world: tell its clients the actor is gone,
-                // and drop any chunk jobs still streaming the old world.
+                // Leaving the old world: release its chunk refs, drop any jobs
+                // still streaming it, and tell its clients the actor is gone.
+                // No ChunkUnloads — the client drops everything on Warp.
                 let c = clients.0.get_mut(&id).unwrap();
                 let old = std::mem::replace(&mut c.world, name.clone());
                 c.jobs.clear();
+                let old_world = worlds.get_or_create(&old);
+                for pos in c.subs.drain() {
+                    old_world.dec_ref(pos);
+                }
                 send_world(&clients, &old, id, &ServerMsg::ActorRemove { id });
 
-                let spawn = worlds.get_or_create(&name).spawn;
+                let world = worlds.get_or_create(&name);
+                let spawn = world.spawn;
                 let c = clients.0.get_mut(&id).unwrap();
                 c.state.pos = spawn;
                 let _ = c.outbox.send(ServerMsg::Warp { spawn, daytime: clock.daytime });
+                c.center = Some(chunk_at(spawn));
+                resubscribe(c, world);
             }
         }
     }
@@ -297,9 +372,70 @@ fn drain_inboxes(
             && c.authenticated
         {
             player_count.0.fetch_sub(1, Ordering::Relaxed);
+            let world = worlds.get_or_create(&c.world);
+            for pos in c.subs {
+                world.dec_ref(pos);
+            }
             send_world(&clients, &c.world, id, &ServerMsg::ActorRemove { id });
         }
     }
+}
+
+/// The chunk containing a voxel-space position.
+fn chunk_at(pos: [f32; 3]) -> IVec3 {
+    IVec3::new(
+        (pos[0].floor() as i32) >> CHUNK_BIT,
+        (pos[1].floor() as i32) >> CHUNK_BIT,
+        (pos[2].floor() as i32) >> CHUNK_BIT,
+    )
+}
+
+/// Recompute a client's subscription around `center`: chunks past
+/// radius + [`SUB_HYSTERESIS`] unload (client told, ref released); newly
+/// covered chunks queue as a nearest-first streaming job and take a ref.
+fn resubscribe(c: &mut Client, world: &mut World) {
+    let Some(center) = c.center else { return };
+    let keep = c.radius + SUB_HYSTERESIS;
+    let leaves: Vec<IVec3> = c
+        .subs
+        .iter()
+        .copied()
+        .filter(|p| {
+            let d = (*p - center).abs();
+            d.x.max(d.y).max(d.z) > keep
+        })
+        .collect();
+    for pos in leaves {
+        c.subs.remove(&pos);
+        world.dec_ref(pos);
+        let _ = c.outbox.send(ServerMsg::ChunkUnload { pos: [pos.x, pos.y, pos.z] });
+    }
+
+    let r = c.radius;
+    let mut enters: Vec<IVec3> = Vec::new();
+    for dx in -r..=r {
+        for dy in -r..=r {
+            for dz in -r..=r {
+                let pos = center + IVec3::new(dx, dy, dz);
+                if !c.subs.contains(&pos) {
+                    enters.push(pos);
+                }
+            }
+        }
+    }
+    if enters.is_empty() {
+        return;
+    }
+    // Nearest-first, so the area around the player fills in first.
+    enters.sort_by_key(|p| {
+        let d = *p - center;
+        d.x * d.x + d.y * d.y + d.z * d.z
+    });
+    for &pos in &enters {
+        c.subs.insert(pos);
+        world.inc_ref(pos);
+    }
+    c.jobs.push_back(ChunkJob { remaining: enters.into(), inflight: VecDeque::new() });
 }
 
 /// Advance every client's chunk pipeline: dispatch waves (up to
@@ -317,7 +453,12 @@ fn pump_chunk_jobs(mut clients: ResMut<Clients>, mut worlds: ResMut<Worlds>) {
                 && budget > 0
             {
                 let n = job.remaining.len().min(WAVE_SIZE);
-                let wave: Vec<IVec3> = job.remaining.drain(..n).collect();
+                // Skip positions the client unsubscribed from while queued.
+                let wave: Vec<IVec3> =
+                    job.remaining.drain(..n).filter(|p| c.subs.contains(p)).collect();
+                if wave.is_empty() {
+                    continue;
+                }
                 let missing: Vec<IVec3> =
                     wave.iter().copied().filter(|&p| !world.ensure_resident(p)).collect();
                 let rx = if missing.is_empty() {
@@ -367,7 +508,13 @@ fn pump_chunk_jobs(mut clients: ResMut<Clients>, mut worlds: ResMut<Worlds>) {
                     },
                 }
                 let wave = job.inflight.pop_front().unwrap();
-                send_wave(world, &wave.positions, &c.outbox);
+                // Deliver only what's still subscribed: a client that moved on
+                // mid-generation gets neither the chunk nor a leak (the unload
+                // was already sent when the subscription shrank, and the
+                // per-connection stream is FIFO).
+                let deliver: Vec<IVec3> =
+                    wave.positions.into_iter().filter(|p| c.subs.contains(p)).collect();
+                send_wave(world, &deliver, &c.outbox);
             }
             if blocked {
                 break;

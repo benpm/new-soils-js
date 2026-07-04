@@ -83,6 +83,10 @@ const EDIT_RATE: f32 = 32.0;
 pub(crate) struct Client {
     inbox: UnboundedReceiver<ClientMsg>,
     outbox: UnboundedSender<ServerMsg>,
+    /// Latest-wins snapshot lane (plan §3): replacing an unsent snapshot is
+    /// correct — the tracker deltas against acked baselines, so skipped ticks
+    /// are just never acked. Everything else stays on the reliable `outbox`.
+    snapshot: watch::Sender<Option<ServerMsg>>,
     authenticated: bool,
     world: String,
     /// This client's player entity (spawned on login) and its NetId.
@@ -317,6 +321,7 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
             Client {
                 inbox: conn.inbox,
                 outbox: conn.outbox,
+                snapshot: conn.snapshot,
                 authenticated: false,
                 world: DEFAULT_WORLD.to_string(),
                 entity: None,
@@ -1020,12 +1025,14 @@ fn replicate_entities(
             }
             c.priority.insert(*id, 0.0);
         }
-        let _ = c.outbox.send(ServerMsg::Snapshot {
+        // Latest-wins: if the socket (or a future datagram lane) hasn't sent
+        // the previous snapshot yet, it is replaced, never queued.
+        let _ = c.snapshot.send_replace(Some(ServerMsg::Snapshot {
             tick,
             baseline_tick: ack,
             last_input_seq: c.last_seq,
             payload,
-        });
+        }));
     }
 }
 

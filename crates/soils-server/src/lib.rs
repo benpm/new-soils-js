@@ -49,10 +49,18 @@ pub(crate) const DEFAULT_WORLD: &str = "default";
 /// A freshly handshaken connection, handed from the tokio accept loop to the
 /// ECS app. The app owns the inbox/outbox ends; the connection task is a pure
 /// pump with no game state.
+///
+/// Two outgoing lanes (plan §3, phase 14): `outbox` is the reliable, ordered
+/// channel (chunks, edits, control); `snapshot` is latest-wins — when the
+/// socket backs up, unsent snapshots are *replaced*, not queued, so a slow
+/// link never builds a backlog of stale entity state. On WebSocket both lanes
+/// share the reliable socket; a datagram transport implements the snapshot
+/// lane as truly unreliable/sequenced sends with the same app-side semantics.
 pub(crate) struct NewConn {
     pub id: u16,
     pub inbox: mpsc::UnboundedReceiver<ClientMsg>,
     pub outbox: mpsc::UnboundedSender<ServerMsg>,
+    pub snapshot: watch::Sender<Option<ServerMsg>>,
 }
 
 /// How to run a server: where to bind, where to persist, whether to be
@@ -324,14 +332,34 @@ async fn pump_connection(
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
     let (in_tx, in_rx) = mpsc::unbounded_channel::<ClientMsg>();
-    if conns.send(NewConn { id, inbox: in_rx, outbox: out_tx }).is_err() {
+    let (snap_tx, mut snap_rx) = watch::channel::<Option<ServerMsg>>(None);
+    if conns.send(NewConn { id, inbox: in_rx, outbox: out_tx, snapshot: snap_tx }).is_err() {
         return Ok(()); // server is shutting down
     }
 
     let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if ws_tx.send(Message::Binary(encode(&msg))).await.is_err() {
-                break;
+        // Reliable lane drains in order; the snapshot lane is latest-wins —
+        // `changed()` wakes at most once per replace, and `borrow_and_update`
+        // takes whatever is newest by the time the socket can send again.
+        loop {
+            tokio::select! {
+                m = out_rx.recv() => {
+                    let Some(msg) = m else { break };
+                    if ws_tx.send(Message::Binary(encode(&msg))).await.is_err() {
+                        break;
+                    }
+                }
+                c = snap_rx.changed() => {
+                    if c.is_err() {
+                        break; // app despawned the client
+                    }
+                    let msg = snap_rx.borrow_and_update().clone();
+                    if let Some(msg) = msg
+                        && ws_tx.send(Message::Binary(encode(&msg))).await.is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
     });

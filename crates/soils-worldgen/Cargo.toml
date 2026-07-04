@@ -12,3 +12,10 @@ rayon = "1"
 serde = { workspace = true }
 serde_yaml = "0.9"
 indexmap = { version = "2", features = ["serde"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "terrain"
+harness = false

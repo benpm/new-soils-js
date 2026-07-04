@@ -237,6 +237,151 @@ fn gpu_trace_matches_cpu_oracle() {
     readback.unmap();
 }
 
+/// The GPU occupancy blit (`gi_blit.wgsl`) must produce exactly the volume
+/// the old CPU fill built: chunk bytes land at their chunk-aligned offset,
+/// everything else cleared to air.
+#[test]
+fn gpu_blit_matches_cpu_fill() {
+    let Some((device, queue)) = init_gpu() else {
+        eprintln!("no GPU adapter available; skipping gpu_blit_matches_cpu_fill");
+        return;
+    };
+
+    // A deterministic chunk pattern (chunk layout: (y + z*32)*32 + x).
+    let mut chunk = vec![0u8; 32 * 32 * 32];
+    let mut s = 7u64;
+    for b in chunk.iter_mut() {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *b = (s >> 33) as u8;
+    }
+    let rels = [[0i32, 0, 0], [32, 32, 0]];
+
+    // CPU reference (volume layout: (y*64 + z)*64 + x).
+    let dim = GI_DIM as usize;
+    let mut want = vec![0u8; dim * dim * dim];
+    for rel in rels {
+        for y in 0..32usize {
+            for z in 0..32usize {
+                for x in 0..32usize {
+                    let v = chunk[(y + z * 32) * 32 + x];
+                    let (vx, vy, vz) =
+                        (x + rel[0] as usize, y + rel[1] as usize, z + rel[2] as usize);
+                    want[(vy * dim + vz) * dim + vx] = v;
+                }
+            }
+        }
+    }
+
+    let chunk_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("chunk"),
+        contents: &chunk,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let vol_bytes = (dim * dim * dim) as u64;
+    let world_vox = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("world_vox"),
+        size: vol_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: vol_bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/shaders/gi_blit.wgsl"
+    ))
+    .expect("read gi_blit.wgsl");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("gi_blit"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let ro = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let mut entries: Vec<_> = (0..3).map(ro).collect();
+    entries[1].ty = wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only: false },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("blit_layout"),
+        entries: &entries,
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("blit_pl"),
+        bind_group_layouts: &[&layout],
+        push_constant_ranges: &[],
+    });
+    let make = |entry: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let clear = make("clear_volume");
+    let blit = make("blit_chunk");
+
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        for (i, rel) in rels.iter().enumerate() {
+            let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("blit_params"),
+                contents: bytemuck::cast_slice(&[rel[0], rel[1], rel[2], 0]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: chunk_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: world_vox.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                ],
+            });
+            if i == 0 {
+                pass.set_pipeline(&clear);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups((vol_bytes as u32 / 4).div_ceil(64), 1, 1);
+            }
+            pass.set_pipeline(&blit);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 8, 8);
+        }
+    }
+    encoder.copy_buffer_to_buffer(&world_vox, 0, &readback, 0, vol_bytes);
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |r| r.expect("map readback"));
+    device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    let data = slice.get_mapped_range();
+    assert_eq!(&data[..], &want[..], "GPU blit volume differs from the CPU fill reference");
+    drop(data);
+    readback.unmap();
+}
+
 /// Create a headless device, or `None` if the machine has no usable GPU.
 fn init_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());

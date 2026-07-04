@@ -62,6 +62,13 @@ const MAX_SURFACE: i32 = 256 + 115 + 5 + 24;
 /// only subtract).
 const MAX_ROCK: i32 = 5;
 
+/// |cave noise| above this carves air. The JS original used 0.7 on a simplex
+/// spanning roughly [-1, 1]; the `noise` crate's simplex tops out near 0.75
+/// (measured max 0.745 over 500k samples), so 0.7 carved almost nothing —
+/// the port had effectively lost its caves. 0.55 restores the original's
+/// ~1-2% underground cave density.
+const CAVE_THRESHOLD: f64 = 0.55;
+
 /// Stateless terrain generator seeded once and reused for every chunk.
 pub struct TerrainGen {
     noise: Simplex,
@@ -210,7 +217,7 @@ impl TerrainGen {
                             val = pal.stone;
                         }
                         // Caves carved from solid ground.
-                        if val != pal.air && Self::cave_at(lat, x, y, z).abs() > 0.7 {
+                        if val != pal.air && Self::cave_at(lat, x, y, z).abs() > CAVE_THRESHOLD {
                             val = pal.air;
                         }
                     }
@@ -250,6 +257,36 @@ mod tests {
         let below = tg.generate(glam::IVec3::new(0, 7, 0), &reg);
         assert_ne!(below.get(0, 31, 0), AIR);
         let _ = dirt;
+    }
+
+    #[test]
+    fn caves_are_carved_below_the_surface() {
+        // Deep chunks are fully inside the soil gradient, so any air in them
+        // must come from cave carving. Require a plausible density band over a
+        // 16-chunk region (~1-2% of 524k voxels) — pins CAVE_THRESHOLD against
+        // both regressions (no caves) and runaway carving (swiss cheese).
+        let reg = registry();
+        let tg = TerrainGen::new(0, WorldType::Normal);
+        let mut carved = 0usize;
+        for cx in 6..10 {
+            for cz in 6..10 {
+                let chunk = tg.generate(glam::IVec3::new(cx, 4, cz), &reg);
+                for x in 0..CHUNK_SIZE {
+                    for y in 0..CHUNK_SIZE {
+                        for z in 0..CHUNK_SIZE {
+                            if chunk.get(x, y, z) == AIR {
+                                carved += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let total = 16 * 32 * 32 * 32;
+        assert!(
+            carved > total / 200 && carved < total / 10,
+            "cave density off: {carved}/{total} air voxels"
+        );
     }
 
     #[test]

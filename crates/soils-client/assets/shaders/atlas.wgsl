@@ -52,7 +52,9 @@ struct QuadBuffer {
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var atlas_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var atlas_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: AtlasParams;
-@group(#{MATERIAL_BIND_GROUP}) @binding(4) var<storage, read> gi_cascade0: array<vec4<f32>>;
+// Per-probe ambient-cube irradiance (6 vec4 faces per probe, +x -x +y -y +z
+// -z), projected from merged cascade 0 by gi_irradiance.wgsl.
+@group(#{MATERIAL_BIND_GROUP}) @binding(4) var<storage, read> gi_probes: array<vec4<f32>>;
 // Per-chunk padded L0 light volume: LPAD^3 packed bytes (sky nibble hi, block
 // nibble lo) — the chunk's 32^3 plus one voxel of neighbor light per side.
 @group(#{MATERIAL_BIND_GROUP}) @binding(5) var<storage, read> chunk_light: array<u32>;
@@ -79,56 +81,53 @@ fn light_at(local_pos: vec3<f32>, n: vec3<f32>) -> u32 {
     return (w >> ((idx & 3u) * 8u)) & 0xffu;
 }
 
-// Cascade-0 layout (must match radiance.wgsl / gi.rs).
+// Cascade-0 layout (must match radiance.wgsl / gi_irradiance.wgsl / gi.rs).
 const GI_DIM: f32 = 64.0;
 const GI_PROBES0: i32 = 16;
 const GI_SPACING0: f32 = 4.0;
-const GI_DIRRES0: u32 = 4u;
 // Scales GI irradiance into the terrain's lux exposure regime.
 const GI_LUX: f32 = 3500.0;
 
-fn octa_decode(u: f32, v: f32) -> vec3<f32> {
-    let ox = 2.0 * u - 1.0;
-    let oy = 2.0 * v - 1.0;
-    let z = 1.0 - abs(ox) - abs(oy);
-    var x = ox;
-    var y = oy;
-    if (z < 0.0) {
-        x = (1.0 - abs(oy)) * sign(ox);
-        y = (1.0 - abs(ox)) * sign(oy);
-    }
-    return normalize(vec3<f32>(x, y, z));
+// One probe's ambient cube evaluated at normal `n`: blend the three faces the
+// normal leans on by its squared components (they sum to 1).
+fn gi_cube(pidx: u32, n: vec3<f32>) -> vec3<f32> {
+    let base = pidx * 6u;
+    let n2 = n * n;
+    let fx = select(1u, 0u, n.x >= 0.0);
+    let fy = select(3u, 2u, n.y >= 0.0);
+    let fz = select(5u, 4u, n.z >= 0.0);
+    return n2.x * gi_probes[base + fx].rgb
+        + n2.y * gi_probes[base + fy].rgb
+        + n2.z * gi_probes[base + fz].rgb;
 }
 
-// Cosine-weighted hemisphere integral of the nearest cascade-0 probe's incoming
-// radiance about normal `n`. Returns linear RGB irradiance (0 outside volume).
+// Trilinearly interpolated ambient-cube irradiance about normal `n`: one
+// interpolated fetch over the 8 surrounding probes, replacing the old
+// per-fragment 16-direction integration (that integral now runs once per
+// probe in gi_irradiance.wgsl). Returns linear RGB irradiance (0 outside the
+// probe volume, matching the old nearest-probe cutoff).
 fn gi_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     // Sample one probe-spacing off the surface along the normal: a probe sitting
     // exactly on the surface is embedded in the solid voxel and traces only that
     // (black), so nudge into the air where the lit probes are.
     let local = world_pos + n * GI_SPACING0 - params.gi_origin;
     let pf = local / GI_SPACING0 - vec3<f32>(0.5);
-    let pi = vec3<i32>(i32(round(pf.x)), i32(round(pf.y)), i32(round(pf.z)));
-    if (pi.x < 0 || pi.y < 0 || pi.z < 0 ||
-        pi.x >= GI_PROBES0 || pi.y >= GI_PROBES0 || pi.z >= GI_PROBES0) {
+    let pr = round(pf);
+    if (pr.x < 0.0 || pr.y < 0.0 || pr.z < 0.0 ||
+        pr.x >= f32(GI_PROBES0) || pr.y >= f32(GI_PROBES0) || pr.z >= f32(GI_PROBES0)) {
         return vec3<f32>(0.0);
     }
-    let dirs = GI_DIRRES0 * GI_DIRRES0;
-    let pidx = u32((pi.y * GI_PROBES0 + pi.z) * GI_PROBES0 + pi.x);
+    let p0 = vec3<i32>(floor(pf));
+    let fr = pf - floor(pf);
     var acc = vec3<f32>(0.0);
-    var wsum = 0.0;
-    for (var dy = 0u; dy < GI_DIRRES0; dy += 1u) {
-        for (var dx = 0u; dx < GI_DIRRES0; dx += 1u) {
-            let dir = octa_decode((f32(dx) + 0.5) / f32(GI_DIRRES0), (f32(dy) + 0.5) / f32(GI_DIRRES0));
-            let ndl = max(dot(dir, n), 0.0);
-            if (ndl <= 0.0) { continue; }
-            let e = gi_cascade0[pidx * dirs + dy * GI_DIRRES0 + dx];
-            acc += e.rgb * ndl;
-            wsum += ndl;
-        }
+    for (var k = 0u; k < 8u; k += 1u) {
+        let o = vec3<i32>(i32(k & 1u), i32((k >> 1u) & 1u), i32((k >> 2u) & 1u));
+        let pc = clamp(p0 + o, vec3<i32>(0), vec3<i32>(GI_PROBES0 - 1));
+        let wv = mix(vec3<f32>(1.0) - fr, fr, vec3<f32>(o));
+        let pidx = u32((pc.y * GI_PROBES0 + pc.z) * GI_PROBES0 + pc.x);
+        acc += (wv.x * wv.y * wv.z) * gi_cube(pidx, n);
     }
-    if (wsum <= 0.0) { return vec3<f32>(0.0); }
-    return acc / wsum;
+    return acc;
 }
 
 struct VertexOutput {

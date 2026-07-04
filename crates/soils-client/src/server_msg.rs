@@ -362,7 +362,7 @@ pub fn apply_chunks(
     if queue.queue.is_empty() {
         return;
     }
-    let gi_cascade0 = gi.cascade0();
+    let gi_probes = gi.irradiance();
     let (gi_origin, gi_enabled) = gi.apply_params();
     let params = material::AtlasParams {
         ambient_occlusion: if toggles.ao { 1.0 } else { 0.0 },
@@ -442,7 +442,7 @@ pub fn apply_chunks(
                 cpos,
                 volume,
                 params.clone(),
-                gi_cascade0.clone(),
+                gi_probes.clone(),
             );
             map.map.insert(cpos, e);
             streaming.pending = streaming.pending.saturating_sub(1);

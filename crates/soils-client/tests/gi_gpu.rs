@@ -627,6 +627,146 @@ fn top_cascade_sky_is_gated_by_l0_skylight() {
     readback.unmap();
 }
 
+/// The ambient-cube projection (`gi_irradiance.wgsl`) must match the CPU
+/// cosine-weighted gather (`radiance::gather_irradiance`) per (probe, face):
+/// it is the same integral, moved from per-fragment to per-probe.
+#[test]
+fn gpu_irradiance_projection_matches_cpu_gather() {
+    let Some((device, queue)) = init_gpu() else {
+        eprintln!("no GPU adapter available; skipping gpu_irradiance_projection_matches_cpu_gather");
+        return;
+    };
+
+    let probes = (C0_PROBES * C0_PROBES * C0_PROBES) as usize;
+    let dirs = (C0_DIRRES * C0_DIRRES) as usize;
+    // Synthetic cascade 0: radiance is a probe- and direction-dependent
+    // function, so both index decodes are pinned.
+    let radiance_at = |p: usize, d: [f32; 3]| -> [f32; 3] {
+        let scale = 1.0 + (p % 5) as f32 * 0.25;
+        std::array::from_fn(|i| (d[i] * 0.5 + 0.5) * scale)
+    };
+    let mut cascade0 = vec![0.0f32; probes * dirs * 4];
+    for p in 0..probes {
+        for dy in 0..C0_DIRRES {
+            for dx in 0..C0_DIRRES {
+                let dir = radiance::dir_for_texel(dx, dy, C0_DIRRES);
+                let rgb = radiance_at(p, dir);
+                let e = (p * dirs + (dy * C0_DIRRES + dx) as usize) * 4;
+                cascade0[e..e + 3].copy_from_slice(&rgb);
+            }
+        }
+    }
+    let cascade_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("cascade0"),
+        contents: bytemuck::cast_slice(&cascade0),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let out_bytes = (probes * 6 * 16) as u64;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probes_out"),
+        size: out_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: out_bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/shaders/gi_irradiance.wgsl"
+    ))
+    .expect("read gi_irradiance.wgsl");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("gi_irradiance"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let buffer_entry = |binding, read_only| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("irr_layout"),
+        entries: &[buffer_entry(0, true), buffer_entry(1, false)],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("irr_pl"),
+        bind_group_layouts: &[&layout],
+        push_constant_ranges: &[],
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("project"),
+        layout: Some(&pipeline_layout),
+        module: &module,
+        entry_point: Some("project"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: cascade_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: out_buf.as_entire_binding() },
+        ],
+    });
+
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(((probes * 6) as u32).div_ceil(64), 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &readback, 0, out_bytes);
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |r| r.expect("map readback"));
+    device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    let data = slice.get_mapped_range();
+    let gpu: &[f32] = bytemuck::cast_slice(&data);
+
+    const FACES: [[f32; 3]; 6] = [
+        [1.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+    ];
+    for p in (0..probes).step_by(37).chain([0, probes - 1]) {
+        for (f, n) in FACES.iter().enumerate() {
+            let want = radiance::gather_irradiance(*n, C0_DIRRES, |d| radiance_at(p, d));
+            let i = (p * 6 + f) * 4;
+            for k in 0..3 {
+                assert!(
+                    (gpu[i + k] - want[k]).abs() < 1e-3,
+                    "irradiance mismatch at probe {p} face {f} ch{k}: gpu={} cpu={}",
+                    gpu[i + k],
+                    want[k]
+                );
+            }
+        }
+    }
+
+    drop(data);
+    readback.unmap();
+}
+
 /// Create a headless device, or `None` if the machine has no usable GPU.
 fn init_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());

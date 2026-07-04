@@ -140,7 +140,7 @@ pub fn spawn_gpu_chunk(
     cpos: IVec3,
     volume: ChunkVolume,
     mut params: AtlasParams,
-    gi_cascade0: Handle<ShaderStorageBuffer>,
+    gi_probes: Handle<ShaderStorageBuffer>,
 ) -> Entity {
     let voxels = buffers.add(ShaderStorageBuffer::new(volume.as_bytes(), RenderAssetUsages::default()));
     let quads =
@@ -160,7 +160,7 @@ pub fn spawn_gpu_chunk(
         quads: quads.clone(),
         atlas: atlas.texture.clone(),
         params,
-        gi_cascade0,
+        gi_probes,
         light: light.clone(),
     });
     commands

@@ -74,11 +74,12 @@ impl Default for AtlasParams {
 }
 
 /// One material per chunk: its quad storage buffer (vertex-pulled) plus the
-/// shared atlas texture and params. `gi_cascade0` is shared across all chunks
-/// and points at the GI radiance-cascades output (see `gi.rs`): the merged
-/// cascade-0 radiance field, sampled to light terrain. It is written only by
-/// the compute shader (its GPU buffer is never recreated), so this bind group
-/// stays valid; the volume origin/enable flag ride in `params` instead.
+/// shared atlas texture and params. `gi_probes` is shared across all chunks
+/// and points at the GI radiance-cascades output (see `gi.rs`): per-probe
+/// ambient-cube irradiance projected from merged cascade 0, sampled to light
+/// terrain. It is written only by the compute shader (its GPU buffer is never
+/// recreated), so this bind group stays valid; the volume origin/enable flag
+/// ride in `params` instead.
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct ChunkMeshMaterial {
     #[storage(0, read_only)]
@@ -89,7 +90,7 @@ pub struct ChunkMeshMaterial {
     #[uniform(3)]
     pub params: AtlasParams,
     #[storage(4, read_only)]
-    pub gi_cascade0: Handle<ShaderStorageBuffer>,
+    pub gi_probes: Handle<ShaderStorageBuffer>,
     /// Padded per-chunk L0 light volume (see `gpu_mesh::LIGHT_PAD`). The CPU
     /// recreates this buffer's data on light changes, so `light::process_light`
     /// touches the material afterwards to rebuild the cached bind group.

@@ -98,6 +98,10 @@ pub struct GiAssets {
     emission: Handle<ShaderStorageBuffer>,
     cascades: [Handle<ShaderStorageBuffer>; CASCADES],
     metas: [Handle<ShaderStorageBuffer>; CASCADES],
+    /// Per-probe ambient-cube irradiance (6 vec4 faces per cascade-0 probe),
+    /// projected from merged cascade 0 each GI cycle; what the terrain
+    /// material actually samples.
+    irradiance: Handle<ShaderStorageBuffer>,
     params: Handle<ShaderStorageBuffer>,
     /// Pending GPU volume refill: chunk (voxel, padded-light) buffers (both
     /// GPU-resident for the mesher/material) to blit into the volumes, with
@@ -120,11 +124,11 @@ pub struct GiAssets {
 }
 
 impl GiAssets {
-    /// The cascade-0 radiance-field buffer the chunk material samples. Its GPU
-    /// buffer is written only by the compute shader and never recreated, so it
-    /// is safe to hold in a cached material bind group.
-    pub fn cascade0(&self) -> Handle<ShaderStorageBuffer> {
-        self.cascades[0].clone()
+    /// The per-probe ambient-cube irradiance buffer the chunk material
+    /// samples. Its GPU buffer is written only by the compute shader and never
+    /// recreated, so it is safe to hold in a cached material bind group.
+    pub fn irradiance(&self) -> Handle<ShaderStorageBuffer> {
+        self.irradiance.clone()
     }
 
     /// Force a volume refill and a re-push of origin/enable into every chunk
@@ -188,6 +192,9 @@ fn setup_gi_assets(
     let metas = std::array::from_fn(|c| {
         buffers.add(ShaderStorageBuffer::from(vec![c as u32]))
     });
+    // 6 vec4 ambient-cube faces per cascade-0 probe.
+    let irradiance = buffers
+        .add(ShaderStorageBuffer::with_size(PROBES[0].pow(3) as usize * 6 * 16, usage));
 
     // 12 f32 = origin(3)+day, zenith(3)+lux, horizon(3)+enabled.
     let params = buffers.add(ShaderStorageBuffer::from(vec![0.0f32; 12]));
@@ -199,6 +206,7 @@ fn setup_gi_assets(
         emission,
         cascades,
         metas,
+        irradiance,
         params,
         refill: Vec::new(),
         dummy,
@@ -353,6 +361,8 @@ struct GiPipeline {
     blit_layout: BindGroupLayoutDescriptor,
     clear: CachedComputePipelineId,
     blit: CachedComputePipelineId,
+    irr_layout: BindGroupLayoutDescriptor,
+    irradiance: CachedComputePipelineId,
 }
 
 /// Bind groups + dispatch sizes for one frame's cascades.
@@ -363,6 +373,8 @@ struct GiJobs {
     blits: Vec<BindGroup>,
     trace: Vec<(BindGroup, u32)>,
     merge: Vec<(BindGroup, u32)>,
+    /// Ambient-cube projection, queued the frame cascade 0 finishes merging.
+    irradiance: Option<BindGroup>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
@@ -433,7 +445,35 @@ fn init_pipeline(
         entry_point: Some("blit_chunk".into()),
         ..default()
     });
-    commands.insert_resource(GiPipeline { layout, trace, merge, blit_layout, clear, blit });
+
+    // Ambient-cube projection (merged cascade 0 → per-probe irradiance).
+    let irr_layout = BindGroupLayoutDescriptor::new(
+        "gi_irr_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_read_only_sized(false, None), // 0 cascade0
+                storage_buffer_sized(false, None),           // 1 probes out (rw)
+            ),
+        ),
+    );
+    let irradiance = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("gi_irradiance".into()),
+        layout: vec![irr_layout.clone()],
+        shader: asset_server.load("shaders/gi_irradiance.wgsl"),
+        entry_point: Some("project".into()),
+        ..default()
+    });
+    commands.insert_resource(GiPipeline {
+        layout,
+        trace,
+        merge,
+        blit_layout,
+        clear,
+        blit,
+        irr_layout,
+        irradiance,
+    });
     commands.insert_resource(GiJobs::default());
 }
 
@@ -455,6 +495,7 @@ fn prepare_bind_groups(
     jobs.blits.clear();
     jobs.trace.clear();
     jobs.merge.clear();
+    jobs.irradiance = None;
     let Some(gi) = gi else { return };
     if !gi.enabled {
         return;
@@ -567,6 +608,21 @@ fn prepare_bind_groups(
         );
         jobs.merge.push((bg, cascade_entries(c).div_ceil(64) as u32));
     }
+    // The frame cascade 0 finishes merging, re-project the ambient cubes the
+    // material samples (running it after the merge dispatch in the same pass
+    // is ordered: WebGPU synchronizes storage writes between dispatches).
+    if c == 0 && let Some(irr) = buffers.get(&gi.irradiance) {
+        let irr_layout = pipeline_cache.get_bind_group_layout(&pipeline.irr_layout);
+        let bg = render_device.create_bind_group(
+            None,
+            &irr_layout,
+            &BindGroupEntries::sequential((
+                cascade(0).buffer.as_entire_buffer_binding(),
+                irr.buffer.as_entire_buffer_binding(),
+            )),
+        );
+        jobs.irradiance = Some(bg);
+    }
 }
 
 struct GiNode;
@@ -625,6 +681,14 @@ impl render_graph::Node for GiNode {
                 pass.set_bind_group(0, bg, &[]);
                 pass.dispatch_workgroups(*groups, 1, 1);
             }
+        }
+        // Project the freshly merged cascade 0 into per-probe ambient cubes.
+        if let (Some(bg), Some(irr)) =
+            (&jobs.irradiance, pipeline_cache.get_compute_pipeline(pipeline.irradiance))
+        {
+            pass.set_pipeline(irr);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups((PROBES[0].pow(3) * 6).div_ceil(64), 1, 1);
         }
         Ok(())
     }

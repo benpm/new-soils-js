@@ -48,6 +48,9 @@ struct Meta {
 @group(0) @binding(3) var<storage, read> params: GiParams;
 @group(0) @binding(4) var<storage, read> job: Meta;
 @group(0) @binding(5) var<storage, read> far: array<vec4<f32>>;
+// Packed L0 light per volume voxel (sky nibble hi, block nibble lo), blitted
+// alongside occupancy by gi_blit.wgsl. Seeds the top cascade's sky term.
+@group(0) @binding(6) var<storage, read> world_light: array<u32>;
 
 fn octa_decode(u: f32, v: f32) -> vec3<f32> {
     let ox = 2.0 * u - 1.0;
@@ -85,6 +88,24 @@ fn vox(v: vec3<i32>) -> u32 {
     let idx = (u32(v.y) * GI_DIM + u32(v.z)) * GI_DIM + u32(v.x);
     let w = world_vox[idx >> 2u];
     return (w >> ((idx & 3u) * 8u)) & 0xffu;
+}
+
+// Sky visibility 0..1 at a world position, from the baked L0 skylight (plan
+// §1 L2 item 2): the flood already knows how sky-reachable every voxel is, so
+// rays that clear the top interval are gated by it instead of assuming open
+// sky — enclosed spaces deeper than the march reach stop leaking skylight.
+// Outside the volume there is no data; keep the old full-sky behavior.
+fn sky_vis(p: vec3<f32>) -> f32 {
+    let base = vec3<i32>(i32(params.origin.x), i32(params.origin.y), i32(params.origin.z));
+    let v = vec3<i32>(i32(floor(p.x)), i32(floor(p.y)), i32(floor(p.z))) - base;
+    if (v.x < 0 || v.y < 0 || v.z < 0 ||
+        v.x >= i32(GI_DIM) || v.y >= i32(GI_DIM) || v.z >= i32(GI_DIM)) {
+        return 1.0;
+    }
+    let idx = (u32(v.y) * GI_DIM + u32(v.z)) * GI_DIM + u32(v.x);
+    let w = world_light[idx >> 2u];
+    let sky_nibble = (w >> ((idx & 3u) * 8u + 4u)) & 0xfu;
+    return f32(sky_nibble) / 15.0;
 }
 
 // March the interval [t0,t1) of a world-space ray; return (rgb, vis) where
@@ -136,10 +157,12 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dir = dir_for_texel(dx, dy, res);
 
     var r = trace_interval(probe_pos, dir, INT_START[c], INT_END[c]);
-    // Top cascade: rays that escape see the sky (terminal), giving the whole
-    // hierarchy an ambient sky term once merged down.
+    // Top cascade: rays that escape see the sky (terminal), gated by the L0
+    // skylight at the interval's end — the baked flood supplies far-field sky
+    // occlusion the march never reaches, so caves don't leak daylight.
     if (c == CASCADES - 1u && r.w > 0.5) {
-        r = vec4<f32>(sky(dir), 0.0);
+        let end = probe_pos + dir * INT_END[c];
+        r = vec4<f32>(sky(dir) * sky_vis(end), 0.0);
     }
     cascade[e] = r;
 }

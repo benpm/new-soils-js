@@ -91,15 +91,20 @@ impl Default for GiSettings {
 #[derive(Resource, Clone, ExtractResource)]
 pub struct GiAssets {
     world_vox: Handle<ShaderStorageBuffer>,
+    /// Packed L0 light per volume voxel (sky nibble hi, block nibble lo),
+    /// blitted from the chunks' padded light buffers alongside occupancy;
+    /// seeds the top cascade's sky-visibility term.
+    world_light: Handle<ShaderStorageBuffer>,
     emission: Handle<ShaderStorageBuffer>,
     cascades: [Handle<ShaderStorageBuffer>; CASCADES],
     metas: [Handle<ShaderStorageBuffer>; CASCADES],
     params: Handle<ShaderStorageBuffer>,
-    /// Pending GPU occupancy refill: chunk voxel buffers (GPU-resident for the
-    /// mesher) to blit into the volume, with their offsets relative to the
-    /// volume origin. Populated on refill frames, consumed by the render node
-    /// (a clear pass runs first so unloaded space reads as air).
-    refill: Vec<(Handle<ShaderStorageBuffer>, IVec3)>,
+    /// Pending GPU volume refill: chunk (voxel, padded-light) buffers (both
+    /// GPU-resident for the mesher/material) to blit into the volumes, with
+    /// their offsets relative to the volume origin. Populated on refill
+    /// frames, consumed by the render node (a clear pass runs first so
+    /// unloaded space reads as air under open sky).
+    refill: Vec<(Handle<ShaderStorageBuffer>, Handle<ShaderStorageBuffer>, IVec3)>,
     /// Placeholder bound to the unused `far` slot during trace (can't reuse the
     /// write target — a buffer may not be both read-write and read-only in one
     /// dispatch).
@@ -168,6 +173,9 @@ fn setup_gi_assets(
     // One byte (block id) per voxel; the shader reads it as packed u32s.
     let world_vox =
         buffers.add(ShaderStorageBuffer::with_size((GI_DIM * GI_DIM * GI_DIM) as usize, usage));
+    // One packed L0 light byte per voxel, same layout.
+    let world_light =
+        buffers.add(ShaderStorageBuffer::with_size((GI_DIM * GI_DIM * GI_DIM) as usize, usage));
 
     // Per-block emitted radiance as vec4<f32> rows, indexed by block id.
     let emission_rows: Vec<Vec4> =
@@ -187,6 +195,7 @@ fn setup_gi_assets(
 
     commands.insert_resource(GiAssets {
         world_vox,
+        world_light,
         emission,
         cascades,
         metas,
@@ -283,7 +292,11 @@ fn update_gi_volume(
                     let Some(&e) = map.map.get(&cpos) else { continue };
                     // Air chunks have no GPU buffer; the clear pass covers them.
                     let Ok(gc) = gpu_chunks.get(e) else { continue };
-                    gi.refill.push((gc.voxels.clone(), shl(cpos, CHUNK_BIT) - origin));
+                    gi.refill.push((
+                        gc.voxels.clone(),
+                        gc.light.clone(),
+                        shl(cpos, CHUNK_BIT) - origin,
+                    ));
                 }
             }
         }
@@ -371,6 +384,7 @@ fn init_pipeline(
                 storage_buffer_read_only_sized(false, None), // 3 params
                 storage_buffer_read_only_sized(false, None), // 4 meta
                 storage_buffer_read_only_sized(false, None), // 5 far
+                storage_buffer_read_only_sized(false, None), // 6 world_light
             ),
         ),
     );
@@ -399,6 +413,8 @@ fn init_pipeline(
                 storage_buffer_read_only_sized(false, None), // 0 chunk voxels
                 storage_buffer_sized(false, None),           // 1 world_vox (rw)
                 storage_buffer_read_only_sized(false, None), // 2 blit params
+                storage_buffer_read_only_sized(false, None), // 3 chunk light (padded)
+                storage_buffer_sized(false, None),           // 4 world_light (rw)
             ),
         ),
     );
@@ -444,14 +460,19 @@ fn prepare_bind_groups(
         return;
     }
 
-    // Occupancy refill (independent of the trace throttle): clear the volume,
-    // then blit each queued chunk buffer into it — all on the GPU.
+    // Volume refill (independent of the trace throttle): clear occupancy +
+    // light, then blit each queued chunk's buffers into them — all on the GPU.
     if !gi.refill.is_empty()
-        && let Some(world_vox) = buffers.get(&gi.world_vox)
+        && let (Some(world_vox), Some(world_light)) =
+            (buffers.get(&gi.world_vox), buffers.get(&gi.world_light))
     {
         let blit_layout = pipeline_cache.get_bind_group_layout(&pipeline.blit_layout);
-        for (handle, rel) in &gi.refill {
-            let Some(chunk_buf) = buffers.get(handle) else { continue };
+        for (vox_handle, light_handle, rel) in &gi.refill {
+            let (Some(chunk_buf), Some(light_buf)) =
+                (buffers.get(vox_handle), buffers.get(light_handle))
+            else {
+                continue;
+            };
             let params = render_device.create_buffer_with_data(
                 &bevy::render::render_resource::BufferInitDescriptor {
                     label: Some("gi_blit_params"),
@@ -469,6 +490,8 @@ fn prepare_bind_groups(
                     chunk_buf.buffer.as_entire_buffer_binding(),
                     world_vox.buffer.as_entire_buffer_binding(),
                     params.as_entire_buffer_binding(),
+                    light_buf.buffer.as_entire_buffer_binding(),
+                    world_light.buffer.as_entire_buffer_binding(),
                 )),
             );
             if jobs.clear.is_none() {
@@ -487,8 +510,9 @@ fn prepare_bind_groups(
     let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
 
     // All shared buffers must be resident.
-    let (Some(world_vox), Some(emission), Some(params)) = (
+    let (Some(world_vox), Some(world_light), Some(emission), Some(params)) = (
         buffers.get(&gi.world_vox),
+        buffers.get(&gi.world_light),
         buffers.get(&gi.emission),
         buffers.get(&gi.params),
     ) else {
@@ -523,6 +547,7 @@ fn prepare_bind_groups(
             params.buffer.as_entire_buffer_binding(),
             meta(c).buffer.as_entire_buffer_binding(),
             dummy.buffer.as_entire_buffer_binding(),
+            world_light.buffer.as_entire_buffer_binding(),
         )),
     );
     jobs.trace.push((bg, cascade_entries(c).div_ceil(64) as u32));
@@ -537,6 +562,7 @@ fn prepare_bind_groups(
                 params.buffer.as_entire_buffer_binding(),
                 meta(c).buffer.as_entire_buffer_binding(),
                 cascade(c + 1).buffer.as_entire_buffer_binding(),
+                world_light.buffer.as_entire_buffer_binding(),
             )),
         );
         jobs.merge.push((bg, cascade_entries(c).div_ceil(64) as u32));

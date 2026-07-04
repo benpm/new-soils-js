@@ -298,6 +298,38 @@ mod tests {
     }
 
     #[test]
+    fn winding_matches_normal() {
+        // Backface culling (client material) relies on every triangle being
+        // CCW viewed from outside, i.e. its geometric normal matching the face
+        // normal. Check dot(cross(e1, e2), normal) > 0 for both triangles of
+        // every quad over a mixed scene that emits all six face classes.
+        let mut vol = ChunkVolume::empty();
+        vol.set(5, 5, 5, 1);
+        for x in 0..8 {
+            for z in 0..8 {
+                vol.set(x + 10, 3, z + 10, 2);
+            }
+        }
+        let mesh = greedy_mesh(&vol, true);
+        for t in 0..mesh.indices.len() / 3 {
+            let [a, b, c] =
+                [mesh.indices[3 * t], mesh.indices[3 * t + 1], mesh.indices[3 * t + 2]];
+            let p = |i: u32| mesh.positions[i as usize];
+            let (pa, pb, pc) = (p(a), p(b), p(c));
+            let e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+            let e2 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+            let cross = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            let n = mesh.normals[a as usize];
+            let dot = cross[0] * n[0] + cross[1] * n[1] + cross[2] * n[2];
+            assert!(dot > 0.0, "triangle {t} wound against its normal {n:?}");
+        }
+    }
+
+    #[test]
     fn flat_top_merges_into_one_quad() {
         // A solid 4x1x4 slab: its +Y top has uniform AO, so it should merge
         // into a single quad.

@@ -111,8 +111,12 @@ impl Material for ChunkMeshMaterial {
         // slot valid.
         let vertex_layout = layout.0.get_layout(&[Mesh::ATTRIBUTE_POSITION.at_shader_location(0)])?;
         descriptor.vertex.buffers = vec![vertex_layout];
-        // Quads can be wound either way; render both sides.
-        descriptor.primitive.cull_mode = None;
+        // The mesher's per-sign du/dv swap makes cross(du, dv) == face normal,
+        // and the fixed corner order [0,1,2, 0,2,3] keeps both triangles CCW
+        // viewed from outside (pinned by greedy.rs::winding_matches_normal and
+        // transferred to the GPU port by tests/mesher_gpu.rs), so backfaces can
+        // be culled.
+        descriptor.primitive.cull_mode = Some(bevy::render::render_resource::Face::Back);
         Ok(())
     }
 }

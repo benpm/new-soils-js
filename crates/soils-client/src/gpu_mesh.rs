@@ -20,7 +20,8 @@ use bevy::render::render_resource::{
 };
 use bevy::render::renderer::{RenderContext, RenderDevice};
 use bevy::render::storage::{GpuShaderStorageBuffer, ShaderStorageBuffer};
-use bevy::camera::visibility::NoFrustumCulling;
+use bevy::camera::primitives::Aabb;
+use bevy::camera::visibility::NoAutoAabb;
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 use soils_protocol::{CHUNK_SIZE, ChunkVolume};
 
@@ -153,7 +154,11 @@ pub fn spawn_gpu_chunk(
             MeshMaterial3d(material),
             Transform::from_translation(origin),
             Visibility::default(),
-            NoFrustumCulling,
+            // Exact chunk-local bounds so Bevy frustum-culls normally. NoAutoAabb
+            // stops calculate_bounds from replacing this with the dummy mesh's
+            // degenerate all-zero Aabb.
+            Aabb::from_min_max(Vec3::ZERO, Vec3::splat(CHUNK_SIZE as f32)),
+            NoAutoAabb,
         ))
         .id()
 }

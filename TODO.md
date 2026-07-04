@@ -68,9 +68,15 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       property pinned: incremental == fresh full relight after an edit storm. Deferred: column
       heightmap summary (no consumer yet). (rendering §3; also closes the phase-2 note on
       light persistence)
-- [ ] 10. **Delta snapshot pipeline** — per-client quantized baselines in a 64-tick ring,
-      zigzag-varint/bit-packed deltas, priority accumulator under a byte budget, LZ4 over
-      threshold, acks piggybacked on inputs. (game-systems M6, §4)
+- [x] 10. **Delta snapshot pipeline** — `soils-protocol/snapshot.rs`: 1/256 fixed-point pos with
+      zigzag-varint deltas vs acked baselines, changed-only vel (1/256 i16, not f16 — same
+      size, no dep)/yaw, varint NetId deltas + change masks, LZ4 >200 B, fuzzed panic-free
+      decode; SnapshotTracker shared by client and test harness. Server: per-(client,entity)
+      64-send baseline ring, ack_tick piggybacked on Inputs (ordered transport ⇒ ack covers
+      all earlier sends), priority accumulator (base/dist², players 2×, reset on send) under
+      410 B/tick. Bandwidth pinned: self+3 critters average <150 B/tick (scenario assert).
+      Remote-body buffer interpolation deferred to phase 11 per §9 adoption order.
+      (game-systems M6, §4)
 - [ ] 11. **Prediction & reconciliation** — own-entity rewind/replay, remote snapshot-buffer
       interpolation + capped extrapolation, optimistic-edit rollback, lag-compensated
       interactions; validated on a simulated 150 ms / 2 % loss link. (game-systems M7, §9)

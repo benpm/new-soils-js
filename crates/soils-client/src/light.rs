@@ -24,11 +24,25 @@ use crate::material::{ChunkMeshMaterial, TERRAIN_BRIGHTNESS};
 pub struct LightQueue {
     pub chunks: Vec<IVec3>,
     pub edits: Vec<IVec3>,
+    /// Chunks whose light changed but whose padded GPU volume hasn't been
+    /// re-uploaded yet. A set, so a chunk re-dirtied by wave after wave of
+    /// neighbor floods uploads once per drain instead of once per touch —
+    /// during a join burst the same chunk otherwise re-pads dozens of times.
+    pending_pads: HashSet<IVec3>,
 }
 
-/// Chunks (re)lit per frame. Initial streaming delivers hundreds of chunks in
-/// bursts; lighting a few per frame keeps the main thread responsive.
-const CHUNK_BUDGET: usize = 12;
+/// Backstop on chunks (re)lit per frame; [`FLOOD_MS`] is the real limiter.
+/// High enough that a vsync-limited frame clock (e.g. a ~10 Hz USB display)
+/// still floods a join burst in a few seconds.
+const CHUNK_BUDGET: usize = 64;
+/// Stop flooding once this much of the frame has been spent lighting.
+const FLOOD_MS: f32 = 5.0;
+/// Backstop on padded light volumes re-uploaded per frame; [`PAD_MS`] is the
+/// real limiter. Each is a ~43 KB rebuild plus a bind-group invalidation, so
+/// an unbounded drain during a burst is what used to stretch frames to ~125 ms.
+const PAD_BUDGET: usize = 64;
+/// Stop re-uploading pads once this much of the frame has been spent on them.
+const PAD_MS: f32 = 4.0;
 
 /// The current day-scaled skylight illuminance, mirrored into every chunk
 /// material's `sky_term` when its quantized value changes.
@@ -120,7 +134,7 @@ pub fn process_light(
     blocks: Res<Blocks>,
     mut levels: Local<Vec<u8>>,
 ) {
-    if queue.chunks.is_empty() && queue.edits.is_empty() {
+    if queue.chunks.is_empty() && queue.edits.is_empty() && queue.pending_pads.is_empty() {
         return;
     }
     if levels.is_empty() {
@@ -134,9 +148,12 @@ pub fn process_light(
     // chunk gets no sky seed of its own, so processing the topmost first lets
     // its beam flood the whole loaded column in one propagation.
     queue.chunks.sort_by_key(|c| c.y);
-    let n = queue.chunks.len().min(CHUNK_BUDGET);
-    for _ in 0..n {
-        let cpos = queue.chunks.pop().expect("n <= len");
+    let t0 = std::time::Instant::now();
+    for done in 0..queue.chunks.len().min(CHUNK_BUDGET) {
+        if done > 0 && t0.elapsed().as_secs_f32() * 1000.0 > FLOOD_MS {
+            break; // slow frame: keep at least one flood of progress, defer the rest
+        }
+        let cpos = queue.chunks.pop().expect("bounded by len");
         light::light_new_chunk(&mut world, cpos);
         light::reconcile_sky_below(&mut world, cpos);
     }
@@ -144,8 +161,18 @@ pub fn process_light(
         light::apply_voxel_change(&mut world, v);
     }
 
+    // Coalesce dirt into the pending set, then upload a bounded, deduped batch.
     let dirty = world.dirty;
-    for cpos in dirty {
+    queue.pending_pads.extend(dirty);
+    let batch: Vec<IVec3> = queue.pending_pads.iter().copied().take(PAD_BUDGET).collect();
+    let pads_t0 = std::time::Instant::now();
+    let mut padded_count = 0;
+    for cpos in batch {
+        if padded_count > 0 && pads_t0.elapsed().as_secs_f32() * 1000.0 > PAD_MS {
+            break; // deferred pads stay in the set for next frame
+        }
+        padded_count += 1;
+        queue.pending_pads.remove(&cpos);
         let Some(&e) = map.map.get(&cpos) else { continue };
         let Ok((gc, mat)) = gpu.get(e) else { continue }; // empty chunks render nothing
         let padded = build_padded(&map, &chunks, cpos);

@@ -42,12 +42,16 @@ pub struct ChunkReceived {
     pub epoch: u32,
 }
 
-/// How many chunks may be turned into GPU resources per frame. A fresh world
-/// floods ~729 chunks in ~1s; applying them all at once allocates hundreds of
-/// MB of SSBOs and dispatches hundreds of compute jobs in one frame, which hangs
-/// (and loses) an integrated GPU. Draining at this budget spreads the work:
-/// ~8/frame ≈ 480 chunks/s → a full world fills in ~1.5s with no device loss.
-const CHUNK_APPLY_BUDGET: usize = 8;
+/// Hard cap on chunks turned into GPU resources per frame. A fresh world
+/// floods ~729 chunks in a burst; applying them all at once allocates hundreds
+/// of MB of SSBOs and dispatches hundreds of compute jobs in one frame, which
+/// hangs (and loses) an integrated GPU — the cap protects weak devices.
+const CHUNK_APPLY_MAX: usize = 32;
+/// Time box within the cap: a fixed per-frame count collapses when burst
+/// frames run long (8/frame at ~8 fps was ~60 chunks/s, >10 s to fill a fresh
+/// world). Applying against wall time instead self-regulates: fast frames
+/// apply more, slow frames back off but always make progress.
+const CHUNK_APPLY_MS: f32 = 3.0;
 
 /// Chunks that have arrived but not yet been meshed, drained at
 /// [`CHUNK_APPLY_BUDGET`] per frame by [`apply_chunks`]. `queued` mirrors the
@@ -312,11 +316,15 @@ pub fn apply_chunks(
         ..default()
     };
 
-    // (B) Apply at most CHUNK_APPLY_BUDGET chunks this frame. Turning a chunk into
-    // GPU resources allocates a ~655 KB quad SSBO and queues a compute dispatch;
-    // doing hundreds at once on a burst loses the device, so we spread the work.
+    // (B) Apply chunks until the time box (or hard cap) is hit. Turning a chunk
+    // into GPU resources allocates a ~655 KB quad SSBO and queues a compute
+    // dispatch; doing hundreds at once on a burst loses the device, so we
+    // spread the work — but by wall time, so slow frames don't starve the fill.
+    let t0 = std::time::Instant::now();
     let mut applied = 0;
-    while applied < CHUNK_APPLY_BUDGET {
+    while applied < CHUNK_APPLY_MAX
+        && (applied < 2 || t0.elapsed().as_secs_f32() * 1000.0 < CHUNK_APPLY_MS)
+    {
         let Some(msg) = queue.queue.pop_front() else { break };
         let cpos = IVec3::from_array(msg.pos);
         queue.queued.remove(&cpos);

@@ -10,9 +10,13 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       full-relight oracle + incremental flood, baked only on world modification; client shades
       with it so caves darken with GI off. (rendering §1, §4.1; region-file persistence of light
       deferred to phase 9 when the server adopts the grid)
-- [ ] 3. **Renderer hygiene** — indirect draws from the GPU quad count, per-chunk AABB frustum
-      culling, quad-overflow clamp + fallback, mesher workgroup occupancy, correct winding +
-      backface culling. (rendering §2)
+- [x] 3. **Renderer hygiene** — indirect draws from the GPU quad count, per-chunk AABB frustum
+      culling, quad-overflow clamp, mesher workgroup occupancy, backface culling (winding was
+      already consistent), all gated by a new GPU-vs-CPU mesher equality test
+      (`tests/mesher_gpu.rs`). Overflow logging/CPU-fallback remesh deferred with the pooled
+      quad-memory idea. Measured (RTX 5070, radius 8, vsync off, release): 11.4 → 10.4 ms;
+      the frame is now bounded by per-chunk draw submission (~5k bind groups) + atmosphere,
+      not terrain geometry — pooled quad memory / merged draws is the next lever. (rendering §2)
 - [ ] 4. **Worldgen performance** — instrument chunk generation, then accelerate (compute shader
       or parallel CPU) so singleplayer chunks appear promptly.
 - [ ] 5. **Server as headless Bevy ECS app** — 20 Hz fixed tick, connection tasks feed per-client

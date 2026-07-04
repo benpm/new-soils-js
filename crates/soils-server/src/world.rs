@@ -28,6 +28,7 @@ use soils_protocol::{CHUNK_BIT, CHUNK_CLIP, ChunkVolume};
 use soils_worldgen::{BlockRegistry, TerrainGen, WorldType, default_registry};
 
 use soils_sim::light::{self, ChunkLight, LightWorld};
+use soils_sim::nav;
 
 use crate::persist::PersistHandle;
 use crate::region;
@@ -280,6 +281,12 @@ pub struct World {
     /// header entries for resident chunks — disjoint sets. Eviction therefore
     /// drops the evicted chunk's region entry (see `tick_lifecycle`).
     header_cache: HashMap<PathBuf, Option<Box<[u32; 4096]>>>,
+    /// Per-chunk pathfinding data (plan §10 stages 1+3): walkability grid +
+    /// step-connected regions, lazily derived by [`ensure_nav`]
+    /// (World::ensure_nav). Keyed by the (own, below, above) chunk edit
+    /// versions — walk grids sample the vertical neighbors' border rows, so
+    /// a neighbor edit must also invalidate. Pruned on eviction.
+    navs: HashMap<IVec3, ([u32; 3], nav::WalkGrid, nav::ChunkNav)>,
     /// Spawn point in voxel space (matches the JS default world spawn).
     pub spawn: [f32; 3],
     pub seed: i64,
@@ -306,6 +313,7 @@ impl World {
             regions_dir,
             persist,
             header_cache: HashMap::new(),
+            navs: HashMap::new(),
             // Surface near here sits around y=256; spawn a little above it so
             // the player starts in the open air rather than buried in rock.
             spawn: [282.0, 285.0, 268.0],
@@ -664,7 +672,33 @@ impl World {
             // The background writer will rewrite this chunk's region header;
             // the memoised copy is stale the moment the write lands.
             self.header_cache.remove(&region::region_path(&self.regions_dir, pos));
+            self.navs.remove(&pos);
         }
+    }
+
+    /// Refresh the cached pathfinding data for `cpos` if its version key
+    /// (own + vertical-neighbor edit versions) moved; no-op when fresh, drops
+    /// the entry for non-resident chunks. Cold builds scan the chunk's voxels
+    /// (~1 ms), so callers only ensure the chunks a search will touch.
+    pub fn ensure_nav(&mut self, cpos: IVec3) {
+        if !self.chunks.contains_key(&cpos) {
+            self.navs.remove(&cpos);
+            return;
+        }
+        let ver = |c: IVec3| self.chunks.get(&c).map_or(u32::MAX, |e| e.version);
+        let key = [ver(cpos), ver(cpos - IVec3::Y), ver(cpos + IVec3::Y)];
+        if self.navs.get(&cpos).is_some_and(|(k, ..)| *k == key) {
+            return;
+        }
+        let grid = nav::walk_grid(&|v: IVec3| self.voxel(v), cpos);
+        let regions = nav::build_nav(&grid);
+        self.navs.insert(cpos, (key, grid, regions));
+    }
+
+    /// Cached pathfinding data (build with [`ensure_nav`](Self::ensure_nav)
+    /// first — this never derives).
+    pub fn nav(&self, cpos: IVec3) -> Option<(&nav::WalkGrid, &nav::ChunkNav)> {
+        self.navs.get(&cpos).map(|(_, g, n)| (g, n))
     }
 
     /// Resident-chunk count (memory-bound assertions in tests).
@@ -738,6 +772,63 @@ mod tests {
         world.adopt(pos, fresh);
         let vol = soils_protocol::decode_chunk(&world.serve(pos).unwrap()).unwrap();
         assert_eq!(vol.get(0, 0, 0), 9, "adopt must not overwrite the edited chunk");
+
+        persister.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nav_cache_tracks_own_and_neighbor_edits() {
+        let dir = std::env::temp_dir().join(format!("soils-world-nav-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+
+        // A surface chunk plus its vertical neighbors (the grid samples them).
+        let cpos = IVec3::new(8, 8, 8);
+        for dy in -1..=1 {
+            let p = cpos + IVec3::Y * dy;
+            let vol = generate_one(&world, p);
+            world.adopt(p, vol);
+        }
+        world.ensure_nav(cpos);
+        let count0 = world.nav(cpos).expect("nav built").0.count();
+        assert!(count0 > 0, "a surface chunk has walkable cells");
+
+        // Placing a block on a walkable cell (floor of the chunk interior)
+        // must rebuild the grid after ensure_nav — find one walkable cell and
+        // fill its headroom.
+        let origin = cpos * 32;
+        let cell = (0..32 * 32 * 32)
+            .map(|i| origin + IVec3::new(i % 32, (i / 1024) % 32, (i / 32) % 32))
+            .find(|c| {
+                world.nav(cpos).unwrap().0.get(c.x - origin.x, c.y - origin.y, c.z - origin.z)
+            })
+            .expect("some walkable cell");
+        assert!(world.edit(cell.x, cell.y, cell.z, 3));
+        world.ensure_nav(cpos);
+        // (Counts can be net-zero — the placed block's top becomes walkable —
+        // so assert the cell itself: a stale cache would still say true.)
+        assert!(
+            !world.nav(cpos).unwrap().0.get(
+                cell.x - origin.x,
+                cell.y - origin.y,
+                cell.z - origin.z
+            ),
+            "own edit must invalidate the cached grid"
+        );
+
+        // An edit in the chunk *below* also invalidates (border rows sample
+        // it): after ensure_nav the cache must equal a fresh derivation.
+        let below = origin - IVec3::Y;
+        let was_solid = world.voxel(below) != 0;
+        assert!(world.edit(below.x, below.y, below.z, if was_solid { 0 } else { 3 }));
+        world.ensure_nav(cpos);
+        let fresh = nav::walk_grid(&|v: IVec3| world.voxel(v), cpos);
+        assert!(
+            *world.nav(cpos).unwrap().0 == fresh,
+            "cached grid must match a fresh derivation after a neighbor edit"
+        );
 
         persister.shutdown();
         let _ = std::fs::remove_dir_all(&dir);

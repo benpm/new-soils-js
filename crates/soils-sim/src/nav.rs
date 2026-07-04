@@ -229,6 +229,195 @@ fn relax(
     }
 }
 
+// ---------------- Stage 3: hierarchical layer (HPA*) ----------------
+
+/// Per-chunk abstract nav data: connected regions of walkable cells under
+/// *symmetric step* moves only (lateral + dy ∈ {-1,0,1}). Drops of 2–3 are
+/// deliberately absent from the abstract layer — it under-connects, never
+/// over-connects, and the stage-2 refinement legs still use them. Rebuilt
+/// whenever the owning chunk's edit version changes (the caller keys the
+/// cache).
+pub struct ChunkNav {
+    /// Region id per walkable cell, keyed by packed `voxel_index`.
+    region_of: HashMap<u16, u16>,
+    /// One representative (local) cell per region.
+    pub reps: Vec<IVec3>,
+}
+
+impl ChunkNav {
+    /// Region containing local cell `l`, if it is walkable.
+    pub fn region_at(&self, l: IVec3) -> Option<u16> {
+        self.region_of.get(&(voxel_index(l.x, l.y, l.z) as u16)).copied()
+    }
+
+    pub fn region_count(&self) -> usize {
+        self.reps.len()
+    }
+}
+
+/// Flood a chunk's walk grid into step-connected regions.
+pub fn build_nav(grid: &WalkGrid) -> ChunkNav {
+    let mut region_of: HashMap<u16, u16> = HashMap::new();
+    let mut reps = Vec::new();
+    let s = CHUNK_SIZE;
+    for y in 0..s {
+        for z in 0..s {
+            for x in 0..s {
+                if !grid.get(x, y, z) || region_of.contains_key(&(voxel_index(x, y, z) as u16)) {
+                    continue;
+                }
+                let id = reps.len() as u16;
+                reps.push(IVec3::new(x, y, z));
+                let mut stack = vec![IVec3::new(x, y, z)];
+                region_of.insert(voxel_index(x, y, z) as u16, id);
+                while let Some(c) = stack.pop() {
+                    for d in LATERAL {
+                        for dy in -1..=1 {
+                            let n = c + d + UP * dy;
+                            if n.min_element() < 0 || n.max_element() >= s {
+                                continue;
+                            }
+                            let key = voxel_index(n.x, n.y, n.z) as u16;
+                            if grid.get(n.x, n.y, n.z) && !region_of.contains_key(&key) {
+                                region_of.insert(key, id);
+                                stack.push(n);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ChunkNav { region_of, reps }
+}
+
+/// Hierarchical path (plan §10.3), for when the flat search's budget can't
+/// reach: abstract A* over `(chunk, region)` nodes whose edges are discovered
+/// by sweeping region border cells against neighbor chunks' walk grids, then
+/// stage-2 refinement between consecutive region entry cells (each leg is
+/// local, so `leg_budget` stays small). `navs` returns the caller's cached
+/// `(WalkGrid, ChunkNav)` for a chunk — missing chunks are simply not
+/// traversed. Start and goal must be walkable (resolve first).
+pub fn hpa_path<'a>(
+    world: &impl VoxelSampler,
+    navs: &impl Fn(IVec3) -> Option<(&'a WalkGrid, &'a ChunkNav)>,
+    start: IVec3,
+    goal: IVec3,
+    leg_budget: usize,
+) -> PathResult {
+    let node_of = |p: IVec3| -> Option<(IVec3, u16)> {
+        let c = chunk_of(p);
+        let r = navs(c)?.1.region_at(p - chunk_origin(c))?;
+        Some((c, r))
+    };
+    let Some(start_node) = node_of(start) else { return PathResult::NoPath };
+    let Some(goal_node) = node_of(goal) else { return PathResult::NoPath };
+
+    // Abstract A*: g in voxels ×4, heuristic = euclidean (loose but safe;
+    // the graph is hundreds of nodes at most).
+    type Node = (IVec3, u16);
+    let h = |p: IVec3| p.as_vec3().distance(goal.as_vec3()) as u32;
+    let mut open: BinaryHeap<Reverse<(u32, IVec3ToKey, u16)>> = BinaryHeap::new();
+    // Per reached node: (g, parent, cell where we entered this region).
+    let mut best: HashMap<Node, (u32, Node, IVec3)> = HashMap::new();
+    best.insert(start_node, (0, start_node, start));
+    open.push(Reverse((h(start), IVec3ToKey(start_node.0), start_node.1)));
+
+    let mut found = false;
+    while let Some(Reverse((_, IVec3ToKey(c), r))) = open.pop() {
+        let node = (c, r);
+        if node == goal_node {
+            found = true;
+            break;
+        }
+        let (g_cur, _, entry) = best[&node];
+        let Some((_, nav)) = navs(c) else { continue };
+        let origin = chunk_origin(c);
+        // Sweep this region's border cells for moves that leave the chunk.
+        for (&key, &reg) in &nav.region_of {
+            if reg != r {
+                continue;
+            }
+            let l = unpack_index(key);
+            if l.x != 0 && l.x != CHUNK_SIZE - 1 && l.z != 0 && l.z != CHUNK_SIZE - 1
+                && l.y != 0 && l.y != CHUNK_SIZE - 1
+            {
+                continue;
+            }
+            let from = origin + l;
+            for d in LATERAL {
+                for dy in -1..=1 {
+                    let to = from + d + UP * dy;
+                    let tc = chunk_of(to);
+                    if tc == c {
+                        continue;
+                    }
+                    let Some((tg, tn)) = navs(tc) else { continue };
+                    let tl = to - chunk_origin(tc);
+                    if !tg.get(tl.x, tl.y, tl.z) {
+                        continue;
+                    }
+                    // Same legality as the flat search's step moves.
+                    if dy > 0 && world.is_solid(from + UP * 2) {
+                        continue;
+                    }
+                    let Some(tr) = tn.region_at(tl) else { continue };
+                    let next: Node = (tc, tr);
+                    let step = entry.as_vec3().distance(to.as_vec3()) as u32 + 1;
+                    let g = g_cur + step;
+                    if best.get(&next).is_none_or(|&(old, ..)| g < old) {
+                        best.insert(next, (g, node, to));
+                        open.push(Reverse((g + h(to), IVec3ToKey(tc), tr)));
+                    }
+                }
+            }
+        }
+    }
+    if !found {
+        return PathResult::NoPath;
+    }
+
+    // Walk the abstract chain back to collect region entry cells...
+    let mut joints = vec![];
+    let mut n = goal_node;
+    while n != start_node {
+        let (_, parent, entry) = best[&n];
+        joints.push(entry);
+        n = parent;
+    }
+    joints.push(start);
+    joints.reverse();
+    joints.push(goal);
+
+    // ...and refine leg by leg with the flat search (each leg spans at most
+    // two adjacent regions).
+    let mut path: Vec<IVec3> = vec![start];
+    for w in joints.windows(2) {
+        if w[0] == w[1] {
+            continue;
+        }
+        match find_path(world, w[0], w[1], leg_budget) {
+            PathResult::Path(p) => path.extend(p.into_iter().skip(1)),
+            // The abstract layer said these are connected; a failed leg means
+            // the budget was too small for the local detour.
+            other => return other,
+        }
+    }
+    PathResult::Path(path)
+}
+
+/// Inverse of `voxel_index` for packed u16 keys.
+fn unpack_index(key: u16) -> IVec3 {
+    let i = key as i32;
+    IVec3::new(i % CHUNK_SIZE, i / (CHUNK_SIZE * CHUNK_SIZE), (i / CHUNK_SIZE) % CHUNK_SIZE)
+}
+
+/// Chunk coordinate containing a voxel (arithmetic shift; glam `IVec3` has no
+/// scalar `>>`).
+fn chunk_of(v: IVec3) -> IVec3 {
+    IVec3::new(v.x >> soils_protocol::CHUNK_BIT, v.y >> soils_protocol::CHUNK_BIT, v.z >> soils_protocol::CHUNK_BIT)
+}
+
 /// `IVec3` doesn't implement `Ord`; wrap it so the heap can tie-break.
 #[derive(PartialEq, Eq)]
 struct IVec3ToKey(IVec3);
@@ -427,6 +616,87 @@ mod tests {
             find_path(&flat, IVec3::new(0, 1, 0), IVec3::new(200, 1, 0), 50),
             PathResult::Budget
         );
+    }
+
+    /// Build (WalkGrid, ChunkNav) for every chunk in a range, for hpa tests.
+    fn build_navs(
+        world: &impl VoxelSampler,
+        chunks: &[IVec3],
+    ) -> std::collections::HashMap<IVec3, (WalkGrid, ChunkNav)> {
+        chunks
+            .iter()
+            .map(|&c| {
+                let g = walk_grid(world, c);
+                let n = build_nav(&g);
+                (c, (g, n))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_nav_separates_disconnected_platforms() {
+        // Two slabs at different heights with a gap: two regions.
+        let world = bounded(
+            |v: IVec3| u8::from((v.y == 4 && v.x < 10) || (v.y == 10 && v.x > 20)),
+            40,
+        );
+        let nav = build_nav(&walk_grid(&world, IVec3::ZERO));
+        assert_eq!(nav.region_count(), 2);
+        assert_ne!(
+            nav.region_at(IVec3::new(5, 5, 5)),
+            nav.region_at(IVec3::new(25, 11, 5))
+        );
+        // A connected slab is one region.
+        let flat = |v: IVec3| u8::from(v.y == 4);
+        assert_eq!(build_nav(&walk_grid(&flat, IVec3::ZERO)).region_count(), 1);
+    }
+
+    #[test]
+    fn hpa_reaches_across_chunks_where_flat_budget_cannot() {
+        // A floor at y = -1 (the walkable row is y = 0, inside chunks with
+        // cy = 0) spanning three chunks along x.
+        let world = floor_world(-1);
+        let chunks: Vec<IVec3> =
+            (0..3).map(|cx| IVec3::new(cx, 0, 0)).collect();
+        let navs = build_navs(&world, &chunks);
+        let lookup = |c: IVec3| navs.get(&c).map(|(g, n)| (g, n));
+
+        let start = IVec3::new(1, 0, 9);
+        let goal = IVec3::new(94, 0, 9); // 93 lateral cells away
+        // The flat search under a tight budget can't reach...
+        assert_eq!(find_path(&world, start, goal, 60), PathResult::Budget);
+        // ...but the hierarchical search does, and every move is legal.
+        let PathResult::Path(p) = hpa_path(&world, &lookup, start, goal, 4000) else {
+            panic!("hpa should span the three chunks");
+        };
+        assert_eq!(p[0], start);
+        assert_eq!(*p.last().unwrap(), goal);
+        for w in p.windows(2) {
+            let d = w[1] - w[0];
+            assert_eq!(d.x.abs() + d.z.abs(), 1, "one lateral cell per move: {d:?}");
+            assert!(d.y <= 1 && d.y >= -MAX_FALL);
+            assert!(walkable(&world, w[1]));
+        }
+    }
+
+    #[test]
+    fn hpa_refuses_disconnected_islands_and_missing_nav() {
+        // Two floor islands in different chunks with a void between.
+        let world = |v: IVec3| {
+            u8::from(v.y == -1 && (v.x < 10 || v.x > 80) && v.x >= 0 && v.x <= 90 && v.z.abs() < 16)
+        };
+        let chunks: Vec<IVec3> = (0..3).map(|cx| IVec3::new(cx, 0, 0)).collect();
+        let navs = build_navs(&world, &chunks);
+        let lookup = |c: IVec3| navs.get(&c).map(|(g, n)| (g, n));
+        let start = IVec3::new(1, 0, 9);
+        let goal = IVec3::new(85, 0, 9);
+        assert_eq!(hpa_path(&world, &lookup, start, goal, 4000), PathResult::NoPath);
+        // A goal inside a chunk with no cached nav is unreachable too.
+        let flat = floor_world(-1);
+        let far = IVec3::new(200, 0, 9); // chunk (6,0,0), not in the cache
+        let navs = build_navs(&flat, &chunks);
+        let lookup = |c: IVec3| navs.get(&c).map(|(g, n)| (g, n));
+        assert_eq!(hpa_path(&flat, &lookup, start, far, 4000), PathResult::NoPath);
     }
 
     #[test]

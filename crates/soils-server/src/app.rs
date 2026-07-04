@@ -775,7 +775,7 @@ fn feet_cell(pos: Vec3) -> IVec3 {
 /// tick counter increment.
 fn wander_critters(
     mut ticks: ResMut<TickCount>,
-    worlds: Res<Worlds>,
+    mut worlds: ResMut<Worlds>,
     mut critters: Query<
         (&NetId, &InWorld, &mut SimState, &mut Yaw, &mut Wander),
         Without<PlayerControlled>,
@@ -788,11 +788,10 @@ fn wander_critters(
         players.iter().map(|(w, s)| (w.0.as_str(), s.0.pos)).collect();
 
     for (net, in_world, mut sim, mut yaw, mut wander) in &mut critters {
-        let Some(world) = worlds.map.get(&in_world.0) else { continue };
+        let Some(world) = worlds.map.get_mut(&in_world.0) else { continue };
         if !world.has_chunk(chunk_at(sim.0.pos.to_array())) {
             continue;
         }
-        let sampler = |v: IVec3| world.voxel(v);
         let feet = feet_cell(sim.0.pos);
 
         // Acquire: nearest in-range player's ground cell (players fly, so
@@ -803,7 +802,9 @@ fn wander_critters(
             .map(|(_, p)| (*p, p.distance(sim.0.pos)))
             .filter(|(_, d)| *d < SEEK_RANGE)
             .min_by(|a, b| a.1.total_cmp(&b.1))
-            .and_then(|(p, _)| nav::resolve_walkable(&sampler, feet_cell(p), GROUND_SCAN));
+            .and_then(|(p, _)| {
+                nav::resolve_walkable(&|v: IVec3| world.voxel(v), feet_cell(p), GROUND_SCAN)
+            });
 
         let mut input = soils_sim::PlayerInput {
             move_axes: glam::Vec2::new(0.0, 1.0),
@@ -819,12 +820,36 @@ fn wander_critters(
                 wander.path.clear();
                 // The body may hover, mid-fall, or stand on a block edge —
                 // snap the start to the nearest standable cell.
-                let start = nav::resolve_walkable(&sampler, feet, 2);
-                if let Some(start) = start
-                    && let nav::PathResult::Path(p) =
-                        nav::find_path(&sampler, start, goal, PATH_BUDGET)
-                {
-                    wander.path = p.into_iter().collect();
+                let flat = {
+                    let sampler = |v: IVec3| world.voxel(v);
+                    nav::resolve_walkable(&sampler, feet, 2)
+                        .map(|s| (s, nav::find_path(&sampler, s, goal, PATH_BUDGET)))
+                };
+                match flat {
+                    Some((_, nav::PathResult::Path(p))) => wander.path = p.into(),
+                    // Too far for the flat budget: refresh the touched
+                    // chunks' cached graphs and go hierarchical (§10.3).
+                    Some((s, nav::PathResult::Budget)) => {
+                        let (c0, c1) = (
+                            chunk_of(s.min(goal)) - IVec3::ONE,
+                            chunk_of(s.max(goal)) + IVec3::ONE,
+                        );
+                        for cy in c0.y..=c1.y {
+                            for cz in c0.z..=c1.z {
+                                for cx in c0.x..=c1.x {
+                                    world.ensure_nav(IVec3::new(cx, cy, cz));
+                                }
+                            }
+                        }
+                        let sampler = |v: IVec3| world.voxel(v);
+                        let lookup = |c: IVec3| world.nav(c);
+                        if let nav::PathResult::Path(p) =
+                            nav::hpa_path(&sampler, &lookup, s, goal, PATH_BUDGET)
+                        {
+                            wander.path = p.into();
+                        }
+                    }
+                    _ => {}
                 }
             }
             // Reached (or fell past) waypoints are popped; a waypoint no
@@ -833,7 +858,7 @@ fn wander_critters(
                 wander.path.pop_front();
             }
             if let Some(&next) = wander.path.front() {
-                if !nav::walkable(&sampler, next) {
+                if !nav::walkable(&|v: IVec3| world.voxel(v), next) {
                     wander.path.clear();
                 } else {
                     let center = next.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
@@ -859,8 +884,13 @@ fn wander_critters(
             }
             input.yaw = yaw.0;
         }
-        soils_sim::step_player(&mut sim.0, &input, dt, &sampler);
+        soils_sim::step_player(&mut sim.0, &input, dt, &|v: IVec3| world.voxel(v));
     }
+}
+
+/// Chunk coordinate containing a voxel.
+fn chunk_of(v: IVec3) -> IVec3 {
+    IVec3::new(v.x >> CHUNK_BIT, v.y >> CHUNK_BIT, v.z >> CHUNK_BIT)
 }
 
 /// Replicate entities (plan §4/§7): per client, interest = entities in the

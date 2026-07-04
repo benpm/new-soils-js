@@ -533,7 +533,7 @@ async fn handle_connection(
                     let results = tokio::task::spawn_blocking(move || {
                         let cpositions: Vec<IVec3> =
                             wave.iter().map(|p| IVec3::new(p[0], p[1], p[2])).collect();
-                        world.lock().unwrap().get_or_generate_batch(&cpositions)
+                        World::get_or_generate_batch(&world, &cpositions)
                     })
                     .await;
                     let results = match results {

@@ -27,15 +27,97 @@ use glam::IVec3;
 use soils_protocol::{CHUNK_BIT, CHUNK_CLIP, ChunkVolume};
 use soils_worldgen::{BlockRegistry, TerrainGen, WorldType, default_registry};
 
+use soils_sim::light::{self, ChunkLight, LightWorld};
+
 use crate::persist::PersistHandle;
 use crate::region;
 
+/// Cells with effective light below this count as "dark" for gameplay
+/// (spawn) queries.
+pub const SPAWN_LIGHT: u8 = 4;
+/// Chunk relights per [`World::pump_light`] call (time-boxed by the caller's
+/// budget too).
+const LIGHT_BUDGET: usize = 8;
+
 /// A resident chunk plus its lifecycle state: `dirty` marks unpersisted edits,
-/// `zero_since` runs the unload timer while no client subscribes.
+/// `zero_since` runs the unload timer while no client subscribes. Light is
+/// derived data — recomputed on residency via the shared `soils-sim` flood,
+/// never persisted or replicated (plan-rendering §3).
 struct ChunkEntry {
     volume: ChunkVolume,
+    light: ChunkLight,
+    summary: LightSummary,
     dirty: bool,
     zero_since: Option<Instant>,
+}
+
+/// Per-chunk gameplay-lighting summary, maintained alongside the grid.
+/// Counts are kept for both sun extremes so queries can pick by the *current*
+/// daytime without rescanning voxels (effective light = max(block, sky·sun)).
+#[derive(Default, Clone)]
+struct LightSummary {
+    /// Dark walkable-air cells under full sun.
+    dark_day: u16,
+    /// Dark walkable-air cells with no sun (night).
+    dark_night: u16,
+    /// Up to 8 sampled dark-at-night walkable cells: (packed local index,
+    /// skylight, blocklight).
+    samples: Vec<(u16, u8, u8)>,
+}
+
+/// `soils_sim::light::LightWorld` over the resident chunk map. Records which
+/// chunks' light changed in `dirty` so summaries can be refreshed.
+struct WorldLight<'a> {
+    chunks: &'a mut HashMap<IVec3, ChunkEntry>,
+    levels: &'a [u8],
+    dirty: std::collections::HashSet<IVec3>,
+}
+
+impl WorldLight<'_> {
+    fn voxel(&self, v: IVec3) -> u8 {
+        let c = IVec3::new(v.x >> CHUNK_BIT, v.y >> CHUNK_BIT, v.z >> CHUNK_BIT);
+        match self.chunks.get(&c) {
+            Some(e) => e.volume.get(v.x & CHUNK_CLIP, v.y & CHUNK_CLIP, v.z & CHUNK_CLIP),
+            None => 0,
+        }
+    }
+}
+
+impl LightWorld for WorldLight<'_> {
+    fn solid(&self, v: IVec3) -> bool {
+        self.voxel(v) != 0
+    }
+
+    fn emission(&self, v: IVec3) -> u8 {
+        self.levels.get(self.voxel(v) as usize).copied().unwrap_or(0)
+    }
+
+    fn light(&self, v: IVec3) -> u8 {
+        let c = IVec3::new(v.x >> CHUNK_BIT, v.y >> CHUNK_BIT, v.z >> CHUNK_BIT);
+        match self.chunks.get(&c) {
+            Some(e) => e.light.get(v.x & CHUNK_CLIP, v.y & CHUNK_CLIP, v.z & CHUNK_CLIP),
+            None => 0,
+        }
+    }
+
+    fn set_light(&mut self, v: IVec3, packed: u8) {
+        let c = IVec3::new(v.x >> CHUNK_BIT, v.y >> CHUNK_BIT, v.z >> CHUNK_BIT);
+        if let Some(e) = self.chunks.get_mut(&c) {
+            e.light.set(v.x & CHUNK_CLIP, v.y & CHUNK_CLIP, v.z & CHUNK_CLIP, packed);
+            self.dirty.insert(c);
+        }
+    }
+
+    fn in_domain(&self, v: IVec3) -> bool {
+        let c = IVec3::new(v.x >> CHUNK_BIT, v.y >> CHUNK_BIT, v.z >> CHUNK_BIT);
+        self.chunks.contains_key(&c)
+    }
+
+    fn open_sky_above(&self, _v: IVec3) -> bool {
+        // Only consulted when the chunk above isn't resident: assume open sky;
+        // corrected by `reconcile_sky_below` when it loads.
+        true
+    }
 }
 
 pub struct World {
@@ -50,6 +132,11 @@ pub struct World {
     /// Handle to the background writer: chunk saves are enqueued here instead
     /// of being written on the tick path.
     persist: PersistHandle,
+    /// Chunks awaiting a light flood (made resident this session; processed
+    /// top-of-column-first by [`pump_light`](World::pump_light)).
+    light_queue: Vec<IVec3>,
+    /// Per-block emission levels from the registry, cached for the flood.
+    light_levels: Vec<u8>,
     /// Memoised region-file headers for the read path. `None` = the region file
     /// doesn't exist (nothing there was ever persisted). Turns a per-chunk file
     /// open into one header read per region.
@@ -73,11 +160,14 @@ impl World {
         // Reclaim space leaked by append-only chunk rewrites. Best-effort and
         // bounded by the leak thresholds; runs before any header is memoised.
         region::compact_dir(&regions_dir);
+        let registry = Arc::new(default_registry());
         Self {
-            registry: Arc::new(default_registry()),
+            light_levels: registry.light_table(),
+            registry,
             terrain: Arc::new(TerrainGen::new(seed, WorldType::Normal)),
             chunks: HashMap::new(),
             refs: HashMap::new(),
+            light_queue: Vec::new(),
             regions_dir,
             persist,
             header_cache: HashMap::new(),
@@ -94,7 +184,14 @@ impl World {
         } else {
             Some(Instant::now())
         };
-        ChunkEntry { volume, dirty: false, zero_since }
+        self.light_queue.push(pos);
+        ChunkEntry {
+            volume,
+            light: ChunkLight::dark(),
+            summary: LightSummary::default(),
+            dirty: false,
+            zero_since,
+        }
     }
 
     /// Read a persisted chunk via the memoised region-header cache, opening the
@@ -167,14 +264,141 @@ impl World {
     }
 
     /// Apply a voxel edit at an absolute voxel position, marking the chunk
-    /// dirty for the next flush. Returns false if the containing chunk has not
-    /// been loaded yet.
+    /// dirty for the next flush and incrementally relighting around the cell.
+    /// Returns false if the containing chunk has not been loaded yet.
     pub fn edit(&mut self, x: i32, y: i32, z: i32, value: u8) -> bool {
         let cpos = IVec3::new(x >> CHUNK_BIT, y >> CHUNK_BIT, z >> CHUNK_BIT);
         let Some(entry) = self.chunks.get_mut(&cpos) else { return false };
         entry.volume.set(x & CHUNK_CLIP, y & CHUNK_CLIP, z & CHUNK_CLIP, value);
         entry.dirty = true;
+        let mut lw = WorldLight {
+            chunks: &mut self.chunks,
+            levels: &self.light_levels,
+            dirty: std::collections::HashSet::new(),
+        };
+        light::apply_voxel_change(&mut lw, IVec3::new(x, y, z));
+        let touched = lw.dirty;
+        for c in touched {
+            self.rebuild_summary(c);
+        }
         true
+    }
+
+    /// Run the queued light floods, newest chunks top-of-column first (a chunk
+    /// under a loaded-but-unlit chunk gets no sky seed of its own). Budgeted
+    /// per tick; summaries refresh for every chunk whose light changed.
+    pub fn pump_light(&mut self, max_millis: f32) {
+        if self.light_queue.is_empty() {
+            return;
+        }
+        let t0 = Instant::now();
+        self.light_queue.sort_by_key(|c| c.y);
+        let mut touched = std::collections::HashSet::new();
+        for done in 0..LIGHT_BUDGET {
+            if done > 0 && t0.elapsed().as_secs_f32() * 1000.0 > max_millis {
+                break;
+            }
+            let Some(cpos) = self.light_queue.pop() else { break };
+            let mut lw = WorldLight {
+                chunks: &mut self.chunks,
+                levels: &self.light_levels,
+                dirty: std::collections::HashSet::new(),
+            };
+            light::light_new_chunk(&mut lw, cpos);
+            light::reconcile_sky_below(&mut lw, cpos);
+            touched.extend(lw.dirty);
+            touched.insert(cpos);
+        }
+        for c in touched {
+            self.rebuild_summary(c);
+        }
+    }
+
+    /// Whether all resident chunks have been flooded (tests).
+    pub fn light_settled(&self) -> bool {
+        self.light_queue.is_empty()
+    }
+
+    /// Rebuild one chunk's gameplay-lighting summary: dark walkable-air cells
+    /// under both sun extremes, plus a small sample of dark cells for spawn
+    /// queries. Walkable-air ≈ air with air headroom above and solid below
+    /// (in-chunk approximation; the pathfinding walkability grid refines this
+    /// in a later phase).
+    fn rebuild_summary(&mut self, cpos: IVec3) {
+        let Some(entry) = self.chunks.get(&cpos) else { return };
+        let mut summary = LightSummary::default();
+        for y in 1..31 {
+            for z in 0..32 {
+                for x in 0..32 {
+                    if entry.volume.get(x, y, z) != 0
+                        || entry.volume.get(x, y + 1, z) != 0
+                        || entry.volume.get(x, y - 1, z) == 0
+                    {
+                        continue;
+                    }
+                    let packed = entry.light.get(x, y, z);
+                    let (sky, block) = (light::sky(packed), light::block(packed));
+                    if block < SPAWN_LIGHT {
+                        summary.dark_night += 1;
+                        if sky.max(block) < SPAWN_LIGHT {
+                            summary.dark_day += 1;
+                        }
+                        if summary.samples.len() < 8 {
+                            let idx = (x + y * 32 + z * 1024) as u16;
+                            summary.samples.push((idx, sky, block));
+                        }
+                    }
+                }
+            }
+        }
+        self.chunks.get_mut(&cpos).expect("checked above").summary = summary;
+    }
+
+    /// Gameplay spawn query (plan-rendering §3): the darkest currently-valid
+    /// walkable cell within `radius` chunks of `center`, judged at sun level
+    /// `sun` (0 = midnight, 1 = noon; effective light = max(block, sky·sun)).
+    /// O(chunk summaries), no voxel scans beyond validating sampled cells.
+    pub fn darkest_walkable_near(&self, center: IVec3, radius: i32, sun: f32) -> Option<IVec3> {
+        let ccenter =
+            IVec3::new(center.x >> CHUNK_BIT, center.y >> CHUNK_BIT, center.z >> CHUNK_BIT);
+        let mut best: Option<(f32, IVec3)> = None;
+        for dx in -radius..=radius {
+            for dy in -radius..=radius {
+                for dz in -radius..=radius {
+                    let cpos = ccenter + IVec3::new(dx, dy, dz);
+                    let Some(entry) = self.chunks.get(&cpos) else { continue };
+                    let candidates =
+                        if sun > 0.5 { entry.summary.dark_day } else { entry.summary.dark_night };
+                    if candidates == 0 {
+                        continue;
+                    }
+                    for &(idx, sky, block) in &entry.summary.samples {
+                        let effective = (block as f32).max(sky as f32 * sun);
+                        if effective >= SPAWN_LIGHT as f32 {
+                            continue;
+                        }
+                        if best.is_none_or(|(b, _)| effective < b) {
+                            let (x, y, z) =
+                                ((idx % 32) as i32, ((idx / 32) % 32) as i32, (idx / 1024) as i32);
+                            let world_pos = IVec3::new(
+                                (cpos.x << CHUNK_BIT) + x,
+                                (cpos.y << CHUNK_BIT) + y,
+                                (cpos.z << CHUNK_BIT) + z,
+                            );
+                            // Validate against live voxels (samples can go
+                            // stale between summary rebuilds).
+                            if self.voxel(world_pos) == 0
+                                && self.voxel(world_pos + IVec3::Y) == 0
+                                && self.voxel(world_pos - IVec3::Y) != 0
+                            {
+                                best = Some((effective, world_pos));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(_, p)| p)
     }
 
     /// A client subscribed to `pos`: cancel any unload timer.
@@ -302,6 +526,132 @@ mod tests {
         world.adopt(pos, fresh);
         let vol = soils_protocol::decode_chunk(&world.serve(pos).unwrap()).unwrap();
         assert_eq!(vol.get(0, 0, 0), 9, "adopt must not overwrite the edited chunk");
+
+        persister.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Make a 3×3×3 region around `center` resident and fully lit.
+    fn lit_region(world: &mut World, center: IVec3) -> Vec<IVec3> {
+        let mut chunks = Vec::new();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    chunks.push(center + IVec3::new(dx, dy, dz));
+                }
+            }
+        }
+        let (terrain, registry) = world.gen_ctx();
+        let volumes = terrain.generate_batch(&chunks, &registry);
+        for (pos, vol) in chunks.iter().zip(volumes) {
+            world.adopt(*pos, vol);
+        }
+        while !world.light_settled() {
+            world.pump_light(1000.0);
+        }
+        chunks
+    }
+
+    #[test]
+    fn incremental_light_matches_fresh_relight_after_edit_storm() {
+        let dir = std::env::temp_dir().join(format!("soils-world-light-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Surface region around the spawn chunk: sky, terrain, and caves.
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let center = IVec3::new(8, 8, 8);
+        let chunks = lit_region(&mut world, center);
+
+        // Storm of edits in the center chunk: place a light-tight slab, punch
+        // holes in it, drop emissive-adjacent structure, then remove some.
+        let base = center * 32;
+        let mut s = 42u64;
+        for i in 0..48 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let (x, y, z) =
+                (base.x + (s >> 20) as i32 % 32, base.y + 8 + i % 12, base.z + (s >> 40) as i32 % 32);
+            let value = if i % 3 == 0 { 0 } else { 1 + (i % 4) as u8 };
+            world.edit(x, y, z, value);
+        }
+
+        // Fresh oracle: same voxels, full relight from scratch.
+        let persister2 = Persister::new();
+        let mut fresh = World::new(&dir, "oracle", 0, persister2.handle());
+        for &pos in &chunks {
+            let vol = ChunkVolume::from_bytes(
+                soils_protocol::decode_chunk(&world.serve(pos).unwrap()).unwrap().as_bytes(),
+            );
+            fresh.adopt(pos, vol);
+        }
+        fresh.light_queue.clear(); // relight the whole set in one oracle pass
+        let mut lw = WorldLight {
+            chunks: &mut fresh.chunks,
+            levels: &fresh.light_levels,
+            dirty: std::collections::HashSet::new(),
+        };
+        light::relight_full(&mut lw, &chunks);
+
+        for &pos in &chunks {
+            assert_eq!(
+                world.chunks[&pos].light.as_bytes(),
+                fresh.chunks[&pos].light.as_bytes(),
+                "incremental light diverged from fresh relight at {pos}"
+            );
+        }
+        persister.shutdown();
+        persister2.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn darkest_walkable_query_returns_valid_dark_cells() {
+        let dir = std::env::temp_dir().join(format!("soils-world-dark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+        // Deep underground: solid rock threaded with generated caves — the
+        // natural home of dark walkable cells, even at noon.
+        let center = IVec3::new(8, 4, 8);
+        lit_region(&mut world, center);
+
+        let probe = center * 32 + IVec3::splat(16);
+        let found = world
+            .darkest_walkable_near(probe, 1, 1.0)
+            .expect("cave region should offer a dark walkable cell even at noon");
+        // The candidate is genuinely walkable and genuinely dark.
+        assert_eq!(world.voxel(found), 0, "cell must be air");
+        assert_eq!(world.voxel(found + IVec3::Y), 0, "needs headroom");
+        assert_ne!(world.voxel(found - IVec3::Y), 0, "must stand on solid ground");
+
+        // Summaries track edits: fill the found cell; the query must not hand
+        // out that exact cell again.
+        assert!(world.edit(found.x, found.y, found.z, 1));
+        if let Some(again) = world.darkest_walkable_near(probe, 1, 1.0) {
+            assert_ne!(again, found, "filled cell must leave the candidate set");
+            assert_eq!(world.voxel(again), 0);
+        }
+
+        persister.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn surface_darkness_grows_at_night() {
+        let dir = std::env::temp_dir().join(format!("soils-world-night-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let center = IVec3::new(8, 8, 8);
+        lit_region(&mut world, center);
+
+        // At noon the open surface is lit; at midnight it counts as dark, so
+        // the night query finds a candidate where the day query may not.
+        let probe = center * 32 + IVec3::splat(16);
+        let night = world.darkest_walkable_near(probe, 1, 0.0);
+        assert!(night.is_some(), "night should open surface cells for spawns");
 
         persister.shutdown();
         let _ = std::fs::remove_dir_all(&dir);

@@ -255,9 +255,13 @@ fn check_shutdown(
     }
 }
 
-/// Evict expired zero-ref chunks (hourly-scale memory bound) and flush dirty
-/// (edited) chunks to the background writer on their intervals.
+/// Run queued light floods (budgeted), evict expired zero-ref chunks
+/// (hourly-scale memory bound), and flush dirty (edited) chunks to the
+/// background writer on their intervals.
 fn world_lifecycle(time: Res<Time>, mut worlds: ResMut<Worlds>, mut acc: Local<(f32, f32)>) {
+    for w in worlds.map.values_mut() {
+        w.pump_light(4.0);
+    }
     acc.0 += time.delta_secs();
     acc.1 += time.delta_secs();
     if acc.0 >= 1.0 {

@@ -88,9 +88,19 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       server light floods moved off-thread onto dense cloned regions (300 ms/column stalls);
       per-chunk edit versions added; hot member crates opt-level 3 in dev. Deferred to later
       work: lag-compensated hit interactions (no combat consumers yet). (game-systems M7, §9)
-- [ ] 12. **Radiance-cascades GI upgrades** — GPU-side occupancy fill (kill the CPU refill), seed
-      from L0, 3D-texture + DDA marching, per-probe SH/ambient-cube irradiance; flip default-on
-      where stable. (rendering §1 L2)
+- [x] 12. **Radiance-cascades GI upgrades** — GPU-side occupancy fill (`gi_blit.wgsl` blits the
+      mesher's resident chunk voxel + padded-light buffers into the volumes; the 262 KB/30-frame
+      CPU rebuild is gone), L0 seeding (top-cascade escapes gated by baked skylight at the
+      interval end — caves deeper than the 30-voxel march stop leaking daylight; unresident
+      space defaults to open sky), cascade round-robin (trace+merge paired per frame, top-down,
+      so the material never samples a raw cascade 0), and per-probe ambient-cube irradiance
+      projected once per cycle with trilinear 8-probe sampling in the fragment shader (replaces
+      the per-fragment 16-direction loop; kills nearest-probe blockiness). All four pinned by
+      headless GPU-vs-CPU oracle tests (`tests/gi_gpu.rs`). Deferred: 3D-texture + mips + DDA
+      marching (perf-only — 60 fps steady on discrete with the fixed-step march, and no
+      integrated GPU here to validate the win against watchdog limits) and the default-on flip
+      (single-GPU + lavapipe evidence doesn't meet "where stable"; still opt-in via
+      `SOILS_GI=1` / `/gi on`). (rendering §1 L2)
 - [ ] 13. **Pathfinding** — walkability grid → budgeted local A* → HPA* chunk-portal graph →
       flow fields for crowds; chunk-version invalidation throughout. (game-systems §10)
 - [ ] 14. **Transport upgrade** — WebTransport/QUIC datagrams (or UDP) behind the transport

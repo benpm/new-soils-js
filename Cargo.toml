@@ -29,3 +29,16 @@ glam = "0.30"
 opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
+# Pure-compute members on hot paths (light floods, sim stepping, codecs):
+# at opt-level 1 a single chunk light flood costs ~300 ms and stalls the
+# server tick (and client burst frames); opt-level 3 makes dev behave.
+[profile.dev.package.soils-sim]
+opt-level = 3
+[profile.dev.package.soils-protocol]
+opt-level = 3
+[profile.dev.package.soils-worldgen]
+opt-level = 3
+# The server's LightWorld impl is the per-cell callback layer of the flood —
+# it must be optimized along with the flood itself.
+[profile.dev.package.soils-server]
+opt-level = 3

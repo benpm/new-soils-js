@@ -170,22 +170,40 @@ pub fn encode_snapshot(
     out
 }
 
-/// Receiver-side state: latest applied quantized state per entity — exactly
-/// the baseline the server encodes against once the tick is acked. Shared by
-/// the real client and the test harness so there is one decode path.
+/// Receiver-side state: a short per-entity ring of `(tick, state)` as
+/// decoded — mirroring the server's send history, so a delta encoded against
+/// "newest send at or before the acked tick" applies against the *identical*
+/// state here. Applying deltas to the latest state instead would double-count
+/// everything that moved between the baseline and now (the ack always lags by
+/// the RTT). Shared by the real client and the test harness so there is one
+/// decode path.
 #[derive(Default)]
 pub struct SnapshotTracker {
-    pub states: HashMap<u32, QuantState>,
+    states: HashMap<u32, std::collections::VecDeque<(u32, QuantState)>>,
     /// Highest snapshot tick applied (echo as `ack_tick` in `Inputs`).
     pub latest_tick: u32,
 }
 
+/// Ring depth per entity; matches the server's send-history ring.
+const TRACKER_RING: usize = 64;
+
 impl SnapshotTracker {
-    /// Apply one snapshot payload; returns the updated entities (id + fresh
-    /// state), or None on malformed input. Unknown entities are only accepted
-    /// via FULL records; delta records for unknown ids are skipped (they can
+    /// The most recently applied state for an entity, if any.
+    pub fn latest(&self, id: u32) -> Option<QuantState> {
+        self.states.get(&id).and_then(|r| r.back()).map(|(_, s)| *s)
+    }
+
+    /// Apply one snapshot payload whose deltas are encoded against
+    /// `baseline_tick`; returns the updated entities (id + fresh state), or
+    /// None on malformed input. Unknown entities are only accepted via FULL
+    /// records; delta records without a usable baseline are skipped (they can
     /// only arise from a server bug, not from loss — the transport is ordered).
-    pub fn apply(&mut self, tick: u32, payload: &[u8]) -> Option<Vec<EntityState>> {
+    pub fn apply(
+        &mut self,
+        tick: u32,
+        baseline_tick: u32,
+        payload: &[u8],
+    ) -> Option<Vec<EntityState>> {
         let flags = *payload.first()?;
         let rest = payload.get(1..)?;
         let body: Vec<u8> = if flags & 1 != 0 {
@@ -234,7 +252,14 @@ impl SnapshotTracker {
             let state = if mask & MASK_FULL != 0 {
                 QuantState { pos: dpos, vel: vel.unwrap_or_default(), yaw: yaw.unwrap_or(0) }
             } else {
-                let Some(base) = self.states.get(&id32) else { continue };
+                // Delta base: our newest recorded state at or before the
+                // packet's baseline tick — the mirror of the server's
+                // "newest send the client has acked".
+                let Some(base) = self.states.get(&id32).and_then(|ring| {
+                    ring.iter().rev().find(|(t, _)| *t <= baseline_tick).map(|(_, s)| *s)
+                }) else {
+                    continue;
+                };
                 QuantState {
                     pos: [
                         base.pos[0].checked_add(dpos[0])?,
@@ -245,7 +270,11 @@ impl SnapshotTracker {
                     yaw: yaw.unwrap_or(base.yaw),
                 }
             };
-            self.states.insert(id32, state);
+            let ring = self.states.entry(id32).or_default();
+            ring.push_back((tick, state));
+            if ring.len() > TRACKER_RING {
+                ring.pop_front();
+            }
             out.push(state.dequantize(id32));
         }
         self.latest_tick = self.latest_tick.max(tick);
@@ -279,21 +308,45 @@ mod tests {
 
         // First snapshot: no baselines → FULL records.
         let p1 = encode_snapshot(&[(3, a0), (7, b0)], |_| None);
-        let out = tracker.apply(1, &p1).unwrap();
+        let out = tracker.apply(1, 0, &p1).unwrap();
         assert_eq!(out.len(), 2);
-        assert_eq!(tracker.states[&3], a0);
-        assert_eq!(tracker.states[&7], b0);
+        assert_eq!(tracker.latest(3), Some(a0));
+        assert_eq!(tracker.latest(7), Some(b0));
         assert_eq!(out[0].pos, [282.0, 285.5, 268.25]);
         assert_eq!(out[0].velocity, [1.5, 0.0, -8.0]);
 
-        // Second: A moved slightly (pos-only delta), B unchanged (1-byte mask).
+        // Second: A moved slightly (pos-only delta vs the tick-1 baseline),
+        // B unchanged (1-byte mask).
         let a1 = state([282.5, 285.5, 268.25], [1.5, 0.0, -8.0], 100);
-        let base = tracker.states.clone();
-        let p2 = encode_snapshot(&[(3, a1), (7, b0)], |id| base.get(&id).copied());
+        let base = [(3u32, a0), (7, b0)];
+        let p2 = encode_snapshot(&[(3, a1), (7, b0)], |id| {
+            base.iter().find(|(i, _)| *i == id).map(|(_, s)| *s)
+        });
         assert!(p2.len() < 16, "still+small-move snapshot should be tiny, got {}", p2.len());
-        tracker.apply(2, &p2).unwrap();
-        assert_eq!(tracker.states[&3], a1);
+        tracker.apply(2, 1, &p2).unwrap();
+        assert_eq!(tracker.latest(3), Some(a1));
         assert_eq!(tracker.latest_tick, 2);
+    }
+
+    #[test]
+    fn deltas_apply_against_the_acked_baseline_not_the_latest() {
+        // The RTT case: the server keeps encoding against tick 1 (the last
+        // ack) while the receiver has already applied newer snapshots. If the
+        // receiver applied deltas to its *latest* state instead of the
+        // baseline, every unacked movement would double-count.
+        let mut tracker = SnapshotTracker::default();
+        let s1 = state([100.0, 0.0, 0.0], [8.0, 0.0, 0.0], 0);
+        tracker.apply(1, 0, &encode_snapshot(&[(1, s1)], |_| None)).unwrap();
+
+        let s2 = state([101.0, 0.0, 0.0], [8.0, 0.0, 0.0], 0);
+        let p2 = encode_snapshot(&[(1, s2)], |_| Some(s1)); // baseline: tick 1
+        tracker.apply(2, 1, &p2).unwrap();
+
+        let s3 = state([102.0, 0.0, 0.0], [8.0, 0.0, 0.0], 0);
+        let p3 = encode_snapshot(&[(1, s3)], |_| Some(s1)); // still tick 1!
+        let out = tracker.apply(3, 1, &p3).unwrap();
+        assert_eq!(out[0].pos, [102.0, 0.0, 0.0], "delta must rebase on tick 1, not tick 2");
+        assert_eq!(tracker.latest(1), Some(s3));
     }
 
     #[test]
@@ -301,10 +354,9 @@ mod tests {
         // The §4 envelope: ~8 B per moving entity at walking speeds.
         let mut tracker = SnapshotTracker::default();
         let e0 = state([1000.0, 260.0, 1000.0], [8.0, 0.0, 0.0], 500);
-        tracker.apply(1, &encode_snapshot(&[(1, e0)], |_| None)).unwrap();
+        tracker.apply(1, 0, &encode_snapshot(&[(1, e0)], |_| None)).unwrap();
         let e1 = state([1000.125, 260.0, 1000.0], [8.0, 0.0, 0.0], 500);
-        let base = tracker.states.clone();
-        let p = encode_snapshot(&[(1, e1)], |id| base.get(&id).copied());
+        let p = encode_snapshot(&[(1, e1)], |id| tracker.latest(id));
         assert!(p.len() <= 9, "one moving entity should cost ≤ 9 bytes, got {}", p.len());
     }
 
@@ -323,7 +375,7 @@ mod tests {
         let mut tracker = SnapshotTracker::default();
         let good = encode_snapshot(&[(5, state([1.0, 2.0, 3.0], [0.0; 3], 7))], |_| None);
         for cut in 0..good.len() {
-            let _ = tracker.apply(1, &good[..cut]);
+            let _ = tracker.apply(1, 0, &good[..cut]);
         }
         let mut s = 0x1234_5678_9abc_def0u64;
         for _ in 0..2000 {
@@ -331,11 +383,11 @@ mod tests {
             let mut m = good.clone();
             let i = (s >> 33) as usize % m.len();
             m[i] ^= (s >> 17) as u8 | 1;
-            let _ = tracker.apply(1, &m);
+            let _ = tracker.apply(1, 0, &m);
         }
         // Absurd declared counts must be rejected, not allocated.
         let mut huge = vec![0u8];
         put_varint(&mut huge, u32::MAX as u64);
-        assert!(tracker.apply(1, &huge).is_none());
+        assert!(tracker.apply(1, 0, &huge).is_none());
     }
 }

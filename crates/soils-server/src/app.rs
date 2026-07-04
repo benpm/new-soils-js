@@ -68,7 +68,9 @@ const FLUSH_SECS: f32 = 30.0;
 /// burst. Long-term a client can't get more sim steps than real time allows
 /// (flooding inputs would otherwise be a speed hack); the burst absorbs
 /// tick-alignment jitter and short stalls.
-const INPUT_BURST: f32 = 16.0;
+/// Sized so a brief tick hitch (light floods, saves) can bank half a second
+/// of legitimate inputs without dropping any; still refill-bound long term.
+const INPUT_BURST: f32 = 32.0;
 /// Per-client snapshot byte budget per tick (~8 KB/s at 20 Hz). Entities are
 /// packed in priority order; the starved catch up via the accumulator.
 const SNAPSHOT_BUDGET: usize = 410;
@@ -275,7 +277,7 @@ fn check_shutdown(
 /// background writer on their intervals.
 fn world_lifecycle(time: Res<Time>, mut worlds: ResMut<Worlds>, mut acc: Local<(f32, f32)>) {
     for w in worlds.map.values_mut() {
-        w.pump_light(4.0);
+        w.pump_light();
     }
     acc.0 += time.delta_secs();
     acc.1 += time.delta_secs();
@@ -894,6 +896,7 @@ fn replicate_entities(
         }
         let _ = c.outbox.send(ServerMsg::Snapshot {
             tick,
+            baseline_tick: ack,
             last_input_seq: c.last_seq,
             payload,
         });

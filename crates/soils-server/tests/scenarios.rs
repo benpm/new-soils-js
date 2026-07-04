@@ -101,10 +101,10 @@ async fn snapshot_bandwidth_stays_in_budget() {
     a.await_self_pos().await;
     let (mut bytes, mut packets) = (0usize, 0u32);
     while packets < 40 {
-        if let ServerMsg::Snapshot { tick, payload, .. } = a.next_msg().await {
+        if let ServerMsg::Snapshot { tick, baseline_tick, payload, .. } = a.next_msg().await {
             bytes += payload.len();
             packets += 1;
-            let _ = a.tracker.apply(tick, &payload);
+            let _ = a.tracker.apply(tick, baseline_tick, &payload);
         }
     }
     let per_packet = bytes / packets as usize;

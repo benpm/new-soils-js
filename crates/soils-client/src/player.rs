@@ -14,10 +14,12 @@
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
+use std::collections::VecDeque;
+
 use soils_protocol::{CHUNK_BIT, ClientMsg, InputFrame};
 use soils_sim::{PlayerInput, PlayerState};
 
-use crate::chunk::ChunkMap;
+use crate::chunk::{ChunkMap, VoxelChunk, voxel_at};
 use crate::net::NetClient;
 
 const MOUSE_SENS: f32 = 0.0022;
@@ -26,12 +28,12 @@ const MOUSE_SENS: f32 = 0.0022;
 pub struct Player {
     pub yaw: f32,
     pub pitch: f32,
-    /// Local mirror of the (server-authoritative) simulation state. Since M4
-    /// the server integrates movement; this holds the last known state for
-    /// teleports and future prediction (phase 11).
+    /// Predicted simulation state: stepped locally every fixed tick through
+    /// the shared `soils-sim`, reconciled against server snapshots (rewind to
+    /// `last_input_seq`, replay newer inputs on divergence).
     pub sim: PlayerState,
-    /// Latest server-echoed eye position; [`sync_camera`] eases toward it.
-    pub net_target: Option<Vec3>,
+    /// Sim position at the previous fixed tick, for render interpolation.
+    pub prev_pos: Vec3,
 }
 
 impl Player {
@@ -42,18 +44,20 @@ impl Player {
             yaw: 0.0,
             pitch: -0.5,
             sim: PlayerState { pos, ..PlayerState::default() },
-            net_target: None,
+            prev_pos: pos,
         }
     }
 }
 
-/// Move the player instantly: sets the local state and the network target (no
-/// smear across the jump) and writes the Transform immediately so same-frame
-/// readers see the new position.
+/// Move the player instantly: sets the sim state and the interpolation
+/// baseline (no smear across the jump) and writes the Transform immediately
+/// so same-frame readers see the new position. Prediction history is invalid
+/// across a teleport; [`InputRing::reset`] handles that at the call sites
+/// that own the resource.
 pub fn teleport(player: &mut Player, transform: &mut Transform, pos: Vec3) {
     player.sim.pos = pos;
     player.sim.vel = Vec3::ZERO;
-    player.net_target = Some(pos);
+    player.prev_pos = pos;
     transform.translation = pos;
 }
 
@@ -116,26 +120,51 @@ pub fn collect_input(
 pub struct InputRing {
     seq: u32,
     frames: Vec<InputFrame>,
+    /// `(seq, input, predicted state after stepping it)` — the rewind/replay
+    /// source for reconciliation.
+    history: VecDeque<(u32, PlayerInput, PlayerState)>,
 }
 
-/// One fixed tick: pack this tick's input and send the frame bundle. The
-/// server integrates it through the shared sim (server authority, M4) — the
-/// client no longer steps its own position; it renders the echoed state.
-pub fn send_input(
+/// History depth: ~4 s at 64 Hz, far beyond any sane RTT.
+const HISTORY_CAP: usize = 256;
+
+impl InputRing {
+    /// Drop history across a warp (it describes a dead timeline).
+    pub fn reset(&mut self) {
+        self.frames.clear();
+        self.history.clear();
+    }
+}
+
+/// One fixed tick: predict locally through the shared sim, record the
+/// (input, state) pair, and send the frame bundle. The server integrates the
+/// same inputs authoritatively; [`reconcile_self`] corrects us on divergence.
+pub fn predict_and_send(
     net: Res<NetClient>,
     mut pending: ResMut<PendingInput>,
     mut ring: ResMut<InputRing>,
     tracker: Res<crate::server_msg::SnapTracker>,
-    query: Query<&Player>,
+    map: Res<ChunkMap>,
+    chunks: Query<&VoxelChunk>,
+    mut query: Query<&mut Player>,
 ) {
-    if query.single().is_err() {
-        return;
-    }
+    let Ok(mut player) = query.single_mut() else { return };
     let input = pending.input;
     pending.clear_latches();
+
+    // Predict: step the local sim exactly as the server will.
+    let player = &mut *player;
+    player.prev_pos = player.sim.pos;
+    let sampler = |v: IVec3| voxel_at(&map, &chunks, v);
+    soils_sim::step_player(&mut player.sim, &input, 1.0 / soils_sim::TICK_HZ as f32, &sampler);
+
     ring.seq += 1;
-    let (buttons, flags, yaw) = soils_sim::pack_input(&input);
     let seq = ring.seq;
+    ring.history.push_back((seq, input, player.sim));
+    if ring.history.len() > HISTORY_CAP {
+        ring.history.pop_front();
+    }
+    let (buttons, flags, yaw) = soils_sim::pack_input(&input);
     ring.frames.push(InputFrame { seq, buttons, flags, yaw });
     if ring.frames.len() > 3 {
         ring.frames.remove(0);
@@ -146,16 +175,86 @@ pub fn send_input(
     });
 }
 
+/// Predicted-vs-authoritative tolerance (world units) before a rewind+replay.
+const RECONCILE_EPSILON: f32 = 0.05;
+
+/// Reconcile the prediction against the server's echo of our own entity at
+/// `last_input_seq`: within epsilon → keep the prediction; diverged → rewind
+/// to the authoritative state and replay every newer pending input.
+pub fn reconcile_self(
+    mut reader: MessageReader<crate::server_msg::EntitiesUpdated>,
+    local: Res<crate::actor::LocalPlayer>,
+    mut ring: ResMut<InputRing>,
+    map: Res<ChunkMap>,
+    chunks: Query<&VoxelChunk>,
+    mut query: Query<&mut Player>,
+) {
+    for msg in reader.read() {
+        let Some(state) = msg.states.iter().find(|s| s.id == local.self_entity) else {
+            continue;
+        };
+        let Ok(mut player) = query.single_mut() else { continue };
+        let server_pos = Vec3::from_array(state.pos);
+        let seq = msg.last_input_seq;
+
+        // Everything before the acked input is settled history.
+        while ring.history.front().is_some_and(|(s, ..)| *s < seq) {
+            ring.history.pop_front();
+        }
+        let predicted_then = match ring.history.front() {
+            Some((s, _, st)) if *s == seq => *st,
+            // No matching entry (fresh join, warp, or pre-input echo): adopt
+            // the server state outright only if we're far off.
+            _ => {
+                if (player.sim.pos - server_pos).length() > 1.0 {
+                    player.sim.pos = server_pos;
+                    player.sim.vel = Vec3::from_array(state.velocity);
+                    player.prev_pos = server_pos;
+                }
+                continue;
+            }
+        };
+
+        if (predicted_then.pos - server_pos).length() <= RECONCILE_EPSILON {
+            continue; // prediction holds; nothing to correct
+        }
+
+        // Mispredicted: rewind to the authoritative state at `seq` (position
+        // and velocity from the server; fly/grounded from the recorded state
+        // at that seq — they evolve deterministically from the same inputs,
+        // and taking them from the *current* prediction would double-apply
+        // any fly toggles the replay is about to re-run), then replay the
+        // unacknowledged inputs and rebase the recorded states. The anchor
+        // entry rebases too, so a repeated echo of the same seq is a no-op.
+        let base = PlayerState {
+            pos: server_pos,
+            vel: Vec3::from_array(state.velocity),
+            flying: predicted_then.flying,
+            grounded: predicted_then.grounded,
+        };
+        if let Some(front) = ring.history.front_mut() {
+            front.2 = base;
+        }
+        let mut sim = base;
+        let sampler = |v: IVec3| voxel_at(&map, &chunks, v);
+        for (_, input, recorded) in ring.history.iter_mut().skip(1) {
+            soils_sim::step_player(&mut sim, input, 1.0 / soils_sim::TICK_HZ as f32, &sampler);
+            *recorded = sim;
+        }
+        player.sim = sim;
+        player.prev_pos = sim.pos; // snap to the corrected timeline
+    }
+}
+
 /// When set, the camera transform is under manual control (self-test framing)
-/// and server position echoes must not move it.
+/// and the prediction must not move it.
 #[derive(Resource, Default)]
 pub struct CameraHold(pub bool);
 
-/// Ease the camera toward the latest server-echoed position (interpolation-
-/// only self-rendering until prediction lands in phase 11). Translation only —
-/// rotation belongs to [`mouse_look`].
+/// Derive the rendered camera position by interpolating the last two
+/// predicted ticks. Translation only — rotation belongs to [`mouse_look`].
 pub fn sync_camera(
-    time: Res<Time>,
+    fixed_time: Res<Time<Fixed>>,
     hold: Res<CameraHold>,
     mut query: Query<(&Player, &mut Transform)>,
 ) {
@@ -163,9 +262,7 @@ pub fn sync_camera(
         return;
     }
     let Ok((player, mut transform)) = query.single_mut() else { return };
-    let Some(target) = player.net_target else { return };
-    let t = (time.delta_secs() * 12.0).min(1.0);
-    transform.translation = transform.translation.lerp(target, t);
+    transform.translation = player.prev_pos.lerp(player.sim.pos, fixed_time.overstep_fraction());
 }
 
 /// Toggle pointer-lock with Escape; re-grab on click.

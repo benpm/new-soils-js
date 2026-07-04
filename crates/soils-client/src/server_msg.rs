@@ -87,7 +87,13 @@ pub struct EntitySpawned {
 }
 
 #[derive(Message)]
-pub struct EntitiesUpdated(pub Vec<EntityState>);
+pub struct EntitiesUpdated {
+    pub states: Vec<EntityState>,
+    /// Snapshot tick (drives the remote-body interpolation clock).
+    pub tick: u32,
+    /// Reconciliation anchor: the highest input seq the server had applied.
+    pub last_input_seq: u32,
+}
 
 /// Client-side snapshot state: per-entity quantized baselines (the shared
 /// `soils-protocol` decode path) plus the latest applied tick, echoed to the
@@ -221,10 +227,9 @@ pub fn route_server_messages(
             ServerMsg::EntitySpawn { id, kind, pos } => {
                 spawns.write(EntitySpawned { id, kind, pos });
             }
-            ServerMsg::Snapshot { tick, payload, .. } => {
-                // last_input_seq is the phase-11 reconciliation anchor.
-                if let Some(updated) = tracker.0.apply(tick, &payload) {
-                    entities.write(EntitiesUpdated(updated));
+            ServerMsg::Snapshot { tick, baseline_tick, last_input_seq, payload } => {
+                if let Some(updated) = tracker.0.apply(tick, baseline_tick, &payload) {
+                    entities.write(EntitiesUpdated { states: updated, tick, last_input_seq });
                 }
             }
             ServerMsg::EntityDespawn { id } => {
@@ -243,12 +248,14 @@ pub fn apply_init(
     mut world_time: ResMut<WorldTime>,
     mut login: ResMut<LoginState>,
     mut streaming: ResMut<Streaming>,
+    mut ring: ResMut<player::InputRing>,
     mut query: Query<(&mut Player, &mut Transform)>,
 ) {
     for msg in reader.read() {
         local.id = msg.id;
         local.self_entity = msg.self_entity;
         world_time.daytime = msg.daytime;
+        ring.reset(); // any prediction history predates this session
         login.done = true; // authenticated — drop the login screen
         // A (re)login may be a fresh connection whose server-side radius reset
         // to the default; re-send ours (idempotent on the same connection).
@@ -283,10 +290,12 @@ pub fn apply_warp(
     mut light_queue: ResMut<LightQueue>,
     mut queue: ResMut<ChunkApplyQueue>,
     mut pending_edits: ResMut<crate::edit::PendingEdits>,
+    mut ring: ResMut<player::InputRing>,
     mut query: Query<(&mut Player, &mut Transform)>,
 ) {
     for msg in reader.read() {
         pending_edits.clear(); // old-world verdicts are moot
+        ring.reset(); // prediction history describes the old world
         for (_, entity) in map.map.drain() {
             commands.entity(entity).despawn();
         }
@@ -480,7 +489,7 @@ pub fn apply_entity_spawns(
         let Some(kind) = assets.kinds.get(msg.kind as usize) else { continue };
         let entity = commands
             .spawn((
-                Actor { target, kind: msg.kind },
+                Actor::new(msg.kind, 0, target),
                 Mesh3d(kind.mesh.clone()),
                 MeshMaterial3d(kind.material.clone()),
                 Transform::from_translation(target - Vec3::Y * kind.body_drop),
@@ -490,32 +499,32 @@ pub fn apply_entity_spawns(
     }
 }
 
-/// Full-state updates for entities in interest: retarget bodies; our own
-/// entity's echo eases the camera (interpolation-only self until phase 11).
-/// Must run after [`apply_entity_spawns`] and before
-/// [`apply_entity_despawns`] — the reverse order turns an update+despawn
-/// sharing a frame into a permanent ghost body.
+/// Snapshot states for entities in interest: push remote bodies' interp
+/// buffers (our own entity is handled by `player::reconcile_self`). Must run
+/// after [`apply_entity_spawns`] and before [`apply_entity_despawns`] — the
+/// reverse order turns an update+despawn sharing a frame into a permanent
+/// ghost body.
 pub fn apply_entity_updates(
     mut reader: MessageReader<EntitiesUpdated>,
     local: Res<LocalPlayer>,
     map: Res<ActorMap>,
+    mut clock: ResMut<crate::actor::InterpClock>,
     mut actors: Query<&mut Actor>,
-    mut player_q: Query<&mut Player>,
 ) {
     for msg in reader.read() {
-        for state in &msg.0 {
+        clock.observe(msg.tick);
+        for state in &msg.states {
             if state.id == local.self_entity {
-                if let Ok(mut player) = player_q.single_mut() {
-                    player.net_target = Some(Vec3::from_array(state.pos));
-                    player.sim.pos = Vec3::from_array(state.pos);
-                    player.sim.vel = Vec3::from_array(state.velocity);
-                }
                 continue;
             }
             if let Some(&entity) = map.map.get(&state.id)
                 && let Ok(mut actor) = actors.get_mut(entity)
             {
-                actor.target = Vec3::from_array(state.pos);
+                actor.push_snapshot(
+                    msg.tick,
+                    Vec3::from_array(state.pos),
+                    Vec3::from_array(state.velocity),
+                );
             }
         }
     }

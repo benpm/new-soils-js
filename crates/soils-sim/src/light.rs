@@ -62,6 +62,10 @@ impl ChunkLight {
     }
 
     #[inline]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }

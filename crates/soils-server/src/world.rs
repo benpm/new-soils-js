@@ -35,20 +35,151 @@ use crate::region;
 /// Cells with effective light below this count as "dark" for gameplay
 /// (spawn) queries.
 pub const SPAWN_LIGHT: u8 = 4;
-/// Chunk relights per [`World::pump_light`] call (time-boxed by the caller's
-/// budget too).
-const LIGHT_BUDGET: usize = 8;
 
 /// A resident chunk plus its lifecycle state: `dirty` marks unpersisted edits,
 /// `zero_since` runs the unload timer while no client subscribes. Light is
 /// derived data — recomputed on residency via the shared `soils-sim` flood,
-/// never persisted or replicated (plan-rendering §3).
+/// never persisted or replicated (plan-rendering §3). `version` bumps on
+/// every edit (plan-game-systems §8) and guards async light results against
+/// racing edits.
 struct ChunkEntry {
     volume: ChunkVolume,
     light: ChunkLight,
     summary: LightSummary,
+    version: u32,
     dirty: bool,
     zero_since: Option<Instant>,
+}
+
+/// An off-thread light-flood job: one queued chunk *column* plus a one-chunk
+/// shell, cloned into dense arrays so the flood costs index math instead of
+/// per-voxel map lookups (trait-based flooding over the live map measured
+/// ~300 ms per column and stalled the 20 Hz tick; dense is ~10-20×
+/// cheaper and, more importantly, runs on the rayon pool).
+struct LightJob {
+    /// Region corner (chunk coords) and size (chunks).
+    origin: IVec3,
+    dims: IVec3,
+    /// Per chunk slot: resident at clone time?
+    present: Vec<bool>,
+    voxels: Vec<u8>,
+    light: Vec<u8>,
+    /// (pos, version at clone) for every present chunk — the write-back guard.
+    versions: Vec<(IVec3, u32)>,
+    /// The chunks this job is responsible for lighting from scratch.
+    batch: Vec<IVec3>,
+    levels: Vec<u8>,
+}
+
+/// `soils_sim::light::LightWorld` over a [`LightJob`]'s dense region.
+struct DenseWorld<'a> {
+    job: &'a mut LightJob,
+}
+
+impl DenseWorld<'_> {
+    #[inline]
+    fn index(&self, v: IVec3) -> Option<usize> {
+        let rc = IVec3::new(v.x >> CHUNK_BIT, v.y >> CHUNK_BIT, v.z >> CHUNK_BIT) - self.job.origin;
+        let d = self.job.dims;
+        if rc.x < 0 || rc.y < 0 || rc.z < 0 || rc.x >= d.x || rc.y >= d.y || rc.z >= d.z {
+            return None;
+        }
+        let slot = ((rc.y * d.z + rc.z) * d.x + rc.x) as usize;
+        if !self.job.present[slot] {
+            return None;
+        }
+        let l = soils_protocol::local_of(v);
+        Some(slot * 32768 + soils_protocol::voxel_index(l.x, l.y, l.z))
+    }
+}
+
+impl LightWorld for DenseWorld<'_> {
+    fn solid(&self, v: IVec3) -> bool {
+        self.index(v).is_some_and(|i| self.job.voxels[i] != 0)
+    }
+
+    fn emission(&self, v: IVec3) -> u8 {
+        match self.index(v) {
+            Some(i) => {
+                self.job.levels.get(self.job.voxels[i] as usize).copied().unwrap_or(0)
+            }
+            None => 0,
+        }
+    }
+
+    fn light(&self, v: IVec3) -> u8 {
+        self.index(v).map_or(0, |i| self.job.light[i])
+    }
+
+    fn set_light(&mut self, v: IVec3, packed: u8) {
+        if let Some(i) = self.index(v) {
+            self.job.light[i] = packed;
+        }
+    }
+
+    fn in_domain(&self, v: IVec3) -> bool {
+        self.index(v).is_some()
+    }
+
+    fn open_sky_above(&self, _v: IVec3) -> bool {
+        // Only consulted when the cell above is outside the region: assume
+        // open sky; `reconcile_sky_below` corrects when the truth loads.
+        true
+    }
+}
+
+/// Run one job to completion (on the rayon pool, or inline in tests):
+/// full relight of the batch, border inflow from the lit shell, sky
+/// reconciliation below. Returns the new light for every present chunk.
+fn run_light_job(mut job: LightJob) -> Vec<(IVec3, ChunkLight, u32)> {
+    let batch = job.batch.clone();
+    let mut dw = DenseWorld { job: &mut job };
+    light::relight_full(&mut dw, &batch);
+
+    // Border inflow: lit cells just outside each batch chunk seed the flood
+    // back in (relight_full alone knows nothing beyond the batch set).
+    let mut sky_seeds = std::collections::VecDeque::new();
+    let mut block_seeds = std::collections::VecDeque::new();
+    for &cpos in &batch {
+        let origin = cpos * 32;
+        for a in 0..32 {
+            for b in 0..32 {
+                for v in [
+                    origin + IVec3::new(-1, a, b),
+                    origin + IVec3::new(32, a, b),
+                    origin + IVec3::new(a, -1, b),
+                    origin + IVec3::new(a, 32, b),
+                    origin + IVec3::new(a, b, -1),
+                    origin + IVec3::new(a, b, 32),
+                ] {
+                    let packed = dw.light(v);
+                    if light::sky(packed) > 1 {
+                        sky_seeds.push_back(v);
+                    }
+                    if light::block(packed) > 1 {
+                        block_seeds.push_back(v);
+                    }
+                }
+            }
+        }
+    }
+    light::propagate(&mut dw, light::Channel::Sky, sky_seeds);
+    light::propagate(&mut dw, light::Channel::Block, block_seeds);
+    if let Some(&lowest) = batch.iter().min_by_key(|c| c.y) {
+        light::reconcile_sky_below(&mut dw, lowest);
+    }
+
+    let d = job.dims;
+    job.versions
+        .iter()
+        .map(|&(pos, ver)| {
+            let rc = pos - job.origin;
+            let slot = ((rc.y * d.z + rc.z) * d.x + rc.x) as usize;
+            let mut out = ChunkLight::dark();
+            out.as_bytes_mut().copy_from_slice(&job.light[slot * 32768..(slot + 1) * 32768]);
+            (pos, out, ver)
+        })
+        .collect()
 }
 
 /// Per-chunk gameplay-lighting summary, maintained alongside the grid.
@@ -135,6 +266,9 @@ pub struct World {
     /// Chunks awaiting a light flood (made resident this session; processed
     /// top-of-column-first by [`pump_light`](World::pump_light)).
     light_queue: Vec<IVec3>,
+    /// The in-flight async light job's result channel (one at a time, so
+    /// region shells never overlap).
+    light_inflight: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<(IVec3, ChunkLight, u32)>>>,
     /// Per-block emission levels from the registry, cached for the flood.
     light_levels: Vec<u8>,
     /// Memoised region-file headers for the read path. `None` = the region file
@@ -168,6 +302,7 @@ impl World {
             chunks: HashMap::new(),
             refs: HashMap::new(),
             light_queue: Vec::new(),
+            light_inflight: None,
             regions_dir,
             persist,
             header_cache: HashMap::new(),
@@ -189,6 +324,7 @@ impl World {
             volume,
             light: ChunkLight::dark(),
             summary: LightSummary::default(),
+            version: 0,
             dirty: false,
             zero_since,
         }
@@ -271,6 +407,7 @@ impl World {
         let Some(entry) = self.chunks.get_mut(&cpos) else { return false };
         entry.volume.set(x & CHUNK_CLIP, y & CHUNK_CLIP, z & CHUNK_CLIP, value);
         entry.dirty = true;
+        entry.version = entry.version.wrapping_add(1);
         let mut lw = WorldLight {
             chunks: &mut self.chunks,
             levels: &self.light_levels,
@@ -284,40 +421,112 @@ impl World {
         true
     }
 
-    /// Run the queued light floods, newest chunks top-of-column first (a chunk
-    /// under a loaded-but-unlit chunk gets no sky seed of its own). Budgeted
-    /// per tick; summaries refresh for every chunk whose light changed.
-    pub fn pump_light(&mut self, max_millis: f32) {
-        if self.light_queue.is_empty() {
-            return;
-        }
-        let t0 = Instant::now();
-        self.light_queue.sort_by_key(|c| c.y);
-        let mut touched = std::collections::HashSet::new();
-        for done in 0..LIGHT_BUDGET {
-            if done > 0 && t0.elapsed().as_secs_f32() * 1000.0 > max_millis {
-                break;
+    /// Advance the async lighting pipeline: apply a finished job's results
+    /// (guarded by chunk versions — anything edited mid-flight requeues),
+    /// then dispatch the next column job to the rayon pool if idle. The tick
+    /// only ever pays for clones and write-backs; the flood itself runs off-
+    /// thread over a dense region (see [`LightJob`]).
+    pub fn pump_light(&mut self) {
+        if let Some(rx) = &mut self.light_inflight {
+            match rx.try_recv() {
+                Ok(results) => {
+                    self.light_inflight = None;
+                    self.apply_light_results(results);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+                Err(_) => self.light_inflight = None, // worker died; redispatch
             }
-            let Some(cpos) = self.light_queue.pop() else { break };
-            let mut lw = WorldLight {
-                chunks: &mut self.chunks,
-                levels: &self.light_levels,
-                dirty: std::collections::HashSet::new(),
-            };
-            light::light_new_chunk(&mut lw, cpos);
-            light::reconcile_sky_below(&mut lw, cpos);
-            touched.extend(lw.dirty);
-            touched.insert(cpos);
         }
-        for c in touched {
-            self.rebuild_summary(c);
+        if let Some(job) = self.build_light_job() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            self.light_inflight = Some(rx);
+            rayon::spawn(move || {
+                let _ = tx.send(run_light_job(job));
+            });
         }
     }
 
-    /// Whether all resident chunks have been flooded (tests).
+    /// Take one column batch off the queue and clone its dense region.
+    fn build_light_job(&mut self) -> Option<LightJob> {
+        let batch = loop {
+            let &top = self.light_queue.iter().max_by_key(|c| c.y)?;
+            let column: Vec<IVec3> = self
+                .light_queue
+                .iter()
+                .copied()
+                .filter(|c| c.x == top.x && c.z == top.z && self.chunks.contains_key(c))
+                .collect();
+            self.light_queue.retain(|c| !(c.x == top.x && c.z == top.z));
+            if !column.is_empty() {
+                break column; // evicted-while-queued chunks just drop out
+            }
+        };
+        let ymin = batch.iter().map(|c| c.y).min().unwrap() - 1;
+        let ymax = batch.iter().map(|c| c.y).max().unwrap() + 1;
+        let origin = IVec3::new(batch[0].x - 1, ymin, batch[0].z - 1);
+        let dims = IVec3::new(3, ymax - ymin + 1, 3);
+        let slots = (dims.x * dims.y * dims.z) as usize;
+        let mut job = LightJob {
+            origin,
+            dims,
+            present: vec![false; slots],
+            voxels: vec![0u8; slots * 32768],
+            light: vec![0u8; slots * 32768],
+            versions: Vec::new(),
+            batch,
+            levels: self.light_levels.clone(),
+        };
+        for ry in 0..dims.y {
+            for rz in 0..dims.z {
+                for rx in 0..dims.x {
+                    let pos = origin + IVec3::new(rx, ry, rz);
+                    let Some(entry) = self.chunks.get(&pos) else { continue };
+                    let slot = ((ry * dims.z + rz) * dims.x + rx) as usize;
+                    job.present[slot] = true;
+                    job.voxels[slot * 32768..(slot + 1) * 32768]
+                        .copy_from_slice(entry.volume.as_bytes());
+                    job.light[slot * 32768..(slot + 1) * 32768]
+                        .copy_from_slice(entry.light.as_bytes());
+                    job.versions.push((pos, entry.version));
+                }
+            }
+        }
+        Some(job)
+    }
+
+    fn apply_light_results(&mut self, results: Vec<(IVec3, ChunkLight, u32)>) {
+        for (pos, new_light, ver) in results {
+            match self.chunks.get_mut(&pos) {
+                Some(entry) if entry.version == ver => {
+                    entry.light = new_light;
+                    self.rebuild_summary(pos);
+                }
+                // Edited (or reloaded) while the job flew: its inline relight
+                // is fresher than ours; requeue for a clean pass.
+                Some(_) => self.light_queue.push(pos),
+                None => {}
+            }
+        }
+    }
+
+    /// Whether all queued light work has been applied (tests).
     #[cfg(test)]
     pub fn light_settled(&self) -> bool {
-        self.light_queue.is_empty()
+        self.light_queue.is_empty() && self.light_inflight.is_none()
+    }
+
+    /// Drive the lighting pipeline to completion synchronously (tests only).
+    #[cfg(test)]
+    pub fn pump_light_blocking(&mut self) {
+        if let Some(mut rx) = self.light_inflight.take() {
+            if let Some(results) = rx.blocking_recv() {
+                self.apply_light_results(results);
+            }
+        }
+        while let Some(job) = self.build_light_job() {
+            let results = run_light_job(job);
+            self.apply_light_results(results);
+        }
     }
 
     /// Rebuild one chunk's gameplay-lighting summary: dark walkable-air cells
@@ -549,9 +758,8 @@ mod tests {
         for (pos, vol) in chunks.iter().zip(volumes) {
             world.adopt(*pos, vol);
         }
-        while !world.light_settled() {
-            world.pump_light(1000.0);
-        }
+        world.pump_light_blocking();
+        assert!(world.light_settled());
         chunks
     }
 

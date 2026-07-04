@@ -90,10 +90,12 @@ pub enum ServerMsg {
     /// An entity left interest (or despawned): drop it.
     EntityDespawn { id: u32 },
     /// Per-tick delta snapshot of entities in interest (see
-    /// [`snapshot`](crate::snapshot) for the payload codec). Includes the
-    /// receiver's own player entity; `last_input_seq` is the reconciliation
-    /// anchor for it (highest input the server had applied at `tick`).
-    Snapshot { tick: u32, last_input_seq: u32, payload: Vec<u8> },
+    /// [`snapshot`](crate::snapshot) for the payload codec). Deltas are
+    /// encoded against the receiver's state at `baseline_tick` (its last
+    /// acked tick; 0 on fresh joins → FULL records). Includes the receiver's
+    /// own player entity; `last_input_seq` is the reconciliation anchor for
+    /// it (highest input the server had applied at `tick`).
+    Snapshot { tick: u32, baseline_tick: u32, last_input_seq: u32, payload: Vec<u8> },
     /// Current world time of day, 0.0..1.0.
     Time { daytime: f32 },
     /// Confirms a `Warp`: the client should drop all chunks/actors, teleport to

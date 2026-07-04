@@ -81,6 +81,7 @@ fn main() {
     .init_resource::<player::PendingInput>()
     .init_resource::<player::InputRing>()
     .init_resource::<player::CameraHold>()
+    .init_resource::<actor::InterpClock>()
     .init_resource::<edit::PendingEdits>()
     .init_resource::<light::LightQueue>()
     .init_resource::<light::SkyTerm>()
@@ -127,6 +128,10 @@ fn main() {
                 .after(server_msg::apply_warp),
             server_msg::apply_entity_updates.after(server_msg::apply_entity_spawns),
             server_msg::apply_entity_despawns.after(server_msg::apply_entity_updates),
+            player::reconcile_self
+                .after(server_msg::apply_init)
+                .after(server_msg::apply_warp)
+                .after(server_msg::apply_chunks),
             // Baked lighting runs once all voxel changes for the frame landed.
             light::process_light
                 .after(server_msg::apply_chunks)
@@ -191,7 +196,7 @@ fn main() {
     )
     .add_systems(
         FixedUpdate,
-        player::send_input.run_if(login::logged_in).run_if(console::console_closed),
+        player::predict_and_send.run_if(login::logged_in).run_if(console::console_closed),
     )
     .run();
 }

@@ -26,7 +26,13 @@ pub struct TestServer {
     /// Whether `Drop` deletes `data_dir` (false for [`start_at`]
     /// (Self::start_at), whose caller manages the dir across restarts).
     owns_dir: bool,
+    /// Serializes server-backed tests within one binary: each embedded server
+    /// runs a full worldgen burst + light floods on the process-global rayon
+    /// pool, and ten at once starve each other into effective deadlock.
+    _gate: std::sync::MutexGuard<'static, ()>,
 }
+
+static SERVER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl TestServer {
     /// Fresh scratch data dir. `tag` keeps parallel tests in the same binary
@@ -56,6 +62,7 @@ impl TestServer {
         tag: &str,
         tweak: impl FnOnce(&mut ServerConfig),
     ) -> Self {
+        let gate = SERVER_GATE.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = ServerConfig {
             bind: "127.0.0.1:0".into(),
             data_dir: data_dir.clone(),
@@ -65,7 +72,7 @@ impl TestServer {
         };
         tweak(&mut config);
         let handle = soils_server::spawn(config).expect("spawn embedded server");
-        Self { handle, data_dir, owns_dir: false }
+        Self { handle, data_dir, owns_dir: false, _gate: gate }
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -213,8 +220,9 @@ impl Client {
     /// Apply the next snapshot and return the entities it updated.
     pub async fn next_snapshot(&mut self) -> Vec<EntityState> {
         loop {
-            if let ServerMsg::Snapshot { tick, payload, .. } = self.next_msg().await
-                && let Some(updated) = self.tracker.apply(tick, &payload)
+            if let ServerMsg::Snapshot { tick, baseline_tick, payload, .. } =
+                self.next_msg().await
+                && let Some(updated) = self.tracker.apply(tick, baseline_tick, &payload)
             {
                 return updated;
             }

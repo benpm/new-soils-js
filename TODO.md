@@ -17,8 +17,13 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       quad-memory idea. Measured (RTX 5070, radius 8, vsync off, release): 11.4 → 10.4 ms;
       the frame is now bounded by per-chunk draw submission (~5k bind groups) + atmosphere,
       not terrain geometry — pooled quad memory / merged draws is the next lever. (rendering §2)
-- [ ] 4. **Worldgen performance** — instrument chunk generation, then accelerate (compute shader
-      or parallel CPU) so singleplayer chunks appear promptly.
+- [x] 4. **Worldgen performance** — criterion benches (`soils-worldgen/benches/terrain.rs`),
+      then: cave noise on a 9³ lattice with trilinear interpolation, all-air/rock-top early
+      outs, palette hoisted per batch. Wave of 48 chunks 9.05 → 3.46 ms (release); air chunks
+      ~543× faster. Restored caves lost in the JS port (threshold 0.7 → 0.55 vs noise-crate
+      simplex range, pinned by a density-band test). Server now generates outside the world
+      lock (concurrent edits/loads during waves) and logs wave timings; fresh-world burst of
+      810 chunks ≈ 65 ms total gen time, verified via selftest screenshot.
 - [ ] 5. **Server as headless Bevy ECS app** — 20 Hz fixed tick, connection tasks feed per-client
       inboxes drained at tick start, mutex webs dissolve into ECS state. (game-systems M2)
 - [ ] 6. **Chunk streaming v2** — server-driven subscribe/unload with hysteresis, palette+LZ4

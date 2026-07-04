@@ -91,6 +91,40 @@ async fn critters_replicate_and_wander() {
     .await;
 }
 
+/// Plan §10 stage 2's first consumer: a critter within seek range pathfinds
+/// to the ground beneath the player and closes in, instead of wandering off.
+#[tokio::test]
+async fn critters_seek_a_nearby_player() {
+    let server = TestServer::start_with("seek", |cfg| cfg.critters = 1);
+    let mut a = Client::join(server.addr(), "alice").await;
+    let spawn = a.spawn;
+
+    let critter = a
+        .recv_until(|msg| match msg {
+            ServerMsg::EntitySpawn { id, kind, .. } if kind == soils_sim::KIND_CRITTER => {
+                Some(id)
+            }
+            _ => None,
+        })
+        .await;
+
+    // The player hovers at spawn (~29 voxels up); the critter spawns offset,
+    // falls to the surface, acquires, and A*-walks to the ground under us:
+    // its lateral distance to the player column must close to a couple of
+    // cells and stay there. Wander alone turns away every couple of seconds
+    // and doesn't converge, so this pins the pathing loop.
+    let goal_reached = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        a.await_entity(critter, |s| {
+            let dx = s.pos[0] - spawn[0];
+            let dz = s.pos[2] - spawn[2];
+            (dx * dx + dz * dz).sqrt() < 2.5
+        })
+        .await
+    })
+    .await;
+    assert!(goal_reached.is_ok(), "critter never closed in on the player");
+}
+
 #[tokio::test]
 async fn snapshot_bandwidth_stays_in_budget() {
     let server = TestServer::start_with("bandwidth", |cfg| cfg.critters = 3);

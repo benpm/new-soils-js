@@ -37,6 +37,27 @@ pub fn walkable(world: &impl VoxelSampler, p: IVec3) -> bool {
     passable(world, p) && world.is_solid(p - UP)
 }
 
+/// Resolve a body position to a walkable path endpoint: `p`'s own column
+/// scanned down up to `down` voxels first (bodies hover and fall), then the
+/// eight neighbor columns nearest-first (a body can stand on a block *edge*,
+/// leaving its center column floorless). `None` if nothing nearby is
+/// standable — e.g. positions over unloaded space.
+pub fn resolve_walkable(world: &impl VoxelSampler, p: IVec3, down: i32) -> Option<IVec3> {
+    let mut cols: Vec<IVec3> = (-1..=1)
+        .flat_map(|dz| (-1..=1).map(move |dx| IVec3::new(dx, 0, dz)))
+        .collect();
+    cols.sort_by_key(|d| d.x.abs() + d.z.abs());
+    for d in cols {
+        for k in 0..=down {
+            let c = p + d - UP * k;
+            if walkable(world, c) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
 // ---------------- Stage 1: per-chunk walkability grid ----------------
 
 const WORDS: usize = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize / 64;
@@ -280,6 +301,27 @@ mod tests {
         // With nothing below (unloaded reads air), the row is not walkable.
         let empty = |_v: IVec3| 0u8;
         assert_eq!(walk_grid(&empty, IVec3::ZERO).count(), 0);
+    }
+
+    #[test]
+    fn resolve_walkable_handles_hover_and_edge_standing() {
+        // Hovering high above a floor: the own-column down-scan finds it.
+        let world = floor_world(0);
+        assert_eq!(
+            resolve_walkable(&world, IVec3::new(4, 20, 4), 32),
+            Some(IVec3::new(4, 1, 4))
+        );
+        // Standing on a block edge: the center column has no floor, but the
+        // neighbor column over the block does.
+        let solids = [IVec3::new(3, 0, 3)];
+        let block = scene(&solids);
+        assert_eq!(
+            resolve_walkable(&block, IVec3::new(4, 1, 3), 2),
+            Some(IVec3::new(3, 1, 3))
+        );
+        // Nothing standable anywhere nearby.
+        let empty = |_v: IVec3| 0u8;
+        assert_eq!(resolve_walkable(&empty, IVec3::new(0, 5, 0), 4), None);
     }
 
     #[test]

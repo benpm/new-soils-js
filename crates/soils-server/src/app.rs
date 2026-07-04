@@ -24,14 +24,15 @@ use std::time::{Duration, Instant};
 use bevy_app::{App, AppExit, FixedUpdate, ScheduleRunnerPlugin, Update};
 use bevy_ecs::message::MessageWriter;
 use bevy_ecs::prelude::{
-    Commands, Component, Entity, IntoScheduleConfigs, Local, Query, Res, ResMut, Resource,
+    Commands, Component, Entity, IntoScheduleConfigs, Local, Query, Res, ResMut, Resource, With,
+    Without,
 };
 use bevy_time::{Fixed, Time, TimePlugin};
 use glam::{IVec2, IVec3, Vec3};
 use soils_protocol::{
     CHUNK_BIT, ChunkData, ClientMsg, ChunkVolume, QuantState, ServerMsg, encode_snapshot,
 };
-use soils_sim::{KIND_CRITTER, KIND_PLAYER};
+use soils_sim::{KIND_CRITTER, KIND_PLAYER, nav};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError};
 use tokio::sync::watch;
 
@@ -134,10 +135,23 @@ struct InWorld(String);
 #[derive(Component)]
 #[allow(dead_code)] // client id: read when gameplay systems need "who did it"
 struct PlayerControlled(u16);
-/// Trivial wander AI for test critters: hold a heading for a while, then turn.
+/// Critter AI (plan §10 stage-2 consumer): wander until a player is in range,
+/// then A*-path to the ground under them and follow the waypoints.
 #[derive(Component)]
 struct Wander {
+    /// Next wander heading change (wander mode only).
     next_turn: u64,
+    /// Remaining path waypoints (feet cells), front = next.
+    path: VecDeque<IVec3>,
+    /// Ground cell the current path targets (repath when the player's ground
+    /// cell moves off it).
+    goal: Option<IVec3>,
+}
+
+impl Wander {
+    fn new() -> Self {
+        Self { next_turn: 0, path: VecDeque::new(), goal: None }
+    }
 }
 
 #[derive(Resource)]
@@ -445,7 +459,7 @@ fn drain_inboxes(
                                     }),
                                     Yaw(0.0),
                                     InWorld(world_name.clone()),
-                                    Wander { next_turn: 0 },
+                                    Wander::new(),
                                 ));
                             }
                         }
@@ -735,35 +749,117 @@ fn send_wave(world: &World, positions: &[IVec3], out: &UnboundedSender<ServerMsg
     }
 }
 
-/// Step the ambient test critters: hold a heading for a couple of seconds,
-/// then turn (deterministically, from NetId and tick — no wall-clock or RNG).
-/// Frozen while their terrain isn't resident, so they can't fall through
-/// unloaded space. Also owns the tick counter increment.
+/// How far critters notice players (voxels).
+const SEEK_RANGE: f32 = 48.0;
+/// A* expansion budget per (re)path — the per-tick knob from plan §10.2;
+/// repaths are also staggered so at most one critter repaths per tick.
+const PATH_BUDGET: usize = 400;
+/// Minimum ticks between one critter's repaths.
+const REPATH_TICKS: u64 = 10;
+/// How far below a hovering player to look for the ground cell to path to.
+const GROUND_SCAN: i32 = 32;
+
+/// A critter's standing (feet) cell from its eye position.
+fn feet_cell(pos: Vec3) -> IVec3 {
+    (pos - Vec3::Y * (soils_sim::EYE_TO_FEET - 0.01)).floor().as_ivec3()
+}
+
+/// Step the ambient test critters (plan §10 stage 2's first consumer): if a
+/// player is within [`SEEK_RANGE`], A*-path to the ground beneath them and
+/// walk the waypoints (jumping 1-up steps); otherwise wander deterministically
+/// (heading from NetId and tick — no wall-clock or RNG). Waypoints are
+/// validated against live voxels before each step, so an edit that breaks the
+/// path forces a repath — the stage-2 flavor of version invalidation (cached
+/// nav *graphs* get real version keys in stage 3). Frozen while their terrain
+/// isn't resident, so they can't fall through unloaded space. Also owns the
+/// tick counter increment.
 fn wander_critters(
     mut ticks: ResMut<TickCount>,
     worlds: Res<Worlds>,
-    mut critters: Query<(&NetId, &InWorld, &mut SimState, &mut Yaw, &mut Wander)>,
+    mut critters: Query<
+        (&NetId, &InWorld, &mut SimState, &mut Yaw, &mut Wander),
+        Without<PlayerControlled>,
+    >,
+    players: Query<(&InWorld, &SimState), With<PlayerControlled>>,
 ) {
     ticks.0 += 1;
     let dt = 1.0 / soils_sim::SERVER_TICK_HZ as f32;
+    let player_pos: Vec<(&str, Vec3)> =
+        players.iter().map(|(w, s)| (w.0.as_str(), s.0.pos)).collect();
+
     for (net, in_world, mut sim, mut yaw, mut wander) in &mut critters {
         let Some(world) = worlds.map.get(&in_world.0) else { continue };
         if !world.has_chunk(chunk_at(sim.0.pos.to_array())) {
             continue;
         }
-        if ticks.0 >= wander.next_turn {
-            let h = (net.0 as u64)
-                .wrapping_mul(0x9E3779B97F4A7C15)
-                .wrapping_add(ticks.0.wrapping_mul(0xD1B54A32D192ED03));
-            yaw.0 = (h % 6283) as f32 / 1000.0;
-            wander.next_turn = ticks.0 + 30 + (h >> 32) % 40;
-        }
-        let input = soils_sim::PlayerInput {
+        let sampler = |v: IVec3| world.voxel(v);
+        let feet = feet_cell(sim.0.pos);
+
+        // Acquire: nearest in-range player's ground cell (players fly, so
+        // drop from their feet to the first walkable cell).
+        let target = player_pos
+            .iter()
+            .filter(|(w, _)| *w == in_world.0)
+            .map(|(_, p)| (*p, p.distance(sim.0.pos)))
+            .filter(|(_, d)| *d < SEEK_RANGE)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .and_then(|(p, _)| nav::resolve_walkable(&sampler, feet_cell(p), GROUND_SCAN));
+
+        let mut input = soils_sim::PlayerInput {
             move_axes: glam::Vec2::new(0.0, 1.0),
             yaw: yaw.0,
             ..Default::default()
         };
-        soils_sim::step_player(&mut sim.0, &input, dt, &|v| world.voxel(v));
+        if let Some(goal) = target {
+            // (Re)path when the goal cell moved or the path ran out, at most
+            // once per REPATH_TICKS, staggered across critters by NetId.
+            let stale = wander.goal != Some(goal) || (wander.path.is_empty() && feet != goal);
+            if stale && (ticks.0 + net.0 as u64) % REPATH_TICKS == 0 {
+                wander.goal = Some(goal);
+                wander.path.clear();
+                // The body may hover, mid-fall, or stand on a block edge —
+                // snap the start to the nearest standable cell.
+                let start = nav::resolve_walkable(&sampler, feet, 2);
+                if let Some(start) = start
+                    && let nav::PathResult::Path(p) =
+                        nav::find_path(&sampler, start, goal, PATH_BUDGET)
+                {
+                    wander.path = p.into_iter().collect();
+                }
+            }
+            // Reached (or fell past) waypoints are popped; a waypoint no
+            // longer walkable (edit underneath it) drops the whole path.
+            while wander.path.front() == Some(&feet) {
+                wander.path.pop_front();
+            }
+            if let Some(&next) = wander.path.front() {
+                if !nav::walkable(&sampler, next) {
+                    wander.path.clear();
+                } else {
+                    let center = next.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+                    let d = center - Vec3::new(sim.0.pos.x, center.y, sim.0.pos.z);
+                    yaw.0 = f32::atan2(-d.x, -d.z);
+                    input.yaw = yaw.0;
+                    input.jump = next.y > feet.y && sim.0.grounded;
+                }
+            } else {
+                // At (or under) the goal: face the player and hold position.
+                input.move_axes = glam::Vec2::ZERO;
+            }
+        } else {
+            // No player near: the old deterministic wander.
+            wander.goal = None;
+            wander.path.clear();
+            if ticks.0 >= wander.next_turn {
+                let h = (net.0 as u64)
+                    .wrapping_mul(0x9E3779B97F4A7C15)
+                    .wrapping_add(ticks.0.wrapping_mul(0xD1B54A32D192ED03));
+                yaw.0 = (h % 6283) as f32 / 1000.0;
+                wander.next_turn = ticks.0 + 30 + (h >> 32) % 40;
+            }
+            input.yaw = yaw.0;
+        }
+        soils_sim::step_player(&mut sim.0, &input, dt, &sampler);
     }
 }
 

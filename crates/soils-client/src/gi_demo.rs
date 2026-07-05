@@ -129,7 +129,7 @@ pub fn setup_gi_demo(
         cpos,
         vol,
         params,
-        gi.cascade0(),
+        gi.irradiance(),
     );
     map.map.insert(cpos, e);
     commands.insert_resource(GiDemoChunk(e));

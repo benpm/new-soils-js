@@ -4,9 +4,10 @@
 
 use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey};
 use bevy::prelude::*;
-use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::mesh::{MeshVertexBufferLayoutRef, VertexBufferLayout};
 use bevy::render::render_resource::{
     AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
+    VertexStepMode,
 };
 use bevy::render::storage::ShaderStorageBuffer;
 use bevy::shader::ShaderRef;
@@ -50,6 +51,10 @@ pub struct AtlasParams {
     /// >0.5 shades from the baked L0 light grid; otherwise the flat
     /// `brightness` (the pre-L0 look; the GI demo uses this path).
     pub light_enabled: f32,
+    /// World position of the chunk's (0,0,0) corner. The vertex shader adds
+    /// this to quad positions instead of using Bevy's per-instance mesh
+    /// transform, which indirect draws can't index (set by `spawn_gpu_chunk`).
+    pub chunk_origin: Vec3,
 }
 
 impl Default for AtlasParams {
@@ -63,16 +68,18 @@ impl Default for AtlasParams {
             gi_enabled: 0.0,
             sky_term: TERRAIN_BRIGHTNESS,
             light_enabled: 1.0,
+            chunk_origin: Vec3::ZERO,
         }
     }
 }
 
 /// One material per chunk: its quad storage buffer (vertex-pulled) plus the
-/// shared atlas texture and params. `gi_cascade0` is shared across all chunks
-/// and points at the GI radiance-cascades output (see `gi.rs`): the merged
-/// cascade-0 radiance field, sampled to light terrain. It is written only by
-/// the compute shader (its GPU buffer is never recreated), so this bind group
-/// stays valid; the volume origin/enable flag ride in `params` instead.
+/// shared atlas texture and params. `gi_probes` is shared across all chunks
+/// and points at the GI radiance-cascades output (see `gi.rs`): per-probe
+/// ambient-cube irradiance projected from merged cascade 0, sampled to light
+/// terrain. It is written only by the compute shader (its GPU buffer is never
+/// recreated), so this bind group stays valid; the volume origin/enable flag
+/// ride in `params` instead.
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct ChunkMeshMaterial {
     #[storage(0, read_only)]
@@ -83,7 +90,7 @@ pub struct ChunkMeshMaterial {
     #[uniform(3)]
     pub params: AtlasParams,
     #[storage(4, read_only)]
-    pub gi_cascade0: Handle<ShaderStorageBuffer>,
+    pub gi_probes: Handle<ShaderStorageBuffer>,
     /// Padded per-chunk L0 light volume (see `gpu_mesh::LIGHT_PAD`). The CPU
     /// recreates this buffer's data on light changes, so `light::process_light`
     /// touches the material afterwards to rebuild the cached bind group.
@@ -100,19 +107,39 @@ impl Material for ChunkMeshMaterial {
         "shaders/atlas.wgsl".into()
     }
 
+    // Chunks are drawn only in the main opaque pass via draw_indirect (see
+    // indirect_draw.rs); the prepass/shadow passes would draw the placeholder
+    // mesh instead, so keep them off.
+    fn enable_prepass() -> bool {
+        false
+    }
+
+    fn enable_shadows() -> bool {
+        false
+    }
+
     fn specialize(
         _pipeline: &MaterialPipeline,
         descriptor: &mut RenderPipelineDescriptor,
-        layout: &MeshVertexBufferLayoutRef,
+        _layout: &MeshVertexBufferLayoutRef,
         _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
-        // The dummy mesh only carries POSITION (ignored by the vertex shader,
-        // which pulls from storage); declaring it keeps the bound vertex buffer
-        // slot valid.
-        let vertex_layout = layout.0.get_layout(&[Mesh::ATTRIBUTE_POSITION.at_shader_location(0)])?;
-        descriptor.vertex.buffers = vec![vertex_layout];
-        // Quads can be wound either way; render both sides.
-        descriptor.primitive.cull_mode = None;
+        // The vertex shader pulls quads from storage and consumes no vertex
+        // attributes. Bevy's specialized-pipeline cache still keys on
+        // vertex.buffers[0] (it panics when empty), so declare a stride-0
+        // attribute-less layout: any vertex count is valid for it, whatever
+        // stub buffer the indirect draw binds at slot 0.
+        descriptor.vertex.buffers = vec![VertexBufferLayout {
+            array_stride: 0,
+            step_mode: VertexStepMode::Vertex,
+            attributes: vec![],
+        }];
+        // The mesher's per-sign du/dv swap makes cross(du, dv) == face normal,
+        // and the fixed corner order [0,1,2, 0,2,3] keeps both triangles CCW
+        // viewed from outside (pinned by greedy.rs::winding_matches_normal and
+        // transferred to the GPU port by tests/mesher_gpu.rs), so backfaces can
+        // be culled.
+        descriptor.primitive.cull_mode = Some(bevy::render::render_resource::Face::Back);
         Ok(())
     }
 }

@@ -15,7 +15,7 @@ use std::collections::{HashSet, VecDeque};
 
 use bevy::prelude::*;
 use bevy::render::storage::ShaderStorageBuffer;
-use soils_protocol::{ActorState, ChunkVolume, ServerMsg};
+use soils_protocol::{EntityState, ServerMsg, SnapshotTracker};
 
 use crate::actor::{Actor, ActorAssets, ActorMap, LocalPlayer};
 use crate::chunk::{ChunkMap, VoxelChunk, WorldTime};
@@ -34,28 +34,41 @@ use crate::player::{self, Player, Streaming};
 #[derive(Resource, Default)]
 pub struct WorldEpoch(pub u32);
 
-#[derive(Message, Clone)]
+#[derive(Clone)]
 pub struct ChunkReceived {
     pub pos: [i32; 3],
-    pub empty: bool,
-    pub voxels: Vec<u8>,
+    /// `chunk_codec` payload (palette + LZ4), decoded at apply time.
+    pub payload: Vec<u8>,
     pub epoch: u32,
 }
 
-/// How many chunks may be turned into GPU resources per frame. A fresh world
-/// floods ~729 chunks in ~1s; applying them all at once allocates hundreds of
-/// MB of SSBOs and dispatches hundreds of compute jobs in one frame, which hangs
-/// (and loses) an integrated GPU. Draining at this budget spreads the work:
-/// ~8/frame ≈ 480 chunks/s → a full world fills in ~1.5s with no device loss.
-const CHUNK_APPLY_BUDGET: usize = 8;
+/// The ordered chunk stream from the server. Data and unloads share one
+/// message type (and one apply queue) because their *relative order* is the
+/// contract: a chunk that leaves and re-enters the subscription arrives as
+/// `Unload` then `Data`, and applying them out of order would drop the chunk.
+#[derive(Message, Clone)]
+pub enum ChunkStream {
+    Data(ChunkReceived),
+    Unload { pos: [i32; 3], epoch: u32 },
+}
 
-/// Chunks that have arrived but not yet been meshed, drained at
-/// [`CHUNK_APPLY_BUDGET`] per frame by [`apply_chunks`]. `queued` mirrors the
-/// queue's positions so [`player::request_chunks`] doesn't re-request a chunk
-/// that's already in flight.
+/// Hard cap on chunks turned into GPU resources per frame. A fresh world
+/// floods ~729 chunks in a burst; applying them all at once allocates hundreds
+/// of MB of SSBOs and dispatches hundreds of compute jobs in one frame, which
+/// hangs (and loses) an integrated GPU — the cap protects weak devices.
+const CHUNK_APPLY_MAX: usize = 32;
+/// Time box within the cap: a fixed per-frame count collapses when burst
+/// frames run long (8/frame at ~8 fps was ~60 chunks/s, >10 s to fill a fresh
+/// world). Applying against wall time instead self-regulates: fast frames
+/// apply more, slow frames back off but always make progress.
+const CHUNK_APPLY_MS: f32 = 3.0;
+
+/// The ordered chunk stream awaiting application, drained under a time budget
+/// by [`apply_chunks`]. `queued` mirrors the positions of queued *data*
+/// entries so [`player::track_streaming`] can estimate outstanding work.
 #[derive(Resource, Default)]
 pub struct ChunkApplyQueue {
-    pub queue: VecDeque<ChunkReceived>,
+    pub queue: VecDeque<ChunkStream>,
     pub queued: HashSet<IVec3>,
 }
 
@@ -67,10 +80,29 @@ pub struct EditReceived {
 }
 
 #[derive(Message)]
-pub struct ActorsUpdated(pub Vec<ActorState>);
+pub struct EntitySpawned {
+    pub id: u32,
+    pub kind: u16,
+    pub pos: [f32; 3],
+}
 
 #[derive(Message)]
-pub struct ActorRemoved(pub u16);
+pub struct EntitiesUpdated {
+    pub states: Vec<EntityState>,
+    /// Snapshot tick (drives the remote-body interpolation clock).
+    pub tick: u32,
+    /// Reconciliation anchor: the highest input seq the server had applied.
+    pub last_input_seq: u32,
+}
+
+/// Client-side snapshot state: per-entity quantized baselines (the shared
+/// `soils-protocol` decode path) plus the latest applied tick, echoed to the
+/// server as `ack_tick` on every `Inputs` send.
+#[derive(Resource, Default)]
+pub struct SnapTracker(pub SnapshotTracker);
+
+#[derive(Message)]
+pub struct EntityDespawned(pub u32);
 
 #[derive(Message)]
 pub struct TimeReceived(pub f32);
@@ -78,6 +110,7 @@ pub struct TimeReceived(pub f32);
 #[derive(Message)]
 pub struct InitReceived {
     pub id: u16,
+    pub self_entity: u32,
     pub spawn: [f32; 3],
     pub daytime: f32,
 }
@@ -88,8 +121,12 @@ pub struct WarpReceived {
     pub daytime: f32,
 }
 
+/// The server's verdict on one of our own edits (see `edit::PendingEdits`).
 #[derive(Message)]
-pub struct PositionCorrected(pub [f32; 3]);
+pub struct EditAck {
+    pub seq: u32,
+    pub accepted: bool,
+}
 
 #[derive(Message)]
 pub struct LoginFailed(pub String);
@@ -102,14 +139,16 @@ pub struct NetStatus(pub String);
 pub fn register(app: &mut App) {
     app.init_resource::<WorldEpoch>()
         .init_resource::<ChunkApplyQueue>()
-        .add_message::<ChunkReceived>()
+        .init_resource::<SnapTracker>()
+        .add_message::<ChunkStream>()
         .add_message::<EditReceived>()
-        .add_message::<ActorsUpdated>()
-        .add_message::<ActorRemoved>()
+        .add_message::<EntitySpawned>()
+        .add_message::<EntitiesUpdated>()
+        .add_message::<EntityDespawned>()
         .add_message::<TimeReceived>()
         .add_message::<InitReceived>()
         .add_message::<WarpReceived>()
-        .add_message::<PositionCorrected>()
+        .add_message::<EditAck>()
         .add_message::<LoginFailed>()
         .add_message::<NetStatus>();
 }
@@ -121,14 +160,16 @@ pub fn register(app: &mut App) {
 pub fn route_server_messages(
     net: Res<NetClient>,
     mut epoch: ResMut<WorldEpoch>,
-    mut chunks: MessageWriter<ChunkReceived>,
+    mut tracker: ResMut<SnapTracker>,
+    mut chunks: MessageWriter<ChunkStream>,
     mut edits: MessageWriter<EditReceived>,
-    mut actors: MessageWriter<ActorsUpdated>,
-    mut removes: MessageWriter<ActorRemoved>,
+    mut spawns: MessageWriter<EntitySpawned>,
+    mut entities: MessageWriter<EntitiesUpdated>,
+    mut despawns: MessageWriter<EntityDespawned>,
     mut times: MessageWriter<TimeReceived>,
     mut inits: MessageWriter<InitReceived>,
     mut warps: MessageWriter<WarpReceived>,
-    mut positions: MessageWriter<PositionCorrected>,
+    mut edit_acks: MessageWriter<EditAck>,
     mut login_fails: MessageWriter<LoginFailed>,
     mut statuses: MessageWriter<NetStatus>,
 ) {
@@ -145,24 +186,26 @@ pub fn route_server_messages(
             NetEvent::Msg(msg) => msg,
         };
         match msg {
-            ServerMsg::Init { id, spawn, daytime, .. } => {
-                inits.write(InitReceived { id, spawn, daytime });
+            ServerMsg::Init { id, self_entity, spawn, daytime, .. } => {
+                inits.write(InitReceived { id, self_entity, spawn, daytime });
             }
             ServerMsg::LoginError { message } => {
                 login_fails.write(LoginFailed(message));
             }
-            ServerMsg::Chunk { pos, empty, voxels } => {
-                chunks.write(ChunkReceived { pos, empty, voxels, epoch: epoch.0 });
+            ServerMsg::Chunk { pos, payload } => {
+                chunks.write(ChunkStream::Data(ChunkReceived { pos, payload, epoch: epoch.0 }));
             }
             ServerMsg::Bundle { chunks: datas } => {
                 for d in datas {
-                    chunks.write(ChunkReceived {
+                    chunks.write(ChunkStream::Data(ChunkReceived {
                         pos: d.pos,
-                        empty: d.empty,
-                        voxels: d.voxels,
+                        payload: d.payload,
                         epoch: epoch.0,
-                    });
+                    }));
                 }
+            }
+            ServerMsg::ChunkUnload { pos } => {
+                chunks.write(ChunkStream::Unload { pos, epoch: epoch.0 });
             }
             ServerMsg::Edit { pos, value } => {
                 edits.write(EditReceived { pos, value, epoch: epoch.0 });
@@ -172,16 +215,26 @@ pub fn route_server_messages(
             }
             ServerMsg::Warp { spawn, daytime } => {
                 epoch.0 += 1;
+                tracker.0.clear();
                 warps.write(WarpReceived { spawn, daytime });
             }
-            ServerMsg::Position { pos } => {
-                positions.write(PositionCorrected(pos));
+            ServerMsg::EditAccepted { seq, .. } => {
+                edit_acks.write(EditAck { seq, accepted: true });
             }
-            ServerMsg::ActorUpdate { actors: states } => {
-                actors.write(ActorsUpdated(states));
+            ServerMsg::EditRejected { seq } => {
+                edit_acks.write(EditAck { seq, accepted: false });
             }
-            ServerMsg::ActorRemove { id } => {
-                removes.write(ActorRemoved(id));
+            ServerMsg::EntitySpawn { id, kind, pos } => {
+                spawns.write(EntitySpawned { id, kind, pos });
+            }
+            ServerMsg::Snapshot { tick, baseline_tick, last_input_seq, payload } => {
+                if let Some(updated) = tracker.0.apply(tick, baseline_tick, &payload) {
+                    entities.write(EntitiesUpdated { states: updated, tick, last_input_seq });
+                }
+            }
+            ServerMsg::EntityDespawn { id } => {
+                tracker.0.forget(id);
+                despawns.write(EntityDespawned(id));
             }
         }
     }
@@ -194,12 +247,19 @@ pub fn apply_init(
     mut local: ResMut<LocalPlayer>,
     mut world_time: ResMut<WorldTime>,
     mut login: ResMut<LoginState>,
+    mut streaming: ResMut<Streaming>,
+    mut ring: ResMut<player::InputRing>,
     mut query: Query<(&mut Player, &mut Transform)>,
 ) {
     for msg in reader.read() {
         local.id = msg.id;
+        local.self_entity = msg.self_entity;
         world_time.daytime = msg.daytime;
+        ring.reset(); // any prediction history predates this session
         login.done = true; // authenticated — drop the login screen
+        // A (re)login may be a fresh connection whose server-side radius reset
+        // to the default; re-send ours (idempotent on the same connection).
+        streaming.sent_radius = None;
         if let Ok((mut player, mut transform)) = query.single_mut() {
             player::teleport(&mut player, &mut transform, Vec3::from_array(msg.spawn));
         }
@@ -229,17 +289,20 @@ pub fn apply_warp(
     mut streaming: ResMut<Streaming>,
     mut light_queue: ResMut<LightQueue>,
     mut queue: ResMut<ChunkApplyQueue>,
+    mut pending_edits: ResMut<crate::edit::PendingEdits>,
+    mut ring: ResMut<player::InputRing>,
     mut query: Query<(&mut Player, &mut Transform)>,
 ) {
     for msg in reader.read() {
+        pending_edits.clear(); // old-world verdicts are moot
+        ring.reset(); // prediction history describes the old world
         for (_, entity) in map.map.drain() {
             commands.entity(entity).despawn();
         }
         for (_, entity) in actor_map.map.drain() {
             commands.entity(entity).despawn();
         }
-        light_queue.chunks.clear();
-        light_queue.edits.clear();
+        light_queue.clear();
         world_time.daytime = msg.daytime;
         if let Ok((mut player, mut transform)) = query.single_mut() {
             player::teleport(&mut player, &mut transform, Vec3::from_array(msg.spawn));
@@ -253,18 +316,6 @@ pub fn apply_warp(
     }
 }
 
-/// Server rejected our movement — snap back.
-pub fn apply_position_correction(
-    mut reader: MessageReader<PositionCorrected>,
-    mut query: Query<(&mut Player, &mut Transform)>,
-) {
-    for msg in reader.read() {
-        if let Ok((mut player, mut transform)) = query.single_mut() {
-            player::teleport(&mut player, &mut transform, Vec3::from_array(msg.0));
-        }
-    }
-}
-
 pub fn apply_time(mut reader: MessageReader<TimeReceived>, mut world_time: ResMut<WorldTime>) {
     for msg in reader.read() {
         world_time.daytime = msg.0;
@@ -275,7 +326,7 @@ pub fn apply_time(mut reader: MessageReader<TimeReceived>, mut world_time: ResMu
 /// (meshed or empty-tracked) chunk entity.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_chunks(
-    mut reader: MessageReader<ChunkReceived>,
+    mut reader: MessageReader<ChunkStream>,
     epoch: Res<WorldEpoch>,
     mut commands: Commands,
     mut map: ResMut<ChunkMap>,
@@ -293,19 +344,25 @@ pub fn apply_chunks(
 ) {
     // (A) Move this frame's arrivals into the persistent queue. Bevy messages are
     // double-buffered and dropped after ~2 frames, so we must capture them now
-    // even though only a few are applied per frame. Stale chunks (a world we've
-    // since warped out of) are dropped here, cheaply.
+    // even though only a few are applied per frame. Stale entries (a world we've
+    // since warped out of) are dropped here, cheaply. Data and unloads stay in
+    // one queue: their relative order is part of the protocol.
     for msg in reader.read() {
-        if msg.epoch != epoch.0 {
-            continue;
+        match msg {
+            ChunkStream::Data(d) if d.epoch == epoch.0 => {
+                queue.queued.insert(IVec3::from_array(d.pos));
+                queue.queue.push_back(msg.clone());
+            }
+            ChunkStream::Unload { epoch: e, .. } if *e == epoch.0 => {
+                queue.queue.push_back(msg.clone());
+            }
+            _ => {}
         }
-        queue.queued.insert(IVec3::from_array(msg.pos));
-        queue.queue.push_back(msg.clone());
     }
     if queue.queue.is_empty() {
         return;
     }
-    let gi_cascade0 = gi.cascade0();
+    let gi_probes = gi.irradiance();
     let (gi_origin, gi_enabled) = gi.apply_params();
     let params = material::AtlasParams {
         ambient_occlusion: if toggles.ao { 1.0 } else { 0.0 },
@@ -317,31 +374,54 @@ pub fn apply_chunks(
         ..default()
     };
 
-    // (B) Apply at most CHUNK_APPLY_BUDGET chunks this frame. Turning a chunk into
-    // GPU resources allocates a ~655 KB quad SSBO and queues a compute dispatch;
-    // doing hundreds at once on a burst loses the device, so we spread the work.
+    // (B) Apply chunks until the time box (or hard cap) is hit. Turning a chunk
+    // into GPU resources allocates a ~655 KB quad SSBO and queues a compute
+    // dispatch; doing hundreds at once on a burst loses the device, so we
+    // spread the work — but by wall time, so slow frames don't starve the fill.
+    let t0 = std::time::Instant::now();
     let mut applied = 0;
-    while applied < CHUNK_APPLY_BUDGET {
-        let Some(msg) = queue.queue.pop_front() else { break };
+    while applied < CHUNK_APPLY_MAX
+        && (applied < 2 || t0.elapsed().as_secs_f32() * 1000.0 < CHUNK_APPLY_MS)
+    {
+        let Some(entry) = queue.queue.pop_front() else { break };
+        let msg = match entry {
+            ChunkStream::Data(d) => d,
+            ChunkStream::Unload { pos, epoch: e } => {
+                // Left the server-side subscription: drop our copy (entity,
+                // GPU buffers via asset handles, pending light work). Cheap —
+                // doesn't spend the apply budget.
+                if e == epoch.0 {
+                    let cpos = IVec3::from_array(pos);
+                    if let Some(entity) = map.map.remove(&cpos) {
+                        commands.entity(entity).despawn();
+                    }
+                    light_queue.unload(cpos);
+                }
+                continue;
+            }
+        };
         let cpos = IVec3::from_array(msg.pos);
         queue.queued.remove(&cpos);
         if msg.epoch != epoch.0 {
             continue; // warped away since it was queued; drop without spending budget
         }
-        let volume =
-            if msg.empty { ChunkVolume::empty() } else { ChunkVolume::from_bytes(&msg.voxels) };
+        let is_air = soils_protocol::payload_is_air(&msg.payload);
+        let Some(volume) = soils_protocol::decode_chunk(&msg.payload) else {
+            warn!("dropping undecodable chunk payload at {cpos}");
+            continue;
+        };
         if let Some(&entity) = map.map.get(&cpos) {
             // Existing chunk: update CPU copy + re-upload voxels if it has a
             // GPU mesh, else (was empty) leave as-is.
             if let Ok(mut vc) = chunks.get_mut(entity) {
                 vc.volume = volume.clone();
             }
-            if !msg.empty
+            if !is_air
                 && let Ok(mut gc) = gpu_chunks.get_mut(entity)
             {
                 gpu_mesh::refresh_gpu_chunk(&mut buffers, &mut gc, &volume);
             }
-        } else if msg.empty {
+        } else if is_air {
             // Track empty chunks so they aren't re-requested; no mesh (but
             // they still carry light — sky crosses them into caves below).
             let e = commands
@@ -362,7 +442,7 @@ pub fn apply_chunks(
                 cpos,
                 volume,
                 params.clone(),
-                gi_cascade0.clone(),
+                gi_probes.clone(),
             );
             map.map.insert(cpos, e);
             streaming.pending = streaming.pending.saturating_sub(1);
@@ -392,45 +472,67 @@ pub fn apply_edits(
     }
 }
 
-/// Positions of nearby actors: move existing bodies, spawn new ones. Must run
-/// before [`apply_actor_removes`] — the reverse order turns an update+remove
-/// sharing a frame into a permanent ghost body.
-pub fn apply_actor_updates(
-    mut reader: MessageReader<ActorsUpdated>,
+/// An entity entered interest: spawn its body (shaped by its registry kind).
+/// Our own player entity gets no body — its updates drive the camera.
+pub fn apply_entity_spawns(
+    mut reader: MessageReader<EntitySpawned>,
     mut commands: Commands,
     local: Res<LocalPlayer>,
     mut map: ResMut<ActorMap>,
     assets: Res<ActorAssets>,
+) {
+    for msg in reader.read() {
+        if msg.id == local.self_entity || map.map.contains_key(&msg.id) {
+            continue;
+        }
+        let target = Vec3::from_array(msg.pos);
+        let Some(kind) = assets.kinds.get(msg.kind as usize) else { continue };
+        let entity = commands
+            .spawn((
+                Actor::new(msg.kind, 0, target),
+                Mesh3d(kind.mesh.clone()),
+                MeshMaterial3d(kind.material.clone()),
+                Transform::from_translation(target - Vec3::Y * kind.body_drop),
+            ))
+            .id();
+        map.map.insert(msg.id, entity);
+    }
+}
+
+/// Snapshot states for entities in interest: push remote bodies' interp
+/// buffers (our own entity is handled by `player::reconcile_self`). Must run
+/// after [`apply_entity_spawns`] and before [`apply_entity_despawns`] — the
+/// reverse order turns an update+despawn sharing a frame into a permanent
+/// ghost body.
+pub fn apply_entity_updates(
+    mut reader: MessageReader<EntitiesUpdated>,
+    local: Res<LocalPlayer>,
+    map: Res<ActorMap>,
+    mut clock: ResMut<crate::actor::InterpClock>,
     mut actors: Query<&mut Actor>,
 ) {
     for msg in reader.read() {
-        for state in &msg.0 {
-            if state.id == local.id {
-                continue; // don't render ourselves
+        clock.observe(msg.tick);
+        for state in &msg.states {
+            if state.id == local.self_entity {
+                continue;
             }
-            let target = Vec3::from_array(state.pos);
-            if let Some(&entity) = map.map.get(&state.id) {
-                if let Ok(mut actor) = actors.get_mut(entity) {
-                    actor.target = target;
-                }
-            } else {
-                let entity = commands
-                    .spawn((
-                        Actor { target },
-                        Mesh3d(assets.mesh.clone()),
-                        MeshMaterial3d(assets.material.clone()),
-                        Transform::from_translation(target - Vec3::Y * 0.9),
-                    ))
-                    .id();
-                map.map.insert(state.id, entity);
+            if let Some(&entity) = map.map.get(&state.id)
+                && let Ok(mut actor) = actors.get_mut(entity)
+            {
+                actor.push_snapshot(
+                    msg.tick,
+                    Vec3::from_array(state.pos),
+                    Vec3::from_array(state.velocity),
+                );
             }
         }
     }
 }
 
-/// An actor left view / disconnected.
-pub fn apply_actor_removes(
-    mut reader: MessageReader<ActorRemoved>,
+/// An entity left interest (or despawned): drop its body.
+pub fn apply_entity_despawns(
+    mut reader: MessageReader<EntityDespawned>,
     mut commands: Commands,
     mut map: ResMut<ActorMap>,
 ) {

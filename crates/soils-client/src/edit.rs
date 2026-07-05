@@ -15,6 +15,22 @@ use crate::light::LightQueue;
 use crate::net::NetClient;
 use crate::player::Player;
 
+/// Optimistically applied edits awaiting the server's verdict. On
+/// `EditRejected` the voxel rolls back to its recorded previous value (unless
+/// a later pending edit targets the same voxel — that one's ack settles it).
+#[derive(Resource, Default)]
+pub struct PendingEdits {
+    next_seq: u32,
+    list: Vec<(u32, IVec3, u8)>,
+}
+
+impl PendingEdits {
+    /// Drop everything (warp: the world the edits targeted is gone).
+    pub fn clear(&mut self) {
+        self.list.clear();
+    }
+}
+
 /// The nine right-click placement blocks, selectable with the 1-9 keys. Mirrors
 /// the JS hotbar (`player.placeBlock`), which defaults to "Stone Bricks".
 #[derive(Resource)]
@@ -114,6 +130,7 @@ pub fn edit_blocks(
     mut gpu_chunks: Query<&mut GpuChunk>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
     mut light_queue: ResMut<LightQueue>,
+    mut pending: ResMut<PendingEdits>,
     camera: Query<&Transform, With<Player>>,
 ) {
     // Ignore clicks while the cursor isn't grabbed (UI/escape state).
@@ -146,15 +163,47 @@ pub fn edit_blocks(
         (hit.prev, id)
     };
 
-    // Shared legality rule (reach + known id); the server will apply the same
-    // check once it validates edits.
+    // Shared legality rule (reach + known id); the server runs the same check
+    // authoritatively and answers EditAccepted/EditRejected by seq.
     if !validate_edit(origin, target, value, &registry.0) {
         return;
     }
 
+    let prev = {
+        let ro = chunks.as_readonly();
+        voxel_at(&map, &ro, target)
+    };
     apply_edit(&map, &mut chunks, &mut gpu_chunks, &mut buffers, target, value);
     light_queue.edits.push(target);
-    net.send(ClientMsg::Edit { pos: [target.x, target.y, target.z], value });
+    pending.next_seq += 1;
+    let seq = pending.next_seq;
+    pending.list.push((seq, target, prev));
+    net.send(ClientMsg::Edit { seq, pos: [target.x, target.y, target.z], value });
+}
+
+/// Settle the server's edit verdicts: accepted seqs just leave the pending
+/// list; rejected ones roll the optimistic application back.
+pub fn apply_edit_acks(
+    mut reader: MessageReader<crate::server_msg::EditAck>,
+    mut pending: ResMut<PendingEdits>,
+    map: Res<ChunkMap>,
+    mut chunks: Query<&mut VoxelChunk>,
+    mut gpu_chunks: Query<&mut GpuChunk>,
+    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut light_queue: ResMut<LightQueue>,
+) {
+    for msg in reader.read() {
+        let Some(i) = pending.list.iter().position(|(s, ..)| *s == msg.seq) else { continue };
+        let (_, pos, prev) = pending.list.remove(i);
+        if msg.accepted {
+            continue;
+        }
+        // Roll back unless a later pending edit owns this voxel now.
+        if !pending.list.iter().any(|(_, p, _)| *p == pos) {
+            apply_edit(&map, &mut chunks, &mut gpu_chunks, &mut buffers, pos, prev);
+            light_queue.edits.push(pos);
+        }
+    }
 }
 
 /// Apply an edit to a local chunk: update the CPU voxels, re-upload the GPU

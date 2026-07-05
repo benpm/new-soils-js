@@ -17,6 +17,7 @@ fn test_config(name: &str, enable_discovery: bool, data_dir: &Path) -> ServerCon
         enable_discovery,
         discovery_port: 0,
         name: name.into(),
+        ..ServerConfig::default()
     }
 }
 

@@ -5,7 +5,7 @@
 //! different simplex implementation and PRNG than the JS `alea`+`simplex-noise`
 //! pair, the terrain is equivalent in character but not byte-identical.
 
-use noise::Simplex;
+use noise::{NoiseFn, Simplex};
 use rayon::prelude::*;
 use soils_protocol::{CHUNK_SIZE, ChunkVolume, chunk_origin};
 
@@ -47,10 +47,37 @@ impl Palette {
     }
 }
 
+/// Cave-noise lattice spacing in voxels. The cave field is wavelength-45
+/// simplex, so sampling every 4 voxels (~11 samples per period) and
+/// trilinearly interpolating is visually indistinguishable from per-voxel
+/// evaluation at ~1/45th the 3D-noise cost.
+const CAVE_STEP: i32 = 4;
+/// Lattice points per axis: samples at 0, 4, ..., 32 inclusive.
+const CAVE_N: usize = (CHUNK_SIZE / CAVE_STEP) as usize + 1;
+
+/// Conservative ceiling on the highest solid voxel the height + outcrop math
+/// can produce (256 + summed octave amplitudes 115 + max rock 5, with margin
+/// for simplex overshoot). Chunks whose origin is above this are all air.
+/// Assumes the default-flavoured graph; a wildly different designed graph could
+/// exceed it, but the game and previews use the default height envelope.
+const MAX_SURFACE: i32 = 256 + 115 + 5 + 24;
+/// Max positive contribution of the rock-outcrop term (the other two terms
+/// only subtract).
+const MAX_ROCK: i32 = 5;
+
+/// |cave noise| above this carves air. The JS original used 0.7 on a simplex
+/// spanning roughly [-1, 1]; the `noise` crate's simplex tops out near 0.75
+/// (measured max 0.745 over 500k samples), so 0.7 carved almost nothing —
+/// the port had effectively lost its caves. 0.55 restores the original's
+/// ~1-2% underground cave density.
+const CAVE_THRESHOLD: f64 = 0.55;
+
 /// Stateless terrain generator seeded once and reused for every chunk. The
 /// height/rock/structure math lives in a [`TerrainGraph`] (the same schema the
 /// design tool edits and saves); this type owns the seeded `Simplex` the graph
-/// samples and the chunk-filling soil-gradient loop.
+/// samples and the chunk-filling soil-gradient loop. Caves stay a fast
+/// trilinear-lattice 3D-noise carve (see [`CAVE_THRESHOLD`]), separate from the
+/// 2D graph.
 pub struct TerrainGen {
     noise: Simplex,
     graph: TerrainGraph,
@@ -86,7 +113,12 @@ impl TerrainGen {
         &self.graph
     }
 
-    /// Generate many chunks in parallel. `generate` takes only shared borrows
+    #[inline]
+    fn n3(&self, x: f64, y: f64, z: f64) -> f64 {
+        self.noise.get([x, y, z])
+    }
+
+    /// Generate many chunks in parallel. Generation takes only shared borrows
     /// (`&self`, `&reg`), so a fresh world's chunk burst fans out across all
     /// cores instead of running serially. Results are returned in input order.
     pub fn generate_batch(
@@ -94,14 +126,66 @@ impl TerrainGen {
         positions: &[glam::IVec3],
         reg: &BlockRegistry,
     ) -> Vec<ChunkVolume> {
-        positions.par_iter().map(|&p| self.generate(p, reg)).collect()
+        let pal = Palette::new(reg);
+        positions.par_iter().map(|&p| self.generate_with(&pal, p)).collect()
     }
 
     /// Generate one chunk at the given chunk coordinate.
     pub fn generate(&self, chunk_pos: glam::IVec3, reg: &BlockRegistry) -> ChunkVolume {
-        let pal = Palette::new(reg);
+        self.generate_with(&Palette::new(reg), chunk_pos)
+    }
+
+    /// Sample the signed cave field on a `CAVE_N`^3 lattice covering the chunk
+    /// (inclusive of the +1 borders so interpolation never leaves the grid).
+    fn cave_lattice(&self, origin: glam::IVec3) -> Vec<f64> {
+        let mut lat = vec![0.0f64; CAVE_N * CAVE_N * CAVE_N];
+        let mut i = 0;
+        for iy in 0..CAVE_N {
+            let gy = (origin.y + iy as i32 * CAVE_STEP) as f64;
+            for iz in 0..CAVE_N {
+                let gz = (origin.z + iz as i32 * CAVE_STEP) as f64;
+                for ix in 0..CAVE_N {
+                    let gx = (origin.x + ix as i32 * CAVE_STEP) as f64;
+                    lat[i] = self.n3(gx / 45.0, gy / 45.0, gz / 45.0);
+                    i += 1;
+                }
+            }
+        }
+        lat
+    }
+
+    /// Trilinearly interpolated signed cave noise for a chunk-local voxel.
+    #[inline]
+    fn cave_at(lat: &[f64], x: i32, y: i32, z: i32) -> f64 {
+        let (xi, yi, zi) = ((x / CAVE_STEP) as usize, (y / CAVE_STEP) as usize, (z / CAVE_STEP) as usize);
+        let f = |v: i32| (v % CAVE_STEP) as f64 / CAVE_STEP as f64;
+        let (fx, fy, fz) = (f(x), f(y), f(z));
+        let at = |ix: usize, iy: usize, iz: usize| lat[(iy * CAVE_N + iz) * CAVE_N + ix];
+        let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+        let x00 = lerp(at(xi, yi, zi), at(xi + 1, yi, zi), fx);
+        let x10 = lerp(at(xi, yi + 1, zi), at(xi + 1, yi + 1, zi), fx);
+        let x01 = lerp(at(xi, yi, zi + 1), at(xi + 1, yi, zi + 1), fx);
+        let x11 = lerp(at(xi, yi + 1, zi + 1), at(xi + 1, yi + 1, zi + 1), fx);
+        lerp(lerp(x00, x10, fy), lerp(x01, x11, fy), fz)
+    }
+
+    fn generate_with(&self, pal: &Palette, chunk_pos: glam::IVec3) -> ChunkVolume {
         let origin = chunk_origin(chunk_pos);
         let mut vol = ChunkVolume::empty();
+
+        // Nothing can be solid this high up, whatever the noise does.
+        let ceiling = match self.world_type {
+            WorldType::Flat => 256,
+            WorldType::Normal => MAX_SURFACE,
+        };
+        if origin.y > ceiling {
+            return vol;
+        }
+
+        let cave = match self.world_type {
+            WorldType::Normal => Some(self.cave_lattice(origin)),
+            WorldType::Flat => None,
+        };
 
         for x in 0..CHUNK_SIZE {
             let gx = (origin.x + x) as f64;
@@ -116,6 +200,11 @@ impl TerrainGen {
                         (col.height.floor() as i32, col.rock)
                     }
                 };
+
+                // Whole column above the surface (and any outcrop): all air.
+                if origin.y > height + MAX_ROCK {
+                    continue;
+                }
 
                 for y in 0..CHUNK_SIZE {
                     let gy = origin.y + y;
@@ -139,13 +228,13 @@ impl TerrainGen {
                         pal.air
                     };
 
-                    if self.world_type == WorldType::Normal {
+                    if let Some(lat) = &cave {
                         // Surface rock outcrops.
                         if gy > height - 2 && (gy as f64) <= height as f64 + rock {
                             val = pal.stone;
                         }
                         // Caves carved from solid ground.
-                        if val != pal.air && self.graph.cave_carves(&self.noise, gx, gy as f64, gz) {
+                        if val != pal.air && Self::cave_at(lat, x, y, z).abs() > CAVE_THRESHOLD {
                             val = pal.air;
                         }
                     }
@@ -185,6 +274,47 @@ mod tests {
         let below = tg.generate(glam::IVec3::new(0, 7, 0), &reg);
         assert_ne!(below.get(0, 31, 0), AIR);
         let _ = dirt;
+    }
+
+    #[test]
+    fn caves_are_carved_below_the_surface() {
+        // Deep chunks are fully inside the soil gradient, so any air in them
+        // must come from cave carving. Require a plausible density band over a
+        // 16-chunk region (~1-2% of 524k voxels) — pins CAVE_THRESHOLD against
+        // both regressions (no caves) and runaway carving (swiss cheese).
+        let reg = registry();
+        let tg = TerrainGen::new(0, WorldType::Normal);
+        let mut carved = 0usize;
+        for cx in 6..10 {
+            for cz in 6..10 {
+                let chunk = tg.generate(glam::IVec3::new(cx, 4, cz), &reg);
+                for x in 0..CHUNK_SIZE {
+                    for y in 0..CHUNK_SIZE {
+                        for z in 0..CHUNK_SIZE {
+                            if chunk.get(x, y, z) == AIR {
+                                carved += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let total = 16 * 32 * 32 * 32;
+        assert!(
+            carved > total / 200 && carved < total / 10,
+            "cave density off: {carved}/{total} air voxels"
+        );
+    }
+
+    #[test]
+    fn sky_chunks_are_empty() {
+        let reg = registry();
+        let tg = TerrainGen::new(0, WorldType::Normal);
+        // Above MAX_SURFACE: the early-out must agree with the full math.
+        assert!(tg.generate(glam::IVec3::new(8, 14, 8), &reg).is_empty());
+        assert!(tg.generate(glam::IVec3::new(-3, 20, 5), &reg).is_empty());
+        let flat = TerrainGen::new(0, WorldType::Flat);
+        assert!(flat.generate(glam::IVec3::new(0, 9, 0), &reg).is_empty());
     }
 
     #[test]

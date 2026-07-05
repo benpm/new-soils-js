@@ -9,10 +9,11 @@ use futures_util::{SinkExt, StreamExt};
 use soils_protocol::{ChunkVolume, ClientMsg, ServerMsg, decode, encode};
 use tokio_tungstenite::tungstenite::Message;
 
-// A voxel well below the surface (reliably solid), and the block we stamp there.
-const VOXEL: [i32; 3] = [282, 200, 268];
-const CHUNK: [i32; 3] = [8, 6, 8]; // VOXEL >> 5 per axis
-const LOCAL: (i32, i32, i32) = (26, 8, 12); // VOXEL & 31 per axis
+// A voxel within edit reach of the spawn eye (server authority validates
+// reach), and the block we stamp there.
+const VOXEL: [i32; 3] = [282, 280, 268];
+const CHUNK: [i32; 3] = [8, 8, 8]; // VOXEL >> 5 per axis
+const LOCAL: (i32, i32, i32) = (26, 24, 12); // VOXEL & 31 per axis
 const STAMP: u8 = 5;
 
 #[tokio::main]
@@ -29,14 +30,14 @@ async fn main() {
         }
     }
 
-    // Ensure the target chunk is loaded server-side.
-    tx.send(bin(&ClientMsg::ReqChunks { positions: vec![CHUNK] })).await.unwrap();
+    // The join burst pushes the subscription around the spawn — the target
+    // chunk is inside it, so just wait for it to stream in.
     let chunk = recv_chunk(&mut rx).await;
 
     match mode.as_str() {
         "write" => {
             assert_eq!(chunk.get(LOCAL.0, LOCAL.1, LOCAL.2) != STAMP, true, "stamp already present?");
-            tx.send(bin(&ClientMsg::Edit { pos: VOXEL, value: STAMP })).await.unwrap();
+            tx.send(bin(&ClientMsg::Edit { seq: 1, pos: VOXEL, value: STAMP })).await.unwrap();
             // Give the server a moment to apply + persist before we disconnect.
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             println!("WROTE stamp {STAMP} at {VOXEL:?}");
@@ -59,22 +60,19 @@ async fn recv_chunk<S>(rx: &mut S) -> ChunkVolume
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    // `ReqChunks` is answered with a `Bundle`; accept a bare `Chunk` too.
+    // Drain the pushed stream until the target chunk appears.
     while let Some(Ok(Message::Binary(b))) = rx.next().await {
-        match decode::<ServerMsg>(b.as_ref()) {
-            Some(ServerMsg::Chunk { empty, voxels, .. }) => {
-                return if empty { ChunkVolume::empty() } else { ChunkVolume::from_bytes(&voxels) };
-            }
+        let payload = match decode::<ServerMsg>(b.as_ref()) {
+            Some(ServerMsg::Chunk { pos, payload }) if pos == CHUNK => payload,
             Some(ServerMsg::Bundle { chunks }) => {
-                let d = chunks.into_iter().next().expect("bundle with the requested chunk");
-                return if d.empty {
-                    ChunkVolume::empty()
-                } else {
-                    ChunkVolume::from_bytes(&d.voxels)
-                };
+                match chunks.into_iter().find(|c| c.pos == CHUNK) {
+                    Some(c) => c.payload,
+                    None => continue,
+                }
             }
-            _ => {}
-        }
+            _ => continue,
+        };
+        return soils_protocol::decode_chunk(&payload).expect("chunk payload decodes");
     }
     panic!("server closed before sending the chunk");
 }

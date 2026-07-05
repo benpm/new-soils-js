@@ -8,7 +8,8 @@
 //!
 //! Saves are append-only (like the JS append path): rewriting a chunk appends a
 //! fresh block and repoints the header, which is simple and crash-safe at the
-//! cost of some wasted space until a future compaction pass.
+//! cost of leaked space. [`compact_dir`] reclaims it on world open once a
+//! file's leaked ratio crosses a threshold (temp file + atomic rename).
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -137,7 +138,9 @@ pub fn save_many(dir: &Path, chunks: &[(IVec3, &ChunkVolume)]) -> io::Result<()>
     }
 
     for (path, group) in by_region {
-        let mut file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        // Never truncate: region files are updated in place.
+        let mut file =
+            OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
         // Initialize the header on a freshly created file.
         if file.metadata()?.len() < HEADER_BYTES {
             file.set_len(0)?;
@@ -163,6 +166,81 @@ pub fn save_many(dir: &Path, chunks: &[(IVec3, &ChunkVolume)]) -> io::Result<()>
         }
         file.flush()?;
     }
+    Ok(())
+}
+
+/// Fraction of a file's data bytes that must be dead before it's rewritten.
+const COMPACT_LEAK_RATIO: f64 = 0.25;
+/// And at least this much absolute waste — tiny files aren't worth the churn.
+const COMPACT_MIN_LEAK: u64 = 64 * 1024;
+
+/// Compact every region file in `dir` whose leaked-byte share crosses the
+/// threshold. Called on world open; a corrupt or in-use file is skipped, never
+/// fatal.
+pub fn compact_dir(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return }; // nothing persisted yet
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "bin")
+            && let Err(e) = compact_file(&path)
+        {
+            eprintln!("region compaction skipped {path:?}: {e}");
+        }
+    }
+}
+
+/// Rewrite one region file keeping only header-referenced blocks, if enough
+/// bytes leaked. Crash-safe: the rebuilt image lands in a temp file that
+/// atomically replaces the original.
+fn compact_file(path: &Path) -> io::Result<()> {
+    let data = fs::read(path)?;
+    if data.len() < HEADER_BYTES as usize {
+        return Ok(());
+    }
+    let entry_at = |i: usize| {
+        u32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
+    };
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "block out of bounds");
+
+    // Measure live blocks (the ones the header still points at).
+    let mut blocks: Vec<(usize, usize, usize)> = Vec::new(); // (header idx, start, len)
+    let mut live: u64 = 0;
+    for i in 0..HEADER_ENTRIES {
+        let e = entry_at(i);
+        if e <= EMPTY {
+            continue;
+        }
+        let start = e as usize;
+        let len_bytes: [u8; 4] = data.get(start..start + 4).ok_or_else(bad)?.try_into().unwrap();
+        let len = 4 + u32::from_le_bytes(len_bytes) as usize;
+        if start + len > data.len() {
+            return Err(bad());
+        }
+        blocks.push((i, start, len));
+        live += len as u64;
+    }
+    let total = data.len() as u64 - HEADER_BYTES;
+    let leaked = total.saturating_sub(live);
+    if leaked < COMPACT_MIN_LEAK || (leaked as f64) < COMPACT_LEAK_RATIO * total as f64 {
+        return Ok(());
+    }
+
+    // Rebuild: sentinel entries copy through, live blocks re-pack in order.
+    let mut out = vec![0u8; HEADER_BYTES as usize];
+    for i in 0..HEADER_ENTRIES {
+        if entry_at(i) == EMPTY {
+            out[i * 4..i * 4 + 4].copy_from_slice(&EMPTY.to_le_bytes());
+        }
+    }
+    for (i, start, len) in blocks {
+        let new_off = out.len() as u32;
+        out.extend_from_slice(&data[start..start + len]);
+        out[i * 4..i * 4 + 4].copy_from_slice(&new_off.to_le_bytes());
+    }
+    let tmp = path.with_extension("bin.tmp");
+    fs::write(&tmp, &out)?;
+    fs::rename(&tmp, path)?;
+    println!("region compacted {path:?}: reclaimed {leaked} bytes");
     Ok(())
 }
 
@@ -231,6 +309,47 @@ mod tests {
         assert!(load(&dir, p_empty).unwrap().unwrap().is_empty());
         // An untouched chunk in a written region is still absent.
         assert!(load(&dir, IVec3::new(4, 1, 1)).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_reclaims_leaked_blocks_and_preserves_content() {
+        let dir = std::env::temp_dir().join(format!("soils-region-compact-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        // An incompressible chunk (~32 KB compressed), rewritten repeatedly:
+        // append-only saves leak every superseded block.
+        let mut vol = ChunkVolume::empty();
+        let mut s = 1u64;
+        for i in 0..soils_protocol::CHUNK_CUBED {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            vol.as_bytes_mut()[i] = (s >> 33) as u8;
+        }
+        let pos = IVec3::new(1, 1, 1);
+        let epos = IVec3::new(2, 1, 1);
+        save(&dir, epos, &ChunkVolume::empty()).unwrap();
+        for round in 0..10 {
+            vol.set(0, 0, 0, round);
+            save(&dir, pos, &vol).unwrap();
+        }
+        let path = region_path(&dir, pos);
+        let bloated = fs::metadata(&path).unwrap().len();
+
+        compact_dir(&dir);
+
+        let compacted = fs::metadata(&path).unwrap().len();
+        assert!(
+            compacted < bloated / 4,
+            "compaction should reclaim ~9 of 10 blocks ({bloated} -> {compacted})"
+        );
+        // Content preserved: latest rewrite, the empty sentinel, absent chunks.
+        assert_eq!(load(&dir, pos).unwrap().unwrap().get(0, 0, 0), 9);
+        assert!(load(&dir, epos).unwrap().unwrap().is_empty());
+        assert!(load(&dir, IVec3::new(3, 1, 1)).unwrap().is_none());
+        // Idempotent: nothing left to reclaim.
+        compact_dir(&dir);
+        assert_eq!(fs::metadata(&path).unwrap().len(), compacted);
 
         let _ = fs::remove_dir_all(&dir);
     }

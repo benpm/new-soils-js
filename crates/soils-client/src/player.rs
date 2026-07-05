@@ -14,7 +14,9 @@
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
-use soils_protocol::{CHUNK_BIT, ClientMsg};
+use std::collections::VecDeque;
+
+use soils_protocol::{CHUNK_BIT, ClientMsg, InputFrame};
 use soils_sim::{PlayerInput, PlayerState};
 
 use crate::chunk::{ChunkMap, VoxelChunk, voxel_at};
@@ -26,7 +28,9 @@ const MOUSE_SENS: f32 = 0.0022;
 pub struct Player {
     pub yaw: f32,
     pub pitch: f32,
-    /// Fixed-tick simulation state (eye position, velocity, fly/grounded).
+    /// Predicted simulation state: stepped locally every fixed tick through
+    /// the shared `soils-sim`, reconciled against server snapshots (rewind to
+    /// `last_input_seq`, replay newer inputs on divergence).
     pub sim: PlayerState,
     /// Sim position at the previous fixed tick, for render interpolation.
     pub prev_pos: Vec3,
@@ -45,13 +49,15 @@ impl Player {
     }
 }
 
-/// Move the player instantly: sets the sim position and the interpolation
-/// baseline (no smear across the jump), zeroes velocity, and writes the
-/// Transform immediately so same-frame readers see the new position.
+/// Move the player instantly: sets the sim state and the interpolation
+/// baseline (no smear across the jump) and writes the Transform immediately
+/// so same-frame readers see the new position. Prediction history is invalid
+/// across a teleport; [`InputRing::reset`] handles that at the call sites
+/// that own the resource.
 pub fn teleport(player: &mut Player, transform: &mut Transform, pos: Vec3) {
     player.sim.pos = pos;
-    player.prev_pos = pos;
     player.sim.vel = Vec3::ZERO;
+    player.prev_pos = pos;
     transform.translation = pos;
 }
 
@@ -107,11 +113,37 @@ pub fn collect_input(
     }
 }
 
-/// Advance the simulation one fixed tick (inside `FixedUpdate`, `Res<Time>` is
-/// the fixed clock).
-pub fn step(
-    time: Res<Time>,
+/// The outgoing input stream: one frame per fixed tick, the last few bundled
+/// per send for loss robustness on future unreliable transports (the server
+/// dedupes by `seq`).
+#[derive(Resource, Default)]
+pub struct InputRing {
+    seq: u32,
+    frames: Vec<InputFrame>,
+    /// `(seq, input, predicted state after stepping it)` — the rewind/replay
+    /// source for reconciliation.
+    history: VecDeque<(u32, PlayerInput, PlayerState)>,
+}
+
+/// History depth: ~4 s at 64 Hz, far beyond any sane RTT.
+const HISTORY_CAP: usize = 256;
+
+impl InputRing {
+    /// Drop history across a warp (it describes a dead timeline).
+    pub fn reset(&mut self) {
+        self.frames.clear();
+        self.history.clear();
+    }
+}
+
+/// One fixed tick: predict locally through the shared sim, record the
+/// (input, state) pair, and send the frame bundle. The server integrates the
+/// same inputs authoritatively; [`reconcile_self`] corrects us on divergence.
+pub fn predict_and_send(
+    net: Res<NetClient>,
     mut pending: ResMut<PendingInput>,
+    mut ring: ResMut<InputRing>,
+    tracker: Res<crate::server_msg::SnapTracker>,
     map: Res<ChunkMap>,
     chunks: Query<&VoxelChunk>,
     mut query: Query<&mut Player>,
@@ -119,18 +151,116 @@ pub fn step(
     let Ok(mut player) = query.single_mut() else { return };
     let input = pending.input;
     pending.clear_latches();
+
+    // Predict: step the local sim exactly as the server will.
     let player = &mut *player;
     player.prev_pos = player.sim.pos;
     let sampler = |v: IVec3| voxel_at(&map, &chunks, v);
-    soils_sim::step_player(&mut player.sim, &input, time.delta_secs(), &sampler);
+    soils_sim::step_player(&mut player.sim, &input, 1.0 / soils_sim::TICK_HZ as f32, &sampler);
+
+    ring.seq += 1;
+    let seq = ring.seq;
+    ring.history.push_back((seq, input, player.sim));
+    if ring.history.len() > HISTORY_CAP {
+        ring.history.pop_front();
+    }
+    let (buttons, flags, yaw) = soils_sim::pack_input(&input);
+    ring.frames.push(InputFrame { seq, buttons, flags, yaw });
+    if ring.frames.len() > 3 {
+        ring.frames.remove(0);
+    }
+    net.send(ClientMsg::Inputs {
+        ack_tick: tracker.0.latest_tick,
+        frames: ring.frames.clone(),
+    });
 }
 
-/// Derive the rendered camera position by interpolating the last two ticks.
-/// Translation only — rotation belongs to [`mouse_look`].
+/// Predicted-vs-authoritative tolerance (world units) before a rewind+replay.
+const RECONCILE_EPSILON: f32 = 0.05;
+
+/// Reconcile the prediction against the server's echo of our own entity at
+/// `last_input_seq`: within epsilon → keep the prediction; diverged → rewind
+/// to the authoritative state and replay every newer pending input.
+pub fn reconcile_self(
+    mut reader: MessageReader<crate::server_msg::EntitiesUpdated>,
+    local: Res<crate::actor::LocalPlayer>,
+    mut ring: ResMut<InputRing>,
+    map: Res<ChunkMap>,
+    chunks: Query<&VoxelChunk>,
+    mut query: Query<&mut Player>,
+) {
+    for msg in reader.read() {
+        let Some(state) = msg.states.iter().find(|s| s.id == local.self_entity) else {
+            continue;
+        };
+        let Ok(mut player) = query.single_mut() else { continue };
+        let server_pos = Vec3::from_array(state.pos);
+        let seq = msg.last_input_seq;
+
+        // Everything before the acked input is settled history.
+        while ring.history.front().is_some_and(|(s, ..)| *s < seq) {
+            ring.history.pop_front();
+        }
+        let predicted_then = match ring.history.front() {
+            Some((s, _, st)) if *s == seq => *st,
+            // No matching entry (fresh join, warp, or pre-input echo): adopt
+            // the server state outright only if we're far off.
+            _ => {
+                if (player.sim.pos - server_pos).length() > 1.0 {
+                    player.sim.pos = server_pos;
+                    player.sim.vel = Vec3::from_array(state.velocity);
+                    player.prev_pos = server_pos;
+                }
+                continue;
+            }
+        };
+
+        if (predicted_then.pos - server_pos).length() <= RECONCILE_EPSILON {
+            continue; // prediction holds; nothing to correct
+        }
+
+        // Mispredicted: rewind to the authoritative state at `seq` (position
+        // and velocity from the server; fly/grounded from the recorded state
+        // at that seq — they evolve deterministically from the same inputs,
+        // and taking them from the *current* prediction would double-apply
+        // any fly toggles the replay is about to re-run), then replay the
+        // unacknowledged inputs and rebase the recorded states. The anchor
+        // entry rebases too, so a repeated echo of the same seq is a no-op.
+        let base = PlayerState {
+            pos: server_pos,
+            vel: Vec3::from_array(state.velocity),
+            flying: predicted_then.flying,
+            grounded: predicted_then.grounded,
+        };
+        if let Some(front) = ring.history.front_mut() {
+            front.2 = base;
+        }
+        let mut sim = base;
+        let sampler = |v: IVec3| voxel_at(&map, &chunks, v);
+        for (_, input, recorded) in ring.history.iter_mut().skip(1) {
+            soils_sim::step_player(&mut sim, input, 1.0 / soils_sim::TICK_HZ as f32, &sampler);
+            *recorded = sim;
+        }
+        player.sim = sim;
+        player.prev_pos = sim.pos; // snap to the corrected timeline
+    }
+}
+
+/// When set, the camera transform is under manual control (self-test framing)
+/// and the prediction must not move it.
+#[derive(Resource, Default)]
+pub struct CameraHold(pub bool);
+
+/// Derive the rendered camera position by interpolating the last two
+/// predicted ticks. Translation only — rotation belongs to [`mouse_look`].
 pub fn sync_camera(
     fixed_time: Res<Time<Fixed>>,
+    hold: Res<CameraHold>,
     mut query: Query<(&Player, &mut Transform)>,
 ) {
+    if hold.0 {
+        return;
+    }
     let Ok((player, mut transform)) = query.single_mut() else { return };
     transform.translation = player.prev_pos.lerp(player.sim.pos, fixed_time.overstep_fraction());
 }
@@ -178,30 +308,43 @@ pub fn mouse_look(
     }
 }
 
-/// Tracks which chunk the player was last in, to drive streaming.
+/// Tracks which chunk the player was last in, to drive the HUD streaming
+/// estimate (the *server* owns the subscription since chunk streaming v2 —
+/// the client never requests chunks).
 #[derive(Resource)]
 pub struct Streaming {
     pub last_chunk: Option<IVec3>,
     pub load_radius: i32,
-    /// Chunks requested but not yet received — a live estimate of how much of
-    /// the surrounding world is still generating/streaming (shown on the HUD).
+    /// The view radius last told to the server, so a change (console, pause
+    /// menu) sends exactly one `ViewRadius`.
+    pub sent_radius: Option<i32>,
+    /// Chunks inside the local view box not yet applied — a live estimate of
+    /// how much of the surrounding world is still streaming in (HUD).
     pub pending: usize,
 }
 
 impl Default for Streaming {
     fn default() -> Self {
-        Self { last_chunk: None, load_radius: 4, pending: 0 }
+        Self { last_chunk: None, load_radius: 4, sent_radius: None, pending: 0 }
     }
 }
 
-/// Request chunks around the player whenever they cross a chunk boundary.
-pub fn request_chunks(
+/// Keep the server's view of our radius current, and recompute the HUD
+/// streaming estimate when the player crosses a chunk boundary. The server
+/// pushes/unloads chunks on its own; this mirrors the same box locally so the
+/// HUD can show progress without extra protocol.
+pub fn track_streaming(
     net: Res<NetClient>,
     map: Res<ChunkMap>,
     queue: Res<crate::server_msg::ChunkApplyQueue>,
     mut streaming: ResMut<Streaming>,
     query: Query<&Transform, With<Player>>,
 ) {
+    if streaming.sent_radius != Some(streaming.load_radius) {
+        streaming.sent_radius = Some(streaming.load_radius);
+        net.send(ClientMsg::ViewRadius { radius: streaming.load_radius as u8 });
+    }
+
     let Ok(transform) = query.single() else { return };
     let p = transform.translation;
     let pc = IVec3::new(
@@ -209,34 +352,22 @@ pub fn request_chunks(
         (p.y.floor() as i32) >> CHUNK_BIT,
         (p.z.floor() as i32) >> CHUNK_BIT,
     );
-
     if streaming.last_chunk == Some(pc) {
         return;
     }
     streaming.last_chunk = Some(pc);
 
     let r = streaming.load_radius;
-    let mut positions = Vec::new();
+    let mut pending = 0;
     for dx in -r..=r {
         for dy in -r..=r {
             for dz in -r..=r {
                 let cpos = pc + IVec3::new(dx, dy, dz);
-                // Skip chunks we already have, and chunks already received and
-                // waiting in the apply queue, so we don't re-request in-flight
-                // work (which would double-count the streaming-progress counter).
                 if !map.map.contains_key(&cpos) && !queue.queued.contains(&cpos) {
-                    positions.push([cpos.x, cpos.y, cpos.z]);
+                    pending += 1;
                 }
             }
         }
     }
-    if !positions.is_empty() {
-        // Nearest-first so the area around the player fills in first.
-        positions.sort_by_key(|c| {
-            let d = IVec3::new(c[0], c[1], c[2]) - pc;
-            d.x * d.x + d.y * d.y + d.z * d.z
-        });
-        streaming.pending += positions.len();
-        net.send(ClientMsg::ReqChunks { positions });
-    }
+    streaming.pending = pending;
 }

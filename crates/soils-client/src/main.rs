@@ -15,6 +15,7 @@ mod gi;
 mod gi_demo;
 mod gpu_mesh;
 mod hud;
+mod indirect_draw;
 mod light;
 mod login;
 mod material;
@@ -78,6 +79,10 @@ fn main() {
     .init_resource::<login::LoginState>()
     .init_resource::<singleplayer::Singleplayer>()
     .init_resource::<player::PendingInput>()
+    .init_resource::<player::InputRing>()
+    .init_resource::<player::CameraHold>()
+    .init_resource::<actor::InterpClock>()
+    .init_resource::<edit::PendingEdits>()
     .init_resource::<light::LightQueue>()
     .init_resource::<light::SkyTerm>()
     .insert_resource(net::connect())
@@ -116,12 +121,17 @@ fn main() {
                 server_msg::apply_chunks,
                 server_msg::apply_edits,
                 server_msg::apply_time,
-                server_msg::apply_position_correction,
-                server_msg::apply_actor_updates,
+                edit::apply_edit_acks,
+                server_msg::apply_entity_spawns,
             )
                 .after(server_msg::apply_init)
                 .after(server_msg::apply_warp),
-            server_msg::apply_actor_removes.after(server_msg::apply_actor_updates),
+            server_msg::apply_entity_updates.after(server_msg::apply_entity_spawns),
+            server_msg::apply_entity_despawns.after(server_msg::apply_entity_updates),
+            player::reconcile_self
+                .after(server_msg::apply_init)
+                .after(server_msg::apply_warp)
+                .after(server_msg::apply_chunks),
             // Baked lighting runs once all voxel changes for the frame landed.
             light::process_light
                 .after(server_msg::apply_chunks)
@@ -156,10 +166,9 @@ fn main() {
     .add_systems(
         Update,
         (
-            player::request_chunks,
+            player::track_streaming,
             player::cursor_toggle,
             edit::selection_highlight,
-            actor::send_move,
             console::console_input,
             console::update_console_text,
             hud::update_hud,
@@ -187,7 +196,7 @@ fn main() {
     )
     .add_systems(
         FixedUpdate,
-        player::step.run_if(login::logged_in).run_if(console::console_closed),
+        player::predict_and_send.run_if(login::logged_in).run_if(console::console_closed),
     )
     .run();
 }
@@ -200,6 +209,7 @@ fn screenshot_once(
     time: Res<Time>,
     mut taken: Local<bool>,
     mut camera: Query<(&mut Player, &mut Transform)>,
+    mut hold: ResMut<player::CameraHold>,
     meshed: Query<(&VoxelChunk, &Transform), (With<Mesh3d>, Without<Player>)>,
     remote_actors: Query<&Transform, (With<Actor>, Without<Player>)>,
 ) {
@@ -211,9 +221,10 @@ fn screenshot_once(
     if time.elapsed_secs() > env_secs("SOILS_SHOT_SECS", 9.0) {
         *taken = true;
         // In GI-demo mode keep the scene's own framing (see gi_demo.rs).
-        // Positions go through `teleport` (Transform is interpolation-derived);
-        // rotation via `look_at` is untouched by the sync system.
+        // The hold stops the server position echo from dragging the framed
+        // camera back toward the player's authoritative position mid-capture.
         if !gi_demo::demo_enabled() {
+            hold.0 = true;
             if let Ok((mut p, mut t)) = camera.single_mut() {
                 if let Some(actor) = remote_actors.iter().next() {
                     // Frame a remote actor so its body is visible in the shot.
@@ -344,7 +355,7 @@ fn selftest_login(net: Res<NetClient>) {
         return; // demo builds a local scene; no server/login
     }
     if std::env::var("SOILS_SELFTEST").is_ok() && std::env::var("SOILS_LOGINSHOT").is_err() {
-        net.connect("ws://127.0.0.1:9001".into());
+        net.connect(format!("{}://127.0.0.1:9001", net::default_scheme()));
         net.send(ClientMsg::Login { name: "player".into(), password: String::new(), signup: true });
     }
 }

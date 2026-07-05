@@ -26,9 +26,9 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::{RenderContext, RenderDevice};
 use bevy::render::storage::{GpuShaderStorageBuffer, ShaderStorageBuffer};
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
-use soils_protocol::{CHUNK_BIT, CHUNK_SIZE};
+use soils_protocol::CHUNK_BIT;
 
-use crate::chunk::{Blocks, ChunkMap, VoxelChunk, WorldTime};
+use crate::chunk::{Blocks, ChunkMap, WorldTime};
 
 /// World volume side, in voxels. Must match `GI_DIM` in radiance.wgsl. Sized
 /// for integrated GPUs (see the note in radiance.wgsl).
@@ -91,10 +91,24 @@ impl Default for GiSettings {
 #[derive(Resource, Clone, ExtractResource)]
 pub struct GiAssets {
     world_vox: Handle<ShaderStorageBuffer>,
+    /// Packed L0 light per volume voxel (sky nibble hi, block nibble lo),
+    /// blitted from the chunks' padded light buffers alongside occupancy;
+    /// seeds the top cascade's sky-visibility term.
+    world_light: Handle<ShaderStorageBuffer>,
     emission: Handle<ShaderStorageBuffer>,
     cascades: [Handle<ShaderStorageBuffer>; CASCADES],
     metas: [Handle<ShaderStorageBuffer>; CASCADES],
+    /// Per-probe ambient-cube irradiance (6 vec4 faces per cascade-0 probe),
+    /// projected from merged cascade 0 each GI cycle; what the terrain
+    /// material actually samples.
+    irradiance: Handle<ShaderStorageBuffer>,
     params: Handle<ShaderStorageBuffer>,
+    /// Pending GPU volume refill: chunk (voxel, padded-light) buffers (both
+    /// GPU-resident for the mesher/material) to blit into the volumes, with
+    /// their offsets relative to the volume origin. Populated on refill
+    /// frames, consumed by the render node (a clear pass runs first so
+    /// unloaded space reads as air under open sky).
+    refill: Vec<(Handle<ShaderStorageBuffer>, Handle<ShaderStorageBuffer>, IVec3)>,
     /// Placeholder bound to the unused `far` slot during trace (can't reuse the
     /// write target — a buffer may not be both read-write and read-only in one
     /// dispatch).
@@ -110,11 +124,11 @@ pub struct GiAssets {
 }
 
 impl GiAssets {
-    /// The cascade-0 radiance-field buffer the chunk material samples. Its GPU
-    /// buffer is written only by the compute shader and never recreated, so it
-    /// is safe to hold in a cached material bind group.
-    pub fn cascade0(&self) -> Handle<ShaderStorageBuffer> {
-        self.cascades[0].clone()
+    /// The per-probe ambient-cube irradiance buffer the chunk material
+    /// samples. Its GPU buffer is written only by the compute shader and never
+    /// recreated, so it is safe to hold in a cached material bind group.
+    pub fn irradiance(&self) -> Handle<ShaderStorageBuffer> {
+        self.irradiance.clone()
     }
 
     /// Force a volume refill and a re-push of origin/enable into every chunk
@@ -163,6 +177,9 @@ fn setup_gi_assets(
     // One byte (block id) per voxel; the shader reads it as packed u32s.
     let world_vox =
         buffers.add(ShaderStorageBuffer::with_size((GI_DIM * GI_DIM * GI_DIM) as usize, usage));
+    // One packed L0 light byte per voxel, same layout.
+    let world_light =
+        buffers.add(ShaderStorageBuffer::with_size((GI_DIM * GI_DIM * GI_DIM) as usize, usage));
 
     // Per-block emitted radiance as vec4<f32> rows, indexed by block id.
     let emission_rows: Vec<Vec4> =
@@ -175,6 +192,9 @@ fn setup_gi_assets(
     let metas = std::array::from_fn(|c| {
         buffers.add(ShaderStorageBuffer::from(vec![c as u32]))
     });
+    // 6 vec4 ambient-cube faces per cascade-0 probe.
+    let irradiance = buffers
+        .add(ShaderStorageBuffer::with_size(PROBES[0].pow(3) as usize * 6 * 16, usage));
 
     // 12 f32 = origin(3)+day, zenith(3)+lux, horizon(3)+enabled.
     let params = buffers.add(ShaderStorageBuffer::from(vec![0.0f32; 12]));
@@ -182,10 +202,13 @@ fn setup_gi_assets(
 
     commands.insert_resource(GiAssets {
         world_vox,
+        world_light,
         emission,
         cascades,
         metas,
+        irradiance,
         params,
+        refill: Vec::new(),
         dummy,
         center: None,
         enabled: false,
@@ -212,7 +235,7 @@ fn update_gi_volume(
     settings: Res<GiSettings>,
     world_time: Res<WorldTime>,
     map: Res<ChunkMap>,
-    chunks: Query<&VoxelChunk>,
+    gpu_chunks: Query<&crate::gpu_mesh::GpuChunk>,
     player: Query<&Transform, With<crate::player::Player>>,
     mut gi: ResMut<GiAssets>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
@@ -220,6 +243,9 @@ fn update_gi_volume(
     mut refill: Local<u32>,
 ) {
     gi.enabled = settings.enabled;
+    // Refill requests live for exactly one frame (the extract after this
+    // system clones them into the render world).
+    gi.refill.clear();
 
     // When GI is off, do zero GPU work — just make sure chunk materials aren't
     // still flagged to sample a (now un-updated) radiance field, then bail. This
@@ -260,10 +286,28 @@ fn update_gi_volume(
     };
     // Refill the occupancy volume on recenter, and periodically otherwise, so
     // geometry that streams in (or is edited) while the player stands still is
-    // still picked up by the trace — not just on movement.
+    // still picked up by the trace — not just on movement. The fill itself is
+    // GPU-side (plan §1 L2 item 1): queue the overlapping chunks' resident
+    // voxel buffers; the render node clears the volume and blits them.
     *refill = refill.wrapping_add(1);
     if need_recenter || *refill % 30 == 0 {
-        fill_volume(&gi, &mut buffers, &map, &chunks, origin);
+        let c0 = shr(origin, CHUNK_BIT);
+        let c1 = shr(origin + IVec3::splat(GI_DIM - 1), CHUNK_BIT);
+        for cy in c0.y..=c1.y {
+            for cz in c0.z..=c1.z {
+                for cx in c0.x..=c1.x {
+                    let cpos = IVec3::new(cx, cy, cz);
+                    let Some(&e) = map.map.get(&cpos) else { continue };
+                    // Air chunks have no GPU buffer; the clear pass covers them.
+                    let Ok(gc) = gpu_chunks.get(e) else { continue };
+                    gi.refill.push((
+                        gc.voxels.clone(),
+                        gc.light.clone(),
+                        shl(cpos, CHUNK_BIT) - origin,
+                    ));
+                }
+            }
+        }
     }
     // The compute shader's own params buffer is rewritten every frame; that's
     // fine because its bind group is rebuilt every frame. (It must NOT be bound
@@ -284,58 +328,6 @@ fn update_gi_volume(
     }
 }
 
-/// Blit every loaded chunk overlapping the volume into the packed byte buffer.
-fn fill_volume(
-    gi: &GiAssets,
-    buffers: &mut Assets<ShaderStorageBuffer>,
-    map: &ChunkMap,
-    chunks: &Query<&VoxelChunk>,
-    origin: IVec3,
-) {
-    let dim = GI_DIM;
-    let mut bytes = vec![0u8; (dim * dim * dim) as usize];
-
-    // Chunk-coordinate span the volume covers.
-    let c0 = shr(origin, CHUNK_BIT);
-    let c1 = shr(origin + IVec3::splat(dim - 1), CHUNK_BIT);
-    for cy in c0.y..=c1.y {
-        for cz in c0.z..=c1.z {
-            for cx in c0.x..=c1.x {
-                let cpos = IVec3::new(cx, cy, cz);
-                let Some(&e) = map.map.get(&cpos) else { continue };
-                let Ok(chunk) = chunks.get(e) else { continue };
-                let base = shl(cpos, CHUNK_BIT); // world voxel of chunk corner
-                for ly in 0..CHUNK_SIZE {
-                    let wy = base.y + ly - origin.y;
-                    if wy < 0 || wy >= dim {
-                        continue;
-                    }
-                    for lz in 0..CHUNK_SIZE {
-                        let wz = base.z + lz - origin.z;
-                        if wz < 0 || wz >= dim {
-                            continue;
-                        }
-                        for lx in 0..CHUNK_SIZE {
-                            let wx = base.x + lx - origin.x;
-                            if wx < 0 || wx >= dim {
-                                continue;
-                            }
-                            let id = chunk.volume.get(lx, ly, lz);
-                            if id != 0 {
-                                let idx = ((wy * dim + wz) * dim + wx) as usize;
-                                bytes[idx] = id;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(buf) = buffers.get_mut(&gi.world_vox) {
-        buf.data = Some(bytes);
-    }
-}
 
 /// Pack the params buffer (origin, daylight, sky colours, enabled flag).
 fn write_params(
@@ -366,13 +358,23 @@ struct GiPipeline {
     layout: BindGroupLayoutDescriptor,
     trace: CachedComputePipelineId,
     merge: CachedComputePipelineId,
+    blit_layout: BindGroupLayoutDescriptor,
+    clear: CachedComputePipelineId,
+    blit: CachedComputePipelineId,
+    irr_layout: BindGroupLayoutDescriptor,
+    irradiance: CachedComputePipelineId,
 }
 
 /// Bind groups + dispatch sizes for one frame's cascades.
 #[derive(Resource, Default)]
 struct GiJobs {
+    /// Occupancy refill: clear the volume, then blit each chunk.
+    clear: Option<BindGroup>,
+    blits: Vec<BindGroup>,
     trace: Vec<(BindGroup, u32)>,
     merge: Vec<(BindGroup, u32)>,
+    /// Ambient-cube projection, queued the frame cascade 0 finishes merging.
+    irradiance: Option<BindGroup>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
@@ -394,6 +396,7 @@ fn init_pipeline(
                 storage_buffer_read_only_sized(false, None), // 3 params
                 storage_buffer_read_only_sized(false, None), // 4 meta
                 storage_buffer_read_only_sized(false, None), // 5 far
+                storage_buffer_read_only_sized(false, None), // 6 world_light
             ),
         ),
     );
@@ -412,7 +415,65 @@ fn init_pipeline(
         entry_point: Some("merge".into()),
         ..default()
     });
-    commands.insert_resource(GiPipeline { layout, trace, merge });
+
+    // Occupancy blit (chunk voxels → GI volume, all GPU-side).
+    let blit_layout = BindGroupLayoutDescriptor::new(
+        "gi_blit_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_read_only_sized(false, None), // 0 chunk voxels
+                storage_buffer_sized(false, None),           // 1 world_vox (rw)
+                storage_buffer_read_only_sized(false, None), // 2 blit params
+                storage_buffer_read_only_sized(false, None), // 3 chunk light (padded)
+                storage_buffer_sized(false, None),           // 4 world_light (rw)
+            ),
+        ),
+    );
+    let blit_shader = asset_server.load("shaders/gi_blit.wgsl");
+    let clear = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("gi_clear".into()),
+        layout: vec![blit_layout.clone()],
+        shader: blit_shader.clone(),
+        entry_point: Some("clear_volume".into()),
+        ..default()
+    });
+    let blit = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("gi_blit".into()),
+        layout: vec![blit_layout.clone()],
+        shader: blit_shader,
+        entry_point: Some("blit_chunk".into()),
+        ..default()
+    });
+
+    // Ambient-cube projection (merged cascade 0 → per-probe irradiance).
+    let irr_layout = BindGroupLayoutDescriptor::new(
+        "gi_irr_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_read_only_sized(false, None), // 0 cascade0
+                storage_buffer_sized(false, None),           // 1 probes out (rw)
+            ),
+        ),
+    );
+    let irradiance = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("gi_irradiance".into()),
+        layout: vec![irr_layout.clone()],
+        shader: asset_server.load("shaders/gi_irradiance.wgsl"),
+        entry_point: Some("project".into()),
+        ..default()
+    });
+    commands.insert_resource(GiPipeline {
+        layout,
+        trace,
+        merge,
+        blit_layout,
+        clear,
+        blit,
+        irr_layout,
+        irradiance,
+    });
     commands.insert_resource(GiJobs::default());
 }
 
@@ -430,24 +491,69 @@ fn prepare_bind_groups(
     buffers: Res<RenderAssets<GpuShaderStorageBuffer>>,
     mut frame: Local<u32>,
 ) {
+    jobs.clear = None;
+    jobs.blits.clear();
     jobs.trace.clear();
     jobs.merge.clear();
+    jobs.irradiance = None;
     let Some(gi) = gi else { return };
     if !gi.enabled {
         return;
     }
-    // Throttle: re-trace the cascades only every few frames. The radiance field
-    // (cascade 0) persists between updates, so terrain stays lit; this keeps GI
-    // off the critical path and well clear of GPU watchdog timeouts.
-    *frame = frame.wrapping_add(1);
-    if *frame % GI_TRACE_INTERVAL != 0 {
-        return;
+
+    // Volume refill (independent of the trace throttle): clear occupancy +
+    // light, then blit each queued chunk's buffers into them — all on the GPU.
+    if !gi.refill.is_empty()
+        && let (Some(world_vox), Some(world_light)) =
+            (buffers.get(&gi.world_vox), buffers.get(&gi.world_light))
+    {
+        let blit_layout = pipeline_cache.get_bind_group_layout(&pipeline.blit_layout);
+        for (vox_handle, light_handle, rel) in &gi.refill {
+            let (Some(chunk_buf), Some(light_buf)) =
+                (buffers.get(vox_handle), buffers.get(light_handle))
+            else {
+                continue;
+            };
+            let params = render_device.create_buffer_with_data(
+                &bevy::render::render_resource::BufferInitDescriptor {
+                    label: Some("gi_blit_params"),
+                    contents: &[rel.x, rel.y, rel.z, 0i32]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    usage: bevy::render::render_resource::BufferUsages::STORAGE,
+                },
+            );
+            let bg = render_device.create_bind_group(
+                None,
+                &blit_layout,
+                &BindGroupEntries::sequential((
+                    chunk_buf.buffer.as_entire_buffer_binding(),
+                    world_vox.buffer.as_entire_buffer_binding(),
+                    params.as_entire_buffer_binding(),
+                    light_buf.buffer.as_entire_buffer_binding(),
+                    world_light.buffer.as_entire_buffer_binding(),
+                )),
+            );
+            if jobs.clear.is_none() {
+                jobs.clear = Some(bg.clone());
+            }
+            jobs.blits.push(bg);
+        }
     }
+
+    // Round-robin the cascade work across frames (plan §1 L2 item 5): with
+    // GI_TRACE_INTERVAL = 6 and 4 cascades, frames 0-3 trace one cascade
+    // each, frame 4 runs the merge chain, frame 5 idles — same steady-state
+    // cadence as the old trace-everything-every-6th-frame, without the spike.
+    *frame = frame.wrapping_add(1);
+    let phase = *frame % GI_TRACE_INTERVAL;
     let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
 
     // All shared buffers must be resident.
-    let (Some(world_vox), Some(emission), Some(params)) = (
+    let (Some(world_vox), Some(world_light), Some(emission), Some(params)) = (
         buffers.get(&gi.world_vox),
+        buffers.get(&gi.world_light),
         buffers.get(&gi.emission),
         buffers.get(&gi.params),
     ) else {
@@ -462,25 +568,31 @@ fn prepare_bind_groups(
     let cascade = |c: usize| cascades[c].unwrap();
     let meta = |c: usize| metas[c].unwrap();
 
-    // Trace each cascade (independent). `far` is unused here — bind cascade 0.
-    for c in 0..CASCADES {
-        let bg = render_device.create_bind_group(
-            None,
-            &layout,
-            &BindGroupEntries::sequential((
-                world_vox.buffer.as_entire_buffer_binding(),
-                emission.buffer.as_entire_buffer_binding(),
-                cascade(c).buffer.as_entire_buffer_binding(),
-                params.buffer.as_entire_buffer_binding(),
-                meta(c).buffer.as_entire_buffer_binding(),
-                dummy.buffer.as_entire_buffer_binding(),
-            )),
-        );
-        jobs.trace.push((bg, cascade_entries(c).div_ceil(64) as u32));
+    // Phases 0..CASCADES handle one cascade each, top-down (c3, c2, c1, c0),
+    // and each cascade's *merge* runs in the same frame as its trace: the
+    // merge overwrites the cascade in place, so pairing them means cascade 0
+    // is never left holding a raw (near-field-only) trace for the material to
+    // sample — merging c against an already-merged c+1 from this same cycle
+    // keeps the far-field chain intact. Remaining phases idle.
+    if (phase as usize) >= CASCADES {
+        return;
     }
-
-    // Merge top-down: near = c (rw), far = c+1. Must run c = 2,1,0 in order.
-    for c in (0..CASCADES - 1).rev() {
+    let c = CASCADES - 1 - phase as usize;
+    let bg = render_device.create_bind_group(
+        None,
+        &layout,
+        &BindGroupEntries::sequential((
+            world_vox.buffer.as_entire_buffer_binding(),
+            emission.buffer.as_entire_buffer_binding(),
+            cascade(c).buffer.as_entire_buffer_binding(),
+            params.buffer.as_entire_buffer_binding(),
+            meta(c).buffer.as_entire_buffer_binding(),
+            dummy.buffer.as_entire_buffer_binding(),
+            world_light.buffer.as_entire_buffer_binding(),
+        )),
+    );
+    jobs.trace.push((bg, cascade_entries(c).div_ceil(64) as u32));
+    if c < CASCADES - 1 {
         let bg = render_device.create_bind_group(
             None,
             &layout,
@@ -491,9 +603,25 @@ fn prepare_bind_groups(
                 params.buffer.as_entire_buffer_binding(),
                 meta(c).buffer.as_entire_buffer_binding(),
                 cascade(c + 1).buffer.as_entire_buffer_binding(),
+                world_light.buffer.as_entire_buffer_binding(),
             )),
         );
         jobs.merge.push((bg, cascade_entries(c).div_ceil(64) as u32));
+    }
+    // The frame cascade 0 finishes merging, re-project the ambient cubes the
+    // material samples (running it after the merge dispatch in the same pass
+    // is ordered: WebGPU synchronizes storage writes between dispatches).
+    if c == 0 && let Some(irr) = buffers.get(&gi.irradiance) {
+        let irr_layout = pipeline_cache.get_bind_group_layout(&pipeline.irr_layout);
+        let bg = render_device.create_bind_group(
+            None,
+            &irr_layout,
+            &BindGroupEntries::sequential((
+                cascade(0).buffer.as_entire_buffer_binding(),
+                irr.buffer.as_entire_buffer_binding(),
+            )),
+        );
+        jobs.irradiance = Some(bg);
     }
 }
 
@@ -511,28 +639,56 @@ impl render_graph::Node for GiNode {
         let Some(jobs) = world.get_resource::<GiJobs>() else {
             return Ok(());
         };
-        if jobs.trace.is_empty() {
+        if jobs.trace.is_empty() && jobs.merge.is_empty() && jobs.blits.is_empty() {
             return Ok(());
         }
-        let (Some(trace), Some(merge)) = (
-            pipeline_cache.get_compute_pipeline(pipeline.trace),
-            pipeline_cache.get_compute_pipeline(pipeline.merge),
-        ) else {
-            return Ok(());
-        };
 
         let mut pass = render_context
             .command_encoder()
             .begin_compute_pass(&ComputePassDescriptor { label: Some("gi"), ..default() });
-        pass.set_pipeline(trace);
-        for (bg, groups) in &jobs.trace {
-            pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(*groups, 1, 1);
+
+        // Occupancy refill first, so this frame's (or the next) trace reads
+        // fresh geometry: one clear over the volume, then a blit per chunk.
+        if let (Some(clear_bg), Some(clear), Some(blit)) = (
+            &jobs.clear,
+            pipeline_cache.get_compute_pipeline(pipeline.clear),
+            pipeline_cache.get_compute_pipeline(pipeline.blit),
+        ) {
+            pass.set_pipeline(clear);
+            pass.set_bind_group(0, clear_bg, &[]);
+            pass.dispatch_workgroups(((GI_DIM * GI_DIM * GI_DIM / 4) as u32).div_ceil(64), 1, 1);
+            pass.set_pipeline(blit);
+            for bg in &jobs.blits {
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups(1, 8, 8);
+            }
         }
-        pass.set_pipeline(merge);
-        for (bg, groups) in &jobs.merge {
+
+        if let Some(trace) = pipeline_cache.get_compute_pipeline(pipeline.trace)
+            && !jobs.trace.is_empty()
+        {
+            pass.set_pipeline(trace);
+            for (bg, groups) in &jobs.trace {
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups(*groups, 1, 1);
+            }
+        }
+        if let Some(merge) = pipeline_cache.get_compute_pipeline(pipeline.merge)
+            && !jobs.merge.is_empty()
+        {
+            pass.set_pipeline(merge);
+            for (bg, groups) in &jobs.merge {
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups(*groups, 1, 1);
+            }
+        }
+        // Project the freshly merged cascade 0 into per-probe ambient cubes.
+        if let (Some(bg), Some(irr)) =
+            (&jobs.irradiance, pipeline_cache.get_compute_pipeline(pipeline.irradiance))
+        {
+            pass.set_pipeline(irr);
             pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(*groups, 1, 1);
+            pass.dispatch_workgroups((PROBES[0].pow(3) * 6).div_ceil(64), 1, 1);
         }
         Ok(())
     }

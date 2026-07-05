@@ -346,6 +346,7 @@ mod tests {
             enable_discovery: false,
             discovery_port: 0,
             name: "pause-test".into(),
+            ..ServerConfig::default()
         })
         .expect("embedded server");
 

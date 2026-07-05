@@ -1,13 +1,14 @@
 //! Headless authoritative server for the new-soils Rust port, usable both as
 //! the dedicated `soils-server` binary ([`run`]) and embedded in the client for
-//! single-player ([`spawn`], which runs the server on its own thread/runtime
-//! bound to a loopback ephemeral port).
+//! single-player ([`spawn`], which runs the server on its own threads bound to
+//! a loopback ephemeral port).
 //!
-//! Listens for WebSocket clients, streams generated chunks on request, applies
-//! and broadcasts block edits, ticks the day/night clock, and supports multiple
-//! named worlds (clients can `Warp` between them). This is the Rust counterpart
-//! to `server.js`, trimmed to what the slice needs (no MySQL, no schemapack).
+//! Since TODO phase 5 (game-systems M2) the server is a headless Bevy ECS app
+//! (`app.rs`) ticking at a fixed rate; this module owns only the network edge:
+//! the tokio accept loop, per-connection pump tasks (decode → inbox, outbox →
+//! socket), and the LAN discovery responder. The wire protocol is unchanged.
 
+mod app;
 mod auth;
 mod persist;
 mod region;
@@ -17,60 +18,50 @@ use persist::{PersistHandle, Persister};
 
 use auth::Accounts;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicU16, Ordering},
 };
-use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use glam::IVec3;
 use soils_protocol::{
-    ActorState, ChunkData, ClientMsg, DISCOVERY_PORT, PROBE_MAGIC, ServerInfo, ServerMsg, decode,
-    encode,
+    ClientMsg, DISCOVERY_PORT, PROBE_MAGIC, ServerInfo, ServerMsg, decode, encode,
 };
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
-
-use world::World;
 
 /// Real seconds for a full day cycle (JS used ~20 minutes; shortened so the
 /// effect is visible while testing the slice).
-const DAY_SECONDS: f32 = 120.0;
-/// How often to broadcast actor positions.
-const ACTOR_TICK: Duration = Duration::from_millis(100);
+pub(crate) const DAY_SECONDS: f32 = 120.0;
 /// Chunks per `Bundle` response. Small because solid chunks are ~32 KB each.
-const BUNDLE_SIZE: usize = 16;
+pub(crate) const BUNDLE_SIZE: usize = 16;
 /// Chunks generated per wave. A fresh world's first request is up to 9³=729
 /// chunks; splitting it into nearest-first waves (generated in parallel on the
-/// blocking pool, with an `.await` between waves) lets the near ring stream to
-/// the client while the outer rings are still generating.
-const WAVE_SIZE: usize = 48;
+/// rayon pool, adopted as they complete) lets the near ring stream to the
+/// client while the outer rings are still generating.
+pub(crate) const WAVE_SIZE: usize = 48;
 /// The world every client starts in.
-const DEFAULT_WORLD: &str = "default";
-/// Max accepted movement between two `Move` updates (world units). Generous —
-/// well above sprint-fly + lag spikes (~32 u/s, sent every 50 ms) — so it only
-/// catches gross teleport/speed hacks, not legitimate play.
-const MAX_STEP: f32 = 64.0;
+pub(crate) const DEFAULT_WORLD: &str = "default";
 
-type SharedWorld = Arc<Mutex<World>>;
-/// Named worlds, created on first use.
-type Worlds = Arc<Mutex<HashMap<String, SharedWorld>>>;
-/// Outgoing broadcast: `(sender_id, world, message)`. The sender is excluded so
-/// an editor doesn't receive an echo of its own edit; `world == "*"` targets all
-/// clients (used for the global clock), otherwise only same-world clients.
-type Broadcast = broadcast::Sender<(u16, String, ServerMsg)>;
-/// Each connected player's current world + latest reported state.
-type Players = Arc<Mutex<HashMap<u16, PlayerEntry>>>;
-/// Shared day/night clock (worlds share one clock, as the JS default did).
-type Clock = Arc<Mutex<f32>>;
-
-/// Target for messages sent to everyone regardless of world.
-const ALL_WORLDS: &str = "*";
+/// A freshly handshaken connection, handed from the tokio accept loop to the
+/// ECS app. The app owns the inbox/outbox ends; the connection task is a pure
+/// pump with no game state.
+///
+/// Two outgoing lanes (plan §3, phase 14): `outbox` is the reliable, ordered
+/// channel (chunks, edits, control); `snapshot` is latest-wins — when the
+/// socket backs up, unsent snapshots are *replaced*, not queued, so a slow
+/// link never builds a backlog of stale entity state. On WebSocket both lanes
+/// share the reliable socket; a datagram transport implements the snapshot
+/// lane as truly unreliable/sequenced sends with the same app-side semantics.
+pub(crate) struct NewConn {
+    pub id: u16,
+    pub inbox: mpsc::UnboundedReceiver<ClientMsg>,
+    pub outbox: mpsc::UnboundedSender<ServerMsg>,
+    pub snapshot: watch::Sender<Option<ServerMsg>>,
+}
 
 /// How to run a server: where to bind, where to persist, whether to be
 /// discoverable on the LAN.
@@ -93,6 +84,10 @@ pub struct ServerConfig {
     pub discovery_port: u16,
     /// Server name shown in discovery replies.
     pub name: String,
+    /// Ambient test critters spawned near each world's spawn on first login
+    /// (0 = none). Exercises entity replication; `SOILS_CRITTERS` on the
+    /// dedicated binary.
+    pub critters: u16,
 }
 
 impl Default for ServerConfig {
@@ -104,11 +99,12 @@ impl Default for ServerConfig {
             enable_discovery: true,
             discovery_port: DISCOVERY_PORT,
             name: "new-soils".into(),
+            critters: 0,
         }
     }
 }
 
-/// Handle to an embedded server running on its own detached thread/runtime.
+/// Handle to an embedded server running on its own detached threads.
 /// Dropping it does NOT stop the server; call [`shutdown`](Self::shutdown) or
 /// let process exit tear it down.
 pub struct ServerHandle {
@@ -116,6 +112,8 @@ pub struct ServerHandle {
     shutdown: watch::Sender<bool>,
     discovery: watch::Sender<bool>,
     discovery_port: watch::Receiver<Option<u16>>,
+    /// The embedded server thread, joinable for a synchronous shutdown.
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ServerHandle {
@@ -146,68 +144,26 @@ impl ServerHandle {
         *self.discovery_port.borrow()
     }
 
-    /// Ask the accept loop to stop. Existing connections and background tasks
-    /// die when the server runtime is dropped.
+    /// Ask the server to stop: the accept loop breaks and the ECS app exits
+    /// (flushing queued chunk writes on the way down).
     pub fn shutdown(&self) {
         let _ = self.shutdown.send(true);
     }
-}
 
-/// Everything the background tasks and connection handlers share.
-struct ServerState {
-    worlds: Worlds,
-    players: Players,
-    clock: Clock,
-    bcast: Broadcast,
-    accounts: Arc<Accounts>,
-    next_id: AtomicU16,
-    data_dir: PathBuf,
-    /// Enqueues chunk saves onto the background writer thread (owned by the
-    /// caller of [`serve`], so it can be flushed/joined on shutdown).
-    persist: PersistHandle,
-}
-
-impl ServerState {
-    fn new(data_dir: PathBuf, persist: PersistHandle) -> Arc<Self> {
-        let (bcast, _) = broadcast::channel::<(u16, String, ServerMsg)>(1024);
-        let state = Arc::new(Self {
-            worlds: Arc::new(Mutex::new(HashMap::new())),
-            players: Arc::new(Mutex::new(HashMap::new())),
-            clock: Arc::new(Mutex::new(0.0)),
-            bcast,
-            accounts: Arc::new(Accounts::load(&data_dir)),
-            next_id: AtomicU16::new(1),
-            data_dir,
-            persist,
-        });
-        // Pre-create the default world so it's ready before the first client.
-        state.get_world(DEFAULT_WORLD);
-        state
+    /// [`shutdown`](Self::shutdown), then block until the server thread has
+    /// fully exited — including the dirty-chunk flush and the persistence
+    /// writer drain — so on return every edit is on disk.
+    pub fn shutdown_and_wait(&self) {
+        self.shutdown();
+        if let Some(thread) = self.thread.lock().unwrap().take() {
+            let _ = thread.join();
+        }
     }
-
-    /// Fetch a world by name, creating (opening) it on first request.
-    fn get_world(&self, name: &str) -> SharedWorld {
-        self.worlds
-            .lock()
-            .unwrap()
-            .entry(name.to_string())
-            .or_insert_with(|| {
-                let world = World::new(&self.data_dir, name, world_seed(name), self.persist.clone());
-                Arc::new(Mutex::new(world))
-            })
-            .clone()
-    }
-}
-
-#[derive(Clone)]
-struct PlayerEntry {
-    world: String,
-    state: ActorState,
 }
 
 /// Deterministic per-world seed; the default world keeps seed 0 so its terrain
 /// (and any persisted data) is unchanged.
-fn world_seed(name: &str) -> u32 {
+pub(crate) fn world_seed(name: &str) -> u32 {
     if name == DEFAULT_WORLD {
         return 0;
     }
@@ -222,30 +178,32 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     let listener = TcpListener::bind(&config.bind).await?;
     println!("new-soils server listening on ws://{}", config.bind);
     let persister = Persister::new();
-    let state = ServerState::new(config.data_dir.clone(), persister.handle());
     // Never-firing shutdown/discovery senders: they stay alive in this frame
     // for the whole await, so `changed()` pends forever and the initial
     // discovery state holds until process exit.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (discovery_tx, discovery_rx) = watch::channel(config.enable_discovery);
     let (discovery_port_tx, _discovery_port_rx) = watch::channel(None);
-    let result = serve(listener, config, state, shutdown_rx, discovery_rx, discovery_port_tx).await;
-    // Flush any queued chunk writes to disk before returning.
+    let result =
+        serve(listener, config, persister.handle(), shutdown_rx, discovery_rx, discovery_port_tx)
+            .await;
+    // The ECS app has exited (joined inside `serve`); flush queued chunk writes.
     persister.shutdown();
     drop(shutdown_tx);
     drop(discovery_tx);
     result
 }
 
-/// Start a server on a dedicated background thread with its own tokio runtime.
-/// Blocks only until the TCP bind has completed, then returns the handle with
-/// the real bound address. Used by the client for single-player.
+/// Start a server on a dedicated background thread with its own tokio runtime
+/// (plus the ECS app thread `serve` spawns). Blocks only until the TCP bind
+/// has completed, then returns the handle with the real bound address. Used by
+/// the client for single-player.
 pub fn spawn(config: ServerConfig) -> std::io::Result<ServerHandle> {
     let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<SocketAddr>>();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (discovery_tx, discovery_rx) = watch::channel(config.enable_discovery);
     let (discovery_port_tx, discovery_port_rx) = watch::channel(None);
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("soils-embedded-server".into())
         .spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -266,11 +224,17 @@ pub fn spawn(config: ServerConfig) -> std::io::Result<ServerHandle> {
                 };
                 let _ = tx.send(Ok(addr));
                 let persister = Persister::new();
-                let state = ServerState::new(config.data_dir.clone(), persister.handle());
-                let _ =
-                    serve(listener, config, state, shutdown_rx, discovery_rx, discovery_port_tx)
-                        .await;
-                // Flush queued chunk writes before the runtime thread exits.
+                let _ = serve(
+                    listener,
+                    config,
+                    persister.handle(),
+                    shutdown_rx,
+                    discovery_rx,
+                    discovery_port_tx,
+                )
+                .await;
+                // The ECS app has exited; flush queued chunk writes before the
+                // runtime thread exits.
                 persister.shutdown();
             });
         })?;
@@ -282,72 +246,64 @@ pub fn spawn(config: ServerConfig) -> std::io::Result<ServerHandle> {
         shutdown: shutdown_tx,
         discovery: discovery_tx,
         discovery_port: discovery_port_rx,
+        thread: std::sync::Mutex::new(Some(thread)),
     })
 }
 
-/// Run the background tasks and the accept loop until `shutdown` fires (or
-/// forever, for the dedicated binary).
+/// Run the network edge (ECS app thread, discovery responder, accept loop)
+/// until `shutdown` fires (or forever, for the dedicated binary). Joins the
+/// ECS app thread before returning so the caller can safely flush persistence.
 async fn serve(
     listener: TcpListener,
     config: ServerConfig,
-    state: Arc<ServerState>,
+    persist: PersistHandle,
     mut shutdown: watch::Receiver<bool>,
     discovery: watch::Receiver<bool>,
     discovery_port_tx: watch::Sender<Option<u16>>,
 ) -> std::io::Result<()> {
-    // Day/night clock: advance and broadcast time of day every second (global).
-    {
-        let bcast = state.bcast.clone();
-        let clock = state.clock.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                let daytime = {
-                    let mut t = clock.lock().unwrap();
-                    *t = (*t + 1.0 / DAY_SECONDS) % 1.0;
-                    *t
-                };
-                let _ = bcast.send((0, ALL_WORLDS.to_string(), ServerMsg::Time { daytime }));
-            }
-        });
-    }
+    let accounts = Arc::new(Accounts::load(&config.data_dir));
+    let player_count = Arc::new(AtomicU16::new(0));
+    let (conns_tx, conns_rx) = mpsc::unbounded_channel::<NewConn>();
 
-    // Actor sync: broadcast positions a few times a second, grouped by world so
-    // players only see others in the same world.
-    {
-        let players = state.players.clone();
-        let bcast = state.bcast.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(ACTOR_TICK);
-            loop {
-                interval.tick().await;
-                let mut by_world: HashMap<String, Vec<ActorState>> = HashMap::new();
-                for entry in players.lock().unwrap().values() {
-                    by_world.entry(entry.world.clone()).or_default().push(entry.state.clone());
-                }
-                for (world, actors) in by_world {
-                    let _ = bcast.send((0, world, ServerMsg::ActorUpdate { actors }));
-                }
-            }
-        });
-    }
+    // The ECS app owns all game state on its own thread; it exits when the
+    // same shutdown watch fires.
+    let app_thread = {
+        let shutdown = shutdown.clone();
+        let data_dir = config.data_dir.clone();
+        let accounts = accounts.clone();
+        let player_count = player_count.clone();
+        let critters = config.critters;
+        std::thread::Builder::new().name("soils-ecs".into()).spawn(move || {
+            app::run_app(conns_rx, shutdown, data_dir, persist, accounts, player_count, critters);
+        })?
+    };
 
     // LAN discovery supervisor: runs the UDP probe responder while the
     // `discovery` watch says on, releases the socket while off. Advertises the
     // actually-bound game port (matters when binding port 0).
     {
-        let players = state.players.clone();
         let game_port = listener.local_addr()?.port();
         tokio::spawn(discovery_supervisor(
             config.discovery_port,
             game_port,
-            players,
+            player_count.clone(),
             config.name.clone(),
             discovery,
             discovery_port_tx,
         ));
     }
+
+    let next_id = Arc::new(AtomicU16::new(1));
+
+    // WebTransport endpoint (phase 14 step 2) on the same port over UDP: the
+    // snapshot lane rides real datagrams there (no TCP head-of-line blocking).
+    // Best-effort — a bind or TLS failure logs and leaves the server WS-only.
+    tokio::spawn(webtransport_endpoint(
+        listener.local_addr()?.port(),
+        conns_tx.clone(),
+        next_id.clone(),
+        shutdown.clone(),
+    ));
 
     loop {
         let (stream, peer) = tokio::select! {
@@ -357,20 +313,241 @@ async fn serve(
                 Err(_) => break,
             },
         };
-        let id = state.next_id.fetch_add(1, Ordering::Relaxed);
-        let state = state.clone();
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        let conns_tx = conns_tx.clone();
         tokio::spawn(async move {
-            let world_name = {
-                if let Err(e) = handle_connection(stream, id, &state).await {
-                    eprintln!("connection {peer} ({id}) ended: {e}");
-                }
-                state.players.lock().unwrap().remove(&id).map(|e| e.world)
-            };
-            // Tell same-world clients the actor is gone.
-            if let Some(world) = world_name {
-                let _ = state.bcast.send((id, world, ServerMsg::ActorRemove { id }));
+            if let Err(e) = pump_connection(stream, id, conns_tx).await {
+                eprintln!("connection {peer} ({id}) ended: {e}");
             }
         });
+    }
+
+    // Let the app drain: closing the conns channel is not required (the app
+    // exits on the shutdown watch), but joining guarantees every queued
+    // persistence job is enqueued before the caller flushes.
+    drop(conns_tx);
+    let _ = app_thread.join();
+    Ok(())
+}
+
+/// The per-connection pump: WS handshake, then decode incoming frames into the
+/// app's inbox and flush the app's outbox back to the socket. Holds no game
+/// state; dropping the inbox sender on exit is the disconnect signal.
+async fn pump_connection(
+    stream: TcpStream,
+    id: u16,
+    conns: mpsc::UnboundedSender<NewConn>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ws = tokio_tungstenite::accept_async(stream).await?;
+    let (mut ws_tx, mut ws_rx) = ws.split();
+
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let (in_tx, in_rx) = mpsc::unbounded_channel::<ClientMsg>();
+    let (snap_tx, mut snap_rx) = watch::channel::<Option<ServerMsg>>(None);
+    if conns.send(NewConn { id, inbox: in_rx, outbox: out_tx, snapshot: snap_tx }).is_err() {
+        return Ok(()); // server is shutting down
+    }
+
+    let writer = tokio::spawn(async move {
+        // Reliable lane drains in order; the snapshot lane is latest-wins —
+        // `changed()` wakes at most once per replace, and `borrow_and_update`
+        // takes whatever is newest by the time the socket can send again.
+        loop {
+            tokio::select! {
+                m = out_rx.recv() => {
+                    let Some(msg) = m else { break };
+                    if ws_tx.send(Message::Binary(encode(&msg))).await.is_err() {
+                        break;
+                    }
+                }
+                c = snap_rx.changed() => {
+                    if c.is_err() {
+                        break; // app despawned the client
+                    }
+                    let msg = snap_rx.borrow_and_update().clone();
+                    if let Some(msg) = msg
+                        && ws_tx.send(Message::Binary(encode(&msg))).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut result = Ok(());
+    while let Some(frame) = ws_rx.next().await {
+        match frame {
+            Ok(Message::Binary(b)) => {
+                if let Some(msg) = decode::<ClientMsg>(b.as_ref())
+                    && in_tx.send(msg).is_err()
+                {
+                    break; // app gone (shutdown)
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(e) => {
+                result = Err(e.into());
+                break;
+            }
+        }
+    }
+
+    writer.abort();
+    // `in_tx` drops here; the app notices the closed inbox and despawns the
+    // player next tick.
+    result
+}
+
+/// Accept WebTransport sessions on UDP `port` and hand each to the app as an
+/// ordinary [`NewConn`] — the app never knows which transport a client rides.
+/// Lanes: the client opens one bidirectional stream as the reliable ordered
+/// channel (4-byte-LE length-framed bincode both ways); snapshots go out as
+/// datagrams (truly unreliable/sequenced — send errors are dropped), and
+/// datagram arrivals feed the same inbox as stream messages (for the input
+/// hot path). Uses a per-boot self-signed certificate: native clients skip
+/// verification for LAN play (the WS path remains for everything else).
+async fn webtransport_endpoint(
+    port: u16,
+    conns: mpsc::UnboundedSender<NewConn>,
+    next_id: Arc<AtomicU16>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let identity = match wtransport::Identity::self_signed(["localhost", "127.0.0.1", "::1"]) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("webtransport disabled (self-signed identity failed: {e})");
+            return;
+        }
+    };
+    let config = wtransport::ServerConfig::builder()
+        .with_bind_default(port)
+        .with_identity(identity)
+        .build();
+    let server = match wtransport::Endpoint::server(config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("webtransport disabled (udp/{port} bind failed: {e})");
+            return;
+        }
+    };
+    loop {
+        let incoming = tokio::select! {
+            _ = shutdown.changed() => break,
+            s = server.accept() => s,
+        };
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        let conns = conns.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pump_wt_connection(incoming, id, conns).await {
+                eprintln!("wt connection ({id}) ended: {e}");
+            }
+        });
+    }
+}
+
+/// Per-WebTransport-connection pump; mirrors [`pump_connection`] but with the
+/// snapshot lane on datagrams.
+async fn pump_wt_connection(
+    incoming: wtransport::endpoint::IncomingSession,
+    id: u16,
+    conns: mpsc::UnboundedSender<NewConn>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = incoming.await?.accept().await?;
+    // The client opens the reliable stream immediately after the session.
+    let (mut stream_tx, mut stream_rx) = conn.accept_bi().await?;
+
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let (in_tx, in_rx) = mpsc::unbounded_channel::<ClientMsg>();
+    let (snap_tx, mut snap_rx) = watch::channel::<Option<ServerMsg>>(None);
+    if conns.send(NewConn { id, inbox: in_rx, outbox: out_tx, snapshot: snap_tx }).is_err() {
+        return Ok(()); // server is shutting down
+    }
+
+    let writer_conn = conn.clone();
+    let writer = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                m = out_rx.recv() => {
+                    let Some(msg) = m else { break };
+                    let bytes = encode(&msg);
+                    let mut framed = (bytes.len() as u32).to_le_bytes().to_vec();
+                    framed.extend_from_slice(&bytes);
+                    if stream_tx.write_all(&framed).await.is_err() {
+                        break;
+                    }
+                }
+                c = snap_rx.changed() => {
+                    if c.is_err() {
+                        break;
+                    }
+                    let msg = snap_rx.borrow_and_update().clone();
+                    if let Some(msg) = msg {
+                        // Unreliable by design; a dropped datagram is just a
+                        // snapshot the client never acks.
+                        let _ = writer_conn.send_datagram(encode(&msg));
+                    }
+                }
+            }
+        }
+    });
+
+    // Datagram arrivals (the input hot path) feed the same inbox.
+    let dgram_in = in_tx.clone();
+    let dgram_conn = conn.clone();
+    let dgrams = tokio::spawn(async move {
+        while let Ok(d) = dgram_conn.receive_datagram().await {
+            if let Some(msg) = decode::<ClientMsg>(d.payload().as_ref())
+                && dgram_in.send(msg).is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Reliable inbox: length-framed ClientMsg frames until the stream closes.
+    let mut result = Ok(());
+    let mut len = [0u8; 4];
+    loop {
+        if read_exact(&mut stream_rx, &mut len).await.is_err() {
+            break; // closed
+        }
+        let n = u32::from_le_bytes(len) as usize;
+        if n > MAX_WT_FRAME {
+            result = Err(format!("oversized frame ({n} B)").into());
+            break;
+        }
+        let mut buf = vec![0u8; n];
+        if read_exact(&mut stream_rx, &mut buf).await.is_err() {
+            break;
+        }
+        if let Some(msg) = decode::<ClientMsg>(&buf)
+            && in_tx.send(msg).is_err()
+        {
+            break;
+        }
+    }
+    writer.abort();
+    dgrams.abort();
+    result
+}
+
+/// Largest accepted length-framed message on the reliable WT stream (client
+/// messages are small; this is a decode-bomb guard, not a tuning knob).
+const MAX_WT_FRAME: usize = 1 << 20;
+
+/// Fill `buf` from a WT receive stream (`read` returns partial chunks).
+async fn read_exact(
+    rx: &mut wtransport::RecvStream,
+    buf: &mut [u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match rx.read(&mut buf[filled..]).await? {
+            Some(0) | None => return Err("stream closed mid-frame".into()),
+            Some(n) => filled += n,
+        }
     }
     Ok(())
 }
@@ -386,7 +563,7 @@ async fn serve(
 async fn discovery_supervisor(
     udp_port: u16,
     game_port: u16,
-    players: Players,
+    player_count: Arc<AtomicU16>,
     name: String,
     mut enabled: watch::Receiver<bool>,
     port_tx: watch::Sender<Option<u16>>,
@@ -433,7 +610,7 @@ async fn discovery_supervisor(
             let info = ServerInfo {
                 name: name.clone(),
                 game_port,
-                players: players.lock().unwrap().len() as u16,
+                players: player_count.load(Ordering::Relaxed),
             };
             let mut pkt = PROBE_MAGIC.to_vec();
             pkt.extend(encode(&info));
@@ -442,165 +619,4 @@ async fn discovery_supervisor(
         println!("discovery responder stopped");
         let _ = port_tx.send(None);
     }
-}
-
-async fn handle_connection(
-    stream: TcpStream,
-    id: u16,
-    state: &ServerState,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ws = tokio_tungstenite::accept_async(stream).await?;
-    let (mut ws_tx, mut ws_rx) = ws.split();
-
-    // The client's current world, shared with the broadcast forwarder so it can
-    // filter messages to the right world.
-    let current_world = Arc::new(Mutex::new(DEFAULT_WORLD.to_string()));
-    let mut world = state.get_world(DEFAULT_WORLD);
-    // Only authenticated connections may stream/edit/move.
-    let mut authenticated = false;
-
-    // Per-connection outgoing queue, drained by a single writer task.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
-    let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if ws_tx.send(Message::Binary(encode(&msg).into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Forward broadcasts to this client, filtered by world (and skipping self).
-    let mut bcast_rx = state.bcast.subscribe();
-    let fwd_tx = out_tx.clone();
-    let fwd_world = current_world.clone();
-    let forwarder = tokio::spawn(async move {
-        while let Ok((sender, world, msg)) = bcast_rx.recv().await {
-            if sender == id {
-                continue;
-            }
-            let here = world == ALL_WORLDS || world == *fwd_world.lock().unwrap();
-            if here && fwd_tx.send(msg).is_err() {
-                break;
-            }
-        }
-    });
-
-    while let Some(frame) = ws_rx.next().await {
-        let data = match frame? {
-            Message::Binary(b) => b,
-            Message::Close(_) => break,
-            _ => continue,
-        };
-        let Some(msg) = decode::<ClientMsg>(data.as_ref()) else { continue };
-
-        // Reject everything until the connection has authenticated.
-        if !authenticated && !matches!(msg, ClientMsg::Login { .. }) {
-            continue;
-        }
-
-        match msg {
-            ClientMsg::Login { name, password, signup } => {
-                if let Err(reason) = state.accounts.authenticate(&name, &password, signup) {
-                    println!("login denied: {name} (id {id}): {reason}");
-                    let _ = out_tx.send(ServerMsg::LoginError { message: reason });
-                    continue;
-                }
-                println!("login: {name} (id {id})");
-                authenticated = true;
-                let spawn = world.lock().unwrap().spawn;
-                let seed = world.lock().unwrap().seed;
-                let daytime = *state.clock.lock().unwrap();
-                state.players.lock().unwrap().insert(
-                    id,
-                    PlayerEntry {
-                        world: current_world.lock().unwrap().clone(),
-                        state: ActorState { id, pos: spawn, velocity: [0.0; 3] },
-                    },
-                );
-                let _ = out_tx.send(ServerMsg::Init { id, spawn, seed, daytime });
-            }
-            ClientMsg::ReqChunks { positions } => {
-                // Serve chunks in nearest-first waves (the client already sorts
-                // `positions` nearest-first). Each wave is generated off the
-                // async runtime on the blocking pool — `get_or_generate_batch`
-                // fans the missing chunks across all cores — and the `.await`
-                // between waves lets the writer flush earlier waves while later
-                // ones generate. So the ring around the player appears almost
-                // immediately instead of after the whole (up to 729-chunk) burst.
-                for wave in positions.chunks(WAVE_SIZE) {
-                    let wave: Vec<[i32; 3]> = wave.to_vec();
-                    let world = world.clone();
-                    let results = tokio::task::spawn_blocking(move || {
-                        let cpositions: Vec<IVec3> =
-                            wave.iter().map(|p| IVec3::new(p[0], p[1], p[2])).collect();
-                        world.lock().unwrap().get_or_generate_batch(&cpositions)
-                    })
-                    .await;
-                    let results = match results {
-                        Ok(r) => r,
-                        Err(e) => {
-                            eprintln!("worldgen task failed: {e}");
-                            continue;
-                        }
-                    };
-                    let mut batch: Vec<ChunkData> = Vec::with_capacity(BUNDLE_SIZE);
-                    for (cpos, empty, voxels) in results {
-                        batch.push(ChunkData { pos: [cpos.x, cpos.y, cpos.z], empty, voxels });
-                        if batch.len() >= BUNDLE_SIZE {
-                            let _ =
-                                out_tx.send(ServerMsg::Bundle { chunks: std::mem::take(&mut batch) });
-                        }
-                    }
-                    if !batch.is_empty() {
-                        let _ = out_tx.send(ServerMsg::Bundle { chunks: batch });
-                    }
-                }
-            }
-            ClientMsg::Edit { pos, value } => {
-                let applied = world.lock().unwrap().edit(pos[0], pos[1], pos[2], value);
-                if applied {
-                    let w = current_world.lock().unwrap().clone();
-                    let _ = state.bcast.send((id, w, ServerMsg::Edit { pos, value }));
-                }
-            }
-            ClientMsg::Move { pos, velocity } => {
-                // Server authority: reject implausible jumps (teleport/speed
-                // hacks) and snap the client back to its last accepted position.
-                let mut g = state.players.lock().unwrap();
-                if let Some(entry) = g.get_mut(&id) {
-                    let last = entry.state.pos;
-                    let d2 = (pos[0] - last[0]).powi(2)
-                        + (pos[1] - last[1]).powi(2)
-                        + (pos[2] - last[2]).powi(2);
-                    if d2 > MAX_STEP * MAX_STEP {
-                        drop(g);
-                        let _ = out_tx.send(ServerMsg::Position { pos: last });
-                    } else {
-                        entry.state.pos = pos;
-                        entry.state.velocity = velocity;
-                    }
-                }
-            }
-            ClientMsg::Warp { world: name } => {
-                println!("warp: id {id} -> {name}");
-                // Leaving the old world: tell its clients the actor is gone.
-                let old = current_world.lock().unwrap().clone();
-                let _ = state.bcast.send((id, old, ServerMsg::ActorRemove { id }));
-
-                world = state.get_world(&name);
-                *current_world.lock().unwrap() = name.clone();
-                let spawn = world.lock().unwrap().spawn;
-                if let Some(entry) = state.players.lock().unwrap().get_mut(&id) {
-                    entry.world = name;
-                    entry.state.pos = spawn;
-                }
-                let daytime = *state.clock.lock().unwrap();
-                let _ = out_tx.send(ServerMsg::Warp { spawn, daytime });
-            }
-        }
-    }
-
-    forwarder.abort();
-    writer.abort();
-    Ok(())
 }

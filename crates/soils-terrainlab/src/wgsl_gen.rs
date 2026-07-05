@@ -109,6 +109,7 @@ pub fn generate(graph: &TerrainGraph) -> String {
 /// graph directly: the vertex shader displaces a grid by `height_out(x,z)` and
 /// computes a finite-difference normal; the fragment shades it. This drives the
 /// live 3D preview (the compute variant is validated separately by the test).
+#[allow(dead_code)] // used by the bin (preview3d), not by the gpu_codegen test include
 pub fn generate_material(graph: &TerrainGraph) -> String {
     let mut s = String::new();
     s.push_str(NOISE_PRELUDE);
@@ -292,6 +293,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// Bindings + imports for the preview material. `pv.a = (res, origin, step,
 /// hscale)`, `pv.b = (hmin, hmax, _, _)`.
+#[allow(dead_code)] // used via generate_material (bin only)
 const MATERIAL_HEADER: &str = r#"
 #import bevy_pbr::{mesh_view_bindings::view, view_transformations::position_world_to_clip}
 
@@ -302,6 +304,7 @@ struct Pv { a: vec4<f32>, b: vec4<f32> };
 "#;
 
 /// Vertex (displace a grid by `height_out`) + fragment (colour ramp + lambert).
+#[allow(dead_code)] // used via generate_material (bin only)
 const MATERIAL_BODY: &str = r#"
 struct VOut {
     @builtin(position) clip: vec4<f32>,

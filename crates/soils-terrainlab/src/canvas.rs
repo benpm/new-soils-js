@@ -12,9 +12,13 @@ use crate::node::{EditorNode, OutChannel};
 const NODE_W: f32 = 176.0;
 const HEADER_H: f32 = 22.0;
 const PIN_R: f32 = 5.0;
+/// Background grid spacing (scene units); also the snap-to-grid quantum.
+pub const GRID: f32 = 40.0;
 const FIELD_COLOR: Color32 = Color32::from_rgb(0x6c, 0xcf, 0x70);
 const SINK_COLOR: Color32 = Color32::from_rgb(0xff, 0xa8, 0x30);
 const WIRE_COLOR: Color32 = Color32::from_rgb(0x9a, 0xd0, 0xff);
+const GRID_MINOR: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 8);
+const GRID_MAJOR: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 20);
 
 /// Canvas view + interaction state that must persist between frames.
 #[derive(Clone)]
@@ -22,6 +26,10 @@ pub struct CanvasState {
     pub scene_rect: Rect,
     /// An output pin the user picked, awaiting an input pin to complete a wire.
     pub pending_from: Option<usize>,
+    /// Draw the background alignment grid.
+    pub grid: bool,
+    /// Snap a node to the grid when its drag ends.
+    pub snap: bool,
 }
 
 impl Default for CanvasState {
@@ -29,6 +37,8 @@ impl Default for CanvasState {
         Self {
             scene_rect: Rect::from_min_size(Pos2::new(-100.0, -200.0), Vec2::new(1400.0, 900.0)),
             pending_from: None,
+            grid: true,
+            snap: false,
         }
     }
 }
@@ -37,8 +47,12 @@ impl Default for CanvasState {
 pub fn show(ui: &mut Ui, graph: &mut EditorGraph, state: &mut CanvasState) {
     let mut scene_rect = state.scene_rect;
     let resp = egui::Scene::new().zoom_range(0.15..=2.5).show(ui, &mut scene_rect, |ui| {
-        // Reserve a slot so wires paint *behind* the node frames.
+        // Reserve slots so the grid paints behind wires, and wires behind nodes.
+        let grid_slot = ui.painter().add(Shape::Noop);
         let wire_slot = ui.painter().add(Shape::Noop);
+        if state.grid {
+            ui.painter().set(grid_slot, grid_shape(ui.clip_rect()));
+        }
 
         let n = graph.nodes.len();
         let mut in_pins: Vec<Vec<Pos2>> = vec![Vec::new(); n];
@@ -120,6 +134,13 @@ fn draw_node(
                     if drag.dragged() {
                         graph.nodes[i].pos += drag.drag_delta();
                     }
+                    // Snap to the grid when the drag ends (not mid-drag, so it
+                    // doesn't feel jumpy).
+                    if drag.drag_stopped() && state.snap {
+                        let p = &mut graph.nodes[i].pos;
+                        p.x = (p.x / GRID).round() * GRID;
+                        p.y = (p.y / GRID).round() * GRID;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("✕").clicked() {
                             *to_remove = Some(i);
@@ -193,6 +214,31 @@ fn pin_y(rect: Rect, k: usize, count: usize) -> f32 {
 
 fn pin(ui: &Ui, p: Pos2, color: Color32) {
     ui.painter().circle(p, PIN_R, color, Stroke::new(1.0, Color32::from_gray(20)));
+}
+
+/// Faint alignment grid covering the visible scene rect, with brighter lines
+/// every 5th. Skipped when zoomed so far out that the grid would be a solid
+/// wash (and thousands of lines).
+fn grid_shape(view: Rect) -> Shape {
+    let mut lines: Vec<Shape> = Vec::new();
+    if view.width() / GRID > 300.0 || view.height() / GRID > 300.0 || !view.is_finite() {
+        return Shape::Vec(lines);
+    }
+    let line = |a: Pos2, b: Pos2, major: bool| {
+        let color = if major { GRID_MAJOR } else { GRID_MINOR };
+        Shape::line_segment([a, b], Stroke::new(1.0, color))
+    };
+    let first = |lo: f32| (lo / GRID).ceil() as i32;
+    let last = |hi: f32| (hi / GRID).floor() as i32;
+    for gx in first(view.left())..=last(view.right()) {
+        let x = gx as f32 * GRID;
+        lines.push(line(Pos2::new(x, view.top()), Pos2::new(x, view.bottom()), gx % 5 == 0));
+    }
+    for gy in first(view.top())..=last(view.bottom()) {
+        let y = gy as f32 * GRID;
+        lines.push(line(Pos2::new(view.left(), y), Pos2::new(view.right(), y), gy % 5 == 0));
+    }
+    Shape::Vec(lines)
 }
 
 /// A gentle S-curve wire from an output pin to an input pin.

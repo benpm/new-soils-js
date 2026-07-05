@@ -9,13 +9,20 @@
 //! owns graph *data* (nodes + positions + wires) and the lowering to the game's
 //! schema; `canvas` owns interaction.
 
-use egui::Pos2;
+use egui::{Pos2, Rect, Vec2};
 use soils_worldgen::graph::{In, Node, NodeKind, Outputs, TerrainGraph};
 
 use crate::node::{EditorNode, OutChannel};
 
-/// A placed node: its kind (parameters) and canvas position.
-#[derive(Debug, Clone)]
+/// Column / row spacing used by the layered layout (matches `from_terrain_graph`).
+const COL_W: f32 = 210.0;
+const ROW_H: f32 = 150.0;
+/// Approximate on-canvas node extent, for `bounds()` framing.
+const NODE_EXTENT: Vec2 = Vec2::new(176.0, 120.0);
+
+/// A placed node: its kind (parameters) and canvas position. `PartialEq` backs
+/// the undo/redo change detection.
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeInst {
     pub kind: EditorNode,
     pub pos: Pos2,
@@ -31,7 +38,8 @@ pub struct Wire {
 
 /// The full editor graph: nodes indexed by position, plus wires. Kept minimal
 /// and `egui`-only so it round-trips to `TerrainGraph` without a node-graph dep.
-#[derive(Debug, Clone, Default)]
+/// `PartialEq` lets undo/redo compare two graph states.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EditorGraph {
     pub nodes: Vec<NodeInst>,
     pub wires: Vec<Wire>,
@@ -88,6 +96,58 @@ impl EditorGraph {
     /// The source node feeding (`to`, `input`), if any.
     pub fn source_of(&self, to: usize, input: usize) -> Option<usize> {
         self.wires.iter().find(|w| w.to == to && w.input == input).map(|w| w.from)
+    }
+
+    /// Re-place every node in a tidy left→right layered layout: a node's column
+    /// is its longest-path depth from a source, rows fill top-down within a
+    /// column. Nodes and wires are preserved (only positions change). Output
+    /// sinks, having the deepest inputs, land in the rightmost column.
+    pub fn auto_layout(&mut self) {
+        let depth = self.node_depths();
+        let mut row_in_col: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+        for (i, &d) in depth.iter().enumerate() {
+            let row = row_in_col.entry(d).or_insert(0);
+            self.nodes[i].pos = Pos2::new(d as f32 * COL_W, *row as f32 * ROW_H);
+            *row += 1;
+        }
+    }
+
+    /// Longest path (in edges) from any source to each node, over the editor
+    /// wires. Cycle-guarded (`depth[i] = 0` before recursing) so a transient
+    /// editing cycle can't loop forever.
+    fn node_depths(&self) -> Vec<i32> {
+        fn go(g: &EditorGraph, i: usize, depth: &mut [i32]) -> i32 {
+            if depth[i] >= 0 {
+                return depth[i];
+            }
+            depth[i] = 0;
+            let mut d = 0;
+            for w in &g.wires {
+                if w.to == i {
+                    d = d.max(1 + go(g, w.from, depth));
+                }
+            }
+            depth[i] = d;
+            d
+        }
+        let mut depth = vec![-1i32; self.nodes.len()];
+        for i in 0..self.nodes.len() {
+            go(self, i, &mut depth);
+        }
+        depth
+    }
+
+    /// Bounding rect over node positions (plus node extent), for view framing.
+    pub fn bounds(&self) -> Rect {
+        if self.nodes.is_empty() {
+            return Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
+        }
+        let mut r = Rect::NOTHING;
+        for node in &self.nodes {
+            r.extend_with(node.pos);
+            r.extend_with(node.pos + NODE_EXTENT);
+        }
+        r
     }
 
     /// Lower to a `TerrainGraph`. `Err` on a cycle or missing Height output.
@@ -154,7 +214,7 @@ impl EditorGraph {
         let mut row_in_col: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
         let place = |row_in_col: &mut std::collections::HashMap<i32, i32>, col: i32| -> Pos2 {
             let row = row_in_col.entry(col).or_insert(0);
-            let p = Pos2::new(col as f32 * 210.0, *row as f32 * 150.0);
+            let p = Pos2::new(col as f32 * COL_W, *row as f32 * ROW_H);
             *row += 1;
             p
         };
@@ -348,5 +408,28 @@ mod tests {
         // Wire a->b dropped; wire b->c survives with renumbered indices.
         assert_eq!(eg.wires.len(), 1);
         assert_eq!(eg.wires[0], Wire { from: 0, to: 1, input: 0 });
+    }
+
+    #[test]
+    fn auto_layout_orders_left_to_right() {
+        let mut eg = EditorGraph::from_terrain_graph(&TerrainGraph::default_soils());
+        let (nodes, wires) = (eg.nodes.len(), eg.wires.len());
+        // Scramble positions, then tidy.
+        for (i, node) in eg.nodes.iter_mut().enumerate() {
+            node.pos = Pos2::new((i as f32 * 37.0) % 500.0, (i as f32 * 91.0) % 500.0);
+        }
+        eg.auto_layout();
+        // Topology preserved.
+        assert_eq!(eg.nodes.len(), nodes);
+        assert_eq!(eg.wires.len(), wires);
+        // Every wire flows strictly left→right (source column < target column).
+        for w in &eg.wires {
+            assert!(
+                eg.nodes[w.from].pos.x < eg.nodes[w.to].pos.x,
+                "wire {w:?} not left→right: from x={} to x={}",
+                eg.nodes[w.from].pos.x,
+                eg.nodes[w.to].pos.x
+            );
+        }
     }
 }

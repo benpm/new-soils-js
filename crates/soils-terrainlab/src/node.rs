@@ -26,8 +26,9 @@ impl OutChannel {
 }
 
 /// A node as edited in the GUI. Parameter fields match the corresponding
-/// `NodeKind` variant; input connections live in the Snarl, not here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `NodeKind` variant; input connections live in the `EditorGraph`, not here.
+/// `PartialEq` (not `Eq` — f32 params) backs the undo/redo change detection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EditorNode {
     // sources
     Constant { value: f32 },

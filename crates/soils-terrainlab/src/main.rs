@@ -49,10 +49,64 @@ fn disable_auto_egui_context(mut settings: ResMut<EguiGlobalSettings>) {
     settings.auto_create_primary_context = false;
 }
 
+/// Most undo steps to keep (bounds memory on a long editing session).
+const UNDO_CAP: usize = 200;
+
+/// Undo/redo over `EditorGraph` snapshots. A step is committed only on frames
+/// where the pointer is idle, so a continuous node-drag or slider-drag
+/// coalesces into a single undo step.
+#[derive(Default)]
+struct History {
+    undo: Vec<EditorGraph>,
+    redo: Vec<EditorGraph>,
+    /// The last committed state, compared against to detect a change.
+    baseline: Option<EditorGraph>,
+}
+
+impl History {
+    fn commit(&mut self, current: &EditorGraph) {
+        match &self.baseline {
+            None => self.baseline = Some(current.clone()),
+            Some(base) if base != current => {
+                self.undo.push(base.clone());
+                if self.undo.len() > UNDO_CAP {
+                    self.undo.remove(0);
+                }
+                self.redo.clear();
+                self.baseline = Some(current.clone());
+            }
+            _ => {}
+        }
+    }
+
+    fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+    fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    fn undo(&mut self, current: &mut EditorGraph) {
+        if let Some(prev) = self.undo.pop() {
+            self.redo.push(current.clone());
+            *current = prev;
+            self.baseline = Some(current.clone());
+        }
+    }
+    fn redo(&mut self, current: &mut EditorGraph) {
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(current.clone());
+            *current = next;
+            self.baseline = Some(current.clone());
+        }
+    }
+}
+
 /// Everything the editor owns between frames.
 #[derive(Resource)]
 struct LabState {
     edit: EditorGraph,
+    history: History,
     canvas: CanvasState,
     /// The last graph that lowered cleanly (drives the preview and saves).
     graph: TerrainGraph,
@@ -74,6 +128,7 @@ impl Default for LabState {
         let graph = TerrainGraph::default_soils();
         Self {
             edit: EditorGraph::from_terrain_graph(&graph),
+            history: History::default(),
             canvas: CanvasState::default(),
             graph,
             seed: 0,
@@ -98,6 +153,25 @@ fn ui(
     };
     let ctx = ctx.clone();
 
+    // Keyboard undo/redo, applied before lowering so the restored graph takes
+    // effect this frame. Ctrl+Z = undo; Ctrl+Y or Ctrl+Shift+Z = redo.
+    let (do_undo, do_redo) = ctx.input_mut(|i| {
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        let undo = i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Z));
+        let redo = i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Y))
+            || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::Z));
+        (undo, redo)
+    });
+    if do_undo || do_redo {
+        let LabState { history, edit, canvas, .. } = &mut *state;
+        if do_undo {
+            history.undo(edit);
+        } else {
+            history.redo(edit);
+        }
+        canvas.pending_from = None;
+    }
+
     // Re-lower the editor graph; keep the last good one on error.
     match state.edit.to_terrain_graph() {
         Ok(g) => {
@@ -119,6 +193,12 @@ fn ui(
             let LabState { edit, canvas, .. } = &mut *state;
             canvas::show(ui, edit, canvas);
         });
+    }
+
+    // Commit an undo snapshot once the pointer is idle, so held drags coalesce.
+    if !ctx.is_using_pointer() {
+        let LabState { history, edit, .. } = &mut *state;
+        history.commit(edit);
     }
 
     // Publish the current graph + height range to the 3D preview.
@@ -150,6 +230,25 @@ fn top_bar(ctx: &egui::Context, state: &mut LabState, mode: &mut ViewMode) {
                 save_dialog(state);
             }
             ui.separator();
+            if ui
+                .add_enabled(state.history.can_undo(), egui::Button::new("Undo"))
+                .on_hover_text("Ctrl+Z")
+                .clicked()
+            {
+                let LabState { history, edit, canvas, .. } = &mut *state;
+                history.undo(edit);
+                canvas.pending_from = None;
+            }
+            if ui
+                .add_enabled(state.history.can_redo(), egui::Button::new("Redo"))
+                .on_hover_text("Ctrl+Y")
+                .clicked()
+            {
+                let LabState { history, edit, canvas, .. } = &mut *state;
+                history.redo(edit);
+                canvas.pending_from = None;
+            }
+            ui.separator();
             let (label, next) = match *mode {
                 ViewMode::Graph => ("View: Graph ▸ 3D", ViewMode::Terrain3d),
                 ViewMode::Terrain3d => ("View: 3D ▸ Graph", ViewMode::Graph),
@@ -163,6 +262,13 @@ fn top_bar(ctx: &egui::Context, state: &mut LabState, mode: &mut ViewMode) {
                 let LabState { edit, canvas, .. } = state;
                 canvas::add_node_menu(ui, edit, canvas, at);
             });
+            if ui.button("Auto-layout").clicked() {
+                let LabState { edit, canvas, .. } = &mut *state;
+                edit.auto_layout();
+                canvas.scene_rect = edit.bounds().expand(80.0);
+            }
+            ui.checkbox(&mut state.canvas.grid, "Grid");
+            ui.checkbox(&mut state.canvas.snap, "Snap");
             ui.separator();
             ui.label("seed");
             ui.add(egui::DragValue::new(&mut state.seed));
@@ -341,5 +447,31 @@ fn selftest_screenshot(
         *phase = 2;
         info!("LAB SELFTEST: done");
         exit.write(AppExit::Success);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use node::EditorNode;
+
+    /// Committing after a change makes it undoable; undo then redo returns the
+    /// exact same graph.
+    #[test]
+    fn history_undo_redo_round_trip() {
+        let mut h = History::default();
+        let mut g = EditorGraph::default();
+        g.add(EditorNode::Constant { value: 1.0 }, egui::Pos2::ZERO);
+        h.commit(&g); // seed baseline
+        assert!(!h.can_undo());
+        let before = g.clone();
+        g.add(EditorNode::Abs, egui::Pos2::ZERO);
+        h.commit(&g);
+        assert!(h.can_undo());
+        h.undo(&mut g);
+        assert_eq!(g, before);
+        assert!(h.can_redo());
+        h.redo(&mut g);
+        assert_eq!(g.nodes.len(), 2);
     }
 }

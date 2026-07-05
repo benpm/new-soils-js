@@ -1,5 +1,11 @@
 # Todo
 
+## BigRefactor
+
+Focus on this refactor unles instructed otherwise. Commit for each, make sure to pull as well.
+
+Keep the notes updated with proper documentation.
+
 Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-game-systems.md`,
 `plan-rendering.md`). Each phase is intended to be shippable and test-gated before the next.
 
@@ -131,3 +137,10 @@ Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-ga
       fps steady, pixel-consistent with the WS reference shots). Deferred: WS remains the
       default while WT soaks; no formal transport trait (the two-lane `NewConn` shape *is*
       the seam — a third backend implements the same two channels). (game-systems §3, M8)
+
+
+## The First Content Expansion
+- [ ] Robust, neural texture gen techniques for tile gen with constraints to create complex 3d structures based on inferred structural relationships and probabilies from example. Ingest minecraft builds from the internet, parsing them, converting them to a compressed structure format. These should be editable in a new mode in game: structure design. Structure design should allow the instant output of applying the structure generation algorithm to your structure as input. You should be aple to tweak the ruleset that gets generated from your source map. Use techniques from the internet
+- [ ] Create block types (even with no real properties yet) to match all blocks in this Minecraft texture pack: (https://github.com/Unity-Resource-Pack/Unity-Modded). Use data files from the texture pack to help understand which tiles are what. Also, start creating some amount of data parity with minecraft files. Replace existing textures with these.
+- [ ] Biomes. Biomes should blend into each other oranically. The color of grass should able to shift in a subtle gradient stored a individual block data. Some biomes have tall trees, some short, some none. Some have rain, clouds, storms. Others, a barren moon-like landscape. Biome transitions might be able to have unique structures, such as small, sparse ponds between wetlands and a desert, or a desert and a tundra. Some biomes are more unique and have more extreme boundaries, such as the Crater Forest, where the boundary is a sheer cliff straight into the dense cannopy of massive trees. Make sure structures can be generated at great quantity along chunk boundaries use blue noise to place structure "seeds", which can fully generate as structures and thus "completing" the chunks it resides, only if all chunks it intersects are otherwise fully generated. Generate chunks in 2x2 blocks of chunks to mitigate large structures being incomplete.
+- [ ] Upgrade to Bevy 0.19

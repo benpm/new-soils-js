@@ -1,0 +1,29 @@
+[package]
+name = "soils-terrainlab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+soils-worldgen = { workspace = true }
+soils-protocol = { workspace = true }
+glam = { workspace = true }
+serde = { workspace = true }
+bevy = "0.18"
+# bevy_egui 0.39 targets Bevy 0.18 and pins egui 0.33; egui-snarl 0.9 pins the
+# same egui 0.33, so the node editor's widgets share bevy_egui's egui context.
+# Keep these two in lockstep on any Bevy bump (see docs/analysis.md upgrade note).
+bevy_egui = "0.39"
+# Direct egui pin must equal the version bevy_egui 0.39 bundles, so there is
+# exactly one egui in the graph. (egui-snarl was dropped: its only egui-0.33
+# release renders blank under bevy_egui 0.39; the node canvas is hand-rolled on
+# egui::Scene instead — see crates/soils-terrainlab/src/canvas.rs.)
+egui = "0.33"
+noise = "0.9"
+ron = "0.8"
+rfd = "0.15"
+bytemuck = "1"
+
+[dev-dependencies]
+wgpu = "27"
+pollster = "0.4"

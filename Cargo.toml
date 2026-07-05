@@ -6,6 +6,7 @@ members = [
     "crates/soils-worldgen",
     "crates/soils-server",
     "crates/soils-client",
+    "crates/soils-terrainlab",
 ]
 
 [workspace.package]

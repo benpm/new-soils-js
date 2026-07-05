@@ -2,11 +2,13 @@
 //! No Bevy or networking dependencies, so it is fast to test in isolation.
 
 pub mod blocks;
+pub mod graph;
 pub mod greedy;
 pub mod radiance;
 pub mod terrain;
 
 pub use blocks::{BlockDef, BlockRegistry};
+pub use graph::{CaveParams, ColumnSample, NodeKind, TerrainGraph};
 pub use greedy::{MeshData, greedy_mesh};
 pub use radiance::{LightGrid, Radiance};
 pub use terrain::{TerrainGen, WorldType};

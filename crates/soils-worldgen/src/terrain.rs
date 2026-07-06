@@ -10,6 +10,7 @@ use rayon::prelude::*;
 use soils_protocol::{CHUNK_SIZE, ChunkVolume, chunk_origin};
 
 use crate::blocks::BlockRegistry;
+use crate::graph::TerrainGraph;
 
 /// World generation flavor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +58,8 @@ const CAVE_N: usize = (CHUNK_SIZE / CAVE_STEP) as usize + 1;
 /// Conservative ceiling on the highest solid voxel the height + outcrop math
 /// can produce (256 + summed octave amplitudes 115 + max rock 5, with margin
 /// for simplex overshoot). Chunks whose origin is above this are all air.
+/// Assumes the default-flavoured graph; a wildly different designed graph could
+/// exceed it, but the game and previews use the default height envelope.
 const MAX_SURFACE: i32 = 256 + 115 + 5 + 24;
 /// Max positive contribution of the rock-outcrop term (the other two terms
 /// only subtract).
@@ -69,20 +72,45 @@ const MAX_ROCK: i32 = 5;
 /// ~1-2% underground cave density.
 const CAVE_THRESHOLD: f64 = 0.55;
 
-/// Stateless terrain generator seeded once and reused for every chunk.
+/// Stateless terrain generator seeded once and reused for every chunk. The
+/// height/rock/structure math lives in a [`TerrainGraph`] (the same schema the
+/// design tool edits and saves); this type owns the seeded `Simplex` the graph
+/// samples and the chunk-filling soil-gradient loop. Caves stay a fast
+/// trilinear-lattice 3D-noise carve (see [`CAVE_THRESHOLD`]), separate from the
+/// 2D graph.
 pub struct TerrainGen {
     noise: Simplex,
+    graph: TerrainGraph,
     world_type: WorldType,
 }
 
 impl TerrainGen {
+    /// A generator using the default graph, which reproduces the original
+    /// hardcoded terrain exactly (see [`TerrainGraph::default_soils`]).
     pub fn new(seed: u32, world_type: WorldType) -> Self {
-        Self { noise: Simplex::new(seed), world_type }
+        Self::from_graph(TerrainGraph::default_soils(), seed, world_type)
     }
 
-    #[inline]
-    fn n2(&self, x: f64, z: f64) -> f64 {
-        self.noise.get([x, z])
+    /// A generator driven by a designed graph (e.g. loaded from a
+    /// `*.terrain.ron` produced by `soils-terrainlab`).
+    pub fn from_graph(graph: TerrainGraph, seed: u32, world_type: WorldType) -> Self {
+        Self { noise: Simplex::new(seed), graph, world_type }
+    }
+
+    /// Load a graph from a `*.terrain.ron` file and build a generator from it.
+    pub fn load_ron(path: &std::path::Path, seed: u32, world_type: WorldType) -> std::io::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let graph: TerrainGraph = ron::from_str(&text)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        graph
+            .validate()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Self::from_graph(graph, seed, world_type))
+    }
+
+    /// The graph this generator evaluates.
+    pub fn graph(&self) -> &TerrainGraph {
+        &self.graph
     }
 
     #[inline]
@@ -164,15 +192,12 @@ impl TerrainGen {
             for z in 0..CHUNK_SIZE {
                 let gz = (origin.z + z) as f64;
 
-                let height = match self.world_type {
-                    WorldType::Flat => 256,
+                // Sample the graph's surface channels once per column.
+                let (height, rock) = match self.world_type {
+                    WorldType::Flat => (256, 0.0),
                     WorldType::Normal => {
-                        256 + (self.n2(gx / 1000.0, gz / 1000.0) * 50.0
-                            - self.n2(gx / 500.0, gz / 500.0) * 30.0
-                            + self.n2(gx / 250.0, gz / 250.0) * 20.0
-                            - self.n2(gx / 75.0, gz / 75.0) * 10.0
-                            + self.n2(gx / 25.0, gz / 25.0) * 5.0)
-                            .floor() as i32
+                        let col = self.graph.eval_columns(&self.noise, gx, gz);
+                        (col.height.floor() as i32, col.rock)
                     }
                 };
 
@@ -180,14 +205,6 @@ impl TerrainGen {
                 if origin.y > height + MAX_ROCK {
                     continue;
                 }
-
-                let rock = if self.world_type == WorldType::Normal {
-                    self.n2(gx / 15.0, gz / 15.0) * 5.0
-                        - self.n2(gx / 45.0, gz / 45.0).abs() * 10.0
-                        - self.n2(gx / 25.0, gz / 25.0).abs() * 15.0
-                } else {
-                    0.0
-                };
 
                 for y in 0..CHUNK_SIZE {
                     let gy = origin.y + y;

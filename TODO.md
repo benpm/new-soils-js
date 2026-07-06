@@ -3,6 +3,11 @@
 Linear implementation sequence for the plans in `docs/` (`analysis.md`, `plan-game-systems.md`,
 `plan-rendering.md`). Each phase is intended to be shippable and test-gated before the next.
 
+**Status: all 14 phases complete (2026-07-04).** Each checkoff below records what shipped,
+what was measured, and what was deferred with rationale. Current-state documentation lives in
+`docs/architecture.md`; the performance narrative and the ranked next-optimizations list in
+`docs/perf-report.md`.
+
 - [x] 1. **Extract `soils-sim`** — shared movement/collision/raycast/edit-rule functions; client
       physics moves to `FixedUpdate` on it; split the `net_receive` god-system into per-message
       event systems. (game-systems M1)

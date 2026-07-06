@@ -1,5 +1,10 @@
 # Plan: game-systems reorganization — entities, authoritative server, delta replication
 
+> **Status (2026-07-04): implemented.** Milestones M1–M8 all shipped (TODO phases 1,
+> 5–11, 13–14), including pathfinding stages 1–4 and the WebTransport/QUIC transport.
+> Per-phase deferrals are recorded in `TODO.md`'s checkoffs. Current state:
+> `architecture.md`; measurements: `perf-report.md`.
+
 Goal: restructure so the server owns simulation of arbitrary **entities**, replicates world-state
 **deltas** to clients in compact packets under an authoritative-server model, and leaves clean
 seams for pathfinding and client-side prediction. Companion: `plan-rendering.md`.

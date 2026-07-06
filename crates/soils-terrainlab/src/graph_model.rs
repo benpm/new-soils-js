@@ -9,6 +9,9 @@
 //! owns graph *data* (nodes + positions + wires) and the lowering to the game's
 //! schema; `canvas` owns interaction.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use egui::{Pos2, Rect, Vec2};
 use soils_worldgen::graph::{In, Node, NodeKind, Outputs, TerrainGraph};
 
@@ -148,6 +151,70 @@ impl EditorGraph {
             r.extend_with(node.pos + NODE_EXTENT);
         }
         r
+    }
+
+    /// Per editor node, its index in the lowered [`TerrainGraph`] (`None` for
+    /// `Output` sinks, which are dropped). Mirrors `to_terrain_graph`'s
+    /// canonical numbering, so it can address a node in `state.graph`.
+    pub fn canonical_map(&self) -> Vec<Option<usize>> {
+        let mut map = vec![None; self.nodes.len()];
+        let mut next = 0;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !matches!(node.kind, EditorNode::Output { .. }) {
+                map[i] = Some(next);
+                next += 1;
+            }
+        }
+        map
+    }
+
+    /// A content signature per node: a Merkle hash of `(seed, own params,
+    /// input signatures)`. A node's signature changes iff its own parameters or
+    /// anything upstream changed — i.e. exactly when its output field would —
+    /// so it doubles as a content-addressed cache key for per-node previews and
+    /// is stable across index renumbering. Cycle-guarded (revisit → 0).
+    pub fn node_signatures(&self, seed: u32) -> Vec<u64> {
+        let n = self.nodes.len();
+        let mut sig = vec![0u64; n];
+        let mut done = vec![false; n];
+        let mut visiting = vec![false; n];
+        for i in 0..n {
+            self.sig_of(i, seed, &mut sig, &mut done, &mut visiting);
+        }
+        sig
+    }
+
+    fn sig_of(
+        &self,
+        i: usize,
+        seed: u32,
+        sig: &mut [u64],
+        done: &mut [bool],
+        visiting: &mut [bool],
+    ) -> u64 {
+        if done[i] {
+            return sig[i];
+        }
+        if visiting[i] {
+            return 0; // transient cycle: break it
+        }
+        visiting[i] = true;
+        let mut h = DefaultHasher::new();
+        seed.hash(&mut h);
+        // Debug is a stable, exhaustive rendering of the kind incl. f32 params.
+        format!("{:?}", self.nodes[i].kind).hash(&mut h);
+        for k in 0..self.nodes[i].kind.input_count() {
+            let child = match self.source_of(i, k) {
+                Some(src) => self.sig_of(src, seed, sig, done, visiting),
+                None => 0,
+            };
+            child.hash(&mut h);
+        }
+        let s = h.finish();
+        visiting[i] = false;
+        done[i] = true;
+        sig[i] = s;
+        s
     }
 
     /// Lower to a `TerrainGraph`. `Err` on a cycle or missing Height output.
@@ -431,5 +498,35 @@ mod tests {
                 eg.nodes[w.to].pos.x
             );
         }
+    }
+
+    #[test]
+    fn signatures_track_upstream_changes() {
+        let mut eg = EditorGraph::default();
+        let a = eg.add(EditorNode::Simplex2 { frequency: 0.01, offset: [0.0; 2] }, Pos2::ZERO);
+        let b = eg.add(EditorNode::Simplex2 { frequency: 0.02, offset: [0.0; 2] }, Pos2::ZERO);
+        let s = eg.add(EditorNode::ScaleBias { scale: 2.0, bias: 0.0 }, Pos2::ZERO);
+        let out = eg.add(EditorNode::Output { channel: OutChannel::Height }, Pos2::ZERO);
+        eg.connect(a, s, 0);
+        eg.connect(s, out, 0);
+
+        let before = eg.node_signatures(0);
+        if let EditorNode::Simplex2 { frequency, .. } = &mut eg.nodes[a].kind {
+            *frequency = 0.05;
+        }
+        let after = eg.node_signatures(0);
+
+        assert_ne!(before[a], after[a], "changed leaf's sig must change");
+        assert_ne!(before[s], after[s], "downstream node's sig must change");
+        assert_eq!(before[b], after[b], "unrelated branch's sig unchanged");
+    }
+
+    #[test]
+    fn identical_leaves_hash_equal() {
+        let mut eg = EditorGraph::default();
+        let a = eg.add(EditorNode::Simplex2 { frequency: 0.01, offset: [0.0; 2] }, Pos2::ZERO);
+        let b = eg.add(EditorNode::Simplex2 { frequency: 0.01, offset: [0.0; 2] }, Pos2::ZERO);
+        let sig = eg.node_signatures(0);
+        assert_eq!(sig[a], sig[b], "identical leaves must hash equal");
     }
 }

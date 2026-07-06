@@ -10,6 +10,7 @@
 mod canvas;
 mod graph_model;
 mod node;
+mod node_preview;
 mod preview3d;
 mod wgsl_gen;
 
@@ -21,6 +22,7 @@ use soils_worldgen::graph::TerrainGraph;
 
 use canvas::CanvasState;
 use graph_model::EditorGraph;
+use node_preview::NodePreviews;
 use preview3d::{PreviewInput, TerrainPreviewPlugin, ViewMode};
 
 /// Side of the square 2D preview, in pixels.
@@ -108,6 +110,7 @@ struct LabState {
     edit: EditorGraph,
     history: History,
     canvas: CanvasState,
+    previews: NodePreviews,
     /// The last graph that lowered cleanly (drives the preview and saves).
     graph: TerrainGraph,
     seed: u32,
@@ -130,6 +133,7 @@ impl Default for LabState {
             edit: EditorGraph::from_terrain_graph(&graph),
             history: History::default(),
             canvas: CanvasState::default(),
+            previews: NodePreviews::default(),
             graph,
             seed: 0,
             status: "Loaded default terrain.".into(),
@@ -186,17 +190,37 @@ fn ui(
     top_bar(&ctx, &mut state, &mut mode);
     preview_panel(&ctx, &mut state);
 
+    let pointer_idle = !ctx.is_using_pointer();
+
+    // Per-node intermediate previews: lazily computed off-thread, keyed by node
+    // content signature. Lower a fresh graph from the *current* edit so the
+    // signatures and canonical indices match what the background task samples.
+    let show_previews = *mode == ViewMode::Graph && state.previews.enabled;
+    let mut sigs: Vec<u64> = Vec::new();
+    let mut preview_map = std::collections::HashMap::new();
+    if show_previews {
+        if let Ok(g) = state.edit.to_terrain_graph() {
+            let seed = state.seed;
+            sigs = state.edit.node_signatures(seed);
+            let canon = state.edit.canonical_map();
+            preview_map = state.previews.update(&ctx, &g, seed, &sigs, &canon, pointer_idle);
+        }
+    }
+
     // In Graph mode the opaque node canvas fills the centre; in 3D mode we leave
     // it empty so the terrain (rendered by the Camera3d behind egui) shows.
     if *mode == ViewMode::Graph {
-        egui::CentralPanel::default().show(&ctx, |ui| {
+        let prev = if show_previews { Some(&preview_map) } else { None };
+        // Transparent frame so the 3D terrain (rendered by the Camera3d) shows
+        // through behind the node graph.
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(&ctx, |ui| {
             let LabState { edit, canvas, .. } = &mut *state;
-            canvas::show(ui, edit, canvas);
+            canvas::show(ui, edit, canvas, &sigs, prev);
         });
     }
 
     // Commit an undo snapshot once the pointer is idle, so held drags coalesce.
-    if !ctx.is_using_pointer() {
+    if pointer_idle {
         let LabState { history, edit, .. } = &mut *state;
         history.commit(edit);
     }
@@ -269,6 +293,7 @@ fn top_bar(ctx: &egui::Context, state: &mut LabState, mode: &mut ViewMode) {
             }
             ui.checkbox(&mut state.canvas.grid, "Grid");
             ui.checkbox(&mut state.canvas.snap, "Snap");
+            ui.checkbox(&mut state.previews.enabled, "Previews");
             ui.separator();
             ui.label("seed");
             ui.add(egui::DragValue::new(&mut state.seed));
@@ -291,6 +316,7 @@ fn preview_panel(ctx: &egui::Context, state: &mut LabState) {
             "• Drag a node's title to move it.\n\
              • Click an output pin, then an input pin, to wire.\n\
              • Right-click an input pin to disconnect.\n\
+             • Right-click a node's title (or hover + Delete) to remove.\n\
              • Right-click canvas or use 'Add node' to add.",
         );
     });

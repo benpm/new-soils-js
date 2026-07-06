@@ -61,7 +61,7 @@ impl EditorNode {
             EditorNode::Constant { .. } => "Constant",
             EditorNode::Coord { .. } => "Coord",
             EditorNode::Simplex2 { .. } => "Simplex2",
-            EditorNode::Fbm { .. } => "fBm",
+            EditorNode::Fbm { .. } => "Multi-scale Noise",
             EditorNode::RadialFalloff { .. } => "Radial Falloff",
             EditorNode::Abs => "Abs",
             EditorNode::ScaleBias { .. } => "Scale + Bias",
@@ -132,9 +132,7 @@ impl EditorNode {
     /// A fresh node of each kind, for the "add node" palette.
     pub fn palette() -> Vec<EditorNode> {
         vec![
-            EditorNode::Constant { value: 0.0 },
-            EditorNode::Coord { axis: Axis::X },
-            EditorNode::Simplex2 { frequency: 0.01, offset: [0.0, 0.0] },
+            // Sources first, with the one-node multi-scale noise up top.
             EditorNode::Fbm {
                 octaves: 4,
                 base_frequency: 0.01,
@@ -142,7 +140,10 @@ impl EditorNode {
                 persistence: 0.5,
                 offset: [0.0, 0.0],
             },
+            EditorNode::Simplex2 { frequency: 0.01, offset: [0.0, 0.0] },
             EditorNode::RadialFalloff { center: [0.0, 0.0], radius: 512.0, exponent: 2.0 },
+            EditorNode::Coord { axis: Axis::X },
+            EditorNode::Constant { value: 0.0 },
             EditorNode::Abs,
             EditorNode::ScaleBias { scale: 1.0, bias: 0.0 },
             EditorNode::Clamp { min: 0.0, max: 1.0 },

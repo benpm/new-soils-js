@@ -97,12 +97,12 @@ struct Orbit {
     target: Vec3,
 }
 
-/// The terrain entity + its material handle + the last structure hash.
+/// The terrain material + params buffer handles (the entity is always visible,
+/// so it needn't be tracked).
 #[derive(Resource)]
 struct Terrain3dState {
     material: Handle<TerrainMaterial>,
     params: Handle<ShaderStorageBuffer>,
-    entity: Entity,
 }
 
 pub struct TerrainPreviewPlugin;
@@ -143,17 +143,17 @@ fn setup(
         },
     });
     let mesh = meshes.add(grid_mesh(RES));
-    let entity = commands
-        .spawn((
-            Mesh3d(mesh),
-            MeshMaterial3d(material.clone()),
-            Transform::default(),
-            Visibility::Hidden,
-            bevy::camera::visibility::NoFrustumCulling,
-        ))
-        .id();
+    commands.spawn((
+        Mesh3d(mesh),
+        MeshMaterial3d(material.clone()),
+        Transform::default(),
+        // Always visible: it renders behind the (transparent) node canvas in
+        // Graph mode and fills the view in 3D mode.
+        Visibility::Visible,
+        bevy::camera::visibility::NoFrustumCulling,
+    ));
 
-    commands.insert_resource(Terrain3dState { material, params, entity });
+    commands.insert_resource(Terrain3dState { material, params });
 
     // Camera (owns the primary egui context) + orbit rig + light.
     commands.spawn((
@@ -173,16 +173,15 @@ fn setup(
     ));
 }
 
-/// Regenerate the material shader on structural change, refresh params + colour
-/// range every frame, and show/hide the terrain by view mode.
+/// Regenerate the material shader on structural change and refresh params +
+/// colour range every frame. The terrain is always visible (behind the node
+/// canvas in Graph mode, full-screen in 3D mode).
 fn sync_terrain(
     input: Res<PreviewInput>,
-    mode: Res<ViewMode>,
     state: Res<Terrain3dState>,
     mut shaders: ResMut<Assets<Shader>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
-    mut vis: Query<&mut Visibility>,
     mut state_mut: ResMut<Terrain3dStateHash>,
 ) {
     let Some(graph) = &input.graph else { return };
@@ -209,11 +208,6 @@ fn sync_terrain(
     if let Some(mat) = materials.get_mut(&state.material) {
         mat.pv.b.x = input.hmin;
         mat.pv.b.y = input.hmax.max(input.hmin + 1.0);
-    }
-
-    // Visibility by mode.
-    if let Ok(mut v) = vis.get_mut(state.entity) {
-        *v = if *mode == ViewMode::Terrain3d { Visibility::Visible } else { Visibility::Hidden };
     }
 }
 

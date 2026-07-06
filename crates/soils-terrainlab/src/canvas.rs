@@ -3,11 +3,17 @@
 //! node as a framed group, wires as bezier-ish lines behind the nodes, and
 //! handles dragging, pin-to-pin wiring, and deletion.
 
-use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, Ui, UiBuilder, Vec2, epaint::PathShape};
+use std::collections::HashMap;
+
+use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, TextureId, Ui, UiBuilder, Vec2, epaint::PathShape};
 use soils_worldgen::graph::Axis;
 
 use crate::graph_model::EditorGraph;
 use crate::node::{EditorNode, OutChannel};
+use crate::node_preview::THUMB_PX;
+
+/// Per-node thumbnails to draw: `sig → texture`. `None` disables previews.
+pub type PreviewMap<'a> = Option<&'a HashMap<u64, TextureId>>;
 
 const NODE_W: f32 = 176.0;
 const HEADER_H: f32 = 22.0;
@@ -17,8 +23,8 @@ pub const GRID: f32 = 40.0;
 const FIELD_COLOR: Color32 = Color32::from_rgb(0x6c, 0xcf, 0x70);
 const SINK_COLOR: Color32 = Color32::from_rgb(0xff, 0xa8, 0x30);
 const WIRE_COLOR: Color32 = Color32::from_rgb(0x9a, 0xd0, 0xff);
-const GRID_MINOR: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 8);
-const GRID_MAJOR: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 20);
+const GRID_MINOR: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 3);
+const GRID_MAJOR: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 7);
 
 /// Canvas view + interaction state that must persist between frames.
 #[derive(Clone)]
@@ -44,7 +50,15 @@ impl Default for CanvasState {
 }
 
 /// Draw the whole node graph and apply user edits to `graph` in place.
-pub fn show(ui: &mut Ui, graph: &mut EditorGraph, state: &mut CanvasState) {
+/// `sigs[i]` is node `i`'s content signature and `previews` maps a signature to
+/// its thumbnail (see [`crate::node_preview`]); pass `None` to hide thumbnails.
+pub fn show(
+    ui: &mut Ui,
+    graph: &mut EditorGraph,
+    state: &mut CanvasState,
+    sigs: &[u64],
+    previews: PreviewMap,
+) {
     let mut scene_rect = state.scene_rect;
     let resp = egui::Scene::new().zoom_range(0.15..=2.5).show(ui, &mut scene_rect, |ui| {
         // Reserve slots so the grid paints behind wires, and wires behind nodes.
@@ -61,7 +75,8 @@ pub fn show(ui: &mut Ui, graph: &mut EditorGraph, state: &mut CanvasState) {
 
         // --- draw nodes, record pin positions ---
         for i in 0..n {
-            draw_node(ui, graph, i, &mut in_pins[i], &mut out_pins[i], &mut to_remove, state);
+            let sig = sigs.get(i).copied().unwrap_or(0);
+            draw_node(ui, graph, i, &mut in_pins[i], &mut out_pins[i], &mut to_remove, state, sig, previews);
         }
 
         // --- wires behind nodes ---
@@ -107,6 +122,7 @@ pub fn show(ui: &mut Ui, graph: &mut EditorGraph, state: &mut CanvasState) {
 }
 
 /// Draw one node frame with its params and pins.
+#[allow(clippy::too_many_arguments)]
 fn draw_node(
     ui: &mut Ui,
     graph: &mut EditorGraph,
@@ -115,6 +131,8 @@ fn draw_node(
     out_pin: &mut Option<Pos2>,
     to_remove: &mut Option<usize>,
     state: &mut CanvasState,
+    sig: u64,
+    previews: PreviewMap,
 ) {
     let pos = graph.nodes[i].pos;
     let builder = UiBuilder::new().max_rect(Rect::from_min_size(pos, Vec2::new(NODE_W, 0.0)));
@@ -126,28 +144,51 @@ fn draw_node(
         frame
             .show(ui, |ui| {
                 ui.set_width(NODE_W);
-                // Header: draggable title + delete.
+                // Header: the title doubles as the drag handle and the delete
+                // affordance (right-click → Remove, or hover + Delete).
                 let title = graph.nodes[i].kind.title();
-                ui.horizontal(|ui| {
-                    let h = ui.label(egui::RichText::new(title).strong());
-                    let drag = ui.interact(h.rect, egui::Id::new(("hdr", i)), Sense::drag());
-                    if drag.dragged() {
-                        graph.nodes[i].pos += drag.drag_delta();
+                let h = ui.label(egui::RichText::new(title).strong());
+                let hdr = ui.interact(h.rect, egui::Id::new(("hdr", i)), Sense::click_and_drag());
+                if hdr.dragged() {
+                    graph.nodes[i].pos += hdr.drag_delta();
+                }
+                // Snap to the grid when the drag ends (not mid-drag, so it
+                // doesn't feel jumpy).
+                if hdr.drag_stopped() && state.snap {
+                    let p = &mut graph.nodes[i].pos;
+                    p.x = (p.x / GRID).round() * GRID;
+                    p.y = (p.y / GRID).round() * GRID;
+                }
+                hdr.context_menu(|ui| {
+                    if ui.button("Remove").clicked() {
+                        *to_remove = Some(i);
+                        ui.close();
                     }
-                    // Snap to the grid when the drag ends (not mid-drag, so it
-                    // doesn't feel jumpy).
-                    if drag.drag_stopped() && state.snap {
-                        let p = &mut graph.nodes[i].pos;
-                        p.x = (p.x / GRID).round() * GRID;
-                        p.y = (p.y / GRID).round() * GRID;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕").clicked() {
-                            *to_remove = Some(i);
-                        }
-                    });
                 });
+                if hdr.hovered()
+                    && ui.input(|inp| {
+                        inp.key_pressed(egui::Key::Delete) || inp.key_pressed(egui::Key::Backspace)
+                    })
+                {
+                    *to_remove = Some(i);
+                }
                 params_ui(&mut graph.nodes[i].kind, ui);
+                // Intermediate-output thumbnail (value nodes only). Draws the
+                // cached image, or a placeholder while it's still computing.
+                if !is_output {
+                    if let Some(map) = previews {
+                        let size = Vec2::splat(THUMB_PX);
+                        match map.get(&sig) {
+                            Some(&tid) => {
+                                ui.add(egui::Image::new((tid, size)).corner_radius(2.0));
+                            }
+                            None => {
+                                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                                ui.painter().rect_filled(rect, 2.0, Color32::from_gray(28));
+                            }
+                        }
+                    }
+                }
             })
             .response
     });
@@ -303,12 +344,18 @@ fn params_ui(node: &mut EditorNode, ui: &mut Ui) {
         }
         EditorNode::Fbm { octaves, base_frequency, lacunarity, persistence, .. } => {
             ui.horizontal(|ui| {
-                ui.label("octaves");
+                ui.label("octaves").on_hover_text("Number of noise layers stacked internally");
                 ui.add(egui::DragValue::new(octaves).range(1..=10));
             });
-            drag(ui, "base freq", base_frequency, 0.0005);
-            drag(ui, "lacunarity", lacunarity, 0.01);
-            drag(ui, "persistence", persistence, 0.01);
+            drag(ui, "frequency", base_frequency, 0.0005);
+            ui.horizontal(|ui| {
+                ui.label("lacunarity").on_hover_text("Frequency × per octave (adds finer detail)");
+                ui.add(egui::DragValue::new(lacunarity).speed(0.01));
+            });
+            ui.horizontal(|ui| {
+                ui.label("gain").on_hover_text("Amplitude × per octave (layer roughness)");
+                ui.add(egui::DragValue::new(persistence).speed(0.01));
+            });
         }
         EditorNode::RadialFalloff { center, radius, exponent } => {
             drag(ui, "cx", &mut center[0], 1.0);

@@ -190,6 +190,13 @@ impl TerrainGraph {
         Ok(())
     }
 
+    /// Evaluate a single node's output field at world column `(x, z)`. Lets a
+    /// design tool preview intermediate nodes, not just the named outputs.
+    /// `node` is an index into [`Self::nodes`].
+    pub fn field_at(&self, sim: &Simplex, node: NodeId, x: f64, z: f64) -> f64 {
+        self.eval_node(sim, node, x, z)
+    }
+
     /// Evaluate the surface channels at world column `(x, z)`.
     pub fn eval_columns(&self, sim: &Simplex, x: f64, z: f64) -> ColumnSample {
         ColumnSample {
@@ -446,5 +453,19 @@ mod tests {
         let b = back.eval_columns(&sim, 12.0, 34.0);
         assert_eq!(a.height, b.height);
         assert_eq!(a.rock, b.rock);
+    }
+
+    /// `field_at` on the node feeding the Height output equals the Height
+    /// channel — so a tool can preview intermediate nodes with the same math.
+    #[test]
+    fn field_at_height_node_matches_eval_columns() {
+        let graph = TerrainGraph::default_soils();
+        let sim = Simplex::new(2024);
+        let height_node = graph.outputs.height.node.expect("default height is wired");
+        for &(x, z) in &[(0.0, 0.0), (55.0, -120.0), (900.0, 410.0)] {
+            let via_field = graph.field_at(&sim, height_node, x, z);
+            let via_columns = graph.eval_columns(&sim, x, z).height;
+            assert_eq!(via_field, via_columns, "mismatch at ({x}, {z})");
+        }
     }
 }

@@ -18,6 +18,7 @@
 //! [`apply_voxel_change`] are the incremental paths, property-tested to agree
 //! with it.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use glam::IVec3;
@@ -41,33 +42,113 @@ pub fn pack(sky: u8, block: u8) -> u8 {
 }
 
 /// One chunk's packed light values, parallel to `ChunkVolume`.
+///
+/// Most chunks are uniform — open-sky air is `sky=15` everywhere, enclosed rock
+/// is `0` everywhere — so a `Uniform` variant stores those as a single byte and
+/// lets the flood skip them, promoting to a full `Dense` grid only when a cell
+/// actually diverges. `get` is transparent to the variant; `set` promotes.
 #[derive(Clone)]
-pub struct ChunkLight {
-    data: Box<[u8]>,
+pub enum ChunkLight {
+    Uniform(u8),
+    Dense(Box<[u8]>),
 }
 
 impl ChunkLight {
+    /// Every cell dark (`0`). The default for a freshly resident chunk.
     pub fn dark() -> Self {
-        Self { data: vec![0; CHUNK_CUBED].into_boxed_slice() }
+        Self::Uniform(0)
+    }
+
+    /// Every cell fully sky-lit (`sky=15, block=0`).
+    pub fn full_sky() -> Self {
+        Self::Uniform(pack(MAX_LIGHT, 0))
+    }
+
+    /// Every cell `value`.
+    pub fn uniform(value: u8) -> Self {
+        Self::Uniform(value)
+    }
+
+    /// `Some(v)` iff every cell holds the same value `v`.
+    #[inline]
+    pub fn uniform_value(&self) -> Option<u8> {
+        match self {
+            Self::Uniform(v) => Some(*v),
+            Self::Dense(_) => None,
+        }
     }
 
     #[inline]
     pub fn get(&self, x: i32, y: i32, z: i32) -> u8 {
-        self.data[voxel_index(x, y, z)]
+        match self {
+            Self::Uniform(v) => *v,
+            Self::Dense(d) => d[voxel_index(x, y, z)],
+        }
     }
 
     #[inline]
     pub fn set(&mut self, x: i32, y: i32, z: i32, value: u8) {
-        self.data[voxel_index(x, y, z)] = value;
+        match self {
+            Self::Uniform(v) => {
+                if *v == value {
+                    return;
+                }
+                // Diverged: materialize a dense grid filled with the old value.
+                let mut d = vec![*v; CHUNK_CUBED].into_boxed_slice();
+                d[voxel_index(x, y, z)] = value;
+                *self = Self::Dense(d);
+            }
+            Self::Dense(d) => d[voxel_index(x, y, z)] = value,
+        }
     }
 
+    /// A contiguous `CHUNK_CUBED`-byte view: borrowed for `Dense`, materialized
+    /// on demand for `Uniform`. Prefer [`write_into`](Self::write_into) when a
+    /// destination buffer already exists.
+    pub fn as_dense_bytes(&self) -> Cow<'_, [u8]> {
+        match self {
+            Self::Uniform(v) => Cow::Owned(vec![*v; CHUNK_CUBED]),
+            Self::Dense(d) => Cow::Borrowed(d),
+        }
+    }
+
+    /// Fill `dst` (length `CHUNK_CUBED`) with this chunk's light.
+    pub fn write_into(&self, dst: &mut [u8]) {
+        match self {
+            Self::Uniform(v) => dst.fill(*v),
+            Self::Dense(d) => dst.copy_from_slice(d),
+        }
+    }
+
+    /// Build from a dense buffer, collapsing to `Uniform` when every byte is
+    /// equal (the common all-sky / all-dark result of a flood).
+    pub fn from_bytes_collapsed(bytes: &[u8]) -> Self {
+        match bytes.first() {
+            Some(&first) if bytes.iter().all(|&b| b == first) => Self::Uniform(first),
+            _ => Self::Dense(bytes.to_vec().into_boxed_slice()),
+        }
+    }
+
+    /// Collapse a `Dense` chunk back to `Uniform` in place if all cells are equal.
+    pub fn collapse(&mut self) {
+        if let Self::Dense(d) = self
+            && let Some(&first) = d.first()
+            && d.iter().all(|&b| b == first)
+        {
+            *self = Self::Uniform(first);
+        }
+    }
+
+    /// A mutable dense view, promoting `Uniform` to `Dense` first.
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.data
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.data
+        if let Self::Uniform(v) = *self {
+            *self = Self::Dense(vec![v; CHUNK_CUBED].into_boxed_slice());
+        }
+        match self {
+            Self::Dense(d) => d,
+            Self::Uniform(_) => unreachable!("promoted above"),
+        }
     }
 }
 
@@ -91,6 +172,23 @@ pub trait LightWorld {
     /// Whether the out-of-domain space directly above `v` counts as open sky
     /// (only consulted when `v + Y` is outside the domain).
     fn open_sky_above(&self, v: IVec3) -> bool;
+
+    /// True if the chunk at `cpos` (chunk coords) is entirely air. The default
+    /// scans every cell; implementors with the voxel volume to hand should
+    /// override with a cheap check (e.g. `ChunkVolume::is_empty`) so the
+    /// full-sky fast path in [`light_new_chunk`] stays O(1).
+    fn chunk_all_air(&self, cpos: IVec3) -> bool {
+        chunk_cells(cpos).all(|v| !self.solid(v))
+    }
+
+    /// Set every cell of `cpos` to `packed`. The default writes cell by cell;
+    /// implementors backed by [`ChunkLight`] should override to store a single
+    /// `Uniform` value in O(1).
+    fn set_chunk_uniform(&mut self, cpos: IVec3, packed: u8) {
+        for v in chunk_cells(cpos) {
+            self.set_light(v, packed);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -251,12 +349,81 @@ pub fn relight_full(world: &mut impl LightWorld, chunks: &[IVec3]) {
     propagate(world, Channel::Block, block_seeds);
 }
 
+/// Fast path for [`light_new_chunk`]: if the chunk at `cpos` is entirely air,
+/// receives `sky=15` across its whole top face (open sky above, or an already
+/// `15` neighbor), and takes no block light on any of its six faces, then every
+/// cell is `(sky=15, block=0)`. Set it uniformly and spill that light outward
+/// via `propagate` — identical to what the general flood would produce, but
+/// without the per-cell zero, the seed scan, or the within-chunk BFS. Returns
+/// `false` (no change) when any condition fails, so the caller runs the full path.
+fn try_full_sky(world: &mut impl LightWorld, cpos: IVec3) -> bool {
+    if !world.chunk_all_air(cpos) {
+        return false;
+    }
+    let origin = chunk_origin(cpos);
+    let s = CHUNK_SIZE;
+    for a in 0..s {
+        for b in 0..s {
+            // Top face must deliver 15: open sky, or a neighbor already at 15.
+            let top_cell = origin + IVec3::new(a, s - 1, b);
+            let above = top_cell + IVec3::Y;
+            let top_ok = if world.in_domain(above) {
+                let l = world.light(above);
+                sky(l) >= MAX_LIGHT && block(l) == 0
+            } else {
+                world.open_sky_above(top_cell)
+            };
+            if !top_ok {
+                return false;
+            }
+            // No block light may enter from any face (it would break uniformity).
+            for nb in [
+                origin + IVec3::new(-1, a, b),
+                origin + IVec3::new(s, a, b),
+                origin + IVec3::new(a, -1, b),
+                origin + IVec3::new(a, b, -1),
+                origin + IVec3::new(a, b, s),
+            ] {
+                if world.in_domain(nb) && block(world.light(nb)) > 0 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    world.set_chunk_uniform(cpos, pack(MAX_LIGHT, 0));
+
+    // Spill the chunk's border light outward exactly as the full flood would
+    // (interior cells are already at the 15 max, so propagate does no work there).
+    let mut sky_seeds = VecDeque::new();
+    for a in 0..s {
+        for b in 0..s {
+            sky_seeds.push_back(origin + IVec3::new(0, a, b));
+            sky_seeds.push_back(origin + IVec3::new(s - 1, a, b));
+            sky_seeds.push_back(origin + IVec3::new(a, 0, b));
+            sky_seeds.push_back(origin + IVec3::new(a, s - 1, b));
+            sky_seeds.push_back(origin + IVec3::new(a, b, 0));
+            sky_seeds.push_back(origin + IVec3::new(a, b, s - 1));
+        }
+    }
+    propagate(world, Channel::Sky, sky_seeds);
+    true
+}
+
 /// Light a chunk that just entered the domain: seed its own emitters and
 /// open-sky top, pull light in across all six faces from loaded neighbors, and
 /// flood (spilling back out into neighbors where this chunk brightens them).
 /// Follow with [`reconcile_sky_below`] so an optimistically sky-lit chunk
 /// below gets darkened by this chunk's terrain.
 pub fn light_new_chunk(world: &mut impl LightWorld, cpos: IVec3) {
+    // "Assume full light": an all-air chunk that receives sky=15 across its
+    // whole top and no block light on any face is uniformly (sky=15, block=0).
+    // Set it in one shot and spill outward, skipping the per-cell zero + seed
+    // scan + within-chunk BFS. Oracle-equivalent to the general path below.
+    if try_full_sky(world, cpos) {
+        return;
+    }
+
     for v in chunk_cells(cpos) {
         world.set_light(v, 0);
     }
@@ -654,5 +821,87 @@ mod tests {
         w.max = IVec3::new(64, 32, 32);
         light_new_chunk(&mut w, IVec3::new(1, 0, 0));
         assert_eq!(w.block_at(33, 16, 16), 12, "3 steps from the level-15 emitter");
+    }
+
+    #[test]
+    fn chunk_light_enum_get_set_and_collapse() {
+        let mut cl = ChunkLight::dark();
+        assert_eq!(cl.uniform_value(), Some(0));
+        assert_eq!(cl.get(3, 4, 5), 0);
+        cl.set(3, 4, 5, 0); // same value: stays uniform
+        assert_eq!(cl.uniform_value(), Some(0));
+        cl.set(3, 4, 5, 0xF0); // diverge: promotes to dense
+        assert_eq!(cl.uniform_value(), None);
+        assert_eq!(cl.get(3, 4, 5), 0xF0);
+        assert_eq!(cl.get(0, 0, 0), 0);
+        let bytes = cl.as_dense_bytes();
+        assert_eq!(bytes.len(), CHUNK_CUBED);
+        assert_eq!(bytes[voxel_index(3, 4, 5)], 0xF0);
+        cl.set(3, 4, 5, 0); // back to all-zero...
+        cl.collapse(); // ...collapses to uniform
+        assert_eq!(cl.uniform_value(), Some(0));
+
+        assert_eq!(ChunkLight::from_bytes_collapsed(&[7u8; CHUNK_CUBED]).uniform_value(), Some(7));
+        let mut mixed = vec![7u8; CHUNK_CUBED];
+        mixed[10] = 8;
+        assert_eq!(ChunkLight::from_bytes_collapsed(&mixed).uniform_value(), None);
+        assert_eq!(ChunkLight::from_bytes_collapsed(&mixed).get(0, 1, 0), 7);
+    }
+
+    #[test]
+    fn full_sky_fast_path_equals_oracle() {
+        // A single all-air open-sky chunk, lit incrementally.
+        let mut w = TestWorld::new(IVec3::new(1, 1, 1));
+        light_new_chunk(&mut w, IVec3::new(0, 0, 0));
+        for &(x, y, z) in &[(0, 0, 0), (16, 16, 16), (31, 31, 31), (0, 31, 0)] {
+            assert_eq!(w.sky_at(x, y, z), 15);
+            assert_eq!(w.block_at(x, y, z), 0);
+        }
+        let mut fresh = TestWorld::new(IVec3::new(1, 1, 1));
+        let chunks = fresh.chunk_list();
+        relight_full(&mut fresh, &chunks);
+        assert_eq!(w.light, fresh.light);
+    }
+
+    #[test]
+    fn full_sky_column_matches_oracle_top_down() {
+        // A vertical column of all-air chunks, lit top-down like the client.
+        let mut w = TestWorld::new(IVec3::new(1, 3, 1));
+        for cy in (0..3).rev() {
+            light_new_chunk(&mut w, IVec3::new(0, cy, 0));
+        }
+        let mut fresh = TestWorld::new(IVec3::new(1, 3, 1));
+        let chunks = fresh.chunk_list();
+        relight_full(&mut fresh, &chunks);
+        assert_eq!(w.light, fresh.light);
+    }
+
+    #[test]
+    fn full_sky_bails_when_block_light_enters() {
+        // Two side-by-side chunks under open sky; the right one has a max-level
+        // emitter on the shared face. Lighting the (all-air) left chunk must see
+        // the block inflow, fall back to the full flood, and match the oracle —
+        // not collapse to a naive uniform sky.
+        let mut w = TestWorld::new(IVec3::new(2, 1, 1));
+        w.emitters.insert(11, 15);
+        w.set_voxel(32, 16, 16, 11); // right chunk, local (0,16,16), on the face
+        light_new_chunk(&mut w, IVec3::new(1, 0, 0)); // right (has emitter)
+        light_new_chunk(&mut w, IVec3::new(0, 0, 0)); // left (must bail)
+
+        // Left saw block light across the face and is not naive-uniform.
+        assert_eq!(w.sky_at(16, 16, 16), 15, "still sky-lit");
+        assert!(w.block_at(31, 16, 16) > 0, "block light crossed into the left chunk");
+
+        let mut fresh = TestWorld::new(IVec3::new(2, 1, 1));
+        fresh.emitters = w.emitters.clone();
+        fresh.voxels = w.voxels.clone();
+        let chunks = fresh.chunk_list();
+        relight_full(&mut fresh, &chunks);
+        for (v, l) in &fresh.light {
+            assert_eq!(w.light.get(v).copied().unwrap_or(0), *l, "mismatch at {v:?}");
+        }
+        for (v, l) in &w.light {
+            assert_eq!(fresh.light.get(v).copied().unwrap_or(0), *l, "extra at {v:?}");
+        }
     }
 }

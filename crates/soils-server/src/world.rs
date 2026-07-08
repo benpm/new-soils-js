@@ -176,8 +176,8 @@ fn run_light_job(mut job: LightJob) -> Vec<(IVec3, ChunkLight, u32)> {
         .map(|&(pos, ver)| {
             let rc = pos - job.origin;
             let slot = ((rc.y * d.z + rc.z) * d.x + rc.x) as usize;
-            let mut out = ChunkLight::dark();
-            out.as_bytes_mut().copy_from_slice(&job.light[slot * 32768..(slot + 1) * 32768]);
+            // Collapse an all-sky / all-dark result to a single byte.
+            let out = ChunkLight::from_bytes_collapsed(&job.light[slot * 32768..(slot + 1) * 32768]);
             (pos, out, ver)
         })
         .collect()
@@ -493,8 +493,7 @@ impl World {
                     job.present[slot] = true;
                     job.voxels[slot * 32768..(slot + 1) * 32768]
                         .copy_from_slice(entry.volume.as_bytes());
-                    job.light[slot * 32768..(slot + 1) * 32768]
-                        .copy_from_slice(entry.light.as_bytes());
+                    entry.light.write_into(&mut job.light[slot * 32768..(slot + 1) * 32768]);
                     job.versions.push((pos, entry.version));
                 }
             }
@@ -896,8 +895,8 @@ mod tests {
 
         for &pos in &chunks {
             assert_eq!(
-                world.chunks[&pos].light.as_bytes(),
-                fresh.chunks[&pos].light.as_bytes(),
+                world.chunks[&pos].light.as_dense_bytes(),
+                fresh.chunks[&pos].light.as_dense_bytes(),
                 "incremental light diverged from fresh relight at {pos}"
             );
         }

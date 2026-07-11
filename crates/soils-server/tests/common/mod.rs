@@ -13,7 +13,6 @@ use soils_protocol::{
     ChunkVolume, ClientMsg, EntityState, InputFrame, ServerMsg, SnapshotTracker, decode,
     decode_chunk, encode,
 };
-use soils_sim::PlayerInput;
 use soils_server::{ServerConfig, ServerHandle};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
@@ -181,19 +180,25 @@ impl Client {
         }
     }
 
-    /// Drive `ticks` fixed ticks of arbitrary input, paced in bursts matched to
-    /// the server's input token refill (64/s) so no frame is dropped. `make(i)`
-    /// builds the input for 0-based tick `i`, so callers can inject one-shot
-    /// edge events (toggle_fly, jump) on chosen ticks.
-    pub async fn drive(&mut self, ticks: u32, mut make: impl FnMut(u32) -> PlayerInput) {
+    /// Fly for `ticks` fixed ticks with forward held, facing `yaw` (0 = -Z,
+    /// -π/2 = +X). Paced in bursts matched to the server's input token refill
+    /// (64/s) so no frame is dropped; players spawn in fly mode, so this moves
+    /// at 8 u/s (32 u/s with `sprint`).
+    pub async fn fly(&mut self, ticks: u32, yaw: f32, sprint: bool) {
         let mut sent = 0;
         while sent < ticks {
             let batch = (ticks - sent).min(16);
             let frames: Vec<InputFrame> = (0..batch)
-                .map(|i| {
+                .map(|_| {
                     self.input_seq += 1;
-                    let (buttons, flags, yaw) = soils_sim::pack_input(&make(sent + i));
-                    InputFrame { seq: self.input_seq, buttons, flags, yaw }
+                    let input = soils_sim::PlayerInput {
+                        move_axes: glam::Vec2::new(0.0, 1.0),
+                        yaw,
+                        sprint,
+                        ..Default::default()
+                    };
+                    let (buttons, flags, yaw_q) = soils_sim::pack_input(&input);
+                    InputFrame { seq: self.input_seq, buttons, flags, yaw: yaw_q }
                 })
                 .collect();
             self.send(&ClientMsg::Inputs { ack_tick: self.tracker.latest_tick, frames }).await;
@@ -202,19 +207,6 @@ impl Client {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
-    }
-
-    /// Fly for `ticks` fixed ticks with forward held, facing `yaw` (0 = -Z,
-    /// -π/2 = +X). Players spawn in fly mode, so this moves at 8 u/s (32 u/s
-    /// with `sprint`).
-    pub async fn fly(&mut self, ticks: u32, yaw: f32, sprint: bool) {
-        self.drive(ticks, |_| PlayerInput {
-            move_axes: glam::Vec2::new(0.0, 1.0),
-            yaw,
-            sprint,
-            ..Default::default()
-        })
-        .await;
     }
 
     /// Send one edit with the next sequence number; returns that `seq`.

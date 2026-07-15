@@ -157,9 +157,33 @@ async fn warp_to_a_new_world_creates_it_on_demand() {
     // The on-demand world is generated and streamed: its spawn chunk arrives.
     // The default world's copy of this chunk was already consumed above, so this
     // one is unambiguously the new world's — proving terrain was generated (not
-    // a crash or an empty stream) after the warp.
+    // a crash or an empty stream) after the warp. Awaiting it also guarantees the
+    // server-side chunk is now resident (it had to generate it to send it).
     let streamed = tokio::time::timeout(Duration::from_secs(20), a.await_chunk(SPAWN_CHUNK)).await;
     assert!(streamed.is_ok(), "on-demand world never streamed its terrain");
+
+    // ...and it is authoritative, not merely streamed: an in-reach edit is
+    // accepted. Editing immediately after the warp echo used to be rejected
+    // because the target chunk wasn't resident yet mid-join; now the terrain is
+    // resident. Retry a few times to absorb the edit-rate bucket / a residency
+    // refcount blip — every attempt gets a definitive response.
+    let mut accepted = false;
+    for _ in 0..5 {
+        let seq = a.edit(NEAR_VOXEL, 5).await;
+        let ok = a
+            .recv_until(|m| match m {
+                ServerMsg::EditAccepted { seq: s, .. } if s == seq => Some(true),
+                ServerMsg::EditRejected { seq: s } if s == seq => Some(false),
+                _ => None,
+            })
+            .await;
+        if ok {
+            accepted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(accepted, "edit into the on-demand world was never accepted");
 }
 
 #[tokio::test]

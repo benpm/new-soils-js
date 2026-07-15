@@ -489,7 +489,13 @@ fn drain_inboxes(
                 let world_name = c.world.clone();
                 let eye = match c.entity.and_then(|e| sims.get(e).ok()) {
                     Some((sim, ..)) => sim.0.pos,
-                    None => continue,
+                    // Entity not yet queryable (e.g. the post-login pre-flush
+                    // window): still answer, so the client never waits forever
+                    // for an ack — every Edit gets exactly one response.
+                    None => {
+                        let _ = c.outbox.send(ServerMsg::EditRejected { seq });
+                        continue;
+                    }
                 };
                 let rate_ok = c.edit_tokens >= 1.0;
                 if rate_ok {

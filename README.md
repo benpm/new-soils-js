@@ -95,6 +95,13 @@ SOILS_WT=1 cargo run -p soils-client   # same, connecting over QUIC datagrams
 > `assets/` folder; a directly-run binary renders empty sky. To run the binary
 > directly, set `BEVY_ASSET_ROOT=crates/soils-client`.
 
+**Server-side scripts** (AssemblyScript → WASM, JIT-run inside the tick): enable
+with `SOILS_SCRIPTS=1 cargo run -p soils-server` (loads `scripts/`, or set
+`SOILS_SCRIPTS_DIR`). Scripts read and mutate authoritative world state and their
+changes replicate to clients normally — see [`scripts/README.md`](scripts/README.md).
+`.ts` needs Node's `asc` (`npm i -g assemblyscript`, or set `SOILS_ASC`);
+precompiled `.wasm`/`.wat` load without any toolchain.
+
 Controls: **WASD** move, **mouse** look, **Shift** sprint, **Space/Ctrl**
 up/down (fly) or jump, **F** toggle fly/walk, **left/right click**
 break/place, **1-9** pick a block, **F3** debug overlay, **/** command

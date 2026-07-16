@@ -3,3 +3,8 @@
 Cargo.lock
 /crates/soils-server/data
 data/
+.claude/worktrees
+scripts/.cache/
+# AssemblyScript toolchain for server scripts (package.json pins the version;
+# run `npm install` to get `asc` so .ts scripts compile).
+node_modules/

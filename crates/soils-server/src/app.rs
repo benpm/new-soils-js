@@ -25,14 +25,15 @@ use avian3d::prelude::{AngularVelocity, LinearVelocity, Position, Rotation};
 use bevy_app::{App, AppExit, FixedUpdate, ScheduleRunnerPlugin, Update};
 use bevy_ecs::message::MessageWriter;
 use bevy_ecs::prelude::{
-    Commands, Component, Entity, IntoScheduleConfigs, Local, Query, Res, ResMut, Resource, With,
-    Without,
+    Commands, Component, Entity, IntoScheduleConfigs, Local, NonSendMut, Query, Res, ResMut,
+    Resource, With, Without,
 };
 use bevy_time::{Fixed, Time, TimePlugin};
 use glam::{IVec2, IVec3, Quat, Vec3};
 use soils_protocol::{
     CHUNK_BIT, ChunkData, ClientMsg, ChunkVolume, QuantState, ServerMsg, encode_snapshot,
 };
+use soils_script::{ScriptCommand, ScriptEvent, ScriptRuntime, ScriptWorld};
 use soils_sim::{KIND_CRITTER, KIND_PHYSICS_CUBE, KIND_PLAYER, nav};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError};
 use tokio::sync::watch;
@@ -266,6 +267,50 @@ impl Worlds {
     }
 }
 
+/// Server-side script runtime (AssemblyScript/WASM), or `None` when scripting
+/// is disabled. Held as a **non-send** resource: `ScriptRuntime` owns wasm
+/// stores with non-`Send` interior, which also pins `run_scripts` to this ECS
+/// thread — exactly where all state lives.
+struct ScriptRt(Option<ScriptRuntime>);
+/// Game events accumulated during a tick and dispatched to script reaction
+/// callbacks by `run_scripts`. Cleared every tick.
+#[derive(Resource, Default)]
+struct ScriptEvents(Vec<ScriptEvent>);
+
+/// A single entity's data, snapshotted for the read-only view scripts consult.
+struct EntityInfo {
+    netid: u32,
+    kind: u16,
+    pos: Vec3,
+}
+
+/// Read view handed to scripts for one `run_scripts` call: live voxels of one
+/// world plus a snapshot of its entities. Borrowed only for the call's span.
+struct ServerScriptWorld<'a> {
+    world: &'a World,
+    entities: &'a [EntityInfo],
+}
+
+impl ScriptWorld for ServerScriptWorld<'_> {
+    fn voxel(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.world.voxel(IVec3::new(x, y, z))
+    }
+    fn entity_count(&self) -> usize {
+        self.entities.len()
+    }
+    fn entity_field(&self, index: usize, field: i32) -> f32 {
+        let Some(e) = self.entities.get(index) else { return 0.0 };
+        match field {
+            0 => e.netid as f32,
+            1 => e.kind as f32,
+            2 => e.pos.x,
+            3 => e.pos.y,
+            4 => e.pos.z,
+            _ => 0.0,
+        }
+    }
+}
+
 /// Build and run the app until the shutdown watch fires. Blocks the calling
 /// thread (the dedicated `soils-ecs` thread).
 pub(crate) fn run_app(
@@ -276,11 +321,32 @@ pub(crate) fn run_app(
     accounts: Arc<Accounts>,
     player_count: Arc<AtomicU16>,
     critters: u16,
+    scripts_dir: Option<PathBuf>,
     physics_enabled: bool,
 ) {
     let mut worlds = Worlds { map: HashMap::new(), data_dir, persist };
     // Pre-create the default world so it's ready before the first client.
     worlds.get_or_create(DEFAULT_WORLD);
+
+    // Optional scripting: build a runtime over the scripts dir (seeded from the
+    // default world so script rng is deterministic). Failure = scripting off.
+    let script_rt = scripts_dir.and_then(|dir| {
+        let seed = world_seed(DEFAULT_WORLD) as i64;
+        match ScriptRuntime::new(&dir, seed) {
+            Ok(rt) => {
+                // No count here: `.ts` compiles run on background threads and
+                // land over the next few ticks, so any number printed now would
+                // be a lie (it read 0 even when scripts were about to load).
+                // Each script announces itself with `[script] loaded …`.
+                println!("scripting enabled: loading scripts from {}", dir.display());
+                Some(rt)
+            }
+            Err(e) => {
+                eprintln!("scripting disabled: {e}");
+                None
+            }
+        }
+    });
 
     let physics = PhysicsCfg { enabled: physics_enabled };
 
@@ -304,6 +370,8 @@ pub(crate) fn run_app(
     .init_resource::<CrittersSpawned>()
     .init_resource::<TickCount>()
     .init_resource::<Clock>()
+    .init_resource::<ScriptEvents>()
+    .insert_non_send_resource(ScriptRt(script_rt))
     .add_systems(Update, check_shutdown)
     .add_systems(
         FixedUpdate,
@@ -311,6 +379,9 @@ pub(crate) fn run_app(
             accept_connections,
             drain_inboxes,
             wander_critters,
+            // Scripts run after inputs/AI mutate state and before
+            // replication, so their edits/spawns replicate the same tick.
+            run_scripts,
             pump_chunk_jobs,
             replicate_entities,
             tick_clock,
@@ -614,6 +685,7 @@ fn drain_inboxes(
     mut next_net: ResMut<NextNetId>,
     critter_count: Res<CritterCount>,
     mut critters_spawned: ResMut<CrittersSpawned>,
+    mut script_events: ResMut<ScriptEvents>,
     physics: Res<PhysicsCfg>,
     mut sims: Query<(&mut SimState, &mut Yaw, &mut InWorld)>,
 ) {
@@ -681,6 +753,7 @@ fn drain_inboxes(
                         );
                         c.self_net = net;
                         c.last_seq = 0;
+                        script_events.0.push(ScriptEvent::PlayerJoin { netid: net as u32 });
                         let _ = c.outbox.send(ServerMsg::Init {
                             id,
                             self_entity: net,
@@ -749,11 +822,23 @@ fn drain_inboxes(
                 let valid = rate_ok
                     && soils_sim::validate_edit(eye, target, value, &world.registry)
                     && world.ensure_resident(soils_protocol::chunk_of(target));
+                // Read the pre-edit block so scripts see the real `old` value.
+                let old = if valid { world.voxel(target) } else { 0 };
                 let applied = valid && world.edit(pos[0], pos[1], pos[2], value);
                 let c = &clients.0[&id];
                 if applied {
                     let _ = c.outbox.send(ServerMsg::EditAccepted { seq, pos, value });
                     send_world(&clients, &world_name, id, &ServerMsg::Edit { pos, value });
+                    // Player edits feed scripts' on_edit (script edits do not, so
+                    // no recursion).
+                    script_events.0.push(ScriptEvent::Edit {
+                        x: pos[0],
+                        y: pos[1],
+                        z: pos[2],
+                        old,
+                        new: value,
+                        by: id as u32,
+                    });
                 } else {
                     let _ = c.outbox.send(ServerMsg::EditRejected { seq });
                 }
@@ -853,9 +938,107 @@ fn drain_inboxes(
             }
             if c.authenticated {
                 player_count.0.fetch_sub(1, Ordering::Relaxed);
+                script_events.0.push(ScriptEvent::PlayerLeave { netid: c.self_net as u32 });
                 let world = worlds.get_or_create(&c.world);
                 for pos in c.subs {
                     world.dec_ref(pos);
+                }
+            }
+        }
+    }
+}
+
+/// Run server scripts for the tick: dispatch this tick's events to reaction
+/// callbacks + `on_tick`, then apply the emitted commands to the authoritative
+/// world. Script voxel edits broadcast as `ServerMsg::Edit`; spawns/despawns/
+/// moves land as ECS changes that `replicate_entities` picks up next.
+///
+/// v1 scopes scripts to the default world. Runs on the ECS thread (non-send
+/// resource); a no-op when scripting is disabled.
+fn run_scripts(
+    time: Res<Time>,
+    tick: Res<TickCount>,
+    mut rt: NonSendMut<ScriptRt>,
+    mut events: ResMut<ScriptEvents>,
+    mut worlds: ResMut<Worlds>,
+    clients: Res<Clients>,
+    mut next_net: ResMut<NextNetId>,
+    mut commands: Commands,
+    mut sims: Query<(Entity, &NetId, &Kind, &mut SimState, &InWorld)>,
+) {
+    // Always clear the event buffer so it can't grow unbounded when disabled.
+    let tick_events = std::mem::take(&mut events.0);
+    let Some(rt) = rt.0.as_mut() else { return };
+    rt.poll(); // hot-reload changed scripts
+
+    let world_name = DEFAULT_WORLD;
+
+    // Snapshot the default world's entities for the read view.
+    let infos: Vec<EntityInfo> = sims
+        .iter()
+        .filter(|(_, _, _, _, w)| w.0 == world_name)
+        .map(|(_, net, kind, sim, _)| EntityInfo { netid: net.0, kind: kind.0, pos: sim.0.pos })
+        .collect();
+
+    // Run scripts against a borrowed read view, collect commands, drop the view.
+    let cmds: Vec<ScriptCommand> = {
+        let world = worlds.get_or_create(world_name);
+        let view = ServerScriptWorld { world, entities: &infos };
+        rt.run(&view, tick.0, time.delta_secs(), &tick_events)
+    };
+    if cmds.is_empty() {
+        return;
+    }
+
+    for cmd in cmds {
+        match cmd {
+            ScriptCommand::Edit { x, y, z, id } => {
+                let world = worlds.get_or_create(world_name);
+                let target = IVec3::new(x, y, z);
+                if world.ensure_resident(soils_protocol::chunk_of(target)) && world.edit(x, y, z, id)
+                {
+                    // No `except` client: broadcast to everyone in the world.
+                    send_world(&clients, world_name, u16::MAX, &ServerMsg::Edit {
+                        pos: [x, y, z],
+                        value: id,
+                    });
+                }
+            }
+            ScriptCommand::Spawn { kind, x, y, z } => {
+                let net = next_net.0;
+                next_net.0 += 1;
+                commands.spawn((
+                    NetId(net),
+                    Kind(kind),
+                    SimState(soils_sim::PlayerState {
+                        pos: Vec3::new(x, y, z),
+                        flying: false,
+                        ..Default::default()
+                    }),
+                    Yaw(0.0),
+                    InWorld(world_name.to_string()),
+                    Wander::new(),
+                ));
+            }
+            ScriptCommand::Despawn { netid } => {
+                for (e, net, _, _, _) in &sims {
+                    if net.0 == netid {
+                        commands.entity(e).despawn();
+                    }
+                }
+            }
+            ScriptCommand::SetVel { netid, x, y, z } => {
+                for (_, net, _, mut sim, _) in &mut sims {
+                    if net.0 == netid {
+                        sim.0.vel = Vec3::new(x, y, z);
+                    }
+                }
+            }
+            ScriptCommand::SetPos { netid, x, y, z } => {
+                for (_, net, _, mut sim, _) in &mut sims {
+                    if net.0 == netid {
+                        sim.0.pos = Vec3::new(x, y, z);
+                    }
                 }
             }
         }

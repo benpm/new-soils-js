@@ -4,6 +4,7 @@ members = [
     "crates/soils-protocol",
     "crates/soils-sim",
     "crates/soils-worldgen",
+    "crates/soils-script",
     "crates/soils-physics",
     "crates/soils-server",
     "crates/soils-client",
@@ -19,6 +20,7 @@ license = "MIT"
 soils-protocol = { path = "crates/soils-protocol" }
 soils-sim = { path = "crates/soils-sim" }
 soils-worldgen = { path = "crates/soils-worldgen" }
+soils-script = { path = "crates/soils-script" }
 soils-physics = { path = "crates/soils-physics" }
 soils-server = { path = "crates/soils-server" }
 serde = { version = "1", features = ["derive"] }
@@ -55,4 +57,7 @@ opt-level = 3
 # The server's LightWorld impl is the per-cell callback layer of the flood —
 # it must be optimized along with the flood itself.
 [profile.dev.package.soils-server]
+opt-level = 3
+# wasmtime's JIT + the host ABI are on the tick path when scripting is enabled.
+[profile.dev.package.soils-script]
 opt-level = 3

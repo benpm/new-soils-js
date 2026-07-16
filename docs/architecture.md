@@ -12,6 +12,7 @@ complete. This is the "what is" companion to the "what should be" plans
 | `soils-protocol` | Wire types + codecs: `ClientMsg`/`ServerMsg` (bincode), the palette+LZ4 chunk codec (`chunk_codec.rs`), the quantized delta-snapshot codec + `SnapshotTracker` (`snapshot.rs`), chunk/voxel coordinates. No Bevy, no tokio. |
 | `soils-worldgen` | Block registry, terrain generation (lattice-interpolated cave noise, early-outs), and the *CPU oracles*: reference greedy mesher (`greedy.rs`) and radiance-cascades math (`radiance.rs`). Pure, unit-tested, criterion-benched. |
 | `soils-sim` | The shared simulation both sides run: player movement/collision (`step_player`), input packing, edit validation, the L0 light flood (`light.rs`), entity registry (`entities.yaml`), and pathfinding (`nav.rs`: walk grids, budgeted A*, HPA*, flow fields). Engine-free, everything over a `VoxelSampler` trait (unloaded space reads as air). |
+| `soils-script` | Server-side scripting host: a wasmtime (Cranelift JIT) runtime that loads AssemblyScript (`.ts`, compiled at runtime via `asc`) or precompiled `.wasm`/`.wat`, exposes a scalar host ABI (`host.rs`) for reading/mutating world state, and runs scripts under a per-call fuel + memory budget (`lib.rs`). No Bevy/tokio. |
 | `soils-physics` | Shared Avian rigid-body physics: config + body/collider builders, `Collider::voxels` terrain conversion (`collider.rs`), the kinematic player-proxy, and the `add_physics` app setup. Used by both server (authority) and client (local prediction), like `soils-sim`. Behind `SOILS_PHYSICS`. |
 | `soils-server` | Headless authoritative server: a Bevy ECS app (`app.rs`) at a 20 Hz fixed tick behind a tokio network edge (`lib.rs`), world/chunk lifecycle + persistence (`world.rs`, `region.rs`, `persist.rs`), accounts (`auth.rs`). |
 | `soils-client` | The Bevy game: net bridge (`net.rs`), chunk streaming + GPU meshing (`server_msg.rs`, `gpu_mesh.rs`, `indirect_draw.rs`), materials + L0 shading (`material.rs`, `light.rs`), radiance-cascades GI (`gi.rs`), prediction (`player.rs`), remote-entity interpolation (`actor.rs`), optimistic edits (`edit.rs`), UI. |
@@ -85,10 +86,11 @@ apart.
 
 - **Tick** (`FixedUpdate`, 20 Hz): accept new connections → drain inboxes
   (auth, input token bucket at the 64 Hz sim rate ×32 burst, edit validation:
-  seq, rate bucket, reach, block id, residency) → critter AI → chunk job
-  pumping → entity replication → clock → world lifecycle. Player movement
-  integrates client inputs through the shared `step_player` at the client dt,
-  so speed-hacking is structurally impossible (scenario-verified).
+  seq, rate bucket, reach, block id, residency) → critter AI → **scripts**
+  (when enabled) → chunk job pumping → entity replication → clock → world
+  lifecycle. Player movement integrates client inputs through the shared
+  `step_player` at the client dt, so speed-hacking is structurally impossible
+  (scenario-verified).
 - **Chunk lifecycle**: subscriptions are server-owned boxes around each
   client (radius + hysteresis); wanted chunks are probed cache→disk on the
   tick and generated on rayon in nearest-first waves (≤8 in flight per
@@ -109,6 +111,36 @@ apart.
   neighbors). Critters seek nearby players via budgeted A*, fall back to
   HPA* (region-portal graph + flat refinement) when the budget can't reach,
   and validate each waypoint against live voxels so edits force repaths.
+
+## Scripting (server-side WASM)
+
+Opt-in (`SOILS_SCRIPTS=1` → `scripts/`, or `SOILS_SCRIPTS_DIR`). The `run_scripts`
+system sits in the tick chain after AI and before replication, so a script's
+mutations replicate the same tick.
+
+- **Runtime**: one wasmtime `Engine` (Cranelift JIT) per server; each script
+  gets its own `Store` + instance. `.ts` sources compile at runtime via `asc`
+  (Node) on a background thread — never on the tick — and hot-reload on change;
+  precompiled `.wasm`/`.wat` load directly. No `asc` → `.ts` skipped, binaries
+  still load.
+- **ABI** (`host.rs`, module `"soils"`, scalar i32/f32 only — no loader/GC
+  bridge): reads (`get_voxel`, `entity_count`/`entity_field`, `seed`, `tick`,
+  deterministic `rng`) resolve against a scoped, borrow-checked read view live
+  only for the call; writes (`edit_voxel`, `spawn`/`despawn`, `set_velocity`/
+  `set_pos`) are **buffered** as commands and applied by the embedder after the
+  call, so wasm never re-enters the ECS mid-borrow.
+- **Lifecycle exports** (all optional): `on_init`, `on_tick(tick, dt)`, and the
+  reaction hooks `on_edit` / `on_player_join` / `on_player_leave` fed from an
+  event buffer the tick systems fill (player edits, logins, disconnects).
+  Script-originated edits do not re-enter `on_edit` (no recursion).
+- **Downstream events → network state**: buffered commands funnel into the
+  *existing* authority paths — `World::edit` + `send_world(ServerMsg::Edit)` for
+  voxels, ECS `spawn`/`despawn`/`SimState` writes for entities — so replication
+  carries them to clients with **no protocol or client changes**.
+- **Isolation**: each callback runs under a fuel budget (a runaway loop traps,
+  the script is disabled until reloaded, its partial output discarded) and a
+  per-instance memory cap; a trap never stalls the tick or crashes the server.
+  Held as a Bevy *non-send* resource, pinning script execution to the ECS thread.
 
 ## Client
 
@@ -180,6 +212,11 @@ share-one-simulation rule as movement, but through the `soils-physics` crate.
   orientation replicates as a unit quaternion, two clients converge on the same
   rest state, and the `SpawnCube` command creates a replicated cube.
   `soils-physics` unit tests cover drop-and-settle and voxel-collider alignment.
+- **Scripting**: `soils-script` unit tests drive inline WAT modules (host
+  reads, buffered writes, event reactions, deterministic rng, fuel-trap
+  disable); `soils-server/tests/scripting.rs` loads a `.wat` fixture and asserts
+  a script's edit/spawn reaches a real protocol client; an `asc`-gated test
+  covers the AssemblyScript compile path (auto-skips without the toolchain).
 - **Visual**: `SOILS_SELFTEST=1` renders, screenshots, and asserts terrain
   presence headlessly; the GI demo scene isolates the bounce for eyeballing;
   CI renders release screenshots under Mesa lavapipe.

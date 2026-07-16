@@ -8,6 +8,7 @@ license.workspace = true
 soils-protocol = { workspace = true }
 soils-sim = { workspace = true }
 soils-worldgen = { workspace = true }
+soils-script = { workspace = true }
 soils-physics = { workspace = true }
 avian3d = { workspace = true }
 glam = { workspace = true }

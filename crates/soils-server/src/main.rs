@@ -15,5 +15,11 @@ async fn main() {
         config.critters = n.parse().unwrap_or(0);
     }
     config.physics = std::env::var("SOILS_PHYSICS").is_ok_and(|v| v != "0");
+    // Scripting: SOILS_SCRIPTS_DIR wins; else SOILS_SCRIPTS=1 loads ./scripts.
+    if let Ok(dir) = std::env::var("SOILS_SCRIPTS_DIR") {
+        config.scripts_dir = Some(dir.into());
+    } else if std::env::var("SOILS_SCRIPTS").is_ok_and(|v| v != "0") {
+        config.scripts_dir = Some("scripts".into());
+    }
     soils_server::run(config).await.expect("server failed");
 }

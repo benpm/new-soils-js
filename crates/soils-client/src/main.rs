@@ -21,6 +21,7 @@ mod login;
 mod material;
 mod net;
 mod pause;
+mod physics;
 mod player;
 mod server_msg;
 mod singleplayer;
@@ -89,6 +90,7 @@ fn main() {
     .insert_resource(discovery::spawn());
 
     server_msg::register(&mut app);
+    physics::register(&mut app);
 
     app.add_systems(
         Startup,

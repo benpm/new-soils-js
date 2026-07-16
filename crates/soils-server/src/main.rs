@@ -14,5 +14,6 @@ async fn main() {
     if let Ok(n) = std::env::var("SOILS_CRITTERS") {
         config.critters = n.parse().unwrap_or(0);
     }
+    config.physics = std::env::var("SOILS_PHYSICS").is_ok_and(|v| v != "0");
     soils_server::run(config).await.expect("server failed");
 }

@@ -47,6 +47,11 @@ pub enum ClientMsg {
     Edit { seq: u32, pos: [i32; 3], value: u8 },
     /// Switch to a (server-created-on-demand) named world.
     Warp { world: String },
+    /// Request a rigid-body physics cube at `pos` (world units). Server-gated
+    /// on `SOILS_PHYSICS`, reach-checked against the authoritative player
+    /// position, and rate-limited like edits. Spawns a replicated
+    /// `KIND_PHYSICS_CUBE` on success.
+    SpawnCube { pos: [f32; 3] },
 }
 
 /// One fixed tick of movement input (see `soils_sim::pack_input`). `seq`
@@ -113,11 +118,14 @@ pub struct ChunkData {
 
 /// One entity's replicated state (full-state form; the delta pipeline of a
 /// later phase replaces this on the wire). `yaw` is a u16 turn fraction
-/// (`soils_sim::pack_input` convention).
+/// (`soils_sim::pack_input` convention). `rot` is a full orientation quaternion
+/// `[x, y, z, w]`, identity for entities that only use `yaw` (players,
+/// critters) and the real body orientation for rigid-body physics entities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityState {
     pub id: u32,
     pub pos: [f32; 3],
     pub velocity: [f32; 3],
     pub yaw: u16,
+    pub rot: [f32; 4],
 }

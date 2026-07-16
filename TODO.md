@@ -144,6 +144,15 @@ what was measured, and what was deferred with rationale. Current-state documenta
       the seam — a third backend implements the same two channels). (game-systems §3, M8)
 
 
+## Networked physics (Avian) — behind `SOILS_PHYSICS`
+- [x] `soils-physics` crate wrapping Avian 0.6 (pinned to bevy 0.18); drop-and-settle + voxel-collider-alignment unit tests.
+- [x] Snapshot codec: optional quantized orientation quaternion (`MASK_ROT`), free for yaw-only entities; round-trip test.
+- [x] Server authoritative Avian world; `KIND_PHYSICS_CUBE` props replicated via the existing interest/snapshot pipeline; real per-chunk `Collider::voxels` terrain around live bodies (rebuilt on edit `version`). Tests: fall+rotation, two-client rest convergence.
+- [x] Client local Avian world: predicts props, rebases to server snapshots past an epsilon; client terrain colliders from `ChunkMap`. Rendered from the predicted transform. (In-game validated.)
+- [x] Kinematic player proxy (server + client) so props are shoved by the player, movement feel unchanged.
+- [x] `spawn`/`cube` console command → `ClientMsg::SpawnCube` (reach-checked, rate-limited); test.
+- [ ] Optional follow-ups: replicate angular velocity (smoother predicted spin); full two-way player via an Avian character controller (ride on / be pushed by props); interpolation plugin for sub-tick smoothing.
+
 ## The First Content Expansion
 - [ ] Robust, neural texture gen techniques for tile gen with constraints to create complex 3d structures based on inferred structural relationships and probabilies from example. Ingest minecraft builds from the internet, parsing them, converting them to a compressed structure format. These should be editable in a new mode in game: structure design. Structure design should allow the instant output of applying the structure generation algorithm to your structure as input. You should be aple to tweak the ruleset that gets generated from your source map. Use techniques from the internet
 - [ ] Create block types (even with no real properties yet) to match all blocks in this Minecraft texture pack: (https://github.com/Unity-Resource-Pack/Unity-Modded). Use data files from the texture pack to help understand which tiles are what. Also, start creating some amount of data parity with minecraft files. Replace existing textures with these.

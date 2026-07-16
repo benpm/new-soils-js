@@ -42,8 +42,10 @@ pub struct KindAssets {
 #[derive(Component)]
 pub struct Actor {
     pub kind: u16,
-    /// Buffered `(tick, eye position, velocity)` snapshots, tick-ascending.
-    buffer: std::collections::VecDeque<(u32, Vec3, Vec3)>,
+    /// Buffered `(tick, eye position, velocity, orientation)` snapshots,
+    /// tick-ascending. Orientation is identity for yaw-only entities and the
+    /// real body quaternion for rigid-body physics entities.
+    buffer: std::collections::VecDeque<(u32, Vec3, Vec3, Quat)>,
 }
 
 /// Render this many server ticks behind the newest snapshot.
@@ -54,38 +56,39 @@ const EXTRAPOLATE_CAP: f32 = 0.25;
 impl Actor {
     pub fn new(kind: u16, tick: u32, pos: Vec3) -> Self {
         let mut buffer = std::collections::VecDeque::new();
-        buffer.push_back((tick, pos, Vec3::ZERO));
+        buffer.push_back((tick, pos, Vec3::ZERO, Quat::IDENTITY));
         Self { kind, buffer }
     }
 
-    pub fn push_snapshot(&mut self, tick: u32, pos: Vec3, vel: Vec3) {
+    pub fn push_snapshot(&mut self, tick: u32, pos: Vec3, vel: Vec3, rot: Quat) {
         if self.buffer.back().is_some_and(|(t, ..)| *t >= tick) {
             return; // stale or duplicate
         }
-        self.buffer.push_back((tick, pos, vel));
+        self.buffer.push_back((tick, pos, vel, rot));
         while self.buffer.len() > 32 {
             self.buffer.pop_front();
         }
     }
 
-    /// Sample the eye position at fractional server tick `t`.
-    fn sample(&mut self, t: f32) -> Option<Vec3> {
+    /// Sample the eye position and orientation at fractional server tick `t`.
+    fn sample(&mut self, t: f32) -> Option<(Vec3, Quat)> {
         // Drop segments entirely behind the render time (keep one anchor).
         while self.buffer.len() >= 2 && (self.buffer[1].0 as f32) <= t {
             self.buffer.pop_front();
         }
-        let &(t0, p0, v0) = self.buffer.front()?;
+        let &(t0, p0, v0, r0) = self.buffer.front()?;
         match self.buffer.get(1) {
-            Some(&(t1, p1, _)) => {
+            Some(&(t1, p1, _, r1)) => {
                 let span = (t1 - t0).max(1) as f32;
                 let f = ((t - t0 as f32) / span).clamp(0.0, 1.0);
-                Some(p0.lerp(p1, f))
+                Some((p0.lerp(p1, f), r0.slerp(r1, f)))
             }
             None => {
-                // Beyond the buffer: extrapolate along the last velocity, capped.
+                // Beyond the buffer: extrapolate along the last velocity, capped;
+                // hold the last orientation.
                 let dt = ((t - t0 as f32) / soils_sim::SERVER_TICK_HZ as f32)
                     .clamp(0.0, EXTRAPOLATE_CAP);
-                Some(p0 + v0 * dt)
+                Some((p0 + v0 * dt, r0))
             }
         }
     }
@@ -129,7 +132,10 @@ pub fn setup_actor_assets(
                 perceptual_roughness: 0.8,
                 ..default()
             });
-            KindAssets { mesh, material, body_drop: hy }
+            // Physics props replicate their body *center* (Avian Position), so
+            // no eye→center drop; players/critters replicate the eye position.
+            let body_drop = if kind == soils_sim::KIND_PHYSICS_CUBE { 0.0 } else { hy };
+            KindAssets { mesh, material, body_drop }
         })
         .collect();
     commands.insert_resource(ActorAssets { kinds });
@@ -155,8 +161,9 @@ pub fn interpolate_actors(
 
     let t = clock.t;
     for (mut transform, mut actor) in &mut query {
-        let Some(eye) = actor.sample(t) else { continue };
+        let Some((eye, rot)) = actor.sample(t) else { continue };
         let drop = assets.kinds.get(actor.kind as usize).map_or(0.9, |k| k.body_drop);
         transform.translation = eye - Vec3::Y * drop;
+        transform.rotation = rot;
     }
 }

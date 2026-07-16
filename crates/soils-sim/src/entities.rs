@@ -58,6 +58,9 @@ pub fn default_entity_registry() -> EntityRegistry {
 /// Well-known kind ids, asserted against the YAML in tests.
 pub const KIND_PLAYER: u16 = 0;
 pub const KIND_CRITTER: u16 = 1;
+/// Server-spawned rigid-body physics prop (Avian). Replicated with a full
+/// orientation quaternion; the client renders it as an oriented cube.
+pub const KIND_PHYSICS_CUBE: u16 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -68,6 +71,7 @@ mod tests {
         let reg = default_entity_registry();
         assert_eq!(reg.id_of("Player"), Some(KIND_PLAYER));
         assert_eq!(reg.id_of("Critter"), Some(KIND_CRITTER));
+        assert_eq!(reg.id_of("PhysicsCube"), Some(KIND_PHYSICS_CUBE));
         let player = reg.get(KIND_PLAYER).unwrap();
         assert_eq!(player.render, "capsule");
         assert!(player.speed > 0.0 && player.half_extents[1] > 0.0);

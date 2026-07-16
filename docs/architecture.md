@@ -12,6 +12,7 @@ complete. This is the "what is" companion to the "what should be" plans
 | `soils-protocol` | Wire types + codecs: `ClientMsg`/`ServerMsg` (bincode), the palette+LZ4 chunk codec (`chunk_codec.rs`), the quantized delta-snapshot codec + `SnapshotTracker` (`snapshot.rs`), chunk/voxel coordinates. No Bevy, no tokio. |
 | `soils-worldgen` | Block registry, terrain generation (lattice-interpolated cave noise, early-outs), and the *CPU oracles*: reference greedy mesher (`greedy.rs`) and radiance-cascades math (`radiance.rs`). Pure, unit-tested, criterion-benched. |
 | `soils-sim` | The shared simulation both sides run: player movement/collision (`step_player`), input packing, edit validation, the L0 light flood (`light.rs`), entity registry (`entities.yaml`), and pathfinding (`nav.rs`: walk grids, budgeted A*, HPA*, flow fields). Engine-free, everything over a `VoxelSampler` trait (unloaded space reads as air). |
+| `soils-physics` | Shared Avian rigid-body physics: config + body/collider builders, `Collider::voxels` terrain conversion (`collider.rs`), the kinematic player-proxy, and the `add_physics` app setup. Used by both server (authority) and client (local prediction), like `soils-sim`. Behind `SOILS_PHYSICS`. |
 | `soils-server` | Headless authoritative server: a Bevy ECS app (`app.rs`) at a 20 Hz fixed tick behind a tokio network edge (`lib.rs`), world/chunk lifecycle + persistence (`world.rs`, `region.rs`, `persist.rs`), accounts (`auth.rs`). |
 | `soils-client` | The Bevy game: net bridge (`net.rs`), chunk streaming + GPU meshing (`server_msg.rs`, `gpu_mesh.rs`, `indirect_draw.rs`), materials + L0 shading (`material.rs`, `light.rs`), radiance-cascades GI (`gi.rs`), prediction (`player.rs`), remote-entity interpolation (`actor.rs`), optimistic edits (`edit.rs`), UI. |
 
@@ -133,6 +134,35 @@ apart.
   2-tick interpolation delay with capped extrapolation. Edits apply
   optimistically with rollback on rejection.
 
+## Physics (Avian, behind `SOILS_PHYSICS`)
+
+Optional 3D rigid-body physics via [Avian](https://github.com/Jondolf/avian) 0.6,
+authoritative on the server and locally predicted on the client — the same
+share-one-simulation rule as movement, but through the `soils-physics` crate.
+
+- **Engine**: Avian, single-threaded + `enhanced-determinism`, stepped in
+  `FixedPostUpdate`. Body state lives in components (`Position`, `Rotation`,
+  `LinearVelocity`), so it snapshots/rebases trivially.
+- **Terrain**: solid voxels become `Collider::voxels` static colliders, one per
+  chunk, maintained only within a small radius of live bodies and rebuilt when
+  a chunk's edit `version` bumps (`maintain_physics_terrain` server-side,
+  `maintain_client_terrain` client-side). Parry's voxel grid matches ours 1:1.
+- **Replication**: physics entities (`KIND_PHYSICS_CUBE`) reuse the entity
+  interest/snapshot pipeline; the snapshot codec gained an optional quantized
+  orientation quaternion (`MASK_ROT`) that yaw-only entities never pay for. The
+  server mirrors Avian state into `SimState`/`BodyRot` before `replicate_entities`.
+- **Client prediction**: a local Avian world mirrors props in interest, predicts
+  them forward, and rebases each to the authoritative snapshot past an epsilon
+  (`soils-client/src/physics.rs`) — the prop analogue of `reconcile_self`. No
+  input to replay, so it's rebase-and-continue, not input-replay rollback.
+- **Player interaction**: the player carries a kinematic Avian proxy driven from
+  `soils-sim` (`player_proxy`), so props are shoved by the player without
+  changing the tuned movement. Full two-way (riding on props) would require
+  moving the player onto an Avian character controller — deferred.
+- **Spawning**: the `spawn`/`cube` console command (→ `ClientMsg::SpawnCube`,
+  reach-checked + rate-limited) drops a cube ahead of the camera; a demo stack
+  also falls near the first player on join.
+
 ## Testing
 
 - **Oracles**: GPU mesher vs CPU greedy mesher (sorted multiset equality);
@@ -146,6 +176,10 @@ apart.
   gate — parallel embedded servers starve the shared rayon pool.
 - **Prediction**: a TCP delay proxy (75 ms each way, 2% input loss) drives a
   headless client twin through convergence and forced-misprediction cases.
+- **Physics** (`soils-server/tests/physics.rs`): a dropped cube falls and its
+  orientation replicates as a unit quaternion, two clients converge on the same
+  rest state, and the `SpawnCube` command creates a replicated cube.
+  `soils-physics` unit tests cover drop-and-settle and voxel-collider alignment.
 - **Visual**: `SOILS_SELFTEST=1` renders, screenshots, and asserts terrain
   presence headlessly; the GI demo scene isolates the bounce for eyeballing;
   CI renders release screenshots under Mesa lavapipe.

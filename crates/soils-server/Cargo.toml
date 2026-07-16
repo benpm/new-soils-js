@@ -8,6 +8,8 @@ license.workspace = true
 soils-protocol = { workspace = true }
 soils-sim = { workspace = true }
 soils-worldgen = { workspace = true }
+soils-physics = { workspace = true }
+avian3d = { workspace = true }
 glam = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tokio-tungstenite = "0.24"

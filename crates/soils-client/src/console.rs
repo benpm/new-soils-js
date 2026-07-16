@@ -1,7 +1,7 @@
 //! A small command console (open with `/`), mirroring the JS command box.
 //! Supported: `tp x y z`, `daytime t`, `loadradius n`, `fog on|off`,
-//! `ao on|off`, `gi on|off`. While open, gameplay input is suppressed (see
-//! `console_closed`).
+//! `ao on|off`, `gi on|off`, `spawn`/`cube` (drop a physics cube ahead of the
+//! camera). While open, gameplay input is suppressed (see `console_closed`).
 
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
@@ -182,6 +182,14 @@ fn run_command(
         "warp" if !args.is_empty() => {
             // Server creates the world on demand and replies with `Warp`.
             net.send(ClientMsg::Warp { world: args[0].to_string() });
+        }
+        "spawn" | "cube" => {
+            // Drop a physics cube a few metres ahead of the camera (server-gated
+            // on SOILS_PHYSICS, reach-checked, rate-limited).
+            if let Ok((_, t)) = player.single() {
+                let pos = t.translation + t.forward() * 3.0;
+                net.send(ClientMsg::SpawnCube { pos: pos.to_array() });
+            }
         }
         _ => {}
     }

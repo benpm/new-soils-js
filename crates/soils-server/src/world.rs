@@ -396,6 +396,12 @@ impl World {
         self.chunks.contains_key(&cpos)
     }
 
+    /// A resident chunk's voxel volume and edit version, for building physics
+    /// colliders (`version` bumps on edit, so a stale collider is rebuilt).
+    pub fn chunk_volume(&self, cpos: IVec3) -> Option<(&ChunkVolume, u32)> {
+        self.chunks.get(&cpos).map(|e| (&e.volume, e.version))
+    }
+
     /// Read one voxel at an absolute position. Unloaded space is Air (id 0) —
     /// the shared `soils-sim` sampler contract, used for server-side player
     /// stepping and edit validation.

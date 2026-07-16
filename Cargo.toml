@@ -4,6 +4,7 @@ members = [
     "crates/soils-protocol",
     "crates/soils-sim",
     "crates/soils-worldgen",
+    "crates/soils-physics",
     "crates/soils-server",
     "crates/soils-client",
     "crates/soils-terrainlab",
@@ -18,9 +19,21 @@ license = "MIT"
 soils-protocol = { path = "crates/soils-protocol" }
 soils-sim = { path = "crates/soils-sim" }
 soils-worldgen = { path = "crates/soils-worldgen" }
+soils-physics = { path = "crates/soils-physics" }
 soils-server = { path = "crates/soils-server" }
 serde = { version = "1", features = ["derive"] }
 bincode = "2"
+# 3D rigid-body physics (Avian). 0.6.1 is the last release tracking bevy 0.18
+# (0.7 needs bevy 0.19). default-features off to drop `parallel` — a
+# single-threaded, deterministic step keeps client prediction/rollback
+# re-simulation matching the original run; `enhanced-determinism` shrinks drift.
+avian3d = { version = "0.6.1", default-features = false, features = [
+    "3d",
+    "f32",
+    "parry-f32",
+    "default-collider",
+    "enhanced-determinism",
+] }
 # Kept in lockstep with the glam version Bevy re-exports, so sim/protocol math
 # types flow into client code without array bridging.
 glam = "0.30"

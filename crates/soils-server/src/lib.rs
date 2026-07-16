@@ -88,6 +88,9 @@ pub struct ServerConfig {
     /// (0 = none). Exercises entity replication; `SOILS_CRITTERS` on the
     /// dedicated binary.
     pub critters: u16,
+    /// Enable Avian rigid-body physics (authoritative world + demo props).
+    /// `SOILS_PHYSICS=1` on the dedicated binary.
+    pub physics: bool,
 }
 
 impl Default for ServerConfig {
@@ -100,6 +103,7 @@ impl Default for ServerConfig {
             discovery_port: DISCOVERY_PORT,
             name: "new-soils".into(),
             critters: 0,
+            physics: false,
         }
     }
 }
@@ -273,8 +277,11 @@ async fn serve(
         let accounts = accounts.clone();
         let player_count = player_count.clone();
         let critters = config.critters;
+        let physics = config.physics;
         std::thread::Builder::new().name("soils-ecs".into()).spawn(move || {
-            app::run_app(conns_rx, shutdown, data_dir, persist, accounts, player_count, critters);
+            app::run_app(
+                conns_rx, shutdown, data_dir, persist, accounts, player_count, critters, physics,
+            );
         })?
     };
 

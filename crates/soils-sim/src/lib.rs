@@ -12,7 +12,8 @@ pub mod light;
 pub mod nav;
 
 pub use entities::{
-    ENTITIES_YAML, EntityDef, EntityRegistry, KIND_CRITTER, KIND_PLAYER, default_entity_registry,
+    ENTITIES_YAML, EntityDef, EntityRegistry, KIND_CRITTER, KIND_PHYSICS_CUBE, KIND_PLAYER,
+    default_entity_registry,
 };
 
 use glam::{IVec3, Quat, Vec2, Vec3};

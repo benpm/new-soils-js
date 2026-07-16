@@ -480,9 +480,15 @@ pub fn apply_entity_spawns(
     local: Res<LocalPlayer>,
     mut map: ResMut<ActorMap>,
     assets: Res<ActorAssets>,
+    physics: Res<crate::physics::ClientPhysics>,
 ) {
     for msg in reader.read() {
         if msg.id == local.self_entity || map.map.contains_key(&msg.id) {
+            continue;
+        }
+        // When the local physics world is on, physics props are simulated and
+        // rendered there, not through the interpolation actor path.
+        if physics.enabled && msg.kind == soils_sim::KIND_PHYSICS_CUBE {
             continue;
         }
         let target = Vec3::from_array(msg.pos);
@@ -524,6 +530,7 @@ pub fn apply_entity_updates(
                     msg.tick,
                     Vec3::from_array(state.pos),
                     Vec3::from_array(state.velocity),
+                    Quat::from_array(state.rot),
                 );
             }
         }

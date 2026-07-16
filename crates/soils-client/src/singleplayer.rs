@@ -31,6 +31,7 @@ impl Singleplayer {
             data_dir: std::path::PathBuf::from("data/singleplayer"),
             enable_discovery: false,
             name: "singleplayer".into(),
+            physics: std::env::var("SOILS_PHYSICS").is_ok_and(|v| v != "0"),
             ..ServerConfig::default()
         })
     }

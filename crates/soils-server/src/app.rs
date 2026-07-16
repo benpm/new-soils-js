@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
+use avian3d::prelude::{AngularVelocity, LinearVelocity, Position, Rotation};
 use bevy_app::{App, AppExit, FixedUpdate, ScheduleRunnerPlugin, Update};
 use bevy_ecs::message::MessageWriter;
 use bevy_ecs::prelude::{
@@ -28,11 +29,11 @@ use bevy_ecs::prelude::{
     Without,
 };
 use bevy_time::{Fixed, Time, TimePlugin};
-use glam::{IVec2, IVec3, Vec3};
+use glam::{IVec2, IVec3, Quat, Vec3};
 use soils_protocol::{
     CHUNK_BIT, ChunkData, ClientMsg, ChunkVolume, QuantState, ServerMsg, encode_snapshot,
 };
-use soils_sim::{KIND_CRITTER, KIND_PLAYER, nav};
+use soils_sim::{KIND_CRITTER, KIND_PHYSICS_CUBE, KIND_PLAYER, nav};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError};
 use tokio::sync::watch;
 
@@ -139,6 +140,40 @@ struct InWorld(String);
 #[derive(Component)]
 #[allow(dead_code)] // client id: read when gameplay systems need "who did it"
 struct PlayerControlled(u16);
+/// Marks an Avian rigid-body entity whose transform is driven by the physics
+/// world (not `soils-sim`). Its `SimState`/`BodyRot` are mirrored from Avian
+/// each tick so the existing replication path ships them.
+#[derive(Component)]
+struct PhysicsBody;
+/// Full orientation of a physics entity, mirrored from Avian `Rotation` and
+/// replicated (identity for yaw-only entities, which don't carry it).
+#[derive(Component)]
+struct BodyRot(Quat);
+/// Marks a player entity that has been given a kinematic Avian collider so
+/// physics props collide with (and are shoved by) the player. The player's
+/// motion is still `soils-sim`; this proxy is driven from `SimState`, never the
+/// other way around, so movement feel is unchanged.
+#[derive(Component)]
+struct PlayerProxy;
+
+/// Whether Avian physics is enabled (`SOILS_PHYSICS=1`). Off → the server runs
+/// exactly as before, no physics world, no demo props.
+#[derive(Resource, Clone, Copy)]
+struct PhysicsCfg {
+    enabled: bool,
+}
+
+/// Static Avian terrain colliders, one `Collider::voxels` entity per resident
+/// chunk near an active physics body. Keyed by (world, chunk); the stored
+/// `version` mirrors the chunk's edit version so an edited chunk's collider is
+/// rebuilt. Bounded to the neighbourhood of live bodies, not the whole world.
+#[derive(Resource, Default)]
+struct PhysicsTerrain {
+    colliders: HashMap<(String, IVec3), (Entity, u32)>,
+}
+
+/// Chebyshev chunk radius of terrain kept collidable around each physics body.
+const TERRAIN_COLLIDER_RADIUS: i32 = 1;
 /// Critter AI (plan §10 stage-2 consumer): wander until a player is in range,
 /// then A*-path to the ground under them and follow the waypoints.
 #[derive(Component)]
@@ -220,6 +255,11 @@ impl Worlds {
         }
         self.map.get_mut(name).unwrap()
     }
+
+    /// Read-only lookup (physics colliders read chunk voxels without mutating).
+    fn world(&self, name: &str) -> Option<&World> {
+        self.map.get(name)
+    }
 }
 
 /// Build and run the app until the shutdown watch fires. Blocks the calling
@@ -232,45 +272,239 @@ pub(crate) fn run_app(
     accounts: Arc<Accounts>,
     player_count: Arc<AtomicU16>,
     critters: u16,
+    physics_enabled: bool,
 ) {
     let mut worlds = Worlds { map: HashMap::new(), data_dir, persist };
     // Pre-create the default world so it's ready before the first client.
     worlds.get_or_create(DEFAULT_WORLD);
 
-    App::new()
-        .add_plugins((
-            TimePlugin,
-            // The loop sleep only bounds tick jitter; FixedUpdate fires at
-            // SERVER_TICK_HZ via the Time<Fixed> accumulator.
-            ScheduleRunnerPlugin::run_loop(Duration::from_millis(5)),
-        ))
-        .insert_resource(Time::<Fixed>::from_hz(soils_sim::SERVER_TICK_HZ))
-        .insert_resource(NetRx(conns))
-        .insert_resource(ShutdownRx(shutdown))
-        .insert_resource(AccountsRes(accounts))
-        .insert_resource(PlayerCount(player_count))
-        .insert_resource(Clients(HashMap::new()))
-        .insert_resource(worlds)
-        .insert_resource(NextNetId(1))
-        .insert_resource(CritterCount(critters))
-        .init_resource::<CrittersSpawned>()
-        .init_resource::<TickCount>()
-        .init_resource::<Clock>()
-        .add_systems(Update, check_shutdown)
-        .add_systems(
+    let physics = PhysicsCfg { enabled: physics_enabled };
+
+    let mut app = App::new();
+    app.add_plugins((
+        TimePlugin,
+        // The loop sleep only bounds tick jitter; FixedUpdate fires at
+        // SERVER_TICK_HZ via the Time<Fixed> accumulator.
+        ScheduleRunnerPlugin::run_loop(Duration::from_millis(5)),
+    ))
+    .insert_resource(Time::<Fixed>::from_hz(soils_sim::SERVER_TICK_HZ))
+    .insert_resource(NetRx(conns))
+    .insert_resource(ShutdownRx(shutdown))
+    .insert_resource(AccountsRes(accounts))
+    .insert_resource(PlayerCount(player_count))
+    .insert_resource(Clients(HashMap::new()))
+    .insert_resource(worlds)
+    .insert_resource(NextNetId(1))
+    .insert_resource(CritterCount(critters))
+    .insert_resource(physics)
+    .init_resource::<CrittersSpawned>()
+    .init_resource::<TickCount>()
+    .init_resource::<Clock>()
+    .add_systems(Update, check_shutdown)
+    .add_systems(
+        FixedUpdate,
+        (
+            accept_connections,
+            drain_inboxes,
+            wander_critters,
+            pump_chunk_jobs,
+            replicate_entities,
+            tick_clock,
+            world_lifecycle,
+        )
+            .chain(),
+    );
+
+    if physics.enabled {
+        println!("physics enabled: Avian rigid-body simulation (SOILS_PHYSICS)");
+        // Avian steps in FixedPostUpdate (after our FixedUpdate chain). Mirror
+        // its results into the replication components just before
+        // `replicate_entities`, and lazily drop a demo prop stack once a player
+        // is in-world to observe.
+        soils_physics::add_physics(&mut app);
+        app.init_resource::<PhysicsTerrain>();
+        app.add_systems(
             FixedUpdate,
             (
-                accept_connections,
-                drain_inboxes,
-                wander_critters,
-                pump_chunk_jobs,
-                replicate_entities,
-                tick_clock,
-                world_lifecycle,
+                maintain_physics_terrain,
+                attach_player_proxies,
+                sync_player_proxies,
+                spawn_physics_demo,
+                sync_physics_to_replication,
             )
-                .chain(),
-        )
-        .run();
+                .chain()
+                .after(drain_inboxes)
+                .before(replicate_entities),
+        );
+    }
+
+    app.run();
+}
+
+/// Give every player a kinematic Avian collider once (so props collide with
+/// them). Idempotent via the [`PlayerProxy`] marker.
+fn attach_player_proxies(
+    mut commands: Commands,
+    players: Query<(Entity, &SimState), (With<PlayerControlled>, Without<PlayerProxy>)>,
+) {
+    for (entity, sim) in &players {
+        commands.entity(entity).insert((PlayerProxy, soils_physics::player_proxy(sim.0.pos)));
+    }
+}
+
+/// Drive each player proxy from its authoritative `soils-sim` state (position +
+/// velocity) so Avian shoves nearby props the way the player moves. Runs before
+/// the physics step.
+fn sync_player_proxies(
+    mut players: Query<(&SimState, &mut Position, &mut LinearVelocity), With<PlayerProxy>>,
+) {
+    for (sim, mut pos, mut vel) in &mut players {
+        pos.0 = soils_physics::player_center(sim.0.pos);
+        vel.0 = sim.0.vel;
+    }
+}
+
+/// Mirror each physics body's Avian state into the replication components so
+/// the existing `replicate_entities` path ships it. Runs before replication;
+/// the Avian values are last tick's post-step results (physics runs in
+/// `FixedPostUpdate`, after this).
+fn sync_physics_to_replication(
+    mut bodies: Query<
+        (&Position, &Rotation, &LinearVelocity, &mut SimState, &mut BodyRot),
+        With<PhysicsBody>,
+    >,
+) {
+    for (pos, rot, vel, mut sim, mut body_rot) in &mut bodies {
+        sim.0.pos = pos.0;
+        sim.0.vel = vel.0;
+        body_rot.0 = rot.0;
+    }
+}
+
+/// Keep a static `Collider::voxels` entity resident for every chunk within
+/// [`TERRAIN_COLLIDER_RADIUS`] of an active physics body, so bodies collide
+/// with real terrain. Bounded to live bodies' neighbourhoods; rebuilt when a
+/// chunk's edit version changes; despawned when no body is nearby. Runs before
+/// `replicate_entities` (and before physics steps in `FixedPostUpdate`).
+fn maintain_physics_terrain(
+    bodies: Query<(&SimState, &InWorld), With<PhysicsBody>>,
+    worlds: Res<Worlds>,
+    mut terrain: ResMut<PhysicsTerrain>,
+    mut commands: Commands,
+) {
+    // Chunks that should have a collider this tick (world, chunk pos).
+    let mut needed: HashSet<(String, IVec3)> = HashSet::new();
+    for (sim, in_world) in &bodies {
+        let bc = IVec3::new(
+            (sim.0.pos.x.floor() as i32) >> CHUNK_BIT,
+            (sim.0.pos.y.floor() as i32) >> CHUNK_BIT,
+            (sim.0.pos.z.floor() as i32) >> CHUNK_BIT,
+        );
+        let r = TERRAIN_COLLIDER_RADIUS;
+        for dx in -r..=r {
+            for dy in -r..=r {
+                for dz in -r..=r {
+                    needed.insert((in_world.0.clone(), bc + IVec3::new(dx, dy, dz)));
+                }
+            }
+        }
+    }
+
+    // Despawn colliders no longer needed.
+    terrain.colliders.retain(|key, (entity, _)| {
+        if needed.contains(key) {
+            true
+        } else {
+            commands.entity(*entity).despawn();
+            false
+        }
+    });
+
+    // Spawn/rebuild colliders for needed, resident chunks.
+    for key in &needed {
+        let (world_name, cpos) = key;
+        let Some(world) = worlds.world(world_name) else { continue };
+        let Some((volume, version)) = world.chunk_volume(*cpos) else { continue };
+        match terrain.colliders.get(key) {
+            Some((_, v)) if *v == version => continue, // up to date
+            Some((old, _)) => commands.entity(*old).despawn(), // edited → rebuild
+            None => {}
+        }
+        let Some(bundle) = soils_physics::chunk_collider_bundle(*cpos, volume) else {
+            // All-air chunk: no collider, but remember we've covered it so we
+            // don't rescan every tick (version guards edits that add solids).
+            terrain.colliders.remove(key);
+            continue;
+        };
+        let entity = commands.spawn(bundle).id();
+        terrain.colliders.insert(key.clone(), (entity, version));
+    }
+}
+
+/// One-shot demo: once a player is in the default world, drop a small stack of
+/// spinning physics cubes onto the terrain surface beneath them, so the
+/// networked physics is visible. Server-only; the cubes replicate as
+/// `KIND_PHYSICS_CUBE` entities and land on the real per-chunk terrain
+/// colliders maintained by [`maintain_physics_terrain`].
+fn spawn_physics_demo(
+    mut done: Local<bool>,
+    players: Query<(&SimState, &InWorld), With<PlayerControlled>>,
+    worlds: Res<Worlds>,
+    mut commands: Commands,
+    mut next_net: ResMut<NextNetId>,
+) {
+    if *done {
+        return;
+    }
+    let Some((sim, in_world)) = players.iter().find(|(_, w)| w.0 == DEFAULT_WORLD) else {
+        return;
+    };
+    let feet = sim.0.pos - Vec3::Y * soils_sim::EYE_TO_FEET;
+
+    // Find the terrain surface directly beneath the player (highest solid voxel
+    // in resident terrain); drop the stack a few metres above it. If the column
+    // isn't resident yet, wait for a later tick.
+    let Some(world) = worlds.world(&in_world.0) else { return };
+    let fx = feet.x.floor() as i32;
+    let fz = feet.z.floor() as i32;
+    let feet_y = feet.y.floor() as i32;
+    let surface = (feet_y - 48..=feet_y)
+        .rev()
+        .find(|&y| world.voxel(IVec3::new(fx, y, fz)) != 0);
+    let Some(surface_y) = surface else { return };
+    *done = true;
+
+    let base = Vec3::new(feet.x, surface_y as f32 + 6.0, feet.z);
+    // A 3-cube stack, each given a spin so the replicated orientation is
+    // non-trivial as they fall and settle.
+    for i in 0..3u32 {
+        let pos = base + Vec3::Y * (i as f32 * 1.2);
+        spawn_physics_cube(&mut commands, &mut next_net, &in_world.0, pos, Vec3::new(1.5, 2.0, 0.5));
+    }
+}
+
+/// Spawn one replicated rigid-body cube at `pos` with initial angular velocity
+/// `spin`. Shared by the demo and the `SpawnCube` command.
+fn spawn_physics_cube(
+    commands: &mut Commands,
+    next_net: &mut NextNetId,
+    world: &str,
+    pos: Vec3,
+    spin: Vec3,
+) {
+    let net = next_net.0;
+    next_net.0 += 1;
+    commands.spawn((
+        NetId(net),
+        Kind(KIND_PHYSICS_CUBE),
+        SimState(soils_sim::PlayerState { pos, ..Default::default() }),
+        Yaw(0.0),
+        InWorld(world.to_string()),
+        PhysicsBody,
+        BodyRot(Quat::IDENTITY),
+        soils_physics::cube_body(pos, 1.0),
+        AngularVelocity(spin),
+    ));
 }
 
 fn check_shutdown(
@@ -366,6 +600,7 @@ fn drain_inboxes(
     mut next_net: ResMut<NextNetId>,
     critter_count: Res<CritterCount>,
     mut critters_spawned: ResMut<CrittersSpawned>,
+    physics: Res<PhysicsCfg>,
     mut sims: Query<(&mut SimState, &mut Yaw, &mut InWorld)>,
 ) {
     // Phase 1: refill rate buckets and pull everything out of the inboxes.
@@ -497,10 +732,10 @@ fn drain_inboxes(
                 }
                 let target = IVec3::new(pos[0], pos[1], pos[2]);
                 let world = worlds.get_or_create(&world_name);
-                let applied = rate_ok
+                let valid = rate_ok
                     && soils_sim::validate_edit(eye, target, value, &world.registry)
-                    && world.ensure_resident(soils_protocol::chunk_of(target))
-                    && world.edit(pos[0], pos[1], pos[2], value);
+                    && world.ensure_resident(soils_protocol::chunk_of(target));
+                let applied = valid && world.edit(pos[0], pos[1], pos[2], value);
                 let c = &clients.0[&id];
                 if applied {
                     let _ = c.outbox.send(ServerMsg::EditAccepted { seq, pos, value });
@@ -536,6 +771,31 @@ fn drain_inboxes(
                 if c.center != Some(pc) {
                     c.center = Some(pc);
                     resubscribe(c, world);
+                }
+            }
+            ClientMsg::SpawnCube { pos } => {
+                // Physics-gated, reach-checked against the authoritative player
+                // position, and rate-limited via the edit token bucket.
+                if !physics.enabled {
+                    continue;
+                }
+                let c = clients.0.get_mut(&id).unwrap();
+                let world_name = c.world.clone();
+                let eye = match c.entity.and_then(|e| sims.get(e).ok()) {
+                    Some((sim, ..)) => sim.0.pos,
+                    None => continue,
+                };
+                let p = Vec3::from_array(pos);
+                let in_reach = (p - eye).length() <= soils_sim::REACH as f32 + 2.0;
+                if c.edit_tokens >= 1.0 && in_reach {
+                    c.edit_tokens -= 1.0;
+                    spawn_physics_cube(
+                        &mut commands,
+                        &mut next_net,
+                        &world_name,
+                        p,
+                        Vec3::new(1.0, 1.5, 0.5),
+                    );
                 }
             }
             ClientMsg::Warp { world: name } => {
@@ -908,7 +1168,7 @@ fn chunk_of(v: IVec3) -> IVec3 {
 fn replicate_entities(
     ticks: Res<TickCount>,
     mut clients: ResMut<Clients>,
-    entities: Query<(&NetId, &Kind, &InWorld, &SimState, &Yaw)>,
+    entities: Query<(&NetId, &Kind, &InWorld, &SimState, &Yaw, Option<&BodyRot>)>,
 ) {
     struct Snap {
         net: u32,
@@ -917,17 +1177,25 @@ fn replicate_entities(
         quant: QuantState,
     }
     let mut by_col: HashMap<(&str, IVec2), Vec<Snap>> = HashMap::new();
-    for (net, kind, in_world, sim, yaw) in &entities {
+    for (net, kind, in_world, sim, yaw, body_rot) in &entities {
         let col = IVec2::new(
             (sim.0.pos.x.floor() as i32) >> CHUNK_BIT,
             (sim.0.pos.z.floor() as i32) >> CHUNK_BIT,
         );
         let yaw_q = soils_sim::pack_yaw(yaw.0);
+        let pos = sim.0.pos.to_array();
+        let vel = sim.0.vel.to_array();
+        // Physics bodies carry a full orientation; everything else is yaw-only
+        // and pays nothing extra on the wire (identity rot → MASK_ROT unset).
+        let quant = match body_rot {
+            Some(rot) => QuantState::quantize_with_rot(pos, vel, yaw_q, rot.0.to_array()),
+            None => QuantState::quantize(pos, vel, yaw_q),
+        };
         by_col.entry((in_world.0.as_str(), col)).or_default().push(Snap {
             net: net.0,
             kind: kind.0,
-            pos: sim.0.pos.to_array(),
-            quant: QuantState::quantize(sim.0.pos.to_array(), sim.0.vel.to_array(), yaw_q),
+            pos,
+            quant,
         });
     }
     let tick = ticks.0 as u32;

@@ -9,6 +9,8 @@ soils-protocol = { workspace = true }
 soils-sim = { workspace = true }
 soils-worldgen = { workspace = true }
 soils-server = { workspace = true }
+soils-physics = { workspace = true }
+avian3d = { workspace = true }
 bevy = "0.18"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }

@@ -128,4 +128,7 @@ pub struct EntityState {
     pub velocity: [f32; 3],
     pub yaw: u16,
     pub rot: [f32; 4],
+    /// Angular velocity (rad/s), zero for yaw-only entities. Lets the client
+    /// predict a physics body's spin between snapshots.
+    pub angvel: [f32; 3],
 }

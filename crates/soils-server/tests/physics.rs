@@ -40,8 +40,14 @@ async fn physics_cube_falls_and_replicates_rotation() {
     a.await_entity(cube, |s| s.pos[1] < first.pos[1] - 1.0).await;
 
     // Tumbles: it was spawned with angular velocity, so the replicated
-    // orientation leaves identity ([0,0,0,1] → w drops below ~1).
-    let rotated = a.await_entity(cube, |s| s.rot[3].abs() < 0.99).await;
+    // orientation leaves identity ([0,0,0,1] → w drops below ~1) and the
+    // angular velocity itself replicates non-zero (used for client spin
+    // prediction).
+    let rotated = a
+        .await_entity(cube, |s| {
+            s.rot[3].abs() < 0.99 && s.angvel.iter().map(|a| a * a).sum::<f32>() > 0.5
+        })
+        .await;
 
     // The quaternion round-trips as (roughly) unit-length through quantization.
     let n = rotated.rot.iter().map(|c| c * c).sum::<f32>().sqrt();

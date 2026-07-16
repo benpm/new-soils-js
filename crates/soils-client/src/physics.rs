@@ -147,22 +147,34 @@ fn spawn_physics_bodies(
     }
 }
 
-/// Rebase a predicted body to the server's authoritative state when the local
-/// prediction has drifted past [`REBASE_EPSILON`]; otherwise keep predicting.
+/// Reconcile a predicted body against the server's authoritative state.
+/// Velocities (linear + angular) are corrected every snapshot — setting a
+/// derivative is visually smooth and keeps the predicted trajectory/spin
+/// tracking — while position and orientation are only hard-snapped when the
+/// local prediction has drifted past [`REBASE_EPSILON`], so small mismatches
+/// don't pop.
 fn correct_physics_bodies(
     mut reader: MessageReader<EntitiesUpdated>,
     actors: Res<PhysicsActors>,
-    mut bodies: Query<(&mut Position, &mut Rotation, &mut LinearVelocity)>,
+    mut bodies: Query<(
+        &mut Position,
+        &mut Rotation,
+        &mut LinearVelocity,
+        &mut AngularVelocity,
+    )>,
 ) {
     for msg in reader.read() {
         for state in &msg.states {
             let Some(&entity) = actors.map.get(&state.id) else { continue };
-            let Ok((mut pos, mut rot, mut vel)) = bodies.get_mut(entity) else { continue };
+            let Ok((mut pos, mut rot, mut vel, mut angvel)) = bodies.get_mut(entity) else {
+                continue;
+            };
+            vel.0 = Vec3::from_array(state.velocity);
+            angvel.0 = Vec3::from_array(state.angvel);
             let server_pos = Vec3::from_array(state.pos);
             if (pos.0 - server_pos).length() > REBASE_EPSILON {
                 pos.0 = server_pos;
                 rot.0 = Quat::from_array(state.rot);
-                vel.0 = Vec3::from_array(state.velocity);
             }
         }
     }

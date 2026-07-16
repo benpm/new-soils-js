@@ -149,6 +149,10 @@ struct PhysicsBody;
 /// replicated (identity for yaw-only entities, which don't carry it).
 #[derive(Component)]
 struct BodyRot(Quat);
+/// Angular velocity of a physics entity, mirrored from Avian and replicated so
+/// the client can predict its spin between snapshots.
+#[derive(Component)]
+struct BodyAngVel(Vec3);
 /// Marks a player entity that has been given a kinematic Avian collider so
 /// physics props collide with (and are shoved by) the player. The player's
 /// motion is still `soils-sim`; this proxy is driven from `SimState`, never the
@@ -370,14 +374,23 @@ fn sync_player_proxies(
 /// `FixedPostUpdate`, after this).
 fn sync_physics_to_replication(
     mut bodies: Query<
-        (&Position, &Rotation, &LinearVelocity, &mut SimState, &mut BodyRot),
+        (
+            &Position,
+            &Rotation,
+            &LinearVelocity,
+            &AngularVelocity,
+            &mut SimState,
+            &mut BodyRot,
+            &mut BodyAngVel,
+        ),
         With<PhysicsBody>,
     >,
 ) {
-    for (pos, rot, vel, mut sim, mut body_rot) in &mut bodies {
+    for (pos, rot, vel, angvel, mut sim, mut body_rot, mut body_angvel) in &mut bodies {
         sim.0.pos = pos.0;
         sim.0.vel = vel.0;
         body_rot.0 = rot.0;
+        body_angvel.0 = angvel.0;
     }
 }
 
@@ -502,6 +515,7 @@ fn spawn_physics_cube(
         InWorld(world.to_string()),
         PhysicsBody,
         BodyRot(Quat::IDENTITY),
+        BodyAngVel(spin),
         soils_physics::cube_body(pos, 1.0),
         AngularVelocity(spin),
     ));
@@ -1168,7 +1182,15 @@ fn chunk_of(v: IVec3) -> IVec3 {
 fn replicate_entities(
     ticks: Res<TickCount>,
     mut clients: ResMut<Clients>,
-    entities: Query<(&NetId, &Kind, &InWorld, &SimState, &Yaw, Option<&BodyRot>)>,
+    entities: Query<(
+        &NetId,
+        &Kind,
+        &InWorld,
+        &SimState,
+        &Yaw,
+        Option<&BodyRot>,
+        Option<&BodyAngVel>,
+    )>,
 ) {
     struct Snap {
         net: u32,
@@ -1177,7 +1199,7 @@ fn replicate_entities(
         quant: QuantState,
     }
     let mut by_col: HashMap<(&str, IVec2), Vec<Snap>> = HashMap::new();
-    for (net, kind, in_world, sim, yaw, body_rot) in &entities {
+    for (net, kind, in_world, sim, yaw, body_rot, body_angvel) in &entities {
         let col = IVec2::new(
             (sim.0.pos.x.floor() as i32) >> CHUNK_BIT,
             (sim.0.pos.z.floor() as i32) >> CHUNK_BIT,
@@ -1185,10 +1207,13 @@ fn replicate_entities(
         let yaw_q = soils_sim::pack_yaw(yaw.0);
         let pos = sim.0.pos.to_array();
         let vel = sim.0.vel.to_array();
-        // Physics bodies carry a full orientation; everything else is yaw-only
-        // and pays nothing extra on the wire (identity rot → MASK_ROT unset).
+        // Physics bodies carry a full orientation + spin; everything else is
+        // yaw-only and pays nothing extra on the wire (identity/zero → unset).
         let quant = match body_rot {
-            Some(rot) => QuantState::quantize_with_rot(pos, vel, yaw_q, rot.0.to_array()),
+            Some(rot) => {
+                let angvel = body_angvel.map_or([0.0; 3], |a| a.0.to_array());
+                QuantState::quantize_body(pos, vel, yaw_q, rot.0.to_array(), angvel)
+            }
             None => QuantState::quantize(pos, vel, yaw_q),
         };
         by_col.entry((in_world.0.as_str(), col)).or_default().push(Snap {

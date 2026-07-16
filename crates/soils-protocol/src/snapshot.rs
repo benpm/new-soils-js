@@ -17,6 +17,8 @@
 //!     [ROT]  4 × i16 LE         (absolute quaternion x,y,z,w, fixed-point
 //!            1/32767; only for rigid-body physics entities — omitted when the
 //!            orientation is identity, so yaw-only entities never carry it)
+//!     [ANGVEL] 3 × i16 LE       (absolute angular velocity, fixed-point 1/256
+//!            rad/s; physics bodies only, omitted when zero)
 //! ```
 //!
 //! Quantized integers are the single source of truth on both ends — deltas
@@ -47,20 +49,24 @@ const MASK_YAW: u8 = 1 << 3;
 /// Orientation quaternion present (physics bodies only; identity → omitted, so
 /// yaw-only entities never pay for it).
 const MASK_ROT: u8 = 1 << 4;
+/// Angular velocity present (physics bodies only; zero → omitted). Lets the
+/// client predict a body's spin between snapshots instead of holding it fixed.
+const MASK_ANGVEL: u8 = 1 << 5;
 
-/// One entity's quantized replicated state. `rot` is a quantized orientation
-/// quaternion, identity for entities that only rotate about yaw.
+/// One entity's quantized replicated state. `rot`/`angvel` are the rigid-body
+/// orientation and spin, left at identity/zero for entities that only use yaw.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct QuantState {
     pub pos: [i32; 3],
     pub vel: [i16; 3],
     pub yaw: u16,
     pub rot: [i16; 4],
+    pub angvel: [i16; 3],
 }
 
 impl Default for QuantState {
     fn default() -> Self {
-        Self { pos: [0; 3], vel: [0; 3], yaw: 0, rot: IDENTITY_ROT }
+        Self { pos: [0; 3], vel: [0; 3], yaw: 0, rot: IDENTITY_ROT, angvel: [0; 3] }
     }
 }
 
@@ -75,18 +81,33 @@ impl QuantState {
         )
     }
 
-    /// Yaw-only entities (players, critters): orientation stays identity.
+    /// Yaw-only entities (players, critters): orientation/spin stay at rest.
     pub fn quantize(pos: [f32; 3], vel: [f32; 3], yaw: u16) -> Self {
         let (pos, vel) = Self::quantize_pos_vel(pos, vel);
-        Self { pos, vel, yaw, rot: IDENTITY_ROT }
+        Self { pos, vel, yaw, rot: IDENTITY_ROT, angvel: [0; 3] }
     }
 
-    /// Rigid-body physics entities: full orientation quaternion `[x, y, z, w]`.
-    pub fn quantize_with_rot(pos: [f32; 3], vel: [f32; 3], yaw: u16, rot: [f32; 4]) -> Self {
+    /// Rigid-body physics entities: full orientation quaternion `[x, y, z, w]`
+    /// and angular velocity (rad/s).
+    pub fn quantize_body(
+        pos: [f32; 3],
+        vel: [f32; 3],
+        yaw: u16,
+        rot: [f32; 4],
+        angvel: [f32; 3],
+    ) -> Self {
         let (qpos, qvel) = Self::quantize_pos_vel(pos, vel);
         let qr = |v: f32| ((v * QUAT_QUANT).round() as i32).clamp(i16::MIN as i32, i16::MAX as i32)
             as i16;
-        Self { pos: qpos, vel: qvel, yaw, rot: [qr(rot[0]), qr(rot[1]), qr(rot[2]), qr(rot[3])] }
+        let qa = |v: f32| ((v * QUANT).round() as i32).clamp(i16::MIN as i32, i16::MAX as i32)
+            as i16;
+        Self {
+            pos: qpos,
+            vel: qvel,
+            yaw,
+            rot: [qr(rot[0]), qr(rot[1]), qr(rot[2]), qr(rot[3])],
+            angvel: [qa(angvel[0]), qa(angvel[1]), qa(angvel[2])],
+        }
     }
 
     pub fn dequantize(&self, id: u32) -> EntityState {
@@ -108,6 +129,11 @@ impl QuantState {
                 self.rot[1] as f32 / QUAT_QUANT,
                 self.rot[2] as f32 / QUAT_QUANT,
                 self.rot[3] as f32 / QUAT_QUANT,
+            ],
+            angvel: [
+                self.angvel[0] as f32 / QUANT,
+                self.angvel[1] as f32 / QUANT,
+                self.angvel[2] as f32 / QUANT,
             ],
         }
     }
@@ -162,11 +188,14 @@ pub fn encode_snapshot(
         let base = baseline(id);
         let (mask, dpos) = match base {
             None => {
-                // FULL is self-contained: pos/vel/yaw always, rot only when the
-                // body is actually rotated (yaw-only entities stay identity).
+                // FULL is self-contained: pos/vel/yaw always, rot/angvel only
+                // when non-trivial (yaw-only entities stay identity/zero).
                 let mut mask = MASK_FULL | MASK_POS | MASK_VEL | MASK_YAW;
                 if state.rot != IDENTITY_ROT {
                     mask |= MASK_ROT;
+                }
+                if state.angvel != [0; 3] {
+                    mask |= MASK_ANGVEL;
                 }
                 (mask, state.pos)
             }
@@ -188,6 +217,9 @@ pub fn encode_snapshot(
                 }
                 if state.rot != b.rot {
                     mask |= MASK_ROT;
+                }
+                if state.angvel != b.angvel {
+                    mask |= MASK_ANGVEL;
                 }
                 (mask, dpos)
             }
@@ -211,6 +243,12 @@ pub fn encode_snapshot(
             // physics bodies that are actually turning.
             for r in state.rot {
                 body.extend_from_slice(&r.to_le_bytes());
+            }
+        }
+        if mask & MASK_ANGVEL != 0 {
+            // Absolute angular velocity (3 × i16 LE, 1/256 rad/s).
+            for a in state.angvel {
+                body.extend_from_slice(&a.to_le_bytes());
             }
         }
     }
@@ -312,14 +350,24 @@ impl SnapshotTracker {
                 }
                 rot = Some(r);
             }
+            let mut angvel = None;
+            if mask & MASK_ANGVEL != 0 {
+                let mut a = [0i16; 3];
+                for slot in &mut a {
+                    *slot = i16::from_le_bytes(body.get(at..at + 2)?.try_into().ok()?);
+                    at += 2;
+                }
+                angvel = Some(a);
+            }
 
             let state = if mask & MASK_FULL != 0 {
                 QuantState {
                     pos: dpos,
                     vel: vel.unwrap_or_default(),
                     yaw: yaw.unwrap_or(0),
-                    // FULL omits rot when identity.
+                    // FULL omits rot/angvel when identity/zero.
                     rot: rot.unwrap_or(IDENTITY_ROT),
+                    angvel: angvel.unwrap_or([0; 3]),
                 }
             } else {
                 // Delta base: our newest recorded state at or before the
@@ -339,6 +387,7 @@ impl SnapshotTracker {
                     vel: vel.unwrap_or(base.vel),
                     yaw: yaw.unwrap_or(base.yaw),
                     rot: rot.unwrap_or(base.rot),
+                    angvel: angvel.unwrap_or(base.angvel),
                 }
             };
             let ring = self.states.entry(id32).or_default();
@@ -373,20 +422,22 @@ mod tests {
 
     #[test]
     fn rotation_round_trips_and_is_free_for_yaw_only_entities() {
-        // A yaw-only entity: identity rot → MASK_ROT never set, so the FULL
-        // record is exactly the same size as before rotation existed.
+        // A yaw-only entity: identity rot + zero angvel → neither mask set, so
+        // the FULL record is exactly the same size as before physics existed.
         let yaw_only = state([1.0, 2.0, 3.0], [0.0; 3], 42);
         let p_yaw = encode_snapshot(&[(1, yaw_only)], |_| None);
 
-        // A physics body tumbling: rot ships and round-trips within quant error.
+        // A tumbling physics body: rot + angvel ship and round-trip within
+        // quant error.
         let quat = [0.5f32, 0.5, 0.5, 0.5]; // a real unit quaternion
-        let body = QuantState::quantize_with_rot([1.0, 2.0, 3.0], [0.0; 3], 0, quat);
+        let spin = [1.5f32, -2.0, 0.25];
+        let body = QuantState::quantize_body([1.0, 2.0, 3.0], [0.0; 3], 0, quat, spin);
         let mut tracker = SnapshotTracker::default();
         let p_body = encode_snapshot(&[(1, body)], |_| None);
         assert_eq!(
             p_body.len(),
-            p_yaw.len() + 8,
-            "rotated body costs exactly 8 B more (4×i16) than a yaw-only FULL"
+            p_yaw.len() + 8 + 6,
+            "rotated+spinning body costs 8 B rot + 6 B angvel over a yaw-only FULL"
         );
         let out = tracker.apply(1, 0, &p_body).unwrap();
         for i in 0..4 {
@@ -397,11 +448,19 @@ mod tests {
                 quat[i]
             );
         }
+        for i in 0..3 {
+            assert!(
+                (out[0].angvel[i] - spin[i]).abs() <= 1.0 / QUANT * 2.0,
+                "angvel[{i}] round-trip off: {} vs {}",
+                out[0].angvel[i],
+                spin[i]
+            );
+        }
         assert_eq!(tracker.latest(1), Some(body));
 
         // Delta: same position, only orientation changed → ROT-only delta.
         let quat2 = [0.0f32, 0.0, 0.7071, 0.7071];
-        let body2 = QuantState::quantize_with_rot([1.0, 2.0, 3.0], [0.0; 3], 0, quat2);
+        let body2 = QuantState::quantize_body([1.0, 2.0, 3.0], [0.0; 3], 0, quat2, spin);
         let p2 = encode_snapshot(&[(1, body2)], |_| Some(body));
         tracker.apply(2, 1, &p2).unwrap();
         assert_eq!(tracker.latest(1), Some(body2));

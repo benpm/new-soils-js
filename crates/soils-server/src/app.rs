@@ -325,7 +325,7 @@ pub(crate) fn run_app(
         // its results into the replication components just before
         // `replicate_entities`, and lazily drop a demo prop stack once a player
         // is in-world to observe.
-        soils_physics::add_physics(&mut app);
+        soils_physics::add_physics(&mut app, false);
         app.init_resource::<PhysicsTerrain>();
         app.add_systems(
             FixedUpdate,

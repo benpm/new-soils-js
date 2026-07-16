@@ -31,14 +31,18 @@ pub fn gravity() -> Vec3 {
 }
 
 /// Add Avian to a Bevy app with our gravity. Physics runs in `FixedPostUpdate`
-/// (Avian's default schedule). Callers drive it via their fixed schedule; the
-/// rollback path (later) steps `PhysicsSchedule` manually instead.
+/// (Avian's default schedule).
+///
+/// `interpolate` turns on Avian's transform interpolation so rendered bodies
+/// ease between the fixed physics ticks — set it on the render client (props
+/// look smooth above the physics rate and corrections don't pop), leave it off
+/// on the headless server (which reads `Position`, never `Transform`).
 ///
 /// Avian's prepare step needs transform propagation; the headless server has no
 /// `TransformPlugin`, so add it here if the app lacks it. The render client
 /// already has it via `DefaultPlugins`, so guard against a double-add (which
 /// would panic).
-pub fn add_physics(app: &mut App) {
+pub fn add_physics(app: &mut App, interpolate: bool) {
     // Avian's broad-phase/collider-tree work uses the Bevy task pools; a bare
     // headless app (server) never initialised them. Add the pools + transform
     // propagation if missing; the render client already has both via
@@ -49,7 +53,13 @@ pub fn add_physics(app: &mut App) {
     if !app.is_plugin_added::<bevy::transform::TransformPlugin>() {
         app.add_plugins(bevy::transform::TransformPlugin);
     }
-    app.add_plugins(PhysicsPlugins::default());
+    if interpolate {
+        app.add_plugins(
+            PhysicsPlugins::default().set(PhysicsInterpolationPlugin::interpolate_all()),
+        );
+    } else {
+        app.add_plugins(PhysicsPlugins::default());
+    }
     app.insert_resource(Gravity(gravity()));
 }
 
@@ -119,7 +129,7 @@ pub(crate) mod tests_support {
     pub fn headless_app() -> App {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, bevy::transform::TransformPlugin));
-        add_physics(&mut app);
+        add_physics(&mut app, false);
         app.insert_resource(Time::<Fixed>::from_hz(PHYSICS_HZ));
         app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
             Duration::from_secs_f64(1.0 / PHYSICS_HZ),

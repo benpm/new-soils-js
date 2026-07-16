@@ -67,7 +67,9 @@ pub fn register(app: &mut App) {
     if !cfg.enabled {
         return;
     }
-    soils_physics::add_physics(app);
+    // Interpolation on: props ease between the fixed physics ticks so they
+    // render smoothly above the tick rate and corrections don't visibly pop.
+    soils_physics::add_physics(app, true);
     app.init_resource::<PhysicsActors>();
     app.init_resource::<ClientTerrain>();
     app.init_resource::<ClientPlayerProxy>();

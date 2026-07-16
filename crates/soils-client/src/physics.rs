@@ -22,7 +22,7 @@ use soils_sim::KIND_PHYSICS_CUBE;
 use crate::actor::{ActorAssets, LocalPlayer};
 use crate::chunk::{ChunkMap, VoxelChunk};
 use crate::player::Player;
-use crate::server_msg::{EntitiesUpdated, EntityDespawned, EntitySpawned};
+use crate::server_msg::{EntitiesUpdated, EntityDespawned, EntitySpawned, WarpReceived};
 
 /// Whether the client runs a local physics world (`SOILS_PHYSICS`). Inserted
 /// unconditionally so other systems (e.g. actor spawning) can branch on it.
@@ -54,8 +54,11 @@ struct ClientTerrain {
 #[derive(Resource, Default)]
 struct ClientPlayerProxy(Option<Entity>);
 
-/// Chebyshev chunk radius of terrain kept collidable around the player.
-const TERRAIN_RADIUS: i32 = 2;
+/// Chebyshev chunk radius of terrain kept collidable around the player and each
+/// prop (matches the server's radius; props are usually near one or the other).
+const TERRAIN_RADIUS: i32 = 1;
+/// Max voxel colliders built per frame, so a join/stream burst can't hitch.
+const MAX_TERRAIN_BUILDS_PER_FRAME: u32 = 8;
 /// Divergence (world units) before a predicted body is rebased to the server.
 const REBASE_EPSILON: f32 = 0.1;
 
@@ -76,6 +79,10 @@ pub fn register(app: &mut App) {
     app.add_systems(
         Update,
         (
+            // Warp clears the old world's physics before new-world spawns land.
+            clear_physics_on_warp
+                .after(crate::server_msg::apply_warp)
+                .before(spawn_physics_bodies),
             spawn_physics_bodies.after(crate::server_msg::apply_entity_spawns),
             correct_physics_bodies
                 .after(spawn_physics_bodies)
@@ -182,6 +189,26 @@ fn correct_physics_bodies(
     }
 }
 
+/// On warp, drop every predicted prop and terrain collider — the old world's
+/// physics is meaningless in the new one, and the server re-spawns whatever is
+/// in interest there. A safety net over the per-entity despawns.
+fn clear_physics_on_warp(
+    mut reader: MessageReader<WarpReceived>,
+    mut commands: Commands,
+    mut actors: ResMut<PhysicsActors>,
+    mut terrain: ResMut<ClientTerrain>,
+) {
+    if reader.read().count() == 0 {
+        return;
+    }
+    for (_, entity) in actors.map.drain() {
+        commands.entity(entity).despawn();
+    }
+    for (_, entity) in terrain.colliders.drain() {
+        commands.entity(entity).despawn();
+    }
+}
+
 /// Drop a body's local proxy when it leaves interest / despawns.
 fn despawn_physics_bodies(
     mut reader: MessageReader<EntityDespawned>,
@@ -196,19 +223,20 @@ fn despawn_physics_bodies(
 }
 
 /// Keep static `Collider::voxels` terrain resident within [`TERRAIN_RADIUS`]
-/// chunks of the player, rebuilding an edited chunk (its `VoxelChunk` changed)
-/// and dropping colliders for chunks that fall out of range or unload.
+/// chunks of the player *and every predicted prop* (so a prop resting away from
+/// the player still has ground and doesn't sink client-side), rebuilding edited
+/// chunks and dropping colliders that fall out of range or unload. Collider
+/// builds are capped per frame so a join burst can't hitch the frame.
 fn maintain_client_terrain(
     player: Query<&Transform, With<Player>>,
+    transforms: Query<&Transform>,
+    actors: Res<PhysicsActors>,
     map: Res<ChunkMap>,
     chunks: Query<&VoxelChunk>,
     edited: Query<&VoxelChunk, Changed<VoxelChunk>>,
     mut terrain: ResMut<ClientTerrain>,
     mut commands: Commands,
 ) {
-    let Ok(ptf) = player.single() else { return };
-    let pc = chunk_of(ptf.translation);
-
     // Edited chunks: drop the stale collider so it rebuilds below.
     for vc in &edited {
         if let Some(entity) = terrain.colliders.remove(&vc.pos) {
@@ -216,13 +244,25 @@ fn maintain_client_terrain(
         }
     }
 
-    // Chunks that should be collidable this frame.
+    // Chunks that should be collidable this frame: a box around the player and
+    // around each predicted prop.
+    let mut centers: Vec<IVec3> = Vec::new();
+    if let Ok(ptf) = player.single() {
+        centers.push(chunk_of(ptf.translation));
+    }
+    for &entity in actors.map.values() {
+        if let Ok(tf) = transforms.get(entity) {
+            centers.push(chunk_of(tf.translation));
+        }
+    }
     let r = TERRAIN_RADIUS;
     let mut needed: HashSet<IVec3> = HashSet::new();
-    for dx in -r..=r {
-        for dy in -r..=r {
-            for dz in -r..=r {
-                needed.insert(pc + IVec3::new(dx, dy, dz));
+    for c in centers {
+        for dx in -r..=r {
+            for dy in -r..=r {
+                for dz in -r..=r {
+                    needed.insert(c + IVec3::new(dx, dy, dz));
+                }
             }
         }
     }
@@ -237,8 +277,13 @@ fn maintain_client_terrain(
         }
     });
 
-    // Build colliders for needed, resident chunks that lack one.
+    // Build colliders for needed, resident chunks that lack one — bounded per
+    // frame (each `Collider::voxels` scans a full chunk).
+    let mut budget = MAX_TERRAIN_BUILDS_PER_FRAME;
     for cpos in &needed {
+        if budget == 0 {
+            break;
+        }
         if terrain.colliders.contains_key(cpos) {
             continue;
         }
@@ -247,6 +292,7 @@ fn maintain_client_terrain(
         if let Some(bundle) = soils_physics::chunk_collider_bundle(*cpos, &vc.volume) {
             let entity = commands.spawn(bundle).id();
             terrain.colliders.insert(*cpos, entity);
+            budget -= 1;
         }
     }
 }

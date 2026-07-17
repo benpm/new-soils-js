@@ -164,8 +164,8 @@ pinned by a density-band test) — optimization and correctness in one pass.
 | Scenario | Result |
 |---|---|
 | Radius 4 fresh world, vsync on | 60–62 fps through the whole join burst |
-| Radius 4, vsync off | ~254 fps |
-| Radius 8, vsync off | ~96 fps (draw-submission + atmosphere bound) |
+| Radius 4, vsync off | ~254 fps (remeasured 2026-07-16: 211) |
+| Radius 8, vsync off | ~96 fps (remeasured 2026-07-16: **116** once the light backlog drains — but ~46 fps for the ~4–5 min it takes to get there; see "Remeasured" below, the draw-bound attribution was wrong) |
 | Fresh 729-chunk world, click-to-playable | ~3 s (gate: < 3 s in `tests/streaming.rs`) |
 | Server tick | 20 Hz held during joins, edit storms, and light rebuilds |
 
@@ -174,18 +174,53 @@ the client is GPU/submission-bound, not CPU-bound. Hot workspace members
 (`soils-sim/protocol/worldgen/server`) build at `opt-level 3` even in dev so
 the embedded server and tests behave.
 
+## Remeasured 2026-07-16 (the draw-bound premise was wrong)
+
+The numbers above were read off the F3 HUD; the self-test now reports frame
+cost, per-render-pass GPU/CPU time, and the light backlog to stdout
+(`SOILS_VSYNC=0 SOILS_RADIUS=8 SOILS_RENDERDIAG=1`), which changes the picture:
+
+| Radius 8, vsync off, release | frame | fps |
+|---|---|---|
+| **True steady state** (light backlog drained) | **8.63 ms** | **116** |
+| While the light backlog drains (~4–5 min after join) | 21.5 ms | 46 |
+
+- **The renderer is not the bottleneck.** Every render pass combined is ~2.4 ms,
+  and `main_opaque_pass_3d` costs **0.073 ms of GPU** — terrain rasterization is
+  essentially free. Pooled quads / merged draws would attack ~1 ms of CPU draw
+  submission in an 8.6 ms frame. It is no longer the top lever.
+- **The real cost is the client light flood.** A chrome trace
+  (`--features bevy/trace_chrome,bevy/debug`) puts 89% of the frame in one
+  system: `light::process_light`, at ~29 ms/frame. Its 5 ms `FLOOD_MS` budget
+  can't bite — the loop only checks the clock *between* chunks, and a single
+  `light_new_chunk` + `reconcile_sky_below` already costs ~29 ms, so the client
+  drains ~1 chunk/frame and takes ~4–5 minutes to light a radius-8 world (3909
+  of 4913 chunks still queued at 60 s), running at 46 fps the whole time.
+- **Root cause, and it's already solved server-side.** `EcsWorld` (the client's
+  `LightWorld` impl) does a `HashMap` lookup + `Query::get` *per voxel*; a flood
+  touches 32³ cells. This is exactly the "trait-based flooding over the live map
+  … ~300 ms per column" that the server replaced with dense cloned regions
+  (`LightJob`/`DenseWorld`, ~10–20× cheaper, on rayon). The client never got
+  that treatment.
+
 ## What's left on the table
 
 Ranked by expected payoff on the reference hardware:
 
-1. **Pooled quad memory + merged draws** — the frame's dominant cost is ~5k
-   per-chunk draw calls with one material bind group each. Suballocating all
-   chunk quads from one pool and drawing with one bind group (multi-draw or
-   a single indirect batch) attacks the actual bottleneck. This was the
-   explicit "next lever" noted when phase 3 landed.
-2. **Atmosphere cost** — Bevy's physically-based sky is the other steady
-   line item. Options: lower LUT resolutions, or compute-once-per-daytime
-   instead of per-frame.
+1. **Client dense light regions** — port the server's `LightJob`/`DenseWorld`
+   pattern (ideally hoisted into `soils-sim`, where the flood algorithms already
+   live, so both ends share one implementation). Expected: the ~4–5 minute,
+   46 fps light-drain window after a radius-8 join collapses to seconds, and the
+   per-chunk flood stops blowing its own frame budget. This is the top lever.
+2. **Atmosphere / environment map** — the remaining steady line items are
+   `lightprobe_radiance_map` (0.68 ms GPU) and `lightprobe_irradiance_map`
+   (0.35 ms) from `AtmosphereEnvironmentMapLight`, plus `atmosphere_luts`
+   (0.22 ms) — ~1.25 ms of an 8.6 ms frame, rebuilt every frame though the sky
+   only changes with daytime. Recompute on a daytime delta instead.
+3. **Pooled quad memory + merged draws** — ~1 ms of CPU draw submission
+   (`main_opaque_pass_3d/elapsed_cpu`) across ~2.5k chunk draws. Previously
+   ranked first on the assumption the frame was draw-bound; the measurement
+   above says otherwise, so this is now a modest cleanup, not the next lever.
 3. **GI 3D-texture + DDA marching** (plan §1 L2 item 3, deferred) — the
    fixed-step 0.5-voxel march through a storage buffer is fine on desktop
    (60 fps with headroom) but is the piece to optimize for iGPUs: hardware

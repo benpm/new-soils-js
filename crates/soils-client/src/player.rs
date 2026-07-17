@@ -325,7 +325,14 @@ pub struct Streaming {
 
 impl Default for Streaming {
     fn default() -> Self {
-        Self { last_chunk: None, load_radius: 4, sent_radius: None, pending: 0 }
+        // `SOILS_RADIUS` sets the starting view radius (same clamp as the
+        // `loadradius` console command), so perf runs can pin the chunk count
+        // without driving the console.
+        let load_radius = std::env::var("SOILS_RADIUS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .map_or(4, |r| r.clamp(2, 8));
+        Self { last_chunk: None, load_radius, sent_radius: None, pending: 0 }
     }
 }
 

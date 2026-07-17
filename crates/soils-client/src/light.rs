@@ -32,6 +32,14 @@ pub struct LightQueue {
 }
 
 impl LightQueue {
+    /// Outstanding work: (chunks to flood, voxel relights, pads to re-upload).
+    /// Diagnostics only — `process_light` early-outs when all three are zero,
+    /// so a non-zero reading at "steady state" means the pipeline is still
+    /// draining and any fps sampled there is a backlog number, not steady.
+    pub fn backlog(&self) -> (usize, usize, usize) {
+        (self.chunks.len(), self.edits.len(), self.pending_pads.len())
+    }
+
     /// Drop all queued work (warp: the whole world went away).
     pub fn clear(&mut self) {
         self.chunks.clear();

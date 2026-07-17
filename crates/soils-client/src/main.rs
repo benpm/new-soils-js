@@ -59,6 +59,14 @@ fn main() {
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "new-soils (Rust/Bevy)".into(),
+            // `SOILS_VSYNC=0` uncaps the frame clock. Perf runs need this: with
+            // vsync on, fps just reports the display refresh and says nothing
+            // about how much headroom the frame actually has.
+            present_mode: if std::env::var("SOILS_VSYNC").as_deref() == Ok("0") {
+                bevy::window::PresentMode::AutoNoVsync
+            } else {
+                bevy::window::PresentMode::AutoVsync
+            },
             ..default()
         }),
         ..default()
@@ -88,6 +96,13 @@ fn main() {
     .init_resource::<light::SkyTerm>()
     .insert_resource(net::connect())
     .insert_resource(discovery::spawn());
+
+    // `SOILS_RENDERDIAG=1` records per-render-pass CPU/GPU elapsed time into the
+    // DiagnosticsStore (dumped by the self-test at exit). Opt-in: it costs GPU
+    // timestamp queries every pass, so it stays off for normal play.
+    if std::env::var("SOILS_RENDERDIAG").as_deref() == Ok("1") {
+        app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
+    }
 
     server_msg::register(&mut app);
     physics::register(&mut app);
@@ -283,6 +298,8 @@ fn self_test(
     map: Res<ChunkMap>,
     meshed: Query<&Mesh3d>,
     remote_actors: Query<&Actor>,
+    diagnostics: Res<bevy::diagnostic::DiagnosticsStore>,
+    light_queue: Res<light::LightQueue>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if std::env::var("SOILS_SELFTEST").is_err() {
@@ -292,6 +309,41 @@ fn self_test(
         let chunks = map.map.len();
         let meshes = meshed.iter().count();
         let actors = remote_actors.iter().count();
+        // Steady-state frame cost, sampled at exit (the camera parked at the
+        // screenshot deadline, so recent frames are the static viewpoint, not
+        // the join burst). Reported to stdout so perf runs are scriptable and
+        // diffable instead of being read off the F3 HUD in a screenshot.
+        let fps = diagnostics
+            .get(&bevy::diagnostic::FrameTimeDiagnosticsPlugin::FPS)
+            .and_then(|d| d.smoothed())
+            .unwrap_or(0.0);
+        let frame_ms = diagnostics
+            .get(&bevy::diagnostic::FrameTimeDiagnosticsPlugin::FRAME_TIME)
+            .and_then(|d| d.smoothed())
+            .unwrap_or(0.0);
+        info!("SELFTEST PERF: {fps:.1} fps, {frame_ms:.2} ms/frame");
+        // With SOILS_RENDERDIAG=1, break the frame down per render pass so the
+        // bottleneck is measured rather than guessed. Only the elapsed timers —
+        // the pipeline-statistics counters (shader invocations etc.) live in the
+        // same store but are counts, not milliseconds. Sorted slowest-first.
+        let mut passes: Vec<(String, f64)> = diagnostics
+            .iter()
+            .filter(|d| {
+                let p = d.path().as_str();
+                p.starts_with("render/") && (p.ends_with("elapsed_gpu") || p.ends_with("elapsed_cpu"))
+            })
+            .filter_map(|d| d.smoothed().map(|v| (d.path().to_string(), v)))
+            .filter(|(_, v)| *v > 0.001)
+            .collect();
+        passes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (path, ms) in passes.iter().take(24) {
+            info!("SELFTEST PASS: {ms:8.3} ms  {path}");
+        }
+        let (lq_chunks, lq_edits, lq_pads) = light_queue.backlog();
+        info!(
+            "SELFTEST LIGHT BACKLOG: {lq_chunks} chunks to flood, {lq_edits} edits, {lq_pads} pads \
+             pending (non-zero ⇒ still draining, fps above is not steady state)"
+        );
         info!("SELFTEST: {chunks} chunks loaded, {meshes} chunk meshes built, {actors} actors");
         // The login-screen shot (`SOILS_LOGINSHOT`) has no world by design, so
         // skip the world asserts there and just exit cleanly after the shot.

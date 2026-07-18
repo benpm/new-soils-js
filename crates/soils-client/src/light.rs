@@ -8,7 +8,7 @@
 //! material's bind group is cached — so after touching a buffer we also touch
 //! its material (`materials.get_mut`) to force the bind group to rebuild.
 
-use bevy::platform::collections::HashSet;
+use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
 use bevy::render::storage::ShaderStorageBuffer;
 use soils_protocol::{CHUNK_CLIP, CHUNK_SIZE, chunk_of, chunk_origin, local_of};
@@ -29,6 +29,15 @@ pub struct LightQueue {
     /// neighbor floods uploads once per drain instead of once per touch —
     /// during a join burst the same chunk otherwise re-pads dozens of times.
     pending_pads: HashSet<IVec3>,
+    /// Monotonic content version per chunk, bumped only when that chunk's own
+    /// `ChunkLight` bytes change (not when a neighbor's border dirties its pad).
+    /// The pad cache compares these to skip unchanged rebuilds.
+    versions: HashMap<IVec3, u32>,
+    /// Per chunk, the (own + 6 face-neighbor) [`versions`] snapshot captured
+    /// when its padded volume was last built. If nothing in the snapshot moved,
+    /// the pad is already current and the rebuild/upload/bind-invalidate is
+    /// skipped entirely (a burst of redundant re-pads is the cost this removes).
+    pad_snapshots: HashMap<IVec3, [u32; 7]>,
 }
 
 impl LightQueue {
@@ -45,6 +54,8 @@ impl LightQueue {
         self.chunks.clear();
         self.edits.clear();
         self.pending_pads.clear();
+        self.versions.clear();
+        self.pad_snapshots.clear();
     }
 
     /// Drop work queued for one chunk (it left the subscription). Queued
@@ -52,6 +63,9 @@ impl LightQueue {
     pub fn unload(&mut self, pos: IVec3) {
         self.chunks.retain(|c| *c != pos);
         self.pending_pads.remove(&pos);
+        // Forget cached versions/snapshots so a reload re-pads from scratch.
+        self.versions.remove(&pos);
+        self.pad_snapshots.remove(&pos);
     }
 }
 
@@ -86,6 +100,9 @@ struct EcsWorld<'a, 'w, 's> {
     chunks: &'a mut Query<'w, 's, &'static mut VoxelChunk>,
     levels: &'a [u8],
     dirty: HashSet<IVec3>,
+    /// Chunks whose own light bytes actually changed (a subset of `dirty`,
+    /// which also holds pad-dependent neighbors). Drives the version bump.
+    own_changed: HashSet<IVec3>,
 }
 
 impl EcsWorld<'_, '_, '_> {
@@ -121,6 +138,8 @@ impl LightWorld for EcsWorld<'_, '_, '_> {
         chunk.light.set(l.x, l.y, l.z, packed);
         // Dirty this chunk, plus any neighbor whose padded volume sees `v`.
         self.dirty.insert(c);
+        // Only `c`'s own light changed here — bump just its version.
+        self.own_changed.insert(c);
         for i in 0..3 {
             let mut axis = IVec3::ZERO;
             axis[i] = 1;
@@ -165,8 +184,13 @@ pub fn process_light(
         *levels = blocks.0.light_table();
     }
 
-    let mut world =
-        EcsWorld { map: &map, chunks: &mut chunks, levels: &levels, dirty: HashSet::default() };
+    let mut world = EcsWorld {
+        map: &map,
+        chunks: &mut chunks,
+        levels: &levels,
+        dirty: HashSet::default(),
+        own_changed: HashSet::default(),
+    };
 
     // Light from the top of each column down: a chunk under a loaded-but-unlit
     // chunk gets no sky seed of its own, so processing the topmost first lets
@@ -185,17 +209,33 @@ pub fn process_light(
         light::apply_voxel_change(&mut world, v);
     }
 
-    // Coalesce dirt into the pending set, then upload a bounded, deduped batch.
-    let dirty = world.dirty;
+    // Bump content versions for chunks whose own light actually changed, then
+    // coalesce every pad-dependent chunk (own + neighbors) into the pending set.
+    let EcsWorld { dirty, own_changed, .. } = world;
+    for c in own_changed {
+        *queue.versions.entry(c).or_insert(0) += 1;
+    }
     queue.pending_pads.extend(dirty);
-    let batch: Vec<IVec3> = queue.pending_pads.iter().copied().take(PAD_BUDGET).collect();
+
+    // Upload a bounded batch, skipping any chunk whose (own + 6 neighbor)
+    // versions match its last pad — that padded volume is already current, so
+    // the ~39 KB rebuild + GPU upload + bind-group invalidate is pure waste.
+    let batch: Vec<IVec3> = queue.pending_pads.iter().copied().collect();
     let pads_t0 = std::time::Instant::now();
-    let mut padded_count = 0;
+    let mut built = 0;
     for cpos in batch {
-        if padded_count > 0 && pads_t0.elapsed().as_secs_f32() * 1000.0 > PAD_MS {
-            break; // deferred pads stay in the set for next frame
+        let key = pad_key(&queue.versions, cpos);
+        if queue.pad_snapshots.get(&cpos) == Some(&key) {
+            queue.pending_pads.remove(&cpos); // already current, nothing to do
+            continue;
         }
-        padded_count += 1;
+        // Cache miss: this pad must be rebuilt. Respect the frame budget, but
+        // keep at least one rebuild of progress; deferred pads stay pending.
+        if built > 0
+            && (built >= PAD_BUDGET || pads_t0.elapsed().as_secs_f32() * 1000.0 > PAD_MS)
+        {
+            break;
+        }
         queue.pending_pads.remove(&cpos);
         let Some(&e) = map.map.get(&cpos) else { continue };
         let Ok((gc, mat)) = gpu.get(e) else { continue }; // empty chunks render nothing
@@ -205,7 +245,25 @@ pub fn process_light(
         }
         // Force the cached material bind group to pick up the new buffer.
         materials.get_mut(&mat.0);
+        queue.pad_snapshots.insert(cpos, key);
+        built += 1;
     }
+}
+
+/// The version key a chunk's padded volume depends on: its own content version
+/// plus its six face-neighbors' (missing/unloaded neighbors read as 0, matching
+/// `build_padded`'s dark shell fill).
+fn pad_key(versions: &HashMap<IVec3, u32>, cpos: IVec3) -> [u32; 7] {
+    let v = |c: IVec3| versions.get(&c).copied().unwrap_or(0);
+    [
+        v(cpos),
+        v(cpos + IVec3::X),
+        v(cpos - IVec3::X),
+        v(cpos + IVec3::Y),
+        v(cpos - IVec3::Y),
+        v(cpos + IVec3::Z),
+        v(cpos - IVec3::Z),
+    ]
 }
 
 /// Build a chunk's padded light volume: its own 32³ plus one voxel of
@@ -271,5 +329,65 @@ pub fn update_sky_term(
     sky.0 = TERRAIN_BRIGHTNESS * q;
     for (_, m) in materials.iter_mut() {
         m.params.sky_term = sky.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pad is stale (must rebuild) iff its cached snapshot != the current key.
+    fn stale(v: &HashMap<IVec3, u32>, s: &HashMap<IVec3, [u32; 7]>, c: IVec3) -> bool {
+        s.get(&c) != Some(&pad_key(v, c))
+    }
+
+    #[test]
+    fn pad_key_reads_own_and_six_neighbors() {
+        let c = IVec3::new(2, 3, 4);
+        let mut v = HashMap::default();
+        v.insert(c, 10);
+        v.insert(c + IVec3::X, 1);
+        v.insert(c - IVec3::X, 2);
+        v.insert(c + IVec3::Y, 3);
+        v.insert(c - IVec3::Y, 4);
+        v.insert(c + IVec3::Z, 5);
+        v.insert(c - IVec3::Z, 6);
+        assert_eq!(pad_key(&v, c), [10, 1, 2, 3, 4, 5, 6]);
+        // A diagonal/non-face neighbor must not appear in the key.
+        let mut v2 = v.clone();
+        v2.insert(c + IVec3::new(1, 1, 0), 99);
+        assert_eq!(pad_key(&v2, c), pad_key(&v, c));
+    }
+
+    #[test]
+    fn missing_neighbor_versions_read_zero() {
+        let c = IVec3::ZERO;
+        let v = HashMap::default();
+        assert_eq!(pad_key(&v, c), [0; 7]);
+    }
+
+    #[test]
+    fn unchanged_inputs_are_not_stale_changed_inputs_are() {
+        let c = IVec3::new(5, 0, 5);
+        let mut versions = HashMap::default();
+        versions.insert(c, 1);
+        let mut snapshots = HashMap::default();
+
+        // No snapshot yet → always stale (first pad).
+        assert!(stale(&versions, &snapshots, c));
+
+        // After padding we record the key; identical inputs → not stale.
+        snapshots.insert(c, pad_key(&versions, c));
+        assert!(!stale(&versions, &snapshots, c));
+
+        // Own light changes → stale again.
+        *versions.get_mut(&c).unwrap() += 1;
+        assert!(stale(&versions, &snapshots, c));
+        snapshots.insert(c, pad_key(&versions, c));
+        assert!(!stale(&versions, &snapshots, c));
+
+        // A face-neighbor's light changing also invalidates this chunk's pad.
+        *versions.entry(c + IVec3::Y).or_insert(0) += 1;
+        assert!(stale(&versions, &snapshots, c));
     }
 }

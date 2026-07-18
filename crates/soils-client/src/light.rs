@@ -12,7 +12,7 @@ use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
 use bevy::render::storage::ShaderStorageBuffer;
 use soils_protocol::{CHUNK_CLIP, CHUNK_SIZE, chunk_of, chunk_origin, local_of};
-use soils_sim::light::{self, LightWorld};
+use soils_sim::light::{self, ChunkLight, LightWorld};
 
 use crate::chunk::{Blocks, ChunkMap, VoxelChunk, WorldTime};
 use crate::gpu_mesh::{GpuChunk, LIGHT_BYTES, LIGHT_PAD};
@@ -141,6 +141,32 @@ impl LightWorld for EcsWorld<'_, '_, '_> {
         // corrected by `reconcile_sky_below` when it loads.
         true
     }
+
+    fn chunk_all_air(&self, cpos: IVec3) -> bool {
+        // Cheap O(1) check instead of the default per-cell scan.
+        let Some(&e) = self.map.map.get(&cpos) else { return false };
+        let Ok(chunk) = self.chunks.get(e) else { return false };
+        chunk.volume.is_empty()
+    }
+
+    fn set_chunk_uniform(&mut self, cpos: IVec3, packed: u8) {
+        if let Some(&e) = self.map.map.get(&cpos)
+            && let Ok(mut chunk) = self.chunks.get_mut(e)
+        {
+            chunk.light = ChunkLight::uniform(packed);
+        }
+        // The whole chunk changed, so its own padded volume and all six
+        // neighbors' pad shells are stale — mark them dirty (the per-cell
+        // `set_light` path does this via border-widening; the O(1) override
+        // must replicate it, or an adjacent solid chunk keeps a dark border).
+        self.dirty.insert(cpos);
+        for i in 0..3 {
+            let mut axis = IVec3::ZERO;
+            axis[i] = 1;
+            self.dirty.insert(cpos - axis);
+            self.dirty.insert(cpos + axis);
+        }
+    }
 }
 
 /// Run queued lighting work, then refresh the GPU light volumes of every
@@ -218,7 +244,7 @@ fn build_padded(map: &ChunkMap, chunks: &Query<&'static mut VoxelChunk>, cpos: I
     if let Some(&e) = map.map.get(&cpos)
         && let Ok(chunk) = chunks.get(e)
     {
-        let src = chunk.light.as_bytes();
+        let src = chunk.light.as_dense_bytes();
         for y in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
                 let row = ((y + z * CHUNK_SIZE) * CHUNK_SIZE) as usize;

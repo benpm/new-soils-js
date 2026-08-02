@@ -14,8 +14,9 @@
 //! [`tick_lifecycle`](World::tick_lifecycle) evicts it (save-if-dirty) once it
 //! expires. Edits mark chunks dirty instead of persisting per edit; dirty
 //! chunks flush on an interval, on eviction, and on shutdown
-//! ([`flush_dirty`](World::flush_dirty)). Freshly *generated* chunks still
-//! persist immediately on adopt — they are written once and only rewritten if
+//! ([`flush_dirty`](World::flush_dirty)). Freshly *generated* chunks are NOT
+//! persisted — worldgen v2 is deterministic, so pristine chunks regenerate on
+//! demand and a chunk is only written once it has been
 //! edited.
 
 use std::collections::HashMap;
@@ -438,7 +439,9 @@ impl World {
     /// generated chunk is written once; later rewrites only happen via edits).
     pub fn adopt(&mut self, pos: IVec3, volume: ChunkVolume) {
         if !self.chunks.contains_key(&pos) {
-            self.persist.enqueue(self.regions_dir.clone(), pos, volume.clone(), false);
+            // Pristine chunks are no longer persisted — they're reproducible
+            // from the world identity (worldgen v2 is deterministic), so they
+            // hit disk only once edited (the dirty flush).
             let entry = self.entry(pos, volume, false);
             self.chunks.insert(pos, entry);
         }
@@ -810,14 +813,14 @@ mod tests {
     }
 
     #[test]
-    fn generated_chunks_persist_and_reload_from_disk() {
+    fn pristine_stays_off_disk_and_edits_persist() {
         let dir = std::env::temp_dir().join(format!("soils-world-persist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Generate a below-surface (non-empty) chunk; adopting caches it and
-        // enqueues background persistence.
+        // Adopting a generated chunk caches it but must NOT persist it:
+        // pristine chunks regenerate from the world identity on demand.
         let pos = IVec3::new(8, 7, 8);
-        let generated = {
+        {
             let persister = Persister::new();
             let mut world = World::new(&dir, "default", 0, persister.handle());
             assert!(!world.ensure_resident(pos), "fresh world: nothing on disk yet");
@@ -826,21 +829,31 @@ mod tests {
             let vol = soils_protocol::decode_chunk(&payload).expect("payload decodes");
             assert!(!vol.is_empty(), "below-surface chunk should be non-empty");
             persister.shutdown(); // flush the writer
-            (payload, vol)
-        };
-
-        // The region file now exists and holds exactly the generated voxels.
+        }
         let regions = dir.join("worlds").join("default").join("regions");
-        assert!(regions.is_dir(), "region dir should exist after flush");
-        let loaded = region::load(&regions, pos).unwrap().expect("chunk persisted");
-        assert_eq!(loaded.as_bytes(), generated.1.as_bytes());
+        assert!(
+            region::load(&regions, pos).ok().flatten().is_none(),
+            "pristine chunk must not persist on adopt"
+        );
 
-        // A fresh world loads the chunk from disk (identical bytes) rather than
-        // regenerating it.
+        // An edit dirties it; the flush persists it (edited flag set) and a
+        // fresh world then loads it from disk instead of regenerating.
+        let edited_payload = {
+            let persister = Persister::new();
+            let mut world = World::new(&dir, "default", 0, persister.handle());
+            world.adopt(pos, generate_one(&world, pos));
+            let v = pos * 32 + IVec3::new(1, 2, 3);
+            assert!(world.edit(v.x, v.y, v.z, 3));
+            world.flush_dirty();
+            let payload = world.serve(pos).expect("resident");
+            persister.shutdown();
+            payload
+        };
         let persister2 = Persister::new();
         let mut world2 = World::new(&dir, "default", 0, persister2.handle());
-        assert!(world2.ensure_resident(pos), "chunk should load from disk");
-        assert_eq!(world2.serve(pos).unwrap(), generated.0);
+        assert!(world2.ensure_resident(pos), "edited chunk should load from disk");
+        assert_eq!(world2.serve(pos).unwrap(), edited_payload);
+        assert_eq!(world2.chunk_edited(pos), Some(true));
         persister2.shutdown();
 
         let _ = std::fs::remove_dir_all(&dir);

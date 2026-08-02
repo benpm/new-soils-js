@@ -289,8 +289,10 @@ fn compact_file(path: &Path) -> io::Result<()> {
     };
     let bad = || io::Error::new(io::ErrorKind::InvalidData, "block out of bounds");
 
-    // Measure live blocks (the ones the header still points at). The edited
-    // flag rides along untouched.
+    // Measure live blocks: only *edited* entries survive. Pristine chunks
+    // (flag clear) are byte-reproducible from the world identity, so they
+    // prune to ABSENT — their bytes count as reclaimable alongside leaked
+    // (superseded) blocks, and a probe miss just regenerates them.
     let mut blocks: Vec<(usize, usize, usize, u32)> = Vec::new(); // (idx, start, len, flag)
     let mut live: u64 = 0;
     for i in 0..HEADER_ENTRIES {
@@ -304,6 +306,9 @@ fn compact_file(path: &Path) -> io::Result<()> {
         if start + len > data.len() {
             return Err(bad());
         }
+        if !entry_edited(e) {
+            continue; // pristine: prunes with the leaked blocks
+        }
         blocks.push((i, start, len, e & EDITED_FLAG));
         live += len as u64;
     }
@@ -313,12 +318,13 @@ fn compact_file(path: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    // Rebuild: sentinel entries copy through (flag included), live blocks
-    // re-pack in order.
+    // Rebuild: edited sentinel entries copy through (flag included), edited
+    // blocks re-pack in order; pristine entries fall back to ABSENT.
     let mut out = vec![0u8; HEADER_BYTES as usize];
     for i in 0..HEADER_ENTRIES {
-        if entry_kind(entry_at(i)) == EMPTY {
-            out[i * 4..i * 4 + 4].copy_from_slice(&entry_at(i).to_le_bytes());
+        let e = entry_at(i);
+        if entry_kind(e) == EMPTY && entry_edited(e) {
+            out[i * 4..i * 4 + 4].copy_from_slice(&e.to_le_bytes());
         }
     }
     for (i, start, len, flag) in blocks {
@@ -417,10 +423,10 @@ mod tests {
         }
         let pos = IVec3::new(1, 1, 1);
         let epos = IVec3::new(2, 1, 1);
-        save(&dir, epos, &ChunkVolume::empty(), false).unwrap();
+        save(&dir, epos, &ChunkVolume::empty(), true).unwrap();
         for round in 0..10 {
             vol.set(0, 0, 0, round);
-            save(&dir, pos, &vol, false).unwrap();
+            save(&dir, pos, &vol, true).unwrap();
         }
         let path = region_path(&dir, pos);
         let bloated = fs::metadata(&path).unwrap().len();
@@ -481,9 +487,13 @@ mod tests {
         }
         compact_dir(&dir);
         assert!(flag(p_edited));
-        assert!(!flag(p_pristine));
         assert!(flag(p_empty_edited));
         assert_eq!(load(&dir, p_edited).unwrap().unwrap().get(0, 0, 0), 9);
+        // The pristine chunk pruned to ABSENT: it regenerates on demand.
+        assert!(
+            load(&dir, p_pristine).unwrap().is_none(),
+            "pristine chunk should prune out of the compacted file"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

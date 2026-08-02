@@ -91,7 +91,7 @@ struct VoxelMeshJobs {
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct VoxelMeshLabel;
+pub struct VoxelMeshLabel;
 
 fn init_pipeline(
     mut commands: Commands,
@@ -126,7 +126,7 @@ fn init_pipeline(
     commands.insert_resource(VoxelMeshJobs::default());
 }
 
-fn add_render_graph_node(mut render_graph: ResMut<RenderGraph>) {
+pub fn add_render_graph_node(mut render_graph: ResMut<RenderGraph>) {
     render_graph.add_node(VoxelMeshLabel, VoxelMeshNode);
     render_graph.add_node_edge(VoxelMeshLabel, bevy::render::graph::CameraDriverLabel);
 }
@@ -154,6 +154,16 @@ fn prepare_jobs(
     let Some(faces_buf) = buffers.get(&faces.0) else {
         return; // faces table not resident yet; the dirty list carries over
     };
+    // Never consume jobs the node can't dispatch: during startup the compute
+    // pipelines compile asynchronously, and a batch taken before they're
+    // ready would be silently dropped — chunks that never mesh (the join
+    // burst races pipeline compilation on warm servers).
+    if pipeline_cache.get_compute_pipeline(pipeline.clear).is_none()
+        || pipeline_cache.get_compute_pipeline(pipeline.mesh).is_none()
+        || pipeline_cache.get_compute_pipeline(pipeline.finalize).is_none()
+    {
+        return;
+    }
     let dirty = std::mem::take(&mut ops.1);
 
     let jobs_vec = jobs.jobs.get_or_insert_with(|| RawBufferVec::new(BufferUsages::STORAGE));

@@ -9,6 +9,7 @@
 mod actor;
 mod chunk;
 mod console;
+mod cull;
 mod discovery;
 mod edit;
 mod gi;
@@ -38,7 +39,7 @@ use soils_protocol::ClientMsg;
 use soils_worldgen::default_registry;
 
 use actor::{Actor, ActorMap, LocalPlayer};
-use chunk::{Blocks, ChunkMap, VoxelChunk, WorldTime};
+use chunk::{Blocks, ChunkMap, WorldTime};
 use gpu_mesh::GpuMeshPlugin;
 use net::NetClient;
 use player::{Player, Streaming};
@@ -75,6 +76,7 @@ fn main() {
     .add_plugins(GpuMeshPlugin)
     .add_plugins(pool::PoolPlugin)
     .add_plugins(world_draw::WorldDrawPlugin)
+    .add_plugins(cull::CullPlugin)
     .add_plugins(gi::GiPlugin)
     .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
     .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 1.0)))

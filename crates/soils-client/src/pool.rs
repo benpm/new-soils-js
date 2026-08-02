@@ -142,14 +142,14 @@ impl ChunkSlots {
         let non_air = !volume.is_empty();
         let s = self.alloc(cpos, non_air)?;
         if s.mesh != NO_MESH {
-            ops.0.push(PoolOp::UploadVoxels { mesh: s.mesh, volume: volume.clone() });
-            ops.0.push(PoolOp::WriteMeshInfo { mesh: s.mesh, cpos, slot: s.slot });
+            ops.push(PoolOp::UploadVoxels { mesh: s.mesh, volume: volume.clone() });
+            ops.push(PoolOp::WriteMeshInfo { mesh: s.mesh, cpos, slot: s.slot });
             dirty.0.push(s.mesh);
         }
-        ops.0.push(PoolOp::WriteDesc { slot: s.slot, cpos, mesh: s.mesh });
+        ops.push(PoolOp::WriteDesc { slot: s.slot, cpos, mesh: s.mesh });
         let idx = table_index(cpos) as u32;
         self.table[idx as usize] = s.slot;
-        ops.0.push(PoolOp::WriteTable { index: idx, slot: s.slot });
+        ops.push(PoolOp::WriteTable { index: idx, slot: s.slot });
         Some(s)
     }
 
@@ -161,12 +161,12 @@ impl ChunkSlots {
         let idx = table_index(cpos);
         if self.table[idx] == s.slot {
             self.table[idx] = TABLE_EMPTY;
-            ops.0.push(PoolOp::WriteTable { index: idx as u32, slot: TABLE_EMPTY });
+            ops.push(PoolOp::WriteTable { index: idx as u32, slot: TABLE_EMPTY });
         }
         if s.mesh != NO_MESH {
-            ops.0.push(PoolOp::ClearIndirect { mesh: s.mesh });
+            ops.push(PoolOp::ClearIndirect { mesh: s.mesh });
         }
-        ops.0.push(PoolOp::WriteDesc { slot: s.slot, cpos: IVec3::MAX, mesh: NO_MESH });
+        ops.push(PoolOp::WriteDesc { slot: s.slot, cpos: IVec3::MAX, mesh: NO_MESH });
     }
 
     /// Drop everything (warp: the whole world went away), vacating the GPU
@@ -223,14 +223,22 @@ pub struct ChunkPools {
 impl ChunkPools {
     fn create(device: &RenderDevice) -> Self {
         let buf = |label: &str, size: u64, usage: BufferUsages| {
-            device.create_buffer(&BufferDescriptor {
+            // mapped_at_creation marks the whole buffer initialized (zeroed),
+            // so wgpu's lazy zero-init can never race — and clobber — staged
+            // write_buffer uploads on first storage use (observed on Vulkan:
+            // a nondeterministic subset of first-frame desc/light writes were
+            // zeroed after application).
+            let b = device.create_buffer(&BufferDescriptor {
                 label: Some(label),
                 size,
                 usage,
-                mapped_at_creation: false,
-            })
+                mapped_at_creation: true,
+            });
+            b.unmap();
+            b
         };
-        let sc = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        // COPY_SRC included for diagnostics/readback paths.
+        let sc = BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
         Self {
             voxels: buf("chunk_voxel_pool", N_MESH as u64 * SLOT_BYTES, sc),
             light: buf("chunk_light_pool", N_SLOTS as u64 * SLOT_BYTES, sc),
@@ -271,6 +279,12 @@ pub enum PoolOp {
 #[derive(Resource, Default)]
 pub struct PoolOpQueue(pub Vec<PoolOp>);
 
+impl PoolOpQueue {
+    pub fn push(&mut self, op: PoolOp) {
+        self.0.push(op);
+    }
+}
+
 /// Mesh slots whose voxels changed this frame → remesh dispatch list.
 #[derive(Resource, Default)]
 pub struct DirtyMesh(pub Vec<u32>);
@@ -290,22 +304,51 @@ pub struct ExtractedPoolOps(pub Vec<PoolOp>, pub Vec<u32>);
 fn apply_pool_ops(
     mut ops: ResMut<ExtractedPoolOps>,
     pools: Res<ChunkPools>,
+    device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
 ) {
+    if ops.0.is_empty() {
+        return;
+    }
+    // Uploads go through an explicit staging buffer + copy encoder submitted
+    // immediately: `queue.write_buffer`'s staged copies proved lossy against
+    // the pooled buffers on Vulkan (a nondeterministic subset of first-write
+    // regions stayed zero); an explicit submission is unambiguous.
+    let mut staging: Vec<u8> = Vec::new();
+    let mut copies: Vec<(u64, u64, u64)> = Vec::new(); // (src off, dst off, len) into which pool
+    enum Dst {
+        Voxels,
+        Light,
+        Desc,
+        Table,
+        MeshInfo,
+        Indirect,
+    }
+    let mut dsts: Vec<Dst> = Vec::new();
+    let mut stage = |bytes: &[u8], dst: Dst, dst_off: u64,
+                     staging: &mut Vec<u8>,
+                     copies: &mut Vec<(u64, u64, u64)>,
+                     dsts: &mut Vec<Dst>| {
+        let src = staging.len() as u64;
+        staging.extend_from_slice(bytes);
+        copies.push((src, dst_off, bytes.len() as u64));
+        dsts.push(dst);
+    };
     for op in ops.0.drain(..) {
         match op {
             PoolOp::UploadVoxels { mesh, volume } => {
-                queue.write_buffer(&pools.voxels, mesh as u64 * SLOT_BYTES, volume.as_bytes());
+                stage(volume.as_bytes(), Dst::Voxels, mesh as u64 * SLOT_BYTES, &mut staging, &mut copies, &mut dsts);
             }
             PoolOp::WriteVoxelWord { mesh, word_idx, word } => {
-                queue.write_buffer(
-                    &pools.voxels,
-                    mesh as u64 * SLOT_BYTES + word_idx as u64 * 4,
+                stage(
                     &word.to_le_bytes(),
+                    Dst::Voxels,
+                    mesh as u64 * SLOT_BYTES + word_idx as u64 * 4,
+                    &mut staging, &mut copies, &mut dsts,
                 );
             }
             PoolOp::UploadLight { slot, bytes } => {
-                queue.write_buffer(&pools.light, slot as u64 * SLOT_BYTES, &bytes);
+                stage(&bytes, Dst::Light, slot as u64 * SLOT_BYTES, &mut staging, &mut copies, &mut dsts);
             }
             PoolOp::WriteDesc { slot, cpos, mesh } => {
                 // Matches the WGSL ChunkSlot layout: cpos, mesh_slot, flags,
@@ -316,10 +359,10 @@ fn apply_pool_ops(
                 d[4..8].copy_from_slice(&cpos.y.to_le_bytes());
                 d[8..12].copy_from_slice(&cpos.z.to_le_bytes());
                 d[12..16].copy_from_slice(&mesh.to_le_bytes());
-                queue.write_buffer(&pools.desc, slot as u64 * DESC_BYTES, &d);
+                stage(&d, Dst::Desc, slot as u64 * DESC_BYTES, &mut staging, &mut copies, &mut dsts);
             }
             PoolOp::WriteTable { index, slot } => {
-                queue.write_buffer(&pools.table, index as u64 * 4, &slot.to_le_bytes());
+                stage(&slot.to_le_bytes(), Dst::Table, index as u64 * 4, &mut staging, &mut copies, &mut dsts);
             }
             PoolOp::WriteMeshInfo { mesh, cpos, slot } => {
                 let mut d = [0u8; 16];
@@ -327,13 +370,35 @@ fn apply_pool_ops(
                 d[4..8].copy_from_slice(&cpos.y.to_le_bytes());
                 d[8..12].copy_from_slice(&cpos.z.to_le_bytes());
                 d[12..16].copy_from_slice(&slot.to_le_bytes());
-                queue.write_buffer(&pools.mesh_info, mesh as u64 * 16, &d);
+                stage(&d, Dst::MeshInfo, mesh as u64 * 16, &mut staging, &mut copies, &mut dsts);
             }
             PoolOp::ClearIndirect { mesh } => {
-                queue.write_buffer(&pools.indirect, mesh as u64 * 16, &[0u8; 16]);
+                stage(&[0u8; 16], Dst::Indirect, mesh as u64 * 16, &mut staging, &mut copies, &mut dsts);
             }
         }
     }
+    let staging_buf = device.create_buffer_with_data(
+        &bevy::render::render_resource::BufferInitDescriptor {
+            label: Some("pool_op_staging"),
+            contents: &staging,
+            usage: BufferUsages::COPY_SRC,
+        },
+    );
+    let mut encoder = device.create_command_encoder(
+        &bevy::render::render_resource::CommandEncoderDescriptor { label: Some("pool_ops") },
+    );
+    for ((src, dst_off, len), dst) in copies.into_iter().zip(dsts) {
+        let target = match dst {
+            Dst::Voxels => &pools.voxels,
+            Dst::Light => &pools.light,
+            Dst::Desc => &pools.desc,
+            Dst::Table => &pools.table,
+            Dst::MeshInfo => &pools.mesh_info,
+            Dst::Indirect => &pools.indirect,
+        };
+        encoder.copy_buffer_to_buffer(&staging_buf, src, target, dst_off, len);
+    }
+    queue.submit([encoder.finish()]);
 }
 
 /// What the adapter actually gave us, probed once at render startup — the

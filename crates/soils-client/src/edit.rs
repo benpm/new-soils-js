@@ -230,12 +230,12 @@ pub fn apply_edit(
         Some(_) => match slots.ensure_mesh(cpos) {
             Some(m) => {
                 let s = slots.get(cpos).expect("just ensured");
-                pool_ops.0.push(crate::pool::PoolOp::UploadVoxels {
+                pool_ops.push(crate::pool::PoolOp::UploadVoxels {
                     mesh: m,
                     volume: chunk.volume.clone(),
                 });
-                pool_ops.0.push(crate::pool::PoolOp::WriteMeshInfo { mesh: m, cpos, slot: s.slot });
-                pool_ops.0.push(crate::pool::PoolOp::WriteDesc { slot: s.slot, cpos, mesh: m });
+                pool_ops.push(crate::pool::PoolOp::WriteMeshInfo { mesh: m, cpos, slot: s.slot });
+                pool_ops.push(crate::pool::PoolOp::WriteDesc { slot: s.slot, cpos, mesh: m });
                 dirty_mesh.0.push(m);
                 return;
             }
@@ -248,7 +248,7 @@ pub fn apply_edit(
     let base = (word_idx * 4) as usize;
     let bytes = chunk.volume.as_bytes();
     let word = u32::from_le_bytes([bytes[base], bytes[base + 1], bytes[base + 2], bytes[base + 3]]);
-    pool_ops.0.push(crate::pool::PoolOp::WriteVoxelWord { mesh, word_idx, word });
+    pool_ops.push(crate::pool::PoolOp::WriteVoxelWord { mesh, word_idx, word });
     dirty_mesh.0.push(mesh);
     // The mesher's AO probes read 1 voxel out-of-chunk (air today), but the
     // CPU volumes are per-chunk; border edits still change *this* chunk's own

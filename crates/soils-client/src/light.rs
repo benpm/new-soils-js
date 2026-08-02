@@ -200,7 +200,7 @@ pub fn process_light(
         let Some(&e) = map.map.get(&cpos) else { continue };
         let Some(s) = slots.get(cpos) else { continue };
         let Ok(chunk) = chunks.get(e) else { continue };
-        pool_ops.0.push(PoolOp::UploadLight {
+        pool_ops.push(PoolOp::UploadLight {
             slot: s.slot,
             bytes: chunk.light.as_bytes().to_vec().into_boxed_slice(),
         });

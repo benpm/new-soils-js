@@ -17,10 +17,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 wtransport = { version = "0.7.1", features = ["dangerous-configuration"] }
+bytemuck = "1"
 
 [dev-dependencies]
 # Headless GPU test: run the radiance-cascades compute shader on a real device
 # (no window/surface) and compare its output against the CPU oracle.
 wgpu = "27"
 pollster = "0.4"
-bytemuck = "1"
+glam = { workspace = true }

@@ -158,7 +158,7 @@ pub fn setup_login(mut commands: Commands) {
 
 fn field(parent: &mut ChildSpawnerCommands, label: &str, kind: LoginButton, marker: impl Component) {
     parent
-        .spawn((Node { flex_direction: FlexDirection::Row, align_items: AlignItems::Center, column_gap: Val::Px(8.0), ..default() }))
+        .spawn(Node { flex_direction: FlexDirection::Row, align_items: AlignItems::Center, column_gap: Val::Px(8.0), ..default() })
         .with_children(|row| {
             row.spawn((
                 Text::new(format!("{label}:")),

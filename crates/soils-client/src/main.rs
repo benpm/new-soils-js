@@ -14,6 +14,7 @@ mod discovery;
 mod edit;
 mod gi;
 mod gi_demo;
+mod gpu_light;
 mod gpu_mesh;
 mod hud;
 mod light;
@@ -77,6 +78,7 @@ fn main() {
     .add_plugins(pool::PoolPlugin)
     .add_plugins(world_draw::WorldDrawPlugin)
     .add_plugins(cull::CullPlugin)
+    .add_plugins(gpu_light::GpuLightPlugin)
     .add_plugins(gi::GiPlugin)
     .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
     .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 1.0)))
@@ -155,8 +157,9 @@ fn main() {
                 .after(server_msg::apply_init)
                 .after(server_msg::apply_warp)
                 .after(server_msg::apply_chunks),
-            // Baked lighting runs once all voxel changes for the frame landed.
-            light::process_light
+            // Light job planning runs once all voxel changes for the frame
+            // landed (the flood itself is GPU compute — see gpu_light.rs).
+            gpu_light::plan_light_jobs
                 .after(server_msg::apply_chunks)
                 .after(server_msg::apply_edits)
                 .after(edit::edit_blocks),

@@ -555,7 +555,6 @@ pub fn apply_chunks(
                 .spawn(VoxelChunk {
                     pos: cpos,
                     volume,
-                    light: soils_sim::light::ChunkLight::dark(),
                 })
                 .id();
             map.map.insert(cpos, e);

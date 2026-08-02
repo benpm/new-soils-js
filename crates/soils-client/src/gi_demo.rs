@@ -118,7 +118,6 @@ pub fn setup_gi_demo(
         .spawn(crate::chunk::VoxelChunk {
             pos: cpos,
             volume: vol,
-            light: soils_sim::light::ChunkLight::dark(),
         })
         .id();
     map.map.insert(cpos, e);

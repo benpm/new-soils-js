@@ -264,7 +264,6 @@ pub enum PoolOp {
     /// Single-voxel edit: rewrite the containing u32 word.
     WriteVoxelWord { mesh: u32, word_idx: u32, word: u32 },
     /// Full 32 KB light upload into a unified slot.
-    UploadLight { slot: u32, bytes: Box<[u8]> },
     /// (Re)write a slot's descriptor.
     WriteDesc { slot: u32, cpos: IVec3, mesh: u32 },
     /// Point a slot-table cell at a slot (or `TABLE_EMPTY`).
@@ -318,14 +317,13 @@ fn apply_pool_ops(
     let mut copies: Vec<(u64, u64, u64)> = Vec::new(); // (src off, dst off, len) into which pool
     enum Dst {
         Voxels,
-        Light,
         Desc,
         Table,
         MeshInfo,
         Indirect,
     }
     let mut dsts: Vec<Dst> = Vec::new();
-    let mut stage = |bytes: &[u8], dst: Dst, dst_off: u64,
+    let stage = |bytes: &[u8], dst: Dst, dst_off: u64,
                      staging: &mut Vec<u8>,
                      copies: &mut Vec<(u64, u64, u64)>,
                      dsts: &mut Vec<Dst>| {
@@ -346,9 +344,6 @@ fn apply_pool_ops(
                     mesh as u64 * SLOT_BYTES + word_idx as u64 * 4,
                     &mut staging, &mut copies, &mut dsts,
                 );
-            }
-            PoolOp::UploadLight { slot, bytes } => {
-                stage(&bytes, Dst::Light, slot as u64 * SLOT_BYTES, &mut staging, &mut copies, &mut dsts);
             }
             PoolOp::WriteDesc { slot, cpos, mesh } => {
                 // Matches the WGSL ChunkSlot layout: cpos, mesh_slot, flags,
@@ -390,7 +385,6 @@ fn apply_pool_ops(
     for ((src, dst_off, len), dst) in copies.into_iter().zip(dsts) {
         let target = match dst {
             Dst::Voxels => &pools.voxels,
-            Dst::Light => &pools.light,
             Dst::Desc => &pools.desc,
             Dst::Table => &pools.table,
             Dst::MeshInfo => &pools.mesh_info,

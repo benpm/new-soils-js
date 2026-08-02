@@ -19,7 +19,6 @@ bevy_egui = "0.39"
 # release renders blank under bevy_egui 0.39; the node canvas is hand-rolled on
 # egui::Scene instead — see crates/soils-terrainlab/src/canvas.rs.)
 egui = "0.33"
-noise = "0.9"
 ron = "0.8"
 rfd = "0.15"
 bytemuck = "1"

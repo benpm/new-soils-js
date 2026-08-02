@@ -791,7 +791,16 @@ mod tests {
         let mut world = World::new(&dir, "default", 0, persister.handle());
 
         // A surface chunk plus its vertical neighbors (the grid samples them).
-        let cpos = IVec3::new(8, 8, 8);
+        // The surface height at this column depends on the worldgen tuning, so
+        // find the straddling chunk instead of hardcoding it.
+        let cy = {
+            let (terrain, registry) = world.gen_ctx();
+            (0..16)
+                .rev()
+                .find(|&cy| !terrain.generate(IVec3::new(8, cy, 8), &registry).is_empty())
+                .expect("some chunk in the column is solid")
+        };
+        let cpos = IVec3::new(8, cy, 8);
         for dy in -1..=1 {
             let p = cpos + IVec3::Y * dy;
             let vol = generate_one(&world, p);

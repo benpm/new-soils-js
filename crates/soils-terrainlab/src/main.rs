@@ -17,7 +17,6 @@ mod wgsl_gen;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy_egui::{EguiContexts, EguiGlobalSettings, EguiPlugin, EguiPrimaryContextPass, egui};
-use noise::Simplex;
 use soils_worldgen::graph::TerrainGraph;
 
 use canvas::CanvasState;
@@ -229,6 +228,7 @@ fn ui(
     preview_input.graph = Some(state.graph.clone());
     preview_input.hmin = state.hmin;
     preview_input.hmax = state.hmax;
+    preview_input.seed = state.seed;
 }
 
 fn top_bar(ctx: &egui::Context, state: &mut LabState, mode: &mut ViewMode) {
@@ -332,7 +332,7 @@ fn rebuild_preview_if_stale(ctx: &egui::Context, state: &mut LabState) {
     }
     state.preview_key = key;
 
-    let sim = Simplex::new(state.seed);
+    let Ok(compiled) = state.graph.compile() else { return };
     let n = PREVIEW_PX;
     let mut heights = vec![0f64; n * n];
     let mut density = vec![0f64; n * n];
@@ -342,7 +342,11 @@ fn rebuild_preview_if_stale(ctx: &egui::Context, state: &mut LabState) {
         for i in 0..n {
             let wx = (i as f64 / (n - 1) as f64 - 0.5) * PREVIEW_SPAN;
             let wz = (j as f64 / (n - 1) as f64 - 0.5) * PREVIEW_SPAN;
-            let c = state.graph.eval_columns(&sim, wx, wz);
+            let c = compiled.eval_columns(
+                state.seed,
+                (wx * 65536.0).round() as i32,
+                (wz * 65536.0).round() as i32,
+            );
             heights[j * n + i] = c.height;
             density[j * n + i] = c.structure;
             lo = lo.min(c.height);

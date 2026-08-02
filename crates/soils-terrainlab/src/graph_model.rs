@@ -447,12 +447,11 @@ mod tests {
         let back = eg.to_terrain_graph().expect("lowers");
         back.validate().unwrap();
         assert_eq!(graph.nodes.len(), back.nodes.len());
-        let sim = noise::Simplex::new(7);
         for &(x, z) in &[(0.0, 0.0), (321.0, -88.0), (1500.0, 640.0)] {
-            let a = graph.eval_columns(&sim, x, z);
-            let b = back.eval_columns(&sim, x, z);
-            assert!((a.height - b.height).abs() < 1e-6);
-            assert!((a.rock - b.rock).abs() < 1e-6);
+            let a = graph.eval_columns(7, x, z);
+            let b = back.eval_columns(7, x, z);
+            assert_eq!(a.height, b.height);
+            assert_eq!(a.rock, b.rock);
         }
     }
 

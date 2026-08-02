@@ -345,10 +345,6 @@ async fn forced_misprediction_reconciles_behind_the_wall() {
     let mut a = Client::join(proxy, "alice").await;
     let (self_net, spawn) = (a.self_entity, a.spawn);
     let mut pred = Predictor::new(spawn);
-    // The predictor never applies edit broadcasts — the deterministic form of
-    // "the world changed server-side inside my staleness window". (Fly mode
-    // is noclip by design, so this scenario must *walk* into the wall.)
-    pred.ignore_edits = true;
 
     let mut ticker = tokio::time::interval(Duration::from_micros(15_625));
 
@@ -369,22 +365,36 @@ async fn forced_misprediction_reconciles_behind_the_wall() {
         pred.max_divergence
     );
 
-    // A carves a walking tunnel north through the hillside (all within
-    // reach). The server applies the carve; the stale predictor still sees
-    // solid rock — so the *server* walks on while the prediction stays stuck.
+    // A builds a wall just north (both sides see it), goes stale, then carves
+    // a walking tunnel back through it (all within reach). Building the
+    // obstacle keeps the scenario independent of what the terrain generator
+    // put here. The server applies the carve; the stale predictor still sees
+    // the wall — so the *server* walks on while the prediction stays stuck.
+    // (Fly mode is noclip by design, so this scenario must *walk* into it.)
     let eye = pred.sim.pos;
     let (feet_y, x0) = ((eye.y - 1.6).floor() as i32, eye.x.floor() as i32);
-    let mut carved = 0u32;
-    for dz in 1..=6i32 {
-        for dx in -1..=1i32 {
-            for dy in 0..3i32 {
-                a.edit([x0 + dx, feet_y + dy, eye.z.floor() as i32 - dz], 0).await;
-                carved += 1;
-                if carved % 24 == 0 {
-                    // Respect the server's edit rate bucket.
-                    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mut edits = 0u32;
+    for value in [3u8, 0] {
+        for dz in 1..=3i32 {
+            for dx in -1..=1i32 {
+                for dy in 0..3i32 {
+                    a.edit([x0 + dx, feet_y + dy, eye.z.floor() as i32 - dz], value).await;
+                    edits += 1;
+                    if edits % 24 == 0 {
+                        // Respect the server's edit rate bucket.
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                    }
                 }
             }
+        }
+        drain(&mut a, &mut pred, self_net).await;
+        if value == 3 {
+            // Let the wall reach the predictor's map, then stop applying
+            // edits — the deterministic form of "the world changed
+            // server-side inside my staleness window".
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            drain(&mut a, &mut pred, self_net).await;
+            pred.ignore_edits = true;
         }
     }
 

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use soils_protocol::{
+use soils_protocol::{ChunkInfo, 
     ChunkVolume, ClientMsg, EntityState, InputFrame, ServerMsg, SnapshotTracker, decode,
     decode_chunk, encode,
 };
@@ -107,6 +107,8 @@ pub struct Client {
     pub edit_seq: u32,
     /// Snapshot decode state (baselines + latest tick, acked on `fly`).
     pub tracker: SnapshotTracker,
+    pub worldgen: Option<soils_protocol::GenParams>,
+    genctx: Option<(soils_worldgen::TerrainGen, soils_worldgen::BlockRegistry)>,
 }
 
 impl Client {
@@ -122,6 +124,8 @@ impl Client {
             input_seq: 0,
             edit_seq: 0,
             tracker: SnapshotTracker::default(),
+            worldgen: None,
+            genctx: None,
         }
     }
 
@@ -134,12 +138,17 @@ impl Client {
 
     /// Guest-signup login; waits for `Init` and records id + spawn.
     pub async fn login(&mut self, name: &str) {
-        self.send(&ClientMsg::Login { name: name.into(), password: String::new(), signup: true })
-            .await;
-        let (id, self_entity, spawn) = self
+        self.send(&ClientMsg::Login {
+            name: name.into(),
+            password: String::new(),
+            signup: true,
+            protocol: soils_protocol::PROTOCOL_VERSION,
+        })
+        .await;
+        let (id, self_entity, spawn, worldgen) = self
             .recv_until(|msg| match msg {
-                ServerMsg::Init { id, self_entity, spawn, .. } => {
-                    Some((id, self_entity, spawn))
+                ServerMsg::Init { id, self_entity, spawn, worldgen, .. } => {
+                    Some((id, self_entity, spawn, worldgen))
                 }
                 ServerMsg::LoginError { message } => panic!("login failed: {message}"),
                 _ => None,
@@ -148,6 +157,7 @@ impl Client {
         self.id = id;
         self.self_entity = self_entity;
         self.spawn = spawn;
+        self.worldgen = Some(worldgen);
     }
 
     pub async fn send(&mut self, msg: &ClientMsg) {
@@ -254,47 +264,89 @@ impl Client {
         }
     }
 
+    /// The local generator mirror (built lazily from `Init`'s GenParams) —
+    /// the same materialization path the real client runs.
+    pub fn generator(&mut self) -> &(soils_worldgen::TerrainGen, soils_worldgen::BlockRegistry) {
+        if self.genctx.is_none() {
+            let p = self.worldgen.expect("login() captures GenParams");
+            let wt = match p.world_type {
+                1 => soils_worldgen::WorldType::Flat,
+                _ => soils_worldgen::WorldType::Normal,
+            };
+            let terrain = soils_worldgen::TerrainGen::new(p.seed as u32, wt);
+            assert_eq!(
+                soils_worldgen::graph_hash(terrain.graph()),
+                p.graph_hash,
+                "server generator identity differs from this build"
+            );
+            self.genctx = Some((terrain, soils_worldgen::default_registry()));
+        }
+        self.genctx.as_ref().unwrap()
+    }
+
+    /// A manifest entry as a voxel volume: `Edited` decodes its payload,
+    /// `Pristine` generates locally (bit-exact by worldgen v2's contract).
+    pub fn materialize(&mut self, info: &ChunkInfo) -> ChunkVolume {
+        match info {
+            ChunkInfo::Edited { payload, .. } => {
+                decode_chunk(payload).expect("chunk payload decodes")
+            }
+            ChunkInfo::Pristine { pos } => {
+                let (terrain, registry) = self.generator();
+                terrain.generate(glam::IVec3::from_array(*pos), registry)
+            }
+        }
+    }
+
     /// Wait for the server to push a specific chunk (the server owns the
     /// subscription — chunks stream in after login/moves without a request).
-    /// Returns it decoded.
+    /// Returns it materialized.
     pub async fn await_chunk(&mut self, pos: [i32; 3]) -> ChunkVolume {
-        let payload = self
+        let info = self
             .recv_until(|msg| match msg {
-                ServerMsg::Bundle { chunks } => {
-                    chunks.into_iter().find(|c| c.pos == pos).map(|c| c.payload)
-                }
-                ServerMsg::Chunk { pos: p, payload } if p == pos => Some(payload),
+                ServerMsg::Manifest { chunks } => chunks.into_iter().find(|c| c.pos() == pos),
                 _ => None,
             })
             .await;
-        decode_chunk(&payload).expect("chunk payload decodes")
+        self.materialize(&info)
     }
 
     /// Drain pushed chunks until every position in `positions` has arrived.
-    /// Returns raw payloads keyed by position (byte-comparable).
-    pub async fn collect_chunks(
-        &mut self,
-        positions: &[[i32; 3]],
-    ) -> std::collections::HashMap<[i32; 3], Vec<u8>> {
+    /// Payloads are canonical `chunk_codec` bytes (pristine entries are
+    /// generated locally and re-encoded), so two clients' maps byte-compare.
+    pub async fn collect_chunks(&mut self, positions: &[[i32; 3]]) -> CollectedChunks {
         let want: std::collections::HashSet<[i32; 3]> = positions.iter().copied().collect();
-        let mut got = std::collections::HashMap::new();
-        while got.len() < want.len() {
-            match self.next_msg().await {
-                ServerMsg::Bundle { chunks } => {
-                    for c in chunks {
-                        if want.contains(&c.pos) {
-                            got.insert(c.pos, c.payload);
-                        }
+        let mut out = CollectedChunks::default();
+        while out.payloads.len() < want.len() {
+            if let ServerMsg::Manifest { chunks } = self.next_msg().await {
+                for info in chunks {
+                    let pos = info.pos();
+                    if !want.contains(&pos) {
+                        continue;
                     }
+                    match &info {
+                        ChunkInfo::Edited { payload, .. } => {
+                            out.edited += 1;
+                            out.wire_bytes += payload.len() + 13;
+                        }
+                        ChunkInfo::Pristine { .. } => out.wire_bytes += 13,
+                    }
+                    let vol = self.materialize(&info);
+                    out.payloads.insert(pos, soils_protocol::encode_chunk(&vol));
                 }
-                ServerMsg::Chunk { pos, payload } if want.contains(&pos) => {
-                    got.insert(pos, payload);
-                }
-                _ => {}
             }
         }
-        got
+        out
     }
+}
+
+/// Result of [`Client::collect_chunks`]: canonical payloads plus what the
+/// stream actually cost (manifest wire bytes, edited-entry count).
+#[derive(Default)]
+pub struct CollectedChunks {
+    pub payloads: std::collections::HashMap<[i32; 3], Vec<u8>>,
+    pub wire_bytes: usize,
+    pub edited: usize,
 }
 
 /// Poll `cond` until it holds or `timeout` elapses. Used for asynchronous

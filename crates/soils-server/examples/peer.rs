@@ -15,6 +15,7 @@ async fn main() {
     let (mut tx, mut rx) = ws.split();
 
     tx.send(Message::Binary(encode(&ClientMsg::Login {
+        protocol: soils_protocol::PROTOCOL_VERSION,
         name: "peer".into(),
         password: String::new(),
         signup: true,

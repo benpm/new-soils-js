@@ -102,6 +102,14 @@ struct Predictor {
     frames: Vec<InputFrame>,
     history: VecDeque<(u32, PlayerInput, PlayerState)>,
     chunks: HashMap<IVec3, ChunkVolume>,
+    /// Pristine manifest positions not yet materialized. Generated lazily in
+    /// [`tick`] for chunks near the player only — generating whole waves
+    /// inside the drain loop stalls the 64 Hz ticker and bursts inputs into
+    /// the server's token bucket, which reads as fake divergence.
+    pending: std::collections::HashSet<IVec3>,
+    /// Local generator mirror for pristine manifest entries (set after join
+    /// from the Init GenParams).
+    generator: Option<(soils_worldgen::TerrainGen, soils_worldgen::BlockRegistry)>,
     /// Scenario (b): pretend edit broadcasts haven't arrived, so the local
     /// world stays stale and the prediction runs into server-only terrain.
     ignore_edits: bool,
@@ -116,6 +124,15 @@ struct Predictor {
 }
 
 impl Predictor {
+    fn set_gen(&mut self, p: soils_protocol::GenParams) {
+        let wt = match p.world_type {
+            1 => soils_worldgen::WorldType::Flat,
+            _ => soils_worldgen::WorldType::Normal,
+        };
+        let terrain = soils_worldgen::TerrainGen::new(p.seed as u32, wt);
+        self.generator = Some((terrain, soils_worldgen::default_registry()));
+    }
+
     fn new(spawn: [f32; 3]) -> Self {
         Self {
             sim: PlayerState { pos: Vec3::from_array(spawn), ..Default::default() },
@@ -123,6 +140,8 @@ impl Predictor {
             frames: Vec::new(),
             history: VecDeque::new(),
             chunks: HashMap::new(),
+            pending: std::collections::HashSet::new(),
+            generator: None,
             ignore_edits: false,
             max_divergence: 0.0,
             reconciles: 0,
@@ -145,6 +164,21 @@ impl Predictor {
     /// One 64 Hz tick: predict locally, queue the frame bundle. Returns the
     /// `Inputs` message to send (the caller may drop it to simulate loss).
     fn tick(&mut self, input: PlayerInput, ack_tick: u32) -> ClientMsg {
+        // Materialize pending pristine chunks the step could touch (player's
+        // chunk ± 1); everything else stays pending (unloaded-reads-air).
+        if let Some((terrain, registry)) = &self.generator {
+            let pc = chunk_of(self.sim.pos.floor().as_ivec3());
+            let near: Vec<IVec3> = self
+                .pending
+                .iter()
+                .copied()
+                .filter(|p| (*p - pc).abs().max_element() <= 1)
+                .collect();
+            for p in near {
+                self.pending.remove(&p);
+                self.chunks.insert(p, terrain.generate(p, registry));
+            }
+        }
         let chunks = &self.chunks;
         let sampler = |v: IVec3| match chunks.get(&chunk_of(v)) {
             Some(c) => {
@@ -169,20 +203,26 @@ impl Predictor {
 
     fn handle(&mut self, msg: &ServerMsg, self_net: u32, tracker_states: &[(u32, [f32; 3], [f32; 3])]) {
         match msg {
-            ServerMsg::Bundle { chunks } => {
-                for c in chunks {
-                    if let Some(vol) = decode_chunk(&c.payload) {
-                        self.chunks.insert(IVec3::from_array(c.pos), vol);
+            ServerMsg::Manifest { chunks } => {
+                for info in chunks {
+                    let pos = IVec3::from_array(info.pos());
+                    match info {
+                        soils_protocol::ChunkInfo::Edited { payload, .. } => {
+                            self.pending.remove(&pos);
+                            if let Some(vol) = decode_chunk(payload) {
+                                self.chunks.insert(pos, vol);
+                            }
+                        }
+                        soils_protocol::ChunkInfo::Pristine { .. } => {
+                            self.pending.insert(pos);
+                        }
                     }
                 }
             }
-            ServerMsg::Chunk { pos, payload } => {
-                if let Some(vol) = decode_chunk(payload) {
-                    self.chunks.insert(IVec3::from_array(*pos), vol);
-                }
-            }
             ServerMsg::ChunkUnload { pos } => {
-                self.chunks.remove(&IVec3::from_array(*pos));
+                let pos = IVec3::from_array(*pos);
+                self.pending.remove(&pos);
+                self.chunks.remove(&pos);
             }
             ServerMsg::Edit { pos, value } | ServerMsg::EditAccepted { pos, value, .. } => {
                 if self.ignore_edits {
@@ -307,6 +347,7 @@ async fn prediction_holds_on_a_delayed_lossy_link() {
     let mut a = Client::join(proxy, "alice").await;
     let (self_net, spawn) = (a.self_entity, a.spawn);
     let mut pred = Predictor::new(spawn);
+    pred.set_gen(a.worldgen.expect("init captured"));
 
     // Straight-line flight north for ~2.5 s at 64 Hz, dropping every 50th
     // input send (2%); the bundled last-3 frames recover the gaps.
@@ -345,6 +386,7 @@ async fn forced_misprediction_reconciles_behind_the_wall() {
     let mut a = Client::join(proxy, "alice").await;
     let (self_net, spawn) = (a.self_entity, a.spawn);
     let mut pred = Predictor::new(spawn);
+    pred.set_gen(a.worldgen.expect("init captured"));
 
     let mut ticker = tokio::time::interval(Duration::from_micros(15_625));
 

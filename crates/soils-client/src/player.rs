@@ -344,12 +344,16 @@ pub fn track_streaming(
     net: Res<NetClient>,
     map: Res<ChunkMap>,
     queue: Res<crate::server_msg::ChunkApplyQueue>,
+    cgen: Res<crate::server_msg::ClientGen>,
     mut streaming: ResMut<Streaming>,
     query: Query<&Transform, With<Player>>,
 ) {
     if streaming.sent_radius != Some(streaming.load_radius) {
         streaming.sent_radius = Some(streaming.load_radius);
-        net.send(ClientMsg::ViewRadius { radius: streaming.load_radius as u8 });
+        net.send(ClientMsg::ViewRadius {
+            radius: streaming.load_radius as u8,
+            full_streams: !cgen.hash_ok,
+        });
     }
 
     let Ok(transform) = query.single() else { return };

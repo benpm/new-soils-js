@@ -261,6 +261,7 @@ pub fn login_buttons(
                         name: singleplayer::LOCAL_NAME.into(),
                         password: String::new(),
                         signup: true,
+                        protocol: soils_protocol::PROTOCOL_VERSION,
                     });
                 }
                 Err(e) => login.status = format!("could not start server: {e}"),
@@ -297,6 +298,7 @@ fn submit(login: &mut LoginState, net: &NetClient, signup: bool) {
         name: login.name.clone(),
         password: login.password.clone(),
         signup,
+        protocol: soils_protocol::PROTOCOL_VERSION,
     });
 }
 

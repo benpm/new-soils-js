@@ -147,6 +147,7 @@ fn main() {
             )
                 .after(server_msg::apply_init)
                 .after(server_msg::apply_warp),
+            server_msg::flush_chunk_fetch.after(server_msg::route_server_messages),
             server_msg::apply_entity_updates.after(server_msg::apply_entity_spawns),
             server_msg::apply_entity_despawns.after(server_msg::apply_entity_updates),
             player::reconcile_self
@@ -414,7 +415,12 @@ fn selftest_login(net: Res<NetClient>) {
     }
     if std::env::var("SOILS_SELFTEST").is_ok() && std::env::var("SOILS_LOGINSHOT").is_err() {
         net.connect(format!("{}://127.0.0.1:9001", net::default_scheme()));
-        net.send(ClientMsg::Login { name: "player".into(), password: String::new(), signup: true });
+        net.send(ClientMsg::Login {
+            name: "player".into(),
+            password: String::new(),
+            signup: true,
+            protocol: soils_protocol::PROTOCOL_VERSION,
+        });
     }
 }
 

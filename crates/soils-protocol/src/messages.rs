@@ -8,6 +8,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Wire-protocol version, checked at login. Clean breaks (message set or
+/// semantics changes) bump this; the server rejects mismatched clients with a
+/// `LoginError` instead of letting bincode misparse.
+///
+/// v2: manifest streaming — pristine chunks are generated client-side from
+/// [`GenParams`] (worldgen v2 is bit-exact CPU==GPU); only edited chunks ship
+/// payloads. `Chunk`/`Bundle` replaced by `Manifest`; `Edit` broadcasts are
+/// interest-filtered.
+pub const PROTOCOL_VERSION: u32 = 2;
+
 /// Bincode configuration used on both ends. Standard little-endian, variable
 /// int encoding.
 pub fn config() -> bincode::config::Configuration {
@@ -24,16 +34,39 @@ pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Option<T> {
     bincode::serde::decode_from_slice(bytes, config()).ok().map(|(v, _)| v)
 }
 
+/// World-generation identity of a world. A client may generate pristine
+/// chunks locally only when it can reproduce the server's generator exactly:
+/// same seed, same world type, and a matching `graph_hash`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenParams {
+    pub seed: i64,
+    /// 0 = Normal, 1 = Flat (mirrors `soils_worldgen::WorldType`; kept a raw
+    /// u8 so the protocol crate stays worldgen-free).
+    pub world_type: u8,
+    /// Stable hash of the server's terrain graph + `WORLDGEN_ALGO_VERSION`.
+    /// Mismatch (stale client build, designed graph) → the client requests
+    /// `full_streams` and everything ships as `Edited` payloads.
+    pub graph_hash: u64,
+}
+
 /// Messages sent client → server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// Authenticate (or, with `signup`, register) and join. The server replies
     /// with `Init` on success or `LoginError` on failure. `password` may be
-    /// empty (optional-password accounts).
-    Login { name: String, password: String, signup: bool },
+    /// empty (optional-password accounts). `protocol` must equal
+    /// [`PROTOCOL_VERSION`].
+    Login { name: String, password: String, signup: bool, protocol: u32 },
     /// The client's chunk view radius. The server owns the subscription set
     /// (which chunks stream in and when they unload); this only sizes it.
-    ViewRadius { radius: u8 },
+    /// `full_streams` opts out of client-side generation: every chunk ships
+    /// as an `Edited` payload (graph-hash mismatch, gen failure fallback).
+    ViewRadius { radius: u8, full_streams: bool },
+    /// Fetch full payloads for specific subscribed positions regardless of
+    /// class — the escape hatch for hash-mismatch repair, local gen failure,
+    /// and divergence self-tests. Rate-limited server-side; unsubscribed or
+    /// non-resident positions are silently dropped.
+    ChunkFetch { positions: Vec<[i32; 3]> },
     /// Movement inputs (server authority: the server simulates the player via
     /// `soils-sim`, so positions can't be forged). One frame per client fixed
     /// tick; the last few frames are bundled for loss/ordering robustness on
@@ -70,19 +103,22 @@ pub enum ServerMsg {
     /// Sent once after a successful `Login` with spawn + world info.
     /// `self_entity` is the NetId of this client's own player entity — its
     /// updates drive the local camera rather than spawning a body.
-    Init { id: u16, self_entity: u32, spawn: [f32; 3], seed: i64, daytime: f32 },
-    /// A failed `Login` (bad password, name taken, etc.).
+    Init { id: u16, self_entity: u32, spawn: [f32; 3], worldgen: GenParams, daytime: f32 },
+    /// A failed `Login` (bad password, name taken, protocol mismatch, etc.).
     LoginError { message: String },
-    /// A chunk's voxel data as a [`chunk_codec`](crate::chunk_codec) payload
-    /// (palette + LZ4; an all-air chunk is the 2-byte Uniform payload).
-    Chunk { pos: [i32; 3], payload: Vec<u8> },
-    /// Several chunks in one frame, to cut per-message overhead when streaming
-    /// a region. Pushed by the server as the subscription set grows.
-    Bundle { chunks: Vec<ChunkData> },
+    /// Chunks entering the subscription. `Pristine` entries carry no data —
+    /// the client generates them locally from [`GenParams`] (bit-exact by
+    /// worldgen v2's contract); `Edited` entries ship the full
+    /// [`chunk_codec`](crate::chunk_codec) payload. Shares the ordered stream
+    /// with `ChunkUnload` — their relative order is protocol contract.
+    Manifest { chunks: Vec<ChunkInfo> },
     /// The chunk left the client's subscription (moved out of radius +
     /// hysteresis). The client drops its copy and frees GPU resources.
     ChunkUnload { pos: [i32; 3] },
-    /// A voxel edit made by another player (apply locally).
+    /// A voxel edit made by another player (apply locally). Interest-filtered:
+    /// sent only to clients whose subscription contains the chunk — the
+    /// client-gen invariant is "local copy = bit-exact base + every Edit
+    /// received while subscribed".
     Edit { pos: [i32; 3], value: u8 },
     /// The server validated and applied the editor's own edit `seq`.
     EditAccepted { seq: u32, pos: [i32; 3], value: u8 },
@@ -104,16 +140,27 @@ pub enum ServerMsg {
     /// Current world time of day, 0.0..1.0.
     Time { daytime: f32 },
     /// Confirms a `Warp`: the client should drop all chunks/actors, teleport to
-    /// `spawn`, and re-stream the new world.
-    Warp { spawn: [f32; 3], daytime: f32 },
+    /// `spawn`, rebuild its generator from `gen` (each named world has its own
+    /// seed), and re-stream the new world.
+    Warp { spawn: [f32; 3], worldgen: GenParams, daytime: f32 },
 }
 
-/// One chunk's data within a [`ServerMsg::Bundle`]. `payload` is a
-/// [`chunk_codec`](crate::chunk_codec) encoding.
+/// One chunk within a [`ServerMsg::Manifest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkData {
-    pub pos: [i32; 3],
-    pub payload: Vec<u8>,
+pub enum ChunkInfo {
+    /// Never edited: reproduce locally from [`GenParams`] (~13 B on the wire).
+    Pristine { pos: [i32; 3] },
+    /// Ever edited (or `full_streams`): the full
+    /// [`chunk_codec`](crate::chunk_codec) payload.
+    Edited { pos: [i32; 3], payload: Vec<u8> },
+}
+
+impl ChunkInfo {
+    pub fn pos(&self) -> [i32; 3] {
+        match self {
+            ChunkInfo::Pristine { pos } | ChunkInfo::Edited { pos, .. } => *pos,
+        }
+    }
 }
 
 /// One entity's replicated state (full-state form; the delta pipeline of a

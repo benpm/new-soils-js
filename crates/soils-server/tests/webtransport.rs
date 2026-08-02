@@ -56,6 +56,7 @@ async fn webtransport_clients_login_move_and_stream_snapshots() {
 
     // Login over the reliable stream; Init comes back on it.
     send_framed(&mut tx, &ClientMsg::Login {
+        protocol: soils_protocol::PROTOCOL_VERSION,
         name: "wt-alice".into(),
         password: String::new(),
         signup: true,

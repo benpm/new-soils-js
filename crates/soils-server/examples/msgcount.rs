@@ -13,6 +13,7 @@ async fn main() {
     let (ws, _) = tokio_tungstenite::connect_async("ws://127.0.0.1:9001").await.expect("connect");
     let (mut tx, mut rx) = ws.split();
     tx.send(Message::Binary(encode(&ClientMsg::Login {
+        protocol: soils_protocol::PROTOCOL_VERSION,
         name: "msgcount".into(),
         password: String::new(),
         signup: true,
@@ -36,8 +37,8 @@ async fn main() {
             Some(ServerMsg::EntityDespawn { .. }) => "EntityDespawn",
             Some(ServerMsg::EditAccepted { .. }) => "EditAccepted",
             Some(ServerMsg::EditRejected { .. }) => "EditRejected",
-            Some(ServerMsg::Bundle { .. }) => "Bundle",
-            Some(ServerMsg::Chunk { .. }) => "Chunk",
+            Some(ServerMsg::Manifest { .. }) => "Manifest",
+            
             Some(ServerMsg::Edit { .. }) => "Edit",
             _ => "other",
         };

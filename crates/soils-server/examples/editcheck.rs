@@ -6,7 +6,7 @@
 //!   cargo run -p soils-server --example editcheck -- verify
 
 use futures_util::{SinkExt, StreamExt};
-use soils_protocol::{ChunkVolume, ClientMsg, ServerMsg, decode, encode};
+use soils_protocol::{ChunkInfo, ChunkVolume, ClientMsg, ServerMsg, decode, encode};
 use tokio_tungstenite::tungstenite::Message;
 
 // A voxel within edit reach of the spawn eye (server authority validates
@@ -22,7 +22,14 @@ async fn main() {
     let (ws, _) = tokio_tungstenite::connect_async("ws://127.0.0.1:9001").await.expect("connect");
     let (mut tx, mut rx) = ws.split();
 
-    tx.send(bin(&ClientMsg::Login { name: "editcheck".into(), password: String::new(), signup: true })).await.unwrap();
+    tx.send(bin(&ClientMsg::Login {
+        name: "editcheck".into(),
+        password: String::new(),
+        signup: true,
+        protocol: soils_protocol::PROTOCOL_VERSION,
+    }))
+    .await
+    .unwrap();
     // Drain until Init.
     while let Some(Ok(Message::Binary(b))) = rx.next().await {
         if matches!(decode::<ServerMsg>(b.as_ref()), Some(ServerMsg::Init { .. })) {
@@ -60,19 +67,27 @@ async fn recv_chunk<S>(rx: &mut S) -> ChunkVolume
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    // Drain the pushed stream until the target chunk appears.
+    // Drain the pushed stream until the target chunk appears. This example
+    // verifies edit persistence: an edited chunk always ships as a payload;
+    // pristine means "never edited" (the `write` run's pre-check tolerates a
+    // generated stand-in only for reading the pre-edit value).
     while let Some(Ok(Message::Binary(b))) = rx.next().await {
-        let payload = match decode::<ServerMsg>(b.as_ref()) {
-            Some(ServerMsg::Chunk { pos, payload }) if pos == CHUNK => payload,
-            Some(ServerMsg::Bundle { chunks }) => {
-                match chunks.into_iter().find(|c| c.pos == CHUNK) {
-                    Some(c) => c.payload,
-                    None => continue,
-                }
-            }
-            _ => continue,
+        let Some(ServerMsg::Manifest { chunks }) = decode::<ServerMsg>(b.as_ref()) else {
+            continue;
         };
-        return soils_protocol::decode_chunk(&payload).expect("chunk payload decodes");
+        match chunks.into_iter().find(|c| c.pos() == CHUNK) {
+            Some(ChunkInfo::Edited { payload, .. }) => {
+                return soils_protocol::decode_chunk(&payload).expect("chunk payload decodes");
+            }
+            Some(ChunkInfo::Pristine { .. }) => {
+                let tg = soils_worldgen::TerrainGen::new(0, soils_worldgen::WorldType::Normal);
+                return tg.generate(
+                    glam::IVec3::from_array(CHUNK),
+                    &soils_worldgen::default_registry(),
+                );
+            }
+            None => continue,
+        }
     }
     panic!("server closed before sending the chunk");
 }

@@ -31,7 +31,7 @@ use bevy_ecs::prelude::{
 use bevy_time::{Fixed, Time, TimePlugin};
 use glam::{IVec2, IVec3, Quat, Vec3};
 use soils_protocol::{
-    CHUNK_BIT, ChunkData, ClientMsg, ChunkVolume, QuantState, ServerMsg, encode_snapshot,
+    CHUNK_BIT, ChunkInfo, ClientMsg, ChunkVolume, QuantState, ServerMsg, encode_snapshot,
 };
 use soils_script::{ScriptCommand, ScriptEvent, ScriptRuntime, ScriptWorld};
 use soils_sim::{KIND_CRITTER, KIND_PHYSICS_CUBE, KIND_PLAYER, nav};
@@ -114,6 +114,9 @@ pub(crate) struct Client {
     edit_tokens: f32,
     /// View radius in chunks (client-requested via `ViewRadius`, clamped).
     radius: i32,
+    /// Client opted out of local generation (graph-hash mismatch / gen
+    /// failure): every manifest entry ships as an `Edited` payload.
+    full_streams: bool,
     /// The chunk the subscription was last computed around.
     center: Option<IVec3>,
     /// The chunks this client is subscribed to (holds a ref on each).
@@ -653,6 +656,7 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 input_tokens: INPUT_BURST,
                 edit_tokens: EDIT_RATE,
                 radius: DEFAULT_RADIUS,
+                full_streams: false,
                 center: None,
                 subs: HashSet::new(),
                 jobs: VecDeque::new(),
@@ -666,6 +670,18 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
 fn send_world(clients: &Clients, world: &str, except: u16, msg: &ServerMsg) {
     for (&id, c) in &clients.0 {
         if id != except && c.authenticated && c.world == world {
+            let _ = c.outbox.send(msg.clone());
+        }
+    }
+}
+
+/// Interest-filtered edit broadcast: only clients whose subscription contains
+/// `cpos`. The client-gen invariant depends on this being exact — a client's
+/// copy of a chunk is (bit-exact base) + (every Edit received while
+/// subscribed); anyone else gets the edited payload from a future manifest.
+fn send_world_subscribed(clients: &Clients, world: &str, except: u16, cpos: IVec3, msg: &ServerMsg) {
+    for (&id, c) in &clients.0 {
+        if id != except && c.authenticated && c.world == world && c.subs.contains(&cpos) {
             let _ = c.outbox.send(msg.clone());
         }
     }
@@ -712,8 +728,17 @@ fn drain_inboxes(
     // loop guaranteed across clients was per-client FIFO too).
     for (id, msg) in msgs {
         match msg {
-            ClientMsg::Login { name, password, signup } => {
+            ClientMsg::Login { name, password, signup, protocol } => {
                 let c = clients.0.get_mut(&id).unwrap();
+                if protocol != soils_protocol::PROTOCOL_VERSION {
+                    let _ = c.outbox.send(ServerMsg::LoginError {
+                        message: format!(
+                            "protocol mismatch: client v{protocol}, server v{}",
+                            soils_protocol::PROTOCOL_VERSION
+                        ),
+                    });
+                    continue;
+                }
                 match accounts.0.authenticate(&name, &password, signup) {
                     Err(reason) => {
                         println!("login denied: {name} (id {id}): {reason}");
@@ -727,7 +752,7 @@ fn drain_inboxes(
                         c.authenticated = true;
                         let world_name = c.world.clone();
                         let world = worlds.get_or_create(&world_name);
-                        let (spawn, seed) = (world.spawn, world.seed);
+                        let (spawn, worldgen) = (world.spawn, world.gen_params());
                         let c = clients.0.get_mut(&id).unwrap();
                         // (Re)spawn this connection's player entity.
                         if let Some(old) = c.entity.take() {
@@ -758,7 +783,7 @@ fn drain_inboxes(
                             id,
                             self_entity: net,
                             spawn,
-                            seed,
+                            worldgen,
                             daytime: clock.daytime,
                         });
                         // Server-driven streaming: subscribing around the spawn
@@ -796,11 +821,39 @@ fn drain_inboxes(
             // Everything below requires authentication; silently drop otherwise
             // (same as the old pre-auth gate).
             _ if !clients.0[&id].authenticated => {}
-            ClientMsg::ViewRadius { radius } => {
+            ClientMsg::ViewRadius { radius, full_streams } => {
                 let c = clients.0.get_mut(&id).unwrap();
                 c.radius = (radius as i32).clamp(1, MAX_RADIUS);
+                c.full_streams = full_streams;
                 let world = worlds.get_or_create(&c.world.clone());
                 resubscribe(c, world);
+            }
+            ClientMsg::ChunkFetch { positions } => {
+                // Escape hatch: full payloads for subscribed, resident
+                // positions. Reuses the edit token bucket as its rate limit.
+                let c = clients.0.get_mut(&id).unwrap();
+                if c.edit_tokens < 1.0 {
+                    continue;
+                }
+                c.edit_tokens -= 1.0;
+                let world_name = c.world.clone();
+                let world = worlds.get_or_create(&world_name);
+                let c = &clients.0[&id];
+                let chunks: Vec<ChunkInfo> = positions
+                    .iter()
+                    .take(64)
+                    .filter_map(|&p| {
+                        let pos = IVec3::from_array(p);
+                        if !c.subs.contains(&pos) {
+                            return None;
+                        }
+                        let payload = world.serve(pos)?;
+                        Some(ChunkInfo::Edited { pos: p, payload })
+                    })
+                    .collect();
+                if !chunks.is_empty() {
+                    let _ = c.outbox.send(ServerMsg::Manifest { chunks });
+                }
             }
             ClientMsg::Edit { seq, pos, value } => {
                 // Authority (plan §6): rate cap, reach from the *server-side*
@@ -828,7 +881,13 @@ fn drain_inboxes(
                 let c = &clients.0[&id];
                 if applied {
                     let _ = c.outbox.send(ServerMsg::EditAccepted { seq, pos, value });
-                    send_world(&clients, &world_name, id, &ServerMsg::Edit { pos, value });
+                    send_world_subscribed(
+                        &clients,
+                        &world_name,
+                        id,
+                        soils_protocol::chunk_of(target),
+                        &ServerMsg::Edit { pos, value },
+                    );
                     // Player edits feed scripts' on_edit (script edits do not, so
                     // no recursion).
                     script_events.0.push(ScriptEvent::Edit {
@@ -922,7 +981,11 @@ fn drain_inboxes(
                     sim.0.vel = Vec3::ZERO;
                     in_world.0 = name.clone();
                 }
-                let _ = c.outbox.send(ServerMsg::Warp { spawn, daytime: clock.daytime });
+                let _ = c.outbox.send(ServerMsg::Warp {
+                    spawn,
+                    worldgen: world.gen_params(),
+                    daytime: clock.daytime,
+                });
                 c.center = Some(chunk_at(spawn));
                 resubscribe(c, world);
             }
@@ -1178,7 +1241,7 @@ fn pump_chunk_jobs(mut clients: ResMut<Clients>, mut worlds: ResMut<Worlds>) {
                 // per-connection stream is FIFO).
                 let deliver: Vec<IVec3> =
                     wave.positions.into_iter().filter(|p| c.subs.contains(p)).collect();
-                send_wave(world, &deliver, &c.outbox);
+                send_wave(world, &deliver, &c.outbox, c.full_streams);
             }
             if blocked {
                 break;
@@ -1195,19 +1258,30 @@ fn pump_chunk_jobs(mut clients: ResMut<Clients>, mut worlds: ResMut<Worlds>) {
 }
 
 /// Stream one wave's chunks in request order, bundled `BUNDLE_SIZE` at a time.
-fn send_wave(world: &World, positions: &[IVec3], out: &UnboundedSender<ServerMsg>) {
-    let mut batch: Vec<ChunkData> = Vec::with_capacity(BUNDLE_SIZE);
+fn send_wave(
+    world: &World,
+    positions: &[IVec3],
+    out: &UnboundedSender<ServerMsg>,
+    full_streams: bool,
+) {
+    let mut batch: Vec<ChunkInfo> = Vec::with_capacity(BUNDLE_SIZE);
     for &pos in positions {
         // Every position is resident by now (cached at dispatch or adopted
         // above); a miss would mean a logic bug, not a recoverable state.
-        let Some(payload) = world.serve(pos) else { continue };
-        batch.push(ChunkData { pos: [pos.x, pos.y, pos.z], payload });
+        let Some(edited) = world.chunk_edited(pos) else { continue };
+        let info = if edited || full_streams {
+            let Some(payload) = world.serve(pos) else { continue };
+            ChunkInfo::Edited { pos: [pos.x, pos.y, pos.z], payload }
+        } else {
+            ChunkInfo::Pristine { pos: [pos.x, pos.y, pos.z] }
+        };
+        batch.push(info);
         if batch.len() >= BUNDLE_SIZE {
-            let _ = out.send(ServerMsg::Bundle { chunks: std::mem::take(&mut batch) });
+            let _ = out.send(ServerMsg::Manifest { chunks: std::mem::take(&mut batch) });
         }
     }
     if !batch.is_empty() {
-        let _ = out.send(ServerMsg::Bundle { chunks: batch });
+        let _ = out.send(ServerMsg::Manifest { chunks: batch });
     }
 }
 

@@ -16,6 +16,18 @@ pub mod wgsl;
 /// edited) and it feeds the protocol's `graph_hash`.
 pub const WORLDGEN_ALGO_VERSION: u32 = 2;
 
+/// Stable identity of a generator: FNV-1a over the RON-serialized graph plus
+/// [`WORLDGEN_ALGO_VERSION`]. Client and server compare these to decide
+/// whether client-side generation can reproduce server chunks bit-exactly.
+pub fn graph_hash(graph: &TerrainGraph) -> u64 {
+    let text = ron::to_string(graph).expect("graph serializes");
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.bytes().chain(WORLDGEN_ALGO_VERSION.to_le_bytes()) {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 pub use blocks::{BlockDef, BlockRegistry};
 pub use graph::{CaveParams, ColumnSample, CompiledGraph, NodeKind, TerrainGraph};
 pub use greedy::{MeshData, greedy_mesh};

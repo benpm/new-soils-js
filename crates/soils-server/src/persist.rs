@@ -22,6 +22,8 @@ pub struct SaveJob {
     pub dir: PathBuf,
     pub pos: IVec3,
     pub volume: ChunkVolume,
+    /// Lands in the region header's `EDITED_FLAG` (drives manifest classes).
+    pub edited: bool,
 }
 
 enum Msg {
@@ -40,8 +42,8 @@ impl PersistHandle {
     /// Queue a chunk for background persistence. Never blocks on disk; the only
     /// cost is cloning the volume (done by the caller) and a channel send. If
     /// the writer has gone away the job is silently dropped.
-    pub fn enqueue(&self, dir: PathBuf, pos: IVec3, volume: ChunkVolume) {
-        let _ = self.tx.send(Msg::Save(SaveJob { dir, pos, volume }));
+    pub fn enqueue(&self, dir: PathBuf, pos: IVec3, volume: ChunkVolume, edited: bool) {
+        let _ = self.tx.send(Msg::Save(SaveJob { dir, pos, volume, edited }));
     }
 }
 
@@ -114,12 +116,13 @@ fn writer_loop(rx: Receiver<Msg>) {
 /// kill the writer.
 fn flush_batch(batch: Vec<SaveJob>) {
     use std::collections::HashMap;
-    let mut by_dir: HashMap<PathBuf, Vec<(IVec3, ChunkVolume)>> = HashMap::new();
+    let mut by_dir: HashMap<PathBuf, Vec<(IVec3, ChunkVolume, bool)>> = HashMap::new();
     for job in batch {
-        by_dir.entry(job.dir).or_default().push((job.pos, job.volume));
+        by_dir.entry(job.dir).or_default().push((job.pos, job.volume, job.edited));
     }
     for (dir, chunks) in by_dir {
-        let refs: Vec<(IVec3, &ChunkVolume)> = chunks.iter().map(|(p, v)| (*p, v)).collect();
+        let refs: Vec<(IVec3, &ChunkVolume, bool)> =
+            chunks.iter().map(|(p, v, e)| (*p, v, *e)).collect();
         if let Err(e) = region::save_many(&dir, &refs) {
             eprintln!("chunk writer: failed to persist {} chunks in {dir:?}: {e}", refs.len());
         }

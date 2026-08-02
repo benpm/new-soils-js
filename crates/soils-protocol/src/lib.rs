@@ -15,7 +15,10 @@ pub use coords::{
     voxel_index,
 };
 pub use discovery::{DISCOVERY_PORT, PROBE_MAGIC, ServerInfo};
-pub use messages::{ChunkData, ClientMsg, EntityState, InputFrame, ServerMsg, decode, encode};
+pub use messages::{
+    ChunkInfo, ClientMsg, EntityState, GenParams, InputFrame, PROTOCOL_VERSION, ServerMsg, decode,
+    encode,
+};
 pub use snapshot::{QuantState, SnapshotTracker, encode_snapshot};
 pub use voxel::{AIR, ChunkVolume, Voxel};
 
@@ -42,15 +45,27 @@ mod tests {
     fn chunk_message_round_trip() {
         let mut vol = ChunkVolume::empty();
         vol.set(1, 2, 3, 7);
-        let msg = ServerMsg::Chunk { pos: [1, 2, 3], payload: encode_chunk(&vol) };
+        let msg = ServerMsg::Manifest {
+            chunks: vec![
+                ChunkInfo::Pristine { pos: [4, 5, 6] },
+                ChunkInfo::Edited { pos: [1, 2, 3], payload: encode_chunk(&vol) },
+            ],
+        };
         let bytes = encode(&msg);
         let back: ServerMsg = decode(&bytes).expect("decode");
         match back {
-            ServerMsg::Chunk { pos, payload } => {
-                assert_eq!(pos, [1, 2, 3]);
-                let dec = decode_chunk(&payload).expect("payload decodes");
-                assert_eq!(dec.get(1, 2, 3), 7);
-                assert!(!payload_is_air(&payload));
+            ServerMsg::Manifest { chunks } => {
+                assert_eq!(chunks.len(), 2);
+                assert_eq!(chunks[0].pos(), [4, 5, 6]);
+                match &chunks[1] {
+                    ChunkInfo::Edited { pos, payload } => {
+                        assert_eq!(*pos, [1, 2, 3]);
+                        let dec = decode_chunk(payload).expect("payload decodes");
+                        assert_eq!(dec.get(1, 2, 3), 7);
+                        assert!(!payload_is_air(payload));
+                    }
+                    _ => panic!("wrong info variant"),
+                }
             }
             _ => panic!("wrong variant"),
         }

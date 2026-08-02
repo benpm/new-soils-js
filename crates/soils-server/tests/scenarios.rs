@@ -331,8 +331,8 @@ async fn concurrent_requests_serve_identical_chunks() {
         tokio::join!(a.collect_chunks(&wave), b.collect_chunks(&wave));
     for pos in &wave {
         assert_eq!(
-            got_a.get(pos),
-            got_b.get(pos),
+            got_a.payloads.get(pos),
+            got_b.payloads.get(pos),
             "chunk {pos:?} differs between concurrent clients"
         );
     }
@@ -345,7 +345,7 @@ async fn moving_restreams_ahead_and_unloads_behind() {
     a.await_chunk(SPAWN_CHUNK).await;
 
     // Shrinking the view radius unloads the shell beyond radius+1 on its own.
-    a.send(&ClientMsg::ViewRadius { radius: 2 }).await;
+    a.send(&ClientMsg::ViewRadius { radius: 2, full_streams: false }).await;
     a.recv_until(|msg| match msg {
         ServerMsg::ChunkUnload { pos }
             if (pos[0] - 8).abs().max((pos[1] - 8).abs()).max((pos[2] - 8).abs()) > 3 =>
@@ -360,8 +360,7 @@ async fn moving_restreams_ahead_and_unloads_behind() {
     // window recenters, streaming terrain ahead...
     a.fly(128, -std::f32::consts::FRAC_PI_2, true).await;
     a.recv_until(|msg| match msg {
-        ServerMsg::Bundle { chunks } if chunks.iter().any(|c| c.pos[0] >= 11) => Some(()),
-        ServerMsg::Chunk { pos, .. } if pos[0] >= 11 => Some(()),
+        ServerMsg::Manifest { chunks } if chunks.iter().any(|c| c.pos()[0] >= 11) => Some(()),
         _ => None,
     })
     .await;

@@ -124,6 +124,7 @@ pub fn edit_blocks(
     registry: Res<Blocks>,
     hotbar: Res<Hotbar>,
     map: Res<ChunkMap>,
+    mut directory: ResMut<crate::demand::ChunkDirectory>,
     mut chunks: Query<&mut VoxelChunk>,
     mut slots: ResMut<crate::pool::ChunkSlots>,
     mut pool_ops: ResMut<crate::pool::PoolOpQueue>,
@@ -172,6 +173,11 @@ pub fn edit_blocks(
         let ro = chunks.as_readonly();
         voxel_at(&map, &ro, target)
     };
+    directory.edited.insert(IVec3::new(
+        target.x >> CHUNK_BIT,
+        target.y >> CHUNK_BIT,
+        target.z >> CHUNK_BIT,
+    ));
     apply_edit(&map, &mut chunks, &mut slots, &mut pool_ops, &mut dirty_mesh, target, value);
     light_queue.edits.push(target);
     pending.next_seq += 1;

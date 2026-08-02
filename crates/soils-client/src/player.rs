@@ -342,8 +342,6 @@ impl Default for Streaming {
 /// HUD can show progress without extra protocol.
 pub fn track_streaming(
     net: Res<NetClient>,
-    map: Res<ChunkMap>,
-    queue: Res<crate::server_msg::ChunkApplyQueue>,
     cgen: Res<crate::server_msg::ClientGen>,
     mut streaming: ResMut<Streaming>,
     query: Query<&Transform, With<Player>>,
@@ -355,7 +353,8 @@ pub fn track_streaming(
             full_streams: !cgen.hash_ok,
         });
     }
-
+    // `streaming.pending` is maintained by `demand::process_demands`
+    // (directory entries + in-flight gen).
     let Ok(transform) = query.single() else { return };
     let p = transform.translation;
     let pc = IVec3::new(
@@ -363,22 +362,5 @@ pub fn track_streaming(
         (p.y.floor() as i32) >> CHUNK_BIT,
         (p.z.floor() as i32) >> CHUNK_BIT,
     );
-    if streaming.last_chunk == Some(pc) {
-        return;
-    }
     streaming.last_chunk = Some(pc);
-
-    let r = streaming.load_radius;
-    let mut pending = 0;
-    for dx in -r..=r {
-        for dy in -r..=r {
-            for dz in -r..=r {
-                let cpos = pc + IVec3::new(dx, dy, dz);
-                if !map.map.contains_key(&cpos) && !queue.queued.contains(&cpos) {
-                    pending += 1;
-                }
-            }
-        }
-    }
-    streaming.pending = pending;
 }

@@ -11,15 +11,16 @@
 //! routed, the epoch bumps when a `Warp` routes, and consumers drop stale
 //! stamps.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bevy::prelude::*;
-use soils_protocol::{ChunkInfo, ChunkVolume, EntityState, GenParams, ServerMsg, SnapshotTracker};
+use soils_protocol::{ChunkVolume, EntityState, GenParams, ServerMsg, SnapshotTracker};
 use soils_worldgen::{TerrainGen, WorldType};
 
 use crate::actor::{Actor, ActorAssets, ActorMap, LocalPlayer};
 use crate::chunk::{ChunkMap, VoxelChunk, WorldTime};
+use crate::demand::{self, ChunkDirectory, DemandProcessor, DirMsg};
 use crate::edit;
 use crate::light::LightQueue;
 use crate::login::LoginState;
@@ -32,30 +33,6 @@ use crate::pool::{ChunkSlots, DirtyMesh, PoolOpQueue};
 #[derive(Resource, Default)]
 pub struct WorldEpoch(pub u32);
 
-#[derive(Clone)]
-pub struct ChunkReceived {
-    pub pos: [i32; 3],
-    /// `chunk_codec` payload (palette + LZ4), decoded at apply time.
-    pub payload: Vec<u8>,
-    pub epoch: u32,
-}
-
-/// The ordered chunk stream from the server. Data, pending-generation slots,
-/// and unloads share one message type (and one apply queue) because their
-/// *relative order* is the contract: a chunk that leaves and re-enters the
-/// subscription arrives as `Unload` then `Data`/`Pending`, and applying them
-/// out of order would drop the chunk.
-#[derive(Message, Clone)]
-pub enum ChunkStream {
-    Data(ChunkReceived),
-    /// A manifest `Pristine` entry being generated locally (worldgen v2 is
-    /// bit-exact with the server). The slot holds the stream position; apply
-    /// blocks on the queue head until its volume lands in [`ClientGen`] —
-    /// front-wave-first, exactly like the server's own delivery order.
-    Pending { pos: [i32; 3], epoch: u32 },
-    Unload { pos: [i32; 3], epoch: u32 },
-}
-
 /// Client-side chunk generation (worldgen v2): the generator mirror built from
 /// the server's [`GenParams`], the off-thread results map, and the fetch queue
 /// for chunks that can't be generated (graph-hash mismatch, gen failure).
@@ -67,11 +44,11 @@ pub struct ClientGen {
     /// through [`ClientMsg::ChunkFetch`] and `ViewRadius.full_streams` flips.
     pub hash_ok: bool,
     tx: crossbeam_channel::Sender<(u32, Vec<(IVec3, ChunkVolume)>)>,
-    rx: crossbeam_channel::Receiver<(u32, Vec<(IVec3, ChunkVolume)>)>,
-    /// Generated volumes awaiting their queue slot (current epoch only).
-    ready: HashMap<IVec3, ChunkVolume>,
+    pub(crate) rx: crossbeam_channel::Receiver<(u32, Vec<(IVec3, ChunkVolume)>)>,
+    /// Generated volumes awaiting materialization (current epoch only).
+    pub(crate) ready: HashMap<IVec3, ChunkVolume>,
     /// Positions to request as full payloads (batched by `flush_chunk_fetch`).
-    fetch: Vec<[i32; 3]>,
+    pub(crate) fetch: Vec<[i32; 3]>,
     fetch_cooldown: f32,
 }
 
@@ -84,7 +61,7 @@ impl Default for ClientGen {
 
 impl ClientGen {
     /// (Re)build the local generator from a world's identity (login/warp).
-    fn configure(&mut self, p: GenParams) {
+    pub(crate) fn configure(&mut self, p: GenParams) {
         self.ready.clear();
         self.fetch.clear();
         let world_type = match p.world_type {
@@ -107,7 +84,7 @@ impl ClientGen {
 
     /// Dispatch a batch of pristine positions to a worker thread (the batch
     /// generator fans out on rayon internally).
-    fn dispatch(&self, epoch: u32, positions: Vec<IVec3>) {
+    pub(crate) fn dispatch(&self, epoch: u32, positions: Vec<IVec3>) {
         let Some(terrain) = self.terrain.clone() else { return };
         let tx = self.tx.clone();
         std::thread::spawn(move || {
@@ -116,26 +93,6 @@ impl ClientGen {
             let _ = tx.send((epoch, positions.into_iter().zip(volumes).collect()));
         });
     }
-}
-
-/// Hard cap on chunks turned into GPU resources per frame. A fresh world
-/// floods ~729 chunks in a burst; applying them all at once allocates hundreds
-/// of MB of SSBOs and dispatches hundreds of compute jobs in one frame, which
-/// hangs (and loses) an integrated GPU — the cap protects weak devices.
-const CHUNK_APPLY_MAX: usize = 32;
-/// Time box within the cap: a fixed per-frame count collapses when burst
-/// frames run long (8/frame at ~8 fps was ~60 chunks/s, >10 s to fill a fresh
-/// world). Applying against wall time instead self-regulates: fast frames
-/// apply more, slow frames back off but always make progress.
-const CHUNK_APPLY_MS: f32 = 3.0;
-
-/// The ordered chunk stream awaiting application, drained under a time budget
-/// by [`apply_chunks`]. `queued` mirrors the positions of queued *data*
-/// entries so [`player::track_streaming`] can estimate outstanding work.
-#[derive(Resource, Default)]
-pub struct ChunkApplyQueue {
-    pub queue: VecDeque<ChunkStream>,
-    pub queued: HashSet<IVec3>,
 }
 
 #[derive(Message)]
@@ -218,10 +175,12 @@ pub struct NetStatus(pub String);
 /// Register every message type plus the epoch resource.
 pub fn register(app: &mut App) {
     app.init_resource::<WorldEpoch>()
-        .init_resource::<ChunkApplyQueue>()
         .init_resource::<ClientGen>()
         .init_resource::<SnapTracker>()
-        .add_message::<ChunkStream>()
+        .init_resource::<ChunkDirectory>()
+        .init_resource::<DemandProcessor>()
+        .init_resource::<demand::MirrorSet>()
+        .add_message::<DirMsg>()
         .add_message::<EditReceived>()
         .add_message::<EntitySpawned>()
         .add_message::<EntitiesUpdated>()
@@ -243,7 +202,7 @@ pub fn route_server_messages(
     mut epoch: ResMut<WorldEpoch>,
     mut tracker: ResMut<SnapTracker>,
     mut cgen: ResMut<ClientGen>,
-    mut chunks: MessageWriter<ChunkStream>,
+    mut dir_msgs: MessageWriter<DirMsg>,
     mut edits: MessageWriter<EditReceived>,
     mut spawns: MessageWriter<EntitySpawned>,
     mut entities: MessageWriter<EntitiesUpdated>,
@@ -255,8 +214,6 @@ pub fn route_server_messages(
     mut login_fails: MessageWriter<LoginFailed>,
     mut statuses: MessageWriter<NetStatus>,
 ) {
-    // Pristine manifest entries drained this frame; one worker dispatch.
-    let mut pristine: Vec<IVec3> = Vec::new();
     for ev in net.drain() {
         let msg = match ev {
             NetEvent::Connected => {
@@ -278,30 +235,10 @@ pub fn route_server_messages(
                 login_fails.write(LoginFailed(message));
             }
             ServerMsg::Manifest { chunks: infos } => {
-                for info in infos {
-                    match info {
-                        ChunkInfo::Pristine { pos } => {
-                            if cgen.hash_ok {
-                                pristine.push(IVec3::from_array(pos));
-                                chunks.write(ChunkStream::Pending { pos, epoch: epoch.0 });
-                            } else {
-                                // Can't reproduce: ask for the payload (it
-                                // will arrive as an Edited manifest entry).
-                                cgen.fetch.push(pos);
-                            }
-                        }
-                        ChunkInfo::Edited { pos, payload } => {
-                            chunks.write(ChunkStream::Data(ChunkReceived {
-                                pos,
-                                payload,
-                                epoch: epoch.0,
-                            }));
-                        }
-                    }
-                }
+                dir_msgs.write(DirMsg::Manifest { infos, epoch: epoch.0 });
             }
             ServerMsg::ChunkUnload { pos } => {
-                chunks.write(ChunkStream::Unload { pos, epoch: epoch.0 });
+                dir_msgs.write(DirMsg::Unload { pos, epoch: epoch.0 });
             }
             ServerMsg::Edit { pos, value } => {
                 edits.write(EditReceived { pos, value, epoch: epoch.0 });
@@ -334,9 +271,6 @@ pub fn route_server_messages(
                 despawns.write(EntityDespawned(id));
             }
         }
-    }
-    if !pristine.is_empty() {
-        cgen.dispatch(epoch.0, pristine);
     }
 }
 
@@ -388,7 +322,9 @@ pub fn apply_warp(
     mut world_time: ResMut<WorldTime>,
     mut streaming: ResMut<Streaming>,
     mut light_queue: ResMut<LightQueue>,
-    mut queue: ResMut<ChunkApplyQueue>,
+    mut dir: ResMut<ChunkDirectory>,
+    mut proc: ResMut<DemandProcessor>,
+    mut demanded: ResMut<crate::cull::DemandedChunks>,
     mut pending_edits: ResMut<crate::edit::PendingEdits>,
     mut ring: ResMut<player::InputRing>,
     mut slots: ResMut<ChunkSlots>,
@@ -412,10 +348,14 @@ pub fn apply_warp(
         }
         streaming.last_chunk = None; // force a fresh stream
         streaming.pending = 0; // old world's outstanding requests are moot
-        // Drop any queued chunks from the old world (the epoch bump also makes
-        // them safe, but this frees their buffers immediately).
-        queue.queue.clear();
-        queue.queued.clear();
+        dir.entries.clear();
+        dir.edited.clear();
+        dir.overlay.clear();
+        proc.clear();
+        // In-flight readbacks describe the old world; drop them so the demand
+        // pump doesn't age them toward bogus fetches.
+        demanded.positions.clear();
+        demanded.total = 0;
     }
 }
 
@@ -425,151 +365,16 @@ pub fn apply_time(mut reader: MessageReader<TimeReceived>, mut world_time: ResMu
     }
 }
 
-/// Apply streamed chunks: update an existing chunk's voxels or spawn a new
-/// (meshed or empty-tracked) chunk entity.
+/// A voxel edit made by another player. Chunks with CPU bytes apply
+/// directly; the rest overlay the edit and materialize through the mirror
+/// path (an edited chunk becomes CPU-resident by policy).
 #[allow(clippy::too_many_arguments)]
-pub fn apply_chunks(
-    mut reader: MessageReader<ChunkStream>,
-    epoch: Res<WorldEpoch>,
-    mut commands: Commands,
-    mut map: ResMut<ChunkMap>,
-    mut chunks: Query<&mut VoxelChunk>,
-    mut slots: ResMut<ChunkSlots>,
-    mut pool_ops: ResMut<PoolOpQueue>,
-    mut dirty_mesh: ResMut<DirtyMesh>,
-    mut light_queue: ResMut<LightQueue>,
-    mut streaming: ResMut<Streaming>,
-    mut queue: ResMut<ChunkApplyQueue>,
-    mut cgen: ResMut<ClientGen>,
-) {
-    // (A) Move this frame's arrivals into the persistent queue. Bevy messages are
-    // double-buffered and dropped after ~2 frames, so we must capture them now
-    // even though only a few are applied per frame. Stale entries (a world we've
-    // since warped out of) are dropped here, cheaply. Data, pending-gen slots
-    // and unloads stay in one queue: their relative order is part of the
-    // protocol.
-    for msg in reader.read() {
-        match msg {
-            ChunkStream::Data(d) if d.epoch == epoch.0 => {
-                queue.queued.insert(IVec3::from_array(d.pos));
-                queue.queue.push_back(msg.clone());
-            }
-            ChunkStream::Pending { pos, epoch: e } if *e == epoch.0 => {
-                queue.queued.insert(IVec3::from_array(*pos));
-                queue.queue.push_back(msg.clone());
-            }
-            ChunkStream::Unload { epoch: e, .. } if *e == epoch.0 => {
-                queue.queue.push_back(msg.clone());
-            }
-            _ => {}
-        }
-    }
-    // Land finished local-gen batches (stale epochs drop on the floor).
-    while let Ok((e, batch)) = cgen.rx.try_recv() {
-        if e == epoch.0 {
-            cgen.ready.extend(batch);
-        }
-    }
-    if queue.queue.is_empty() {
-        return;
-    }
-
-    // (B) Apply chunks until the time box (or hard cap) is hit. Mapping a
-    // chunk queues a 32 KB voxel upload + a remesh dispatch into the pooled
-    // caches; hundreds at once on a burst still stalls weak devices, so we
-    // spread the work — by wall time, so slow frames don't starve the fill.
-    let t0 = std::time::Instant::now();
-    let mut applied = 0;
-    while applied < CHUNK_APPLY_MAX
-        && (applied < 2 || t0.elapsed().as_secs_f32() * 1000.0 < CHUNK_APPLY_MS)
-    {
-        let Some(entry) = queue.queue.pop_front() else { break };
-        let (cpos, msg_epoch, volume) = match entry {
-            ChunkStream::Data(d) => {
-                let cpos = IVec3::from_array(d.pos);
-                queue.queued.remove(&cpos);
-                if d.epoch != epoch.0 {
-                    continue; // warped away since queued; drop without spending budget
-                }
-                let Some(volume) = soils_protocol::decode_chunk(&d.payload) else {
-                    warn!("dropping undecodable chunk payload at {cpos}");
-                    continue;
-                };
-                (cpos, d.epoch, volume)
-            }
-            ChunkStream::Pending { pos, epoch: e } => {
-                let cpos = IVec3::from_array(pos);
-                if e != epoch.0 {
-                    queue.queued.remove(&cpos);
-                    continue;
-                }
-                match cgen.ready.remove(&cpos) {
-                    Some(volume) => {
-                        queue.queued.remove(&cpos);
-                        (cpos, e, volume)
-                    }
-                    None => {
-                        // Still generating: block the queue head so stream
-                        // order holds (the batch lands within a few frames).
-                        queue.queue.push_front(ChunkStream::Pending { pos, epoch: e });
-                        break;
-                    }
-                }
-            }
-            ChunkStream::Unload { pos, epoch: e } => {
-                // Left the server-side subscription: drop our copy (entity,
-                // GPU buffers via asset handles, pending light work). Cheap —
-                // doesn't spend the apply budget.
-                if e == epoch.0 {
-                    let cpos = IVec3::from_array(pos);
-                    if let Some(entity) = map.map.remove(&cpos) {
-                        commands.entity(entity).despawn();
-                    }
-                    slots.unmap_chunk(&mut pool_ops, cpos);
-                    light_queue.unload(cpos);
-                }
-                continue;
-            }
-        };
-        let _ = msg_epoch;
-        // Map into the pooled GPU caches (allocates slots, uploads voxels,
-        // queues the remesh). Pool exhaustion re-queues the chunk for later.
-        if slots.map_chunk(&mut pool_ops, &mut dirty_mesh, cpos, &volume).is_none() {
-            warn!("chunk pools exhausted; deferring {cpos}");
-            queue.queued.insert(cpos);
-            queue.queue.push_back(ChunkStream::Data(ChunkReceived {
-                pos: cpos.to_array(),
-                payload: soils_protocol::encode_chunk(&volume),
-                epoch: epoch.0,
-            }));
-            break;
-        }
-        if let Some(&entity) = map.map.get(&cpos) {
-            // Existing chunk: refresh the CPU copy (GPU side re-uploaded above).
-            if let Ok(mut vc) = chunks.get_mut(entity) {
-                vc.volume = volume.clone();
-            }
-        } else {
-            // CPU mirror entity (physics, prediction, edits, light flood).
-            let e = commands
-                .spawn(VoxelChunk {
-                    pos: cpos,
-                    volume,
-                })
-                .id();
-            map.map.insert(cpos, e);
-            streaming.pending = streaming.pending.saturating_sub(1);
-        }
-        light_queue.chunks.push(cpos);
-        applied += 1;
-    }
-}
-
-/// A voxel edit made by another player.
 pub fn apply_edits(
     mut reader: MessageReader<EditReceived>,
     epoch: Res<WorldEpoch>,
     map: Res<ChunkMap>,
+    mut dir: ResMut<ChunkDirectory>,
+    mut proc: ResMut<DemandProcessor>,
     mut chunks: Query<&mut VoxelChunk>,
     mut slots: ResMut<ChunkSlots>,
     mut pool_ops: ResMut<PoolOpQueue>,
@@ -581,7 +386,17 @@ pub fn apply_edits(
             continue;
         }
         let v = IVec3::from_array(msg.pos);
-        edit::apply_edit(&map, &mut chunks, &mut slots, &mut pool_ops, &mut dirty_mesh, v, msg.value);
+        let cpos = IVec3::new(
+            v.x >> soils_protocol::CHUNK_BIT,
+            v.y >> soils_protocol::CHUNK_BIT,
+            v.z >> soils_protocol::CHUNK_BIT,
+        );
+        if map.map.contains_key(&cpos) {
+            dir.edited.insert(cpos);
+            edit::apply_edit(&map, &mut chunks, &mut slots, &mut pool_ops, &mut dirty_mesh, v, msg.value);
+        } else {
+            demand::overlay_edit(&mut dir, &mut proc, v, msg.value);
+        }
         light_queue.edits.push(v);
     }
 }

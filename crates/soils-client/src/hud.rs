@@ -5,7 +5,7 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use soils_protocol::CHUNK_BIT;
 
-use crate::chunk::{ChunkMap, WorldTime};
+use crate::chunk::WorldTime;
 use crate::edit::Hotbar;
 use crate::player::{Player, Streaming};
 
@@ -44,7 +44,7 @@ pub fn toggle_hud(keys: Res<ButtonInput<KeyCode>>, mut hud: Query<&mut Visibilit
 /// Refresh the debug overlay text each frame.
 pub fn update_hud(
     diagnostics: Res<DiagnosticsStore>,
-    map: Res<ChunkMap>,
+    slots: Res<crate::pool::ChunkSlots>,
     world_time: Res<WorldTime>,
     streaming: Res<Streaming>,
     hotbar: Res<Hotbar>,
@@ -59,7 +59,7 @@ pub fn update_hud(
     let pos = player.single().map(|t| t.translation).unwrap_or_default();
     let vox = pos.floor().as_ivec3();
     let chunk = IVec3::new(vox.x >> CHUNK_BIT, vox.y >> CHUNK_BIT, vox.z >> CHUNK_BIT);
-    let loaded = map.map.len();
+    let loaded = slots.len();
     let pending = streaming.pending;
     let progress = if pending == 0 { 100.0 } else { 100.0 * loaded as f32 / (loaded + pending) as f32 };
     text.0 = format!(

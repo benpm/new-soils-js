@@ -10,6 +10,7 @@ mod actor;
 mod chunk;
 mod console;
 mod cull;
+mod demand;
 mod discovery;
 mod edit;
 mod gi;
@@ -142,12 +143,15 @@ fn main() {
             )
                 .after(server_msg::route_server_messages),
             (
-                server_msg::apply_chunks,
+                demand::apply_directory,
                 server_msg::apply_edits,
-                server_msg::apply_time,
-                edit::apply_edit_acks,
-                server_msg::apply_entity_spawns,
+                demand::maintain_cpu_mirror,
+                demand::process_demands,
             )
+                .chain()
+                .after(server_msg::apply_init)
+                .after(server_msg::apply_warp),
+            (server_msg::apply_time, edit::apply_edit_acks, server_msg::apply_entity_spawns)
                 .after(server_msg::apply_init)
                 .after(server_msg::apply_warp),
             server_msg::flush_chunk_fetch.after(server_msg::route_server_messages),
@@ -156,11 +160,11 @@ fn main() {
             player::reconcile_self
                 .after(server_msg::apply_init)
                 .after(server_msg::apply_warp)
-                .after(server_msg::apply_chunks),
+                .after(demand::process_demands),
             // Light job planning runs once all voxel changes for the frame
             // landed (the flood itself is GPU compute — see gpu_light.rs).
             gpu_light::plan_light_jobs
-                .after(server_msg::apply_chunks)
+                .after(demand::process_demands)
                 .after(server_msg::apply_edits)
                 .after(edit::edit_blocks),
             light::update_sky_term.after(server_msg::apply_time),
@@ -307,7 +311,6 @@ fn self_test_daytime(mut world_time: ResMut<WorldTime>) {
 /// stream → mesh → render) be validated headlessly under xvfb + lavapipe.
 fn self_test(
     time: Res<Time>,
-    map: Res<ChunkMap>,
     slots: Res<pool::ChunkSlots>,
     remote_actors: Query<&Actor>,
     diagnostics: Res<bevy::diagnostic::DiagnosticsStore>,
@@ -318,7 +321,7 @@ fn self_test(
         return;
     }
     if time.elapsed_secs() > env_secs("SOILS_EXIT_SECS", 11.0) {
-        let chunks = map.map.len();
+        let chunks = slots.len();
         let meshes = slots.iter().filter(|(_, s)| s.mesh != pool::NO_MESH).count();
         let actors = remote_actors.iter().count();
         // Steady-state frame cost, sampled at exit (the camera parked at the

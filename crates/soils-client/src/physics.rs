@@ -126,6 +126,11 @@ fn chunk_of(p: Vec3) -> IVec3 {
     )
 }
 
+/// Marks locally predicted physics props (the CPU mirror keeps terrain
+/// volumes resident around each one).
+#[derive(Component)]
+pub struct PredictedProp;
+
 /// Spawn a local Avian body for each replicated physics prop entering interest.
 fn spawn_physics_bodies(
     mut reader: MessageReader<EntitySpawned>,
@@ -145,6 +150,7 @@ fn spawn_physics_bodies(
         let pos = Vec3::from_array(msg.pos);
         let entity = commands
             .spawn((
+                PredictedProp,
                 RigidBody::Dynamic,
                 Collider::cuboid(1.0, 1.0, 1.0),
                 Transform::from_translation(pos),

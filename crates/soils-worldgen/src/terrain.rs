@@ -63,11 +63,12 @@ const CAVE_N: usize = (CHUNK_SIZE / CAVE_STEP) as usize + 1;
 /// Conservative ceiling on the highest solid voxel the height + outcrop math
 /// can produce (256 + summed octave amplitudes 115 scaled by the noise
 /// envelope 0.75 ≈ 87, + max rock 5, with margin). Chunks whose origin is
-/// above this are all air. Assumes the default-flavoured graph.
-const MAX_SURFACE: i32 = 256 + 115 + 5 + 24;
+/// above this are all air. Assumes the default-flavoured graph. Shared with
+/// the GPU gen kernel codegen (`crate::wgsl`).
+pub(crate) const MAX_SURFACE: i32 = 256 + 115 + 5 + 24;
 /// Max positive contribution of the rock-outcrop term (the other two terms
 /// only subtract).
-const MAX_ROCK: i32 = 5;
+pub(crate) const MAX_ROCK: i32 = 5;
 
 /// Stateless terrain generator seeded once and reused for every chunk. The
 /// height/rock/structure math lives in a [`TerrainGraph`] compiled to the

@@ -106,6 +106,27 @@ pub fn generate_columns(graph: &TerrainGraph) -> Result<String, String> {
     Ok(s)
 }
 
+/// Generate the full chunk-generation compute shader: `gen_lattice` samples
+/// the 9³ cave lattice, `gen_fill` evaluates columns + the soil gradient and
+/// writes the packed 32³ voxel volume — the same pure function as
+/// [`crate::terrain::TerrainGen::generate`], bit for bit (asserted by the
+/// terrainlab `gen_gpu` test). One thread owns each output u32 (4 x-adjacent
+/// voxels), so there are no atomics and no write races.
+pub fn generate_chunk(graph: &TerrainGraph) -> Result<String, String> {
+    graph.validate()?;
+    let caves = graph.caves;
+    let mut s = String::new();
+    let _ = writeln!(s, "const CAVES_ON: bool = {};", caves.enabled);
+    let _ = writeln!(s, "const CAVE_FREQ: i32 = {};", fx::from_f32(caves.frequency));
+    let _ = writeln!(s, "const CAVE_THR: i32 = {};", fx::from_f32(caves.threshold));
+    let _ = writeln!(s, "const MAX_SURFACE: i32 = {};", crate::terrain::MAX_SURFACE);
+    let _ = writeln!(s, "const MAX_ROCK: i32 = {};", crate::terrain::MAX_ROCK);
+    s.push_str(CHUNK_HEADER);
+    s.push_str(&emit_functions(graph)?);
+    s.push_str(CHUNK_MAIN);
+    Ok(s)
+}
+
 /// Emit `fn node_i(x: i32, z: i32) -> i32`. Bodies mirror
 /// `CompiledGraph::eval_node` arm-for-arm.
 fn emit_node(s: &mut String, graph: &TerrainGraph, i: usize, b: usize) {
@@ -246,6 +267,126 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     out_height[idx] = height_out(x, z);
     out_rock[idx] = rock_out(x, z);
     out_structure[idx] = structure_out(x, z);
+}
+"#;
+
+/// Bindings for [`generate_chunk`]. `gen.origin` is the chunk origin in world
+/// voxels; `flags` bit 0 = flat world; palette block ids packed into `pal0`/
+/// `pal1` (grass, slate, stone, rocky | tough, dirt).
+const CHUNK_HEADER: &str = r#"
+struct GenView {
+    origin_x: i32, origin_y: i32, origin_z: i32, flags: u32,
+    seed: u32, pal0: u32, pal1: u32, pad0: u32,
+};
+@group(0) @binding(0) var<uniform> gen: GenView;
+@group(0) @binding(1) var<storage, read> P: array<i32>;
+@group(0) @binding(2) var<storage, read_write> lattice: array<i32>;  // 9^3
+@group(0) @binding(3) var<storage, read_write> out_voxels: array<u32>; // 8192 words
+var<private> SEED: u32;
+"#;
+
+const CHUNK_MAIN: &str = r#"
+const CAVE_STEP: i32 = 4;
+const CAVE_N: i32 = 9;
+
+fn cave_noise_at(gx: i32, gy: i32, gz: i32) -> i32 {
+    return dn_noise3(gen.seed, gx * CAVE_FREQ, gy * CAVE_FREQ, gz * CAVE_FREQ);
+}
+
+@compute @workgroup_size(64)
+fn gen_lattice(@builtin(local_invocation_index) t: u32) {
+    // 729 samples over one workgroup of 64 threads.
+    for (var i = i32(t); i < CAVE_N * CAVE_N * CAVE_N; i = i + 64) {
+        let iy = i / (CAVE_N * CAVE_N);
+        let rem = i % (CAVE_N * CAVE_N);
+        let iz = rem / CAVE_N;
+        let ix = rem % CAVE_N;
+        lattice[i] = cave_noise_at(
+            gen.origin_x + ix * CAVE_STEP,
+            gen.origin_y + iy * CAVE_STEP,
+            gen.origin_z + iz * CAVE_STEP,
+        );
+    }
+}
+
+// Trilinear interpolation over the lattice; fractions are exact Q16.16
+// multiples of 1/CAVE_STEP. Mirrors terrain.rs cave_at.
+fn cave_at(x: i32, y: i32, z: i32) -> i32 {
+    let xi = x / CAVE_STEP; let yi = y / CAVE_STEP; let zi = z / CAVE_STEP;
+    let fxq = (x % CAVE_STEP) * (FX_ONE / CAVE_STEP);
+    let fyq = (y % CAVE_STEP) * (FX_ONE / CAVE_STEP);
+    let fzq = (z % CAVE_STEP) * (FX_ONE / CAVE_STEP);
+    let x00 = fx_lerp(lat_at(xi, yi, zi), lat_at(xi + 1, yi, zi), fxq);
+    let x10 = fx_lerp(lat_at(xi, yi + 1, zi), lat_at(xi + 1, yi + 1, zi), fxq);
+    let x01 = fx_lerp(lat_at(xi, yi, zi + 1), lat_at(xi + 1, yi, zi + 1), fxq);
+    let x11 = fx_lerp(lat_at(xi, yi + 1, zi + 1), lat_at(xi + 1, yi + 1, zi + 1), fxq);
+    return fx_lerp(fx_lerp(x00, x10, fyq), fx_lerp(x01, x11, fyq), fzq);
+}
+
+fn lat_at(ix: i32, iy: i32, iz: i32) -> i32 {
+    return lattice[(iy * CAVE_N + iz) * CAVE_N + ix];
+}
+
+// Soil gradient by depth below the surface; mirrors terrain.rs generate_with.
+fn soil(gy: i32, height: i32) -> u32 {
+    if (gy > height) { return 0u; }
+    if (gy == height) { return gen.pal0 & 0xffu; }          // grass
+    if (gy < height - 64) { return (gen.pal0 >> 8u) & 0xffu; }  // slate
+    if (gy < height - 32) { return (gen.pal0 >> 16u) & 0xffu; } // stone
+    if (gy < height - 16) { return (gen.pal0 >> 24u) & 0xffu; } // rocky dirt
+    if (gy < height - 8) { return gen.pal1 & 0xffu; }           // tough dirt
+    return (gen.pal1 >> 8u) & 0xffu;                            // dirt
+}
+
+@compute @workgroup_size(8, 8)
+fn gen_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // One thread per output word: 4 x-adjacent voxels at (z, y..).
+    SEED = gen.seed;
+    let xw = i32(gid.x);   // word column 0..8
+    let z = i32(gid.y);    // 0..32 (dispatched (1, 4))
+    if (xw >= 8 || z >= 32) { return; }
+    let flat = (gen.flags & 1u) == 1u;
+    let stone = (gen.pal0 >> 16u) & 0xffu;
+
+    let ceiling = select(MAX_SURFACE, 256, flat);
+    let all_air = gen.origin_y > ceiling;
+
+    var heights: array<i32, 4>;
+    var rocks: array<i32, 4>;
+    for (var k = 0; k < 4; k = k + 1) {
+        let gx = gen.origin_x + xw * 4 + k;
+        let gz = gen.origin_z + z;
+        if (flat) {
+            heights[k] = 256; rocks[k] = 0;
+        } else {
+            heights[k] = fx_floor(height_out(gx << 16u, gz << 16u));
+            rocks[k] = rock_out(gx << 16u, gz << 16u);
+        }
+    }
+
+    for (var y = 0; y < 32; y = y + 1) {
+        let gy = gen.origin_y + y;
+        var word = 0u;
+        if (!all_air) {
+            for (var k = 0; k < 4; k = k + 1) {
+                let x = xw * 4 + k;
+                let height = heights[k];
+                var val = soil(gy, height);
+                if (!flat && CAVES_ON) {
+                    // Surface rock outcrops.
+                    if (gy > height - 2 && ((gy - height) << 16u) <= rocks[k]) {
+                        val = stone;
+                    }
+                    // Caves carved from solid ground.
+                    if (val != 0u && fx_abs(cave_at(x, y, z)) > CAVE_THR) {
+                        val = 0u;
+                    }
+                }
+                word = word | (val << (u32(k) * 8u));
+            }
+        }
+        out_voxels[(y + z * 32) * 8 + xw] = word;
+    }
 }
 "#;
 

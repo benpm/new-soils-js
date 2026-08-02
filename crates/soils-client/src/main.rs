@@ -23,6 +23,9 @@ mod net;
 mod pause;
 mod physics;
 mod player;
+// Allowance dropped when the pooled render core (stream-pipeline phase 3) consumes the API.
+#[allow(dead_code)]
+mod pool;
 mod server_msg;
 mod singleplayer;
 
@@ -72,6 +75,7 @@ fn main() {
         ..default()
     }))
     .add_plugins(GpuMeshPlugin)
+    .add_plugins(pool::PoolPlugin)
     .add_plugins(gi::GiPlugin)
     .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
     .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 1.0)))

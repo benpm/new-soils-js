@@ -153,6 +153,41 @@ impl ChunkSlots {
         Some(s)
     }
 
+    /// Map a chunk whose voxels the GPU generates in place: allocate slots
+    /// (mesh included — occupancy is unknown until the gen readback), point
+    /// the table/descriptors at it, and queue a remesh. No voxel upload.
+    pub fn map_chunk_gen(
+        &mut self,
+        ops: &mut PoolOpQueue,
+        dirty: &mut DirtyMesh,
+        cpos: IVec3,
+    ) -> Option<Slot> {
+        let s = self.alloc(cpos, true)?;
+        ops.push(PoolOp::WriteMeshInfo { mesh: s.mesh, cpos, slot: s.slot });
+        dirty.0.push(s.mesh);
+        ops.push(PoolOp::WriteDesc { slot: s.slot, cpos, mesh: s.mesh });
+        let idx = table_index(cpos) as u32;
+        self.table[idx as usize] = s.slot;
+        ops.push(PoolOp::WriteTable { index: idx, slot: s.slot });
+        Some(s)
+    }
+
+    /// Downgrade a resident chunk to an air slot (a GPU-genned chunk whose
+    /// occupancy readback came back all-air): free the mesh slot, stop its
+    /// draws. The light slot and descriptor stay (air still carries light).
+    pub fn demote_mesh(&mut self, ops: &mut PoolOpQueue, cpos: IVec3) {
+        let Some(s) = self.map.get_mut(&cpos) else { return };
+        if s.mesh == NO_MESH {
+            return;
+        }
+        let mesh = s.mesh;
+        s.mesh = NO_MESH;
+        let slot = s.slot;
+        self.free_mesh.push(mesh);
+        ops.push(PoolOp::ClearIndirect { mesh });
+        ops.push(PoolOp::WriteDesc { slot, cpos, mesh: NO_MESH });
+    }
+
     /// Unmap a chunk (unload): free its slots, vacate its table cell (only if
     /// still owned), stop its draws, and poison its descriptor so stale table
     /// cells elsewhere fail validation.

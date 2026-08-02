@@ -61,6 +61,8 @@ fn gpu_chunk_gen_matches_cpu_bit_exactly() {
             storage(1, true),
             storage(2, false),
             storage(3, false),
+            storage(4, true),
+            storage(5, false),
         ],
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -101,7 +103,7 @@ fn gpu_chunk_gen_matches_cpu_bit_exactly() {
     });
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
-        size: 32 * 32 * 32,
+        size: 32 * 32 * 32 + 8,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -119,20 +121,23 @@ fn gpu_chunk_gen_matches_cpu_bit_exactly() {
     for &(cpos, world_type) in cases {
         let origin = cpos * 32;
         let flags: u32 = if world_type == WorldType::Flat { 1 } else { 0 };
-        let view = [
-            origin.x,
-            origin.y,
-            origin.z,
-            flags as i32,
-            SEED as i32,
-            pal0 as i32,
-            pal1 as i32,
-            0,
-        ];
+        let view = [flags, SEED, pal0, pal1];
         let view_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("gen-view"),
             contents: bytemuck::cast_slice(&view),
             usage: wgpu::BufferUsages::UNIFORM,
+        });
+        // One job: this chunk into slot 0.
+        let jobs_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("jobs"),
+            contents: bytemuck::cast_slice(&[origin.x, origin.y, origin.z, 0]),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        // [batch tag, job 0 non-air count] — zeroed per case.
+        let occ_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("occ"),
+            contents: &[0u8; 8],
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg"),
@@ -142,6 +147,8 @@ fn gpu_chunk_gen_matches_cpu_bit_exactly() {
                 wgpu::BindGroupEntry { binding: 1, resource: p_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: lattice.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: voxels.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: jobs_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: occ_buf.as_entire_binding() },
             ],
         });
 
@@ -159,6 +166,7 @@ fn gpu_chunk_gen_matches_cpu_bit_exactly() {
             pass.dispatch_workgroups(1, 4, 1);
         }
         enc.copy_buffer_to_buffer(&voxels, 0, &readback, 0, 32 * 32 * 32);
+        enc.copy_buffer_to_buffer(&occ_buf, 0, &readback, 32 * 32 * 32, 8);
         queue.submit([enc.finish()]);
 
         let slice = readback.slice(..);
@@ -170,10 +178,13 @@ fn gpu_chunk_gen_matches_cpu_bit_exactly() {
         let tg = TerrainGen::new(SEED, world_type);
         let want = tg.generate(cpos, &reg);
         assert_eq!(
-            gpu_bytes.as_slice(),
+            gpu_bytes[..32 * 32 * 32].as_ref() as &[u8],
             want.as_bytes(),
             "chunk {cpos:?} ({world_type:?}) differs\n--- shader ---\n{src}"
         );
+        let occ = u32::from_le_bytes(gpu_bytes[32 * 32 * 32 + 4..].try_into().unwrap());
+        let cpu_occ = want.as_bytes().iter().filter(|b| **b != 0).count() as u32;
+        assert_eq!(occ, cpu_occ, "chunk {cpos:?} occupancy count differs");
     }
 }
 

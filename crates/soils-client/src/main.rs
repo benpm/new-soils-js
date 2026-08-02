@@ -15,6 +15,7 @@ mod discovery;
 mod edit;
 mod gi;
 mod gi_demo;
+mod gpu_gen;
 mod gpu_light;
 mod gpu_mesh;
 mod hud;
@@ -80,6 +81,7 @@ fn main() {
     .add_plugins(world_draw::WorldDrawPlugin)
     .add_plugins(cull::CullPlugin)
     .add_plugins(gpu_light::GpuLightPlugin)
+    .add_plugins(gpu_gen::GpuGenPlugin)
     .add_plugins(gi::GiPlugin)
     .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
     .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 1.0)))
@@ -147,6 +149,7 @@ fn main() {
                 server_msg::apply_edits,
                 demand::maintain_cpu_mirror,
                 demand::process_demands,
+                gpu_gen::flush_gen_batch,
             )
                 .chain()
                 .after(server_msg::apply_init)

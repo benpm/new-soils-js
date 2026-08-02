@@ -39,6 +39,8 @@ pub struct WorldEpoch(pub u32);
 #[derive(Resource)]
 pub struct ClientGen {
     terrain: Option<Arc<TerrainGen>>,
+    /// The world identity this generator was configured from.
+    pub(crate) params: Option<GenParams>,
     /// Server's `graph_hash` matches our compiled generator — pristine
     /// entries generate locally. On mismatch every pristine position goes
     /// through [`ClientMsg::ChunkFetch`] and `ViewRadius.full_streams` flips.
@@ -55,7 +57,7 @@ pub struct ClientGen {
 impl Default for ClientGen {
     fn default() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        Self { terrain: None, hash_ok: false, tx, rx, ready: HashMap::new(), fetch: Vec::new(), fetch_cooldown: 0.0 }
+        Self { terrain: None, params: None, hash_ok: false, tx, rx, ready: HashMap::new(), fetch: Vec::new(), fetch_cooldown: 0.0 }
     }
 }
 
@@ -64,6 +66,7 @@ impl ClientGen {
     pub(crate) fn configure(&mut self, p: GenParams) {
         self.ready.clear();
         self.fetch.clear();
+        self.params = Some(p);
         let world_type = match p.world_type {
             0 => Some(WorldType::Normal),
             1 => Some(WorldType::Flat),
@@ -80,6 +83,10 @@ impl ClientGen {
             );
         }
         self.terrain = terrain;
+    }
+
+    pub(crate) fn terrain(&self) -> Option<&Arc<TerrainGen>> {
+        self.terrain.as_ref()
     }
 
     /// Dispatch a batch of pristine positions to a worker thread (the batch
@@ -325,6 +332,7 @@ pub fn apply_warp(
     mut dir: ResMut<ChunkDirectory>,
     mut proc: ResMut<DemandProcessor>,
     mut demanded: ResMut<crate::cull::DemandedChunks>,
+    mut gen_queue: ResMut<crate::gpu_gen::GpuGenQueue>,
     mut pending_edits: ResMut<crate::edit::PendingEdits>,
     mut ring: ResMut<player::InputRing>,
     mut slots: ResMut<ChunkSlots>,
@@ -352,6 +360,7 @@ pub fn apply_warp(
         dir.edited.clear();
         dir.overlay.clear();
         proc.clear();
+        gen_queue.0.clear();
         // In-flight readbacks describe the old world; drop them so the demand
         // pump doesn't age them toward bogus fetches.
         demanded.positions.clear();

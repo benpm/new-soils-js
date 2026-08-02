@@ -27,6 +27,7 @@ use soils_protocol::{CHUNK_BIT, ChunkInfo, ChunkVolume};
 
 use crate::chunk::{ChunkMap, VoxelChunk};
 use crate::cull::DemandedChunks;
+use crate::gpu_gen::{GEN_BUDGET as GPU_GEN_BUDGET, GenReady, GpuGenQueue};
 use crate::light::LightQueue;
 use crate::player::{Player, Streaming};
 use crate::pool::{ChunkSlots, DirtyMesh, PoolOpQueue};
@@ -311,6 +312,20 @@ pub fn maintain_cpu_mirror(
     mirror.0 = set;
 }
 
+/// The world-mutation half of the demand pump's parameters (bundled: Bevy
+/// systems cap out at 16 params).
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct MaterializeParams<'w, 's> {
+    commands: Commands<'w, 's>,
+    dir: ResMut<'w, ChunkDirectory>,
+    map: ResMut<'w, ChunkMap>,
+    chunks: Query<'w, 's, &'static mut VoxelChunk>,
+    slots: ResMut<'w, ChunkSlots>,
+    pool_ops: ResMut<'w, PoolOpQueue>,
+    dirty_mesh: ResMut<'w, DirtyMesh>,
+    light_queue: ResMut<'w, LightQueue>,
+}
+
 /// The demand pump: land finished gen batches, materialize mirror-priority
 /// and GPU-demanded chunks under a time box, dispatch new gen batches, and
 /// age unknown demands toward a fetch repair.
@@ -318,20 +333,25 @@ pub fn maintain_cpu_mirror(
 pub fn process_demands(
     time: Res<Time>,
     epoch: Res<WorldEpoch>,
-    mut commands: Commands,
-    mut dir: ResMut<ChunkDirectory>,
+    m: MaterializeParams,
     mut proc: ResMut<DemandProcessor>,
     mut cgen: ResMut<ClientGen>,
     demanded: Res<DemandedChunks>,
     mirror: Res<MirrorSet>,
-    mut map: ResMut<ChunkMap>,
-    mut chunks: Query<&mut VoxelChunk>,
-    mut slots: ResMut<ChunkSlots>,
-    mut pool_ops: ResMut<PoolOpQueue>,
-    mut dirty_mesh: ResMut<DirtyMesh>,
-    mut light_queue: ResMut<LightQueue>,
     mut streaming: ResMut<Streaming>,
+    gen_ready: Option<Res<GenReady>>,
+    mut gpu_gen: ResMut<GpuGenQueue>,
 ) {
+    let MaterializeParams {
+        mut commands,
+        mut dir,
+        mut map,
+        mut chunks,
+        mut slots,
+        mut pool_ops,
+        mut dirty_mesh,
+        mut light_queue,
+    } = m;
     // Land finished gen batches (stale epochs drop on the floor).
     while let Ok((e, batch)) = cgen.rx.try_recv() {
         if e == epoch.0 {
@@ -386,10 +406,26 @@ pub fn process_demands(
         }
         match dir.entries.get(&cpos) {
             Some(DirEntry::Pristine) => {
-                // Mirror chunks re-gen even when GPU-resident (they need CPU
-                // bytes); pure GPU demands for resident chunks were filtered
-                // by the scan already.
-                if gen_batch.len() < GEN_BATCH {
+                let want_cpu = mirror.0.contains(&cpos)
+                    || dir.edited.contains(&cpos)
+                    || dir.overlay.contains_key(&cpos);
+                if !want_cpu {
+                    // Born on the GPU: allocate slots now, dispatch the gen
+                    // kernel this frame (occupancy readback demotes all-air
+                    // chunks later). Waits for the pipelines to compile —
+                    // demands re-issue until then.
+                    if gen_ready.is_some() && gpu_gen.0.len() < GPU_GEN_BUDGET {
+                        if let Some(s) =
+                            slots.map_chunk_gen(&mut pool_ops, &mut dirty_mesh, cpos)
+                        {
+                            gpu_gen.0.push((cpos, s.mesh));
+                            light_queue.chunks.push(cpos);
+                            dir.entries.remove(&cpos);
+                            proc.priority_set.remove(&cpos);
+                        }
+                    }
+                } else if gen_batch.len() < GEN_BATCH {
+                    // Mirror/edited chunks need CPU bytes: background gen.
                     gen_batch.push(cpos);
                     proc.generating.insert(cpos);
                 }
@@ -506,9 +542,21 @@ mod tests {
             .init_resource::<DirtyMesh>()
             .init_resource::<LightQueue>()
             .init_resource::<DemandedChunks>()
+            .init_resource::<GpuGenQueue>()
+            // Pretend the GPU gen pipelines are up; a fake sink stands in for
+            // the render-world dispatch (jobs are resident the moment their
+            // slots map, which is what the assertions check).
+            .insert_resource(GenReady)
             .add_systems(
                 Update,
-                (fake_demand_scan, apply_directory, maintain_cpu_mirror, process_demands).chain(),
+                (
+                    fake_demand_scan,
+                    apply_directory,
+                    maintain_cpu_mirror,
+                    process_demands,
+                    |mut q: ResMut<GpuGenQueue>| q.0.clear(),
+                )
+                    .chain(),
             );
         app.world_mut().spawn((
             Player::at((spawn * 32 + IVec3::splat(16)).as_vec3()),

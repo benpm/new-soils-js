@@ -270,18 +270,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// Bindings for [`generate_chunk`]. `gen.origin` is the chunk origin in world
-/// voxels; `flags` bit 0 = flat world; palette block ids packed into `pal0`/
-/// `pal1` (grass, slate, stone, rocky | tough, dirt).
+/// Bindings for [`generate_chunk`]. The kernels are job-arrays: one
+/// `jobs[i] = (origin.xyz, out slot)` entry per chunk, dispatched
+/// `gen_lattice(1, n)` then `gen_fill(1, 4, n)`. `out_voxels` is
+/// slot-addressed (8192 words per slot) so the client binds its pooled voxel
+/// buffer directly; a standalone harness uses slot 0 into a chunk-sized
+/// buffer. `occ[1 + job]` accumulates the chunk's non-air cell count (word 0
+/// is reserved for the caller's batch tag; the caller zeroes the buffer);
+/// `flags` bit 0 = flat world; palette block ids packed into `pal0`/`pal1`
+/// (grass, slate, stone, rocky | tough, dirt).
 const CHUNK_HEADER: &str = r#"
 struct GenView {
-    origin_x: i32, origin_y: i32, origin_z: i32, flags: u32,
-    seed: u32, pal0: u32, pal1: u32, pad0: u32,
+    flags: u32, seed: u32, pal0: u32, pal1: u32,
 };
 @group(0) @binding(0) var<uniform> gen: GenView;
 @group(0) @binding(1) var<storage, read> P: array<i32>;
-@group(0) @binding(2) var<storage, read_write> lattice: array<i32>;  // 9^3
-@group(0) @binding(3) var<storage, read_write> out_voxels: array<u32>; // 8192 words
+@group(0) @binding(2) var<storage, read_write> lattice: array<i32>;    // jobs x 9^3
+@group(0) @binding(3) var<storage, read_write> out_voxels: array<u32>; // 8192 words per slot
+@group(0) @binding(4) var<storage, read> jobs: array<vec4<i32>>;       // origin.xyz, slot
+@group(0) @binding(5) var<storage, read_write> occ: array<atomic<u32>>; // [tag, per-job non-air]
 var<private> SEED: u32;
 "#;
 
@@ -294,37 +301,39 @@ fn cave_noise_at(gx: i32, gy: i32, gz: i32) -> i32 {
 }
 
 @compute @workgroup_size(64)
-fn gen_lattice(@builtin(local_invocation_index) t: u32) {
-    // 729 samples over one workgroup of 64 threads.
+fn gen_lattice(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    // 729 samples over one workgroup of 64 threads; one workgroup per job.
+    let job = wg.y;
+    let o = jobs[job].xyz;
     for (var i = i32(t); i < CAVE_N * CAVE_N * CAVE_N; i = i + 64) {
         let iy = i / (CAVE_N * CAVE_N);
         let rem = i % (CAVE_N * CAVE_N);
         let iz = rem / CAVE_N;
         let ix = rem % CAVE_N;
-        lattice[i] = cave_noise_at(
-            gen.origin_x + ix * CAVE_STEP,
-            gen.origin_y + iy * CAVE_STEP,
-            gen.origin_z + iz * CAVE_STEP,
+        lattice[i32(job) * (CAVE_N * CAVE_N * CAVE_N) + i] = cave_noise_at(
+            o.x + ix * CAVE_STEP,
+            o.y + iy * CAVE_STEP,
+            o.z + iz * CAVE_STEP,
         );
     }
 }
 
 // Trilinear interpolation over the lattice; fractions are exact Q16.16
 // multiples of 1/CAVE_STEP. Mirrors terrain.rs cave_at.
-fn cave_at(x: i32, y: i32, z: i32) -> i32 {
+fn cave_at(job: u32, x: i32, y: i32, z: i32) -> i32 {
     let xi = x / CAVE_STEP; let yi = y / CAVE_STEP; let zi = z / CAVE_STEP;
     let fxq = (x % CAVE_STEP) * (FX_ONE / CAVE_STEP);
     let fyq = (y % CAVE_STEP) * (FX_ONE / CAVE_STEP);
     let fzq = (z % CAVE_STEP) * (FX_ONE / CAVE_STEP);
-    let x00 = fx_lerp(lat_at(xi, yi, zi), lat_at(xi + 1, yi, zi), fxq);
-    let x10 = fx_lerp(lat_at(xi, yi + 1, zi), lat_at(xi + 1, yi + 1, zi), fxq);
-    let x01 = fx_lerp(lat_at(xi, yi, zi + 1), lat_at(xi + 1, yi, zi + 1), fxq);
-    let x11 = fx_lerp(lat_at(xi, yi + 1, zi + 1), lat_at(xi + 1, yi + 1, zi + 1), fxq);
+    let x00 = fx_lerp(lat_at(job, xi, yi, zi), lat_at(job, xi + 1, yi, zi), fxq);
+    let x10 = fx_lerp(lat_at(job, xi, yi + 1, zi), lat_at(job, xi + 1, yi + 1, zi), fxq);
+    let x01 = fx_lerp(lat_at(job, xi, yi, zi + 1), lat_at(job, xi + 1, yi, zi + 1), fxq);
+    let x11 = fx_lerp(lat_at(job, xi, yi + 1, zi + 1), lat_at(job, xi + 1, yi + 1, zi + 1), fxq);
     return fx_lerp(fx_lerp(x00, x10, fyq), fx_lerp(x01, x11, fyq), fzq);
 }
 
-fn lat_at(ix: i32, iy: i32, iz: i32) -> i32 {
-    return lattice[(iy * CAVE_N + iz) * CAVE_N + ix];
+fn lat_at(job: u32, ix: i32, iy: i32, iz: i32) -> i32 {
+    return lattice[i32(job) * (CAVE_N * CAVE_N * CAVE_N) + (iy * CAVE_N + iz) * CAVE_N + ix];
 }
 
 // Soil gradient by depth below the surface; mirrors terrain.rs generate_with.
@@ -340,22 +349,26 @@ fn soil(gy: i32, height: i32) -> u32 {
 
 @compute @workgroup_size(8, 8)
 fn gen_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
-    // One thread per output word: 4 x-adjacent voxels at (z, y..).
+    // One thread per output word: 4 x-adjacent voxels at (z, y..); one job
+    // per z-layer of the dispatch (1, 4, jobs).
     SEED = gen.seed;
+    let job = gid.z;
+    let o = jobs[job].xyz;
+    let slot = u32(jobs[job].w);
     let xw = i32(gid.x);   // word column 0..8
-    let z = i32(gid.y);    // 0..32 (dispatched (1, 4))
+    let z = i32(gid.y);    // 0..32
     if (xw >= 8 || z >= 32) { return; }
     let flat = (gen.flags & 1u) == 1u;
     let stone = (gen.pal0 >> 16u) & 0xffu;
 
     let ceiling = select(MAX_SURFACE, 256, flat);
-    let all_air = gen.origin_y > ceiling;
+    let all_air = o.y > ceiling;
 
     var heights: array<i32, 4>;
     var rocks: array<i32, 4>;
     for (var k = 0; k < 4; k = k + 1) {
-        let gx = gen.origin_x + xw * 4 + k;
-        let gz = gen.origin_z + z;
+        let gx = o.x + xw * 4 + k;
+        let gz = o.z + z;
         if (flat) {
             heights[k] = 256; rocks[k] = 0;
         } else {
@@ -364,8 +377,9 @@ fn gen_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    var non_air = 0u;
     for (var y = 0; y < 32; y = y + 1) {
-        let gy = gen.origin_y + y;
+        let gy = o.y + y;
         var word = 0u;
         if (!all_air) {
             for (var k = 0; k < 4; k = k + 1) {
@@ -378,14 +392,18 @@ fn gen_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
                         val = stone;
                     }
                     // Caves carved from solid ground.
-                    if (val != 0u && fx_abs(cave_at(x, y, z)) > CAVE_THR) {
+                    if (val != 0u && fx_abs(cave_at(job, x, y, z)) > CAVE_THR) {
                         val = 0u;
                     }
                 }
+                if (val != 0u) { non_air = non_air + 1u; }
                 word = word | (val << (u32(k) * 8u));
             }
         }
-        out_voxels[(y + z * 32) * 8 + xw] = word;
+        out_voxels[slot * 8192u + u32((y + z * 32) * 8 + xw)] = word;
+    }
+    if (non_air > 0u) {
+        atomicAdd(&occ[1u + job], non_air);
     }
 }
 "#;

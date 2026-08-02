@@ -15,7 +15,6 @@ mod gi;
 mod gi_demo;
 mod gpu_mesh;
 mod hud;
-mod indirect_draw;
 mod light;
 mod login;
 mod material;
@@ -23,9 +22,8 @@ mod net;
 mod pause;
 mod physics;
 mod player;
-// Allowance dropped when the pooled render core (stream-pipeline phase 3) consumes the API.
-#[allow(dead_code)]
 mod pool;
+mod world_draw;
 mod server_msg;
 mod singleplayer;
 
@@ -76,6 +74,7 @@ fn main() {
     }))
     .add_plugins(GpuMeshPlugin)
     .add_plugins(pool::PoolPlugin)
+    .add_plugins(world_draw::WorldDrawPlugin)
     .add_plugins(gi::GiPlugin)
     .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
     .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 1.0)))
@@ -232,7 +231,7 @@ fn screenshot_once(
     mut taken: Local<bool>,
     mut camera: Query<(&mut Player, &mut Transform)>,
     mut hold: ResMut<player::CameraHold>,
-    meshed: Query<(&VoxelChunk, &Transform), (With<Mesh3d>, Without<Player>)>,
+    slots: Res<pool::ChunkSlots>,
     remote_actors: Query<&Transform, (With<Actor>, Without<Player>)>,
 ) {
     if *taken || std::env::var("SOILS_SELFTEST").is_err() {
@@ -270,13 +269,16 @@ fn screenshot_once(
             }
         }
         let mut sample = 0;
-        for (chunk, t) in &meshed {
+        for (cpos, slot) in slots.iter() {
+            if slot.mesh == pool::NO_MESH {
+                continue;
+            }
             if sample < 3 {
-                info!("SELFTEST: meshed chunk {:?} at world {:?}", chunk.pos, t.translation);
+                info!("SELFTEST: meshed chunk {cpos:?} in mesh slot {}", slot.mesh);
             }
             sample += 1;
         }
-        info!("SELFTEST: {sample} chunks currently have meshes");
+        info!("SELFTEST: {sample} chunks currently have mesh slots");
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk("/tmp/soils-selftest.png"));
@@ -301,7 +303,7 @@ fn self_test_daytime(mut world_time: ResMut<WorldTime>) {
 fn self_test(
     time: Res<Time>,
     map: Res<ChunkMap>,
-    meshed: Query<&Mesh3d>,
+    slots: Res<pool::ChunkSlots>,
     remote_actors: Query<&Actor>,
     diagnostics: Res<bevy::diagnostic::DiagnosticsStore>,
     light_queue: Res<light::LightQueue>,
@@ -312,7 +314,7 @@ fn self_test(
     }
     if time.elapsed_secs() > env_secs("SOILS_EXIT_SECS", 11.0) {
         let chunks = map.map.len();
-        let meshes = meshed.iter().count();
+        let meshes = slots.iter().filter(|(_, s)| s.mesh != pool::NO_MESH).count();
         let actors = remote_actors.iter().count();
         // Steady-state frame cost, sampled at exit (the camera parked at the
         // screenshot deadline, so recent frames are the static viewpoint, not
@@ -349,7 +351,7 @@ fn self_test(
             "SELFTEST LIGHT BACKLOG: {lq_chunks} chunks to flood, {lq_edits} edits, {lq_pads} pads \
              pending (non-zero ⇒ still draining, fps above is not steady state)"
         );
-        info!("SELFTEST: {chunks} chunks loaded, {meshes} chunk meshes built, {actors} actors");
+        info!("SELFTEST: {chunks} chunks loaded, {meshes} chunk mesh slots, {actors} actors");
         // The login-screen shot (`SOILS_LOGINSHOT`) has no world by design, so
         // skip the world asserts there and just exit cleanly after the shot.
         if std::env::var("SOILS_LOGINSHOT").is_err() {

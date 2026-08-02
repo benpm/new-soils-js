@@ -4,19 +4,19 @@
 //! then re-uploads the padded per-chunk light volumes the terrain material
 //! samples.
 //!
-//! GPU note: the padded light buffers are CPU-recreated, and the chunk
-//! material's bind group is cached — so after touching a buffer we also touch
-//! its material (`materials.get_mut`) to force the bind group to rebuild.
+//! GPU note: each dirty chunk re-uploads its 32³ packed light bytes into its
+//! pooled light slot (a plain queue write — the world bind group is static,
+//! nothing invalidates). The draw shader samples neighbors through the slot
+//! table, so no padding is needed.
 
 use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
-use bevy::render::storage::ShaderStorageBuffer;
-use soils_protocol::{CHUNK_CLIP, CHUNK_SIZE, chunk_of, chunk_origin, local_of};
+use soils_protocol::{CHUNK_CLIP, chunk_of, local_of};
 use soils_sim::light::{self, LightWorld};
 
 use crate::chunk::{Blocks, ChunkMap, VoxelChunk, WorldTime};
-use crate::gpu_mesh::{GpuChunk, LIGHT_BYTES, LIGHT_PAD};
-use crate::material::{ChunkMeshMaterial, TERRAIN_BRIGHTNESS};
+use crate::material::TERRAIN_BRIGHTNESS;
+use crate::pool::{ChunkSlots, PoolOp, PoolOpQueue};
 
 /// Chunks to (re)light this frame budget allows, and voxels whose block
 /// changed. Fed by `server_msg::apply_chunks` / edit paths.
@@ -152,9 +152,8 @@ pub fn process_light(
     // `'static` data lifetime so `&mut Query` fits `EcsWorld`'s field (mutable
     // references are invariant over the query's data type).
     mut chunks: Query<&'static mut VoxelChunk>,
-    gpu: Query<(&GpuChunk, &MeshMaterial3d<ChunkMeshMaterial>)>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
-    mut materials: ResMut<Assets<ChunkMeshMaterial>>,
+    slots: Res<ChunkSlots>,
+    mut pool_ops: ResMut<PoolOpQueue>,
     blocks: Res<Blocks>,
     mut levels: Local<Vec<u8>>,
 ) {
@@ -185,80 +184,35 @@ pub fn process_light(
         light::apply_voxel_change(&mut world, v);
     }
 
-    // Coalesce dirt into the pending set, then upload a bounded, deduped batch.
+    // Coalesce dirt into the pending set, then upload a bounded, deduped batch
+    // of 32³ slot rewrites (plain queue writes; nothing invalidates).
     let dirty = world.dirty;
     queue.pending_pads.extend(dirty);
     let batch: Vec<IVec3> = queue.pending_pads.iter().copied().take(PAD_BUDGET).collect();
     let pads_t0 = std::time::Instant::now();
-    let mut padded_count = 0;
+    let mut uploaded = 0;
     for cpos in batch {
-        if padded_count > 0 && pads_t0.elapsed().as_secs_f32() * 1000.0 > PAD_MS {
-            break; // deferred pads stay in the set for next frame
+        if uploaded > 0 && pads_t0.elapsed().as_secs_f32() * 1000.0 > PAD_MS {
+            break; // deferred uploads stay in the set for next frame
         }
-        padded_count += 1;
+        uploaded += 1;
         queue.pending_pads.remove(&cpos);
         let Some(&e) = map.map.get(&cpos) else { continue };
-        let Ok((gc, mat)) = gpu.get(e) else { continue }; // empty chunks render nothing
-        let padded = build_padded(&map, &chunks, cpos);
-        if let Some(buf) = buffers.get_mut(&gc.light) {
-            buf.data = Some(padded);
-        }
-        // Force the cached material bind group to pick up the new buffer.
-        materials.get_mut(&mat.0);
+        let Some(s) = slots.get(cpos) else { continue };
+        let Ok(chunk) = chunks.get(e) else { continue };
+        pool_ops.0.push(PoolOp::UploadLight {
+            slot: s.slot,
+            bytes: chunk.light.as_bytes().to_vec().into_boxed_slice(),
+        });
     }
 }
 
-/// Build a chunk's padded light volume: its own 32³ plus one voxel of
-/// neighbor light on every side, so border faces sample correctly.
-fn build_padded(map: &ChunkMap, chunks: &Query<&'static mut VoxelChunk>, cpos: IVec3) -> Vec<u8> {
-    let mut out = vec![0u8; LIGHT_BYTES];
-    let idx = |x: i32, y: i32, z: i32| ((y + z * LIGHT_PAD) * LIGHT_PAD + x) as usize;
-
-    // Interior: straight copy from this chunk's rows.
-    if let Some(&e) = map.map.get(&cpos)
-        && let Ok(chunk) = chunks.get(e)
-    {
-        let src = chunk.light.as_bytes();
-        for y in 0..CHUNK_SIZE {
-            for z in 0..CHUNK_SIZE {
-                let row = ((y + z * CHUNK_SIZE) * CHUNK_SIZE) as usize;
-                let dst = idx(1, y + 1, z + 1);
-                out[dst..dst + CHUNK_SIZE as usize]
-                    .copy_from_slice(&src[row..row + CHUNK_SIZE as usize]);
-            }
-        }
-    }
-
-    // Shell: sample the six face-neighbor chunks (edges/corners of the pad are
-    // left dark — no face ever reads them).
-    let origin = chunk_origin(cpos);
-    let mut fill = |v: IVec3, px: i32, py: i32, pz: i32| {
-        let Some(&e) = map.map.get(&chunk_of(v)) else { return };
-        let Ok(chunk) = chunks.get(e) else { return };
-        let l = local_of(v);
-        out[idx(px, py, pz)] = chunk.light.get(l.x, l.y, l.z);
-    };
-    let s = CHUNK_SIZE;
-    for a in 0..s {
-        for b in 0..s {
-            fill(origin + IVec3::new(-1, a, b), 0, a + 1, b + 1);
-            fill(origin + IVec3::new(s, a, b), LIGHT_PAD - 1, a + 1, b + 1);
-            fill(origin + IVec3::new(a, -1, b), a + 1, 0, b + 1);
-            fill(origin + IVec3::new(a, s, b), a + 1, LIGHT_PAD - 1, b + 1);
-            fill(origin + IVec3::new(a, b, -1), a + 1, b + 1, 0);
-            fill(origin + IVec3::new(a, b, s), a + 1, b + 1, LIGHT_PAD - 1);
-        }
-    }
-    out
-}
-
-/// Keep every chunk material's `sky_term` in step with the day/night cycle.
-/// Quantized so materials (and their bind groups) are only touched a handful
-/// of times per day cycle, not per frame.
+/// Keep the world `sky_term` in step with the day/night cycle. Quantized so
+/// downstream consumers see a handful of changes per day cycle, not per frame
+/// (the terrain uniform is rewritten every frame regardless).
 pub fn update_sky_term(
     world_time: Res<WorldTime>,
     mut sky: ResMut<SkyTerm>,
-    mut materials: ResMut<Assets<ChunkMeshMaterial>>,
     mut last_q: Local<Option<f32>>,
 ) {
     let day = soils_sim::ease10(world_time.daytime * 2.0 - 1.0);
@@ -269,7 +223,4 @@ pub fn update_sky_term(
     }
     *last_q = Some(q);
     sky.0 = TERRAIN_BRIGHTNESS * q;
-    for (_, m) in materials.iter_mut() {
-        m.params.sky_term = sky.0;
-    }
 }

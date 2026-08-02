@@ -15,21 +15,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use bevy::prelude::*;
-use bevy::render::storage::ShaderStorageBuffer;
 use soils_protocol::{ChunkInfo, ChunkVolume, EntityState, GenParams, ServerMsg, SnapshotTracker};
 use soils_worldgen::{TerrainGen, WorldType};
 
 use crate::actor::{Actor, ActorAssets, ActorMap, LocalPlayer};
 use crate::chunk::{ChunkMap, VoxelChunk, WorldTime};
 use crate::edit;
-use crate::gi;
-use crate::gpu_mesh::{self, AtlasAssets, GpuChunk};
-use crate::light::{LightQueue, SkyTerm};
+use crate::light::LightQueue;
 use crate::login::LoginState;
-use crate::material::{self, ChunkMeshMaterial};
 use crate::net::{NetClient, NetEvent};
-use crate::pause::RenderToggles;
 use crate::player::{self, Player, Streaming};
+use crate::pool::{ChunkSlots, DirtyMesh, PoolOpQueue};
 
 /// Bumps every time a `Warp` is routed; chunk/edit messages carry the epoch
 /// they were routed under so consumers can drop leftovers from the old world.
@@ -395,11 +391,14 @@ pub fn apply_warp(
     mut queue: ResMut<ChunkApplyQueue>,
     mut pending_edits: ResMut<crate::edit::PendingEdits>,
     mut ring: ResMut<player::InputRing>,
+    mut slots: ResMut<ChunkSlots>,
+    mut pool_ops: ResMut<PoolOpQueue>,
     mut query: Query<(&mut Player, &mut Transform)>,
 ) {
     for msg in reader.read() {
         pending_edits.clear(); // old-world verdicts are moot
         ring.reset(); // prediction history describes the old world
+        slots.clear_all(&mut pool_ops);
         for (_, entity) in map.map.drain() {
             commands.entity(entity).despawn();
         }
@@ -435,13 +434,9 @@ pub fn apply_chunks(
     mut commands: Commands,
     mut map: ResMut<ChunkMap>,
     mut chunks: Query<&mut VoxelChunk>,
-    mut gpu_chunks: Query<&mut GpuChunk>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
-    mut materials: ResMut<Assets<ChunkMeshMaterial>>,
-    atlas: Res<AtlasAssets>,
-    toggles: Res<RenderToggles>,
-    gi: Res<gi::GiAssets>,
-    sky: Res<SkyTerm>,
+    mut slots: ResMut<ChunkSlots>,
+    mut pool_ops: ResMut<PoolOpQueue>,
+    mut dirty_mesh: ResMut<DirtyMesh>,
     mut light_queue: ResMut<LightQueue>,
     mut streaming: ResMut<Streaming>,
     mut queue: ResMut<ChunkApplyQueue>,
@@ -478,22 +473,11 @@ pub fn apply_chunks(
     if queue.queue.is_empty() {
         return;
     }
-    let gi_probes = gi.irradiance();
-    let (gi_origin, gi_enabled) = gi.apply_params();
-    let params = material::AtlasParams {
-        ambient_occlusion: if toggles.ao { 1.0 } else { 0.0 },
-        fog_density: if toggles.fog { material::FOG_DENSITY } else { 0.0 },
-        gi_origin,
-        gi_enabled,
-        sky_term: sky.0,
-        light_enabled: if toggles.light { 1.0 } else { 0.0 },
-        ..default()
-    };
 
-    // (B) Apply chunks until the time box (or hard cap) is hit. Turning a chunk
-    // into GPU resources allocates a ~655 KB quad SSBO and queues a compute
-    // dispatch; doing hundreds at once on a burst loses the device, so we
-    // spread the work — but by wall time, so slow frames don't starve the fill.
+    // (B) Apply chunks until the time box (or hard cap) is hit. Mapping a
+    // chunk queues a 32 KB voxel upload + a remesh dispatch into the pooled
+    // caches; hundreds at once on a burst still stalls weak devices, so we
+    // spread the work — by wall time, so slow frames don't starve the fill.
     let t0 = std::time::Instant::now();
     let mut applied = 0;
     while applied < CHUNK_APPLY_MAX
@@ -541,27 +525,32 @@ pub fn apply_chunks(
                     if let Some(entity) = map.map.remove(&cpos) {
                         commands.entity(entity).despawn();
                     }
+                    slots.unmap_chunk(&mut pool_ops, cpos);
                     light_queue.unload(cpos);
                 }
                 continue;
             }
         };
         let _ = msg_epoch;
-        let is_air = volume.is_empty();
+        // Map into the pooled GPU caches (allocates slots, uploads voxels,
+        // queues the remesh). Pool exhaustion re-queues the chunk for later.
+        if slots.map_chunk(&mut pool_ops, &mut dirty_mesh, cpos, &volume).is_none() {
+            warn!("chunk pools exhausted; deferring {cpos}");
+            queue.queued.insert(cpos);
+            queue.queue.push_back(ChunkStream::Data(ChunkReceived {
+                pos: cpos.to_array(),
+                payload: soils_protocol::encode_chunk(&volume),
+                epoch: epoch.0,
+            }));
+            break;
+        }
         if let Some(&entity) = map.map.get(&cpos) {
-            // Existing chunk: update CPU copy + re-upload voxels if it has a
-            // GPU mesh, else (was empty) leave as-is.
+            // Existing chunk: refresh the CPU copy (GPU side re-uploaded above).
             if let Ok(mut vc) = chunks.get_mut(entity) {
                 vc.volume = volume.clone();
             }
-            if !is_air
-                && let Ok(mut gc) = gpu_chunks.get_mut(entity)
-            {
-                gpu_mesh::refresh_gpu_chunk(&mut buffers, &mut gc, &volume);
-            }
-        } else if is_air {
-            // Track empty chunks so they aren't re-requested; no mesh (but
-            // they still carry light — sky crosses them into caves below).
+        } else {
+            // CPU mirror entity (physics, prediction, edits, light flood).
             let e = commands
                 .spawn(VoxelChunk {
                     pos: cpos,
@@ -569,19 +558,6 @@ pub fn apply_chunks(
                     light: soils_sim::light::ChunkLight::dark(),
                 })
                 .id();
-            map.map.insert(cpos, e);
-            streaming.pending = streaming.pending.saturating_sub(1);
-        } else {
-            let e = gpu_mesh::spawn_gpu_chunk(
-                &mut commands,
-                &mut buffers,
-                &mut materials,
-                &atlas,
-                cpos,
-                volume,
-                params.clone(),
-                gi_probes.clone(),
-            );
             map.map.insert(cpos, e);
             streaming.pending = streaming.pending.saturating_sub(1);
         }
@@ -596,8 +572,9 @@ pub fn apply_edits(
     epoch: Res<WorldEpoch>,
     map: Res<ChunkMap>,
     mut chunks: Query<&mut VoxelChunk>,
-    mut gpu_chunks: Query<&mut GpuChunk>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut slots: ResMut<ChunkSlots>,
+    mut pool_ops: ResMut<PoolOpQueue>,
+    mut dirty_mesh: ResMut<DirtyMesh>,
     mut light_queue: ResMut<LightQueue>,
 ) {
     for msg in reader.read() {
@@ -605,7 +582,7 @@ pub fn apply_edits(
             continue;
         }
         let v = IVec3::from_array(msg.pos);
-        edit::apply_edit(&map, &mut chunks, &mut gpu_chunks, &mut buffers, v, msg.value);
+        edit::apply_edit(&map, &mut chunks, &mut slots, &mut pool_ops, &mut dirty_mesh, v, msg.value);
         light_queue.edits.push(v);
     }
 }

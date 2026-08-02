@@ -2,60 +2,60 @@
 //! `SOILS_GI_DEMO=1` (best paired with `SOILS_SELFTEST=1` for the auto
 //! screenshot, `SOILS_GI=1`, and `SOILS_DAYTIME=0.5` for a dark night so the
 //! emissive blocks' bounce dominates). It bypasses the server and login,
-//! hand-builds one chunk — a stone floor and back wall with a cyan Diamond-ore
-//! and a red Ruby-ore light source sitting on the floor — and frames the camera
-//! on them. With GI on you should see coloured light pooling on the floor and
-//! wall around each ore; with GI off the scene is uniformly dim.
+//! hand-builds one chunk — an enclosed stone room with a cyan Diamond-ore and a
+//! red Ruby-ore light cluster — and frames the camera on them. With GI on you
+//! should see coloured light pooling on the floor and wall around each ore;
+//! with GI off the scene is uniformly dim.
 
 use bevy::prelude::*;
-use bevy::render::storage::ShaderStorageBuffer;
 use soils_protocol::ChunkVolume;
 
 use crate::chunk::{Blocks, ChunkMap};
 use crate::gi::GiAssets;
-use crate::gpu_mesh::{spawn_gpu_chunk, AtlasAssets, GpuChunk};
 use crate::login::LoginState;
-use crate::material::{AtlasParams, ChunkMeshMaterial};
 use crate::player::{self, Player};
+use crate::pool::{ChunkSlots, DirtyMesh, PoolOpQueue};
+use crate::world_draw::TerrainParams;
 
-/// The demo's single chunk entity, so we can keep it dirty until it meshes.
+/// The demo's single chunk position, so we can keep it remeshing briefly.
 #[derive(Resource)]
-pub struct GiDemoChunk(pub Entity);
+pub struct GiDemoChunk(pub IVec3);
 
 /// True when the GI demo scene is requested.
 pub fn demo_enabled() -> bool {
     std::env::var("SOILS_GI_DEMO").is_ok()
 }
 
-/// Keep the demo chunk flagged dirty for the first few seconds so the GPU
-/// mesher re-runs until its voxel buffer is resident and the mesh is built
-/// (a single freshly-spawned chunk can otherwise lose the 4-frame dirty window
-/// before its buffer uploads, and never mesh).
+/// Re-queue the demo chunk's mesh slot for the first few seconds so the mesher
+/// re-runs after all its pool writes have landed.
 pub fn gi_demo_keep_dirty(
     time: Res<Time>,
     demo: Option<Res<GiDemoChunk>>,
-    mut chunks: Query<&mut GpuChunk>,
+    slots: Res<ChunkSlots>,
+    mut dirty: ResMut<DirtyMesh>,
 ) {
     if !demo_enabled() || time.elapsed_secs() > 4.0 {
         return;
     }
-    if let Some(demo) = demo {
-        if let Ok(mut gc) = chunks.get_mut(demo.0) {
-            gc.pending = 2;
-        }
+    if let Some(demo) = demo
+        && let Some(s) = slots.get(demo.0)
+        && s.mesh != crate::pool::NO_MESH
+    {
+        dirty.0.push(s.mesh);
     }
 }
 
-/// Build the demo scene once, on the first frame it can (all render assets and
-/// the player exist by then). No-op unless `SOILS_GI_DEMO` is set.
+/// Build the demo scene once, on the first frame it can. No-op unless
+/// `SOILS_GI_DEMO` is set.
 #[allow(clippy::too_many_arguments)]
 pub fn setup_gi_demo(
     mut commands: Commands,
-    atlas: Option<Res<AtlasAssets>>,
     gi: Option<ResMut<GiAssets>>,
     blocks: Res<Blocks>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
-    mut materials: ResMut<Assets<ChunkMeshMaterial>>,
+    mut slots: ResMut<ChunkSlots>,
+    mut pool_ops: ResMut<PoolOpQueue>,
+    mut dirty_mesh: ResMut<DirtyMesh>,
+    mut params: ResMut<TerrainParams>,
     mut map: ResMut<ChunkMap>,
     mut login: ResMut<LoginState>,
     mut player: Query<(&mut Player, &mut Transform)>,
@@ -64,7 +64,7 @@ pub fn setup_gi_demo(
     if *done || !demo_enabled() {
         return;
     }
-    let (Some(atlas), Some(mut gi)) = (atlas, gi) else { return };
+    let Some(mut gi) = gi else { return };
     let Ok((mut p, mut cam)) = player.single_mut() else { return };
     *done = true;
 
@@ -94,10 +94,8 @@ pub fn setup_gi_demo(
             }
         }
     }
-    // Two ore lights as 3x3x3 clusters floating mid-room, spread apart. Bigger
-    // and off the floor so probes in the surrounding air can actually trace to
-    // them (a lone floor voxel is missed by the coarse probe rays), and their
-    // coloured bounce (cyan Diamond, red Ruby) pools on floor and walls.
+    // Two ore lights as 3x3x3 clusters floating mid-room, spread apart, so the
+    // coarse probe rays actually hit them.
     for dx in -1..=1 {
         for dy in -1..=1 {
             for dz in -1..=1 {
@@ -107,44 +105,32 @@ pub fn setup_gi_demo(
         }
     }
 
-    let (gi_origin, gi_enabled) = gi.apply_params();
-    let params = AtlasParams {
-        ambient_occlusion: 1.0,
-        // Low flat ambient so the room reads as dark without GI; the ores' GI
-        // bounce then stands out. Fog off for a crisp close-up. The L0 baked
-        // light is bypassed (this chunk is never queued for lighting, and its
-        // warm blocklight would confound the GI A/B comparison).
-        brightness: 300.0,
-        fog_density: 0.0,
-        gi_origin,
-        gi_enabled,
-        light_enabled: 0.0,
-        ..default()
-    };
-    let e = spawn_gpu_chunk(
-        &mut commands,
-        &mut buffers,
-        &mut materials,
-        &atlas,
-        cpos,
-        vol,
-        params,
-        gi.irradiance(),
-    );
-    map.map.insert(cpos, e);
-    commands.insert_resource(GiDemoChunk(e));
+    // Low flat ambient so the room reads as dark without GI; fog off for a
+    // crisp close-up; L0 light bypassed (this chunk never queues for lighting,
+    // and its warm blocklight would confound the GI A/B comparison). These
+    // fields aren't overwritten by update_terrain_params, so setting them once
+    // sticks (fog/light also flow from RenderToggles — the demo leaves the
+    // toggles alone and relies on brightness + the unlit chunk).
+    params.brightness = 300.0;
 
-    // Force the GI volume to refill (now that the room chunk exists) and re-push
-    // origin/enable into all materials next frame — otherwise this chunk, spawned
-    // after GI settled, keeps stale params and never lights up.
+    slots.map_chunk(&mut pool_ops, &mut dirty_mesh, cpos, &vol).expect("demo pools");
+    let e = commands
+        .spawn(crate::chunk::VoxelChunk {
+            pos: cpos,
+            volume: vol,
+            light: soils_sim::light::ChunkLight::dark(),
+        })
+        .id();
+    map.map.insert(cpos, e);
+    commands.insert_resource(GiDemoChunk(cpos));
+
+    // Force the GI volume to refill now that the room chunk exists.
     gi.mark_scene_dirty();
 
     // Frame the camera at the front of the room, looking down at the floor
-    // between the two ore lights (the downward view renders reliably here).
-    // Position goes through the sim teleport (Transform is interpolation-derived);
-    // rotation via look_at is fine, mouse_look owns it.
+    // between the two ore lights.
     player::teleport(&mut p, &mut cam, Vec3::new(272.0, 278.0, 261.0));
     cam.look_at(Vec3::new(272.0, 270.0, 274.0), Vec3::Y);
 
-    info!("SOILS_GI_DEMO: built demo scene (chunk {cpos:?}); GI enabled={gi_enabled}");
+    info!("SOILS_GI_DEMO: built demo scene (chunk {cpos:?})");
 }

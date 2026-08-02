@@ -7,9 +7,11 @@
 
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
-use bevy::render::renderer::RenderDevice;
+use bevy::render::render_resource::{Buffer, BufferDescriptor, BufferUsages};
+use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::settings::WgpuFeatures;
-use bevy::render::{ExtractSchedule, MainWorld, RenderApp, RenderStartup};
+use bevy::render::{ExtractSchedule, MainWorld, Render, RenderApp, RenderStartup, RenderSystems};
+use soils_protocol::{CHUNK_CUBED, ChunkVolume};
 
 /// Unified slots (light + descriptor). Covers a full r8 window (17³ = 4913)
 /// with headroom for hysteresis and in-flight loads.
@@ -46,6 +48,9 @@ pub struct ChunkSlots {
     map: HashMap<IVec3, Slot>,
     free: Vec<u32>,
     free_mesh: Vec<u32>,
+    /// CPU shadow of the GPU slot table, so unmapping only vacates cells this
+    /// chunk still owns (a 32-apart chunk may have overwritten the cell).
+    table: Vec<u32>,
 }
 
 impl Default for ChunkSlots {
@@ -56,6 +61,7 @@ impl Default for ChunkSlots {
             free: (0..N_SLOTS).rev().collect(),
             // Mesh slot 0 is the air sentinel — never in the free list.
             free_mesh: (1..N_MESH).rev().collect(),
+            table: vec![TABLE_EMPTY; (TABLE_DIM * TABLE_DIM * TABLE_DIM) as usize],
         }
     }
 }
@@ -112,28 +118,232 @@ impl ChunkSlots {
         self.map.get(&pos).copied()
     }
 
+    #[allow(dead_code)] // hud/cull consumers arrive with later phases
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
+    #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = (&IVec3, &Slot)> {
         self.map.iter()
     }
 
-    /// Drop everything (warp: the whole world went away).
+    /// Map a chunk into the GPU caches: allocate slots, upload voxels (non-air),
+    /// point the slot table at it, and queue a remesh. Idempotent for
+    /// re-uploads (server resend / gen refresh). Returns the slot, or `None`
+    /// on pool exhaustion (caller retries later).
+    pub fn map_chunk(
+        &mut self,
+        ops: &mut PoolOpQueue,
+        dirty: &mut DirtyMesh,
+        cpos: IVec3,
+        volume: &ChunkVolume,
+    ) -> Option<Slot> {
+        let non_air = !volume.is_empty();
+        let s = self.alloc(cpos, non_air)?;
+        if s.mesh != NO_MESH {
+            ops.0.push(PoolOp::UploadVoxels { mesh: s.mesh, volume: volume.clone() });
+            ops.0.push(PoolOp::WriteMeshInfo { mesh: s.mesh, cpos, slot: s.slot });
+            dirty.0.push(s.mesh);
+        }
+        ops.0.push(PoolOp::WriteDesc { slot: s.slot, cpos, mesh: s.mesh });
+        let idx = table_index(cpos) as u32;
+        self.table[idx as usize] = s.slot;
+        ops.0.push(PoolOp::WriteTable { index: idx, slot: s.slot });
+        Some(s)
+    }
+
+    /// Unmap a chunk (unload): free its slots, vacate its table cell (only if
+    /// still owned), stop its draws, and poison its descriptor so stale table
+    /// cells elsewhere fail validation.
+    pub fn unmap_chunk(&mut self, ops: &mut PoolOpQueue, cpos: IVec3) {
+        let Some(s) = self.free(cpos) else { return };
+        let idx = table_index(cpos);
+        if self.table[idx] == s.slot {
+            self.table[idx] = TABLE_EMPTY;
+            ops.0.push(PoolOp::WriteTable { index: idx as u32, slot: TABLE_EMPTY });
+        }
+        if s.mesh != NO_MESH {
+            ops.0.push(PoolOp::ClearIndirect { mesh: s.mesh });
+        }
+        ops.0.push(PoolOp::WriteDesc { slot: s.slot, cpos: IVec3::MAX, mesh: NO_MESH });
+    }
+
+    /// Drop everything (warp: the whole world went away), vacating the GPU
+    /// side too.
+    pub fn clear_all(&mut self, ops: &mut PoolOpQueue) {
+        let positions: Vec<IVec3> = self.map.keys().copied().collect();
+        for cpos in positions {
+            self.unmap_chunk(ops, cpos);
+        }
+        *self = Self::default();
+    }
+
+    /// Drop everything (tests only — no GPU side to notify).
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         *self = Self::default();
     }
 }
 
-/// What the adapter actually gave us, probed once at render startup. Phase 3
-/// sizes the pools from this (and refuses to start with a clear error instead
-/// of a cryptic wgpu validation panic if the device can't fit them). Bevy's
-/// default `WgpuSettingsPriority::Functionality` already requests the full
-/// adapter feature/limit set, so nothing needs forcing at device creation.
-/// `multi_draw_indirect` itself is always callable in wgpu 27 (emulated as a
-/// `draw_indirect` loop without native support); `native_multi_draw` records
-/// whether `MULTI_DRAW_INDIRECT_COUNT` says it is a real single submission.
+/// Quads per mesh slot in the pooled quad buffer. Realistic terrain chunks
+/// greedy-merge to a few hundred quads; only adversarial builds clamp (the
+/// same contract the old 8192 cap had, at 8-byte packed quads instead of 80).
+pub const QUADS_PER_SLOT: u32 = 4096;
+/// Bytes per packed quad (two u32 words — see `voxel_mesh.wgsl` PackedQuad).
+pub const QUAD_BYTES: u64 = 8;
+/// Bytes per chunk descriptor (`ChunkSlot` in WGSL).
+pub const DESC_BYTES: u64 = 32;
+/// Bytes of one voxel/light slot (32³ bytes).
+pub const SLOT_BYTES: u64 = CHUNK_CUBED as u64;
+
+/// The pooled GPU buffers, created once at render startup — bind groups over
+/// them are static, so uploads never invalidate anything.
+#[derive(Resource)]
+pub struct ChunkPools {
+    /// `N_MESH` × 32 KB voxel volumes (u8 material ids packed in u32 words).
+    pub voxels: Buffer,
+    /// `N_SLOTS` × 32 KB packed light volumes (unpadded — neighbor sampling
+    /// goes through the slot table).
+    pub light: Buffer,
+    /// `N_MESH` × `QUADS_PER_SLOT` packed quads.
+    pub quads: Buffer,
+    /// `N_MESH` × `DrawIndirectArgs`. Zero-initialized: unallocated slots draw
+    /// nothing; the mesher's finalize writes real args per slot.
+    pub indirect: Buffer,
+    /// `N_SLOTS` × `ChunkSlot` descriptors.
+    pub desc: Buffer,
+    /// 32³ wrap-window chunk→slot map (`TABLE_EMPTY` = vacant).
+    pub table: Buffer,
+    /// `N_MESH` × `vec4<i32>` (cpos.xyz, unified light slot): the vertex
+    /// shader's per-mesh-slot chunk origin + the fragment's own-light slot.
+    pub mesh_info: Buffer,
+}
+
+impl ChunkPools {
+    fn create(device: &RenderDevice) -> Self {
+        let buf = |label: &str, size: u64, usage: BufferUsages| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let sc = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        Self {
+            voxels: buf("chunk_voxel_pool", N_MESH as u64 * SLOT_BYTES, sc),
+            light: buf("chunk_light_pool", N_SLOTS as u64 * SLOT_BYTES, sc),
+            quads: buf("chunk_quad_pool", N_MESH as u64 * QUADS_PER_SLOT as u64 * QUAD_BYTES, sc),
+            indirect: buf(
+                "chunk_indirect_args",
+                N_MESH as u64 * 16,
+                sc | BufferUsages::INDIRECT,
+            ),
+            desc: buf("chunk_desc", N_SLOTS as u64 * DESC_BYTES, sc),
+            table: buf("chunk_slot_table", (TABLE_DIM as u64).pow(3) * 4, sc),
+            mesh_info: buf("chunk_mesh_info", N_MESH as u64 * 16, sc),
+        }
+    }
+}
+
+/// A write into the pooled buffers, queued by main-world systems and applied
+/// in the render world via `RenderQueue::write_buffer`. Slots are CPU-owned,
+/// so ops never race GPU-side allocation.
+pub enum PoolOp {
+    /// Full 32 KB voxel upload into a mesh slot.
+    UploadVoxels { mesh: u32, volume: ChunkVolume },
+    /// Single-voxel edit: rewrite the containing u32 word.
+    WriteVoxelWord { mesh: u32, word_idx: u32, word: u32 },
+    /// Full 32 KB light upload into a unified slot.
+    UploadLight { slot: u32, bytes: Box<[u8]> },
+    /// (Re)write a slot's descriptor.
+    WriteDesc { slot: u32, cpos: IVec3, mesh: u32 },
+    /// Point a slot-table cell at a slot (or `TABLE_EMPTY`).
+    WriteTable { index: u32, slot: u32 },
+    /// (Re)write a mesh slot's info row (chunk pos + owning light slot).
+    WriteMeshInfo { mesh: u32, cpos: IVec3, slot: u32 },
+    /// Zero a freed mesh slot's draw args so it stops drawing.
+    ClearIndirect { mesh: u32 },
+}
+
+/// Main-world queue of pool writes, drained into the render world each frame.
+#[derive(Resource, Default)]
+pub struct PoolOpQueue(pub Vec<PoolOp>);
+
+/// Mesh slots whose voxels changed this frame → remesh dispatch list.
+#[derive(Resource, Default)]
+pub struct DirtyMesh(pub Vec<u32>);
+
+fn extract_pool_ops(mut main: ResMut<MainWorld>, mut ops: ResMut<ExtractedPoolOps>) {
+    if let Some(mut q) = main.get_resource_mut::<PoolOpQueue>() {
+        ops.0.append(&mut q.0);
+    }
+    if let Some(mut d) = main.get_resource_mut::<DirtyMesh>() {
+        ops.1.append(&mut d.0);
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct ExtractedPoolOps(pub Vec<PoolOp>, pub Vec<u32>);
+
+fn apply_pool_ops(
+    mut ops: ResMut<ExtractedPoolOps>,
+    pools: Res<ChunkPools>,
+    queue: Res<RenderQueue>,
+) {
+    for op in ops.0.drain(..) {
+        match op {
+            PoolOp::UploadVoxels { mesh, volume } => {
+                queue.write_buffer(&pools.voxels, mesh as u64 * SLOT_BYTES, volume.as_bytes());
+            }
+            PoolOp::WriteVoxelWord { mesh, word_idx, word } => {
+                queue.write_buffer(
+                    &pools.voxels,
+                    mesh as u64 * SLOT_BYTES + word_idx as u64 * 4,
+                    &word.to_le_bytes(),
+                );
+            }
+            PoolOp::UploadLight { slot, bytes } => {
+                queue.write_buffer(&pools.light, slot as u64 * SLOT_BYTES, &bytes);
+            }
+            PoolOp::WriteDesc { slot, cpos, mesh } => {
+                // Matches the WGSL ChunkSlot layout: cpos, mesh_slot, flags,
+                // flags_gpu, quad_count, pad. CPU writes zero the GPU words —
+                // a (re)assigned slot starts clean.
+                let mut d = [0u8; DESC_BYTES as usize];
+                d[0..4].copy_from_slice(&cpos.x.to_le_bytes());
+                d[4..8].copy_from_slice(&cpos.y.to_le_bytes());
+                d[8..12].copy_from_slice(&cpos.z.to_le_bytes());
+                d[12..16].copy_from_slice(&mesh.to_le_bytes());
+                queue.write_buffer(&pools.desc, slot as u64 * DESC_BYTES, &d);
+            }
+            PoolOp::WriteTable { index, slot } => {
+                queue.write_buffer(&pools.table, index as u64 * 4, &slot.to_le_bytes());
+            }
+            PoolOp::WriteMeshInfo { mesh, cpos, slot } => {
+                let mut d = [0u8; 16];
+                d[0..4].copy_from_slice(&cpos.x.to_le_bytes());
+                d[4..8].copy_from_slice(&cpos.y.to_le_bytes());
+                d[8..12].copy_from_slice(&cpos.z.to_le_bytes());
+                d[12..16].copy_from_slice(&slot.to_le_bytes());
+                queue.write_buffer(&pools.mesh_info, mesh as u64 * 16, &d);
+            }
+            PoolOp::ClearIndirect { mesh } => {
+                queue.write_buffer(&pools.indirect, mesh as u64 * 16, &[0u8; 16]);
+            }
+        }
+    }
+}
+
+/// What the adapter actually gave us, probed once at render startup — the
+/// pools above need `max_storage_buffer_binding_size` ≥ 192 MiB (the light
+/// pool). Bevy's default `WgpuSettingsPriority::Functionality` already
+/// requests the full adapter feature/limit set, so nothing needs forcing at
+/// device creation. `multi_draw_indirect` itself is always callable in wgpu 27
+/// (emulated as a `draw_indirect` loop without native support);
+/// `native_multi_draw` records whether `MULTI_DRAW_INDIRECT_COUNT` says it is
+/// a real single submission.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct GpuCaps {
     pub native_multi_draw: bool,
@@ -155,6 +365,15 @@ fn probe_gpu_caps(device: Res<RenderDevice>, mut commands: Commands) {
         caps.max_storage_binding >> 20,
         caps.max_buffer_size >> 20
     );
+    let need = N_SLOTS as u64 * SLOT_BYTES;
+    assert!(
+        caps.max_storage_binding >= need,
+        "adapter's max storage binding ({} MiB) can't hold the {} MiB light pool; \
+         lower N_SLOTS/N_MESH for this device",
+        caps.max_storage_binding >> 20,
+        need >> 20
+    );
+    commands.insert_resource(ChunkPools::create(&device));
     commands.insert_resource(caps);
 }
 
@@ -172,10 +391,17 @@ pub struct PoolPlugin;
 
 impl Plugin for PoolPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ChunkSlots>();
+        app.init_resource::<ChunkSlots>()
+            .init_resource::<PoolOpQueue>()
+            .init_resource::<DirtyMesh>();
         let render_app = app.sub_app_mut(RenderApp);
+        render_app.init_resource::<ExtractedPoolOps>();
         render_app.add_systems(RenderStartup, probe_gpu_caps);
-        render_app.add_systems(ExtractSchedule, mirror_caps);
+        render_app.add_systems(ExtractSchedule, (mirror_caps, extract_pool_ops));
+        render_app.add_systems(
+            Render,
+            apply_pool_ops.in_set(RenderSystems::PrepareResources),
+        );
     }
 }
 

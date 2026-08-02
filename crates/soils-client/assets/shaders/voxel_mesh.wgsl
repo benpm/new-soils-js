@@ -1,56 +1,46 @@
-// GPU greedy voxel mesher (compute). Port of crates/soils-worldgen/src/greedy.rs.
+// GPU greedy voxel mesher (compute) over the POOLED chunk caches. Port of
+// crates/soils-worldgen/src/greedy.rs.
 //
-// Dispatched as one workgroup per (axis d in 0..3, plane in 0..32) = (3, 33, 1)
-// workgroups of 32 lanes. Lanes cooperate on the slice's mask and AO passes
-// (one 32-cell row each, barrier-separated); lane 0 then runs the serial
-// AO-aware greedy sweep and appends merged quads to a shared output buffer via
-// an atomic counter, reproducing the CPU output.
+// Dispatched per remesh batch: `jobs` lists the mesh slots to rebuild;
+// `clear_counter`/`finalize_mesh` run (jobs, 1, 1) and `mesh_slice` runs
+// (3, 33, jobs) — workgroup (d, plane, job) of 32 lanes. Lanes cooperate on
+// the slice's mask and AO passes (one 32-cell row each, barrier-separated);
+// lane 0 then runs the serial AO-aware greedy sweep and appends merged quads
+// to the slot's region of the pooled quad buffer via an atomic counter
+// (parked in the slot's indirect-args word during the pass), reproducing the
+// CPU output.
+//
+// A packed quad is two u32 words (8 B vs the old 80 B):
+//   w0 = x:6 | y:6 | z:6 | w:6 | h:6 | axis:2
+//   w1 = sign:1 | tile:8 | ao:8 (4 corner levels × 2 bits)
+// The draw shader (atlas.wgsl) reconstructs base/du/dv/normal exactly as the
+// emit below defines them.
 
 const CHUNK: i32 = 32;
-const MAX_QUADS: u32 = 8192u;
+// Must match pool::QUADS_PER_SLOT.
+const QUADS_PER_SLOT: u32 = 4096u;
 
-struct QuadGpu {
-    base: vec3<f32>, tile: u32,
-    du: vec3<f32>,   nx: f32,
-    dv: vec3<f32>,   ny: f32,
-    ao: vec4<f32>,
-    nz: f32, pad0: f32, pad1: f32, pad2: f32,
-};
-
-struct QuadBuffer {
-    count: atomic<u32>,
-    p0: u32, p1: u32, p2: u32,
-    quads: array<QuadGpu>,
-};
-
-// Matches wgpu's DrawIndirectArgs; consumed by the chunk's draw_indirect call.
-struct IndirectArgs {
-    vertex_count: u32,
-    instance_count: u32,
-    first_vertex: u32,
-    first_instance: u32,
-};
-
-@group(0) @binding(0) var<storage, read>       voxels: array<u32>;
-@group(0) @binding(1) var<storage, read_write> out_buf: QuadBuffer;
+@group(0) @binding(0) var<storage, read>       voxels: array<u32>;      // N_MESH × 8192 words
+@group(0) @binding(1) var<storage, read_write> quads: array<u32>;       // N_MESH × QPS × 2 words
 @group(0) @binding(2) var<storage, read>       block_faces: array<vec4<u32>>;
-@group(0) @binding(3) var<storage, read_write> indirect: IndirectArgs;
+@group(0) @binding(3) var<storage, read_write> indirect: array<atomic<u32>>; // N_MESH × 4 words
+@group(0) @binding(4) var<storage, read>       jobs: array<u32>;        // mesh slots this pass
 
 // Per-slice scratch, filled cooperatively (one row per lane, see mesh_slice).
 var<workgroup> mask: array<i32, 1024>;
 var<workgroup> aokey: array<u32, 1024>; // 4 corner occlusion levels packed 8 bits each
 
-fn vox(x: i32, y: i32, z: i32) -> u32 {
+fn vox(slot: u32, x: i32, y: i32, z: i32) -> u32 {
     if (x < 0 || x >= CHUNK || y < 0 || y >= CHUNK || z < 0 || z >= CHUNK) {
         return 0u;
     }
     let idx = (y + z * CHUNK) * CHUNK + x;
-    let w = voxels[u32(idx) >> 2u];
+    let w = voxels[slot * 8192u + (u32(idx) >> 2u)];
     return (w >> ((u32(idx) & 3u) * 8u)) & 0xffu;
 }
 
-fn solid(p: array<i32, 3>) -> bool {
-    return vox(p[0], p[1], p[2]) != 0u;
+fn solid(slot: u32, p: array<i32, 3>) -> bool {
+    return vox(slot, p[0], p[1], p[2]) != 0u;
 }
 
 fn occlusion(s1: bool, s2: bool, c: bool) -> i32 {
@@ -76,58 +66,59 @@ fn sel(axis: i32, comp: i32) -> i32 {
     return 0;
 }
 
-fn ao_at(vp: array<i32, 3>, norm: array<i32, 3>, cx: array<i32, 3>, cy: array<i32, 3>, o: vec2<i32>) -> bool {
+fn ao_at(slot: u32, vp: array<i32, 3>, norm: array<i32, 3>, cx: array<i32, 3>, cy: array<i32, 3>, o: vec2<i32>) -> bool {
     var p = array<i32, 3>(
         vp[0] + norm[0] + cx[0] * o.x + cy[0] * o.y,
         vp[1] + norm[1] + cx[1] * o.x + cy[1] * o.y,
         vp[2] + norm[2] + cx[2] * o.x + cy[2] * o.y,
     );
-    return solid(p);
+    return solid(slot, p);
 }
 
-fn level_bright(packed: u32, w: u32) -> f32 {
-    let level = (packed >> (w * 8u)) & 0xffu;
-    return 0.1 + f32(level) * 0.3;
+// Repack the 4×8-bit corner levels (0..3 each) into 4×2 bits.
+fn pack_ao2(ao_packed: u32) -> u32 {
+    return (ao_packed & 3u)
+        | (((ao_packed >> 8u) & 3u) << 2u)
+        | (((ao_packed >> 16u) & 3u) << 4u)
+        | (((ao_packed >> 24u) & 3u) << 6u);
 }
 
-fn emit(base: array<i32, 3>, du: array<i32, 3>, dv: array<i32, 3>, norm: array<i32, 3>, block_id: u32, ao_packed: u32) {
-    let slot = atomicAdd(&out_buf.count, 1u);
-    if (slot >= MAX_QUADS) { return; }
+fn emit(slot: u32, base: array<i32, 3>, width: i32, height: i32, d: i32, positive: bool, block_id: u32, ao_packed: u32) {
+    // The slot's vertex_count word doubles as the append counter during the
+    // pass; finalize converts it to real draw args.
+    let n = atomicAdd(&indirect[slot * 4u], 1u);
+    if (n >= QUADS_PER_SLOT) { return; }
 
-    var q: QuadGpu;
-    q.base = vec3<f32>(f32(base[0]), f32(base[1]), f32(base[2]));
-    q.du = vec3<f32>(f32(du[0]), f32(du[1]), f32(du[2]));
-    q.dv = vec3<f32>(f32(dv[0]), f32(dv[1]), f32(dv[2]));
-    q.nx = f32(norm[0]);
-    q.ny = f32(norm[1]);
-    q.nz = f32(norm[2]);
-    q.tile = tile_for_normal(block_id, norm);
-    q.ao = vec4<f32>(
-        level_bright(ao_packed, 0u),
-        level_bright(ao_packed, 1u),
-        level_bright(ao_packed, 2u),
-        level_bright(ao_packed, 3u),
-    );
-    q.pad0 = 0.0; q.pad1 = 0.0; q.pad2 = 0.0;
-    out_buf.quads[slot] = q;
+    var norm = array<i32, 3>(0, 0, 0);
+    if (positive) { norm[d] = 1; } else { norm[d] = -1; }
+    let w0 = u32(base[0]) | (u32(base[1]) << 6u) | (u32(base[2]) << 12u)
+        | (u32(width) << 18u) | (u32(height) << 24u) | (u32(d) << 30u);
+    let w1 = select(0u, 1u, positive)
+        | (tile_for_normal(block_id, norm) << 1u)
+        | (pack_ao2(ao_packed) << 9u);
+    let at = (slot * QUADS_PER_SLOT + n) * 2u;
+    quads[at] = w0;
+    quads[at + 1u] = w1;
 }
 
 @compute @workgroup_size(1)
-fn clear_counter() {
-    atomicStore(&out_buf.count, 0u);
+fn clear_counter(@builtin(workgroup_id) wg: vec3<u32>) {
+    atomicStore(&indirect[jobs[wg.x] * 4u], 0u);
 }
 
 // Runs after mesh_slice (dispatches in one compute pass are ordered): clamps
-// the overflowed count and publishes the draw args, so the render pass draws
-// exactly count*6 vertices instead of a fixed worst-case dummy mesh.
+// the overflowed count and publishes the slot's draw args. `first_vertex`
+// points the shared vertex-pull shader at this slot's quad range;
+// `first_instance` carries the slot id (read back via vertex_index math, no
+// INDIRECT_FIRST_INSTANCE dependency).
 @compute @workgroup_size(1)
-fn finalize_mesh() {
-    let n = min(atomicLoad(&out_buf.count), MAX_QUADS);
-    atomicStore(&out_buf.count, n);
-    indirect.vertex_count = n * 6u;
-    indirect.instance_count = 1u;
-    indirect.first_vertex = 0u;
-    indirect.first_instance = 0u;
+fn finalize_mesh(@builtin(workgroup_id) wg: vec3<u32>) {
+    let slot = jobs[wg.x];
+    let n = min(atomicLoad(&indirect[slot * 4u]), QUADS_PER_SLOT);
+    atomicStore(&indirect[slot * 4u], n * 6u);
+    atomicStore(&indirect[slot * 4u + 1u], 1u);
+    atomicStore(&indirect[slot * 4u + 2u], slot * QUADS_PER_SLOT * 6u);
+    atomicStore(&indirect[slot * 4u + 3u], slot);
 }
 
 @compute @workgroup_size(32)
@@ -135,6 +126,7 @@ fn mesh_slice(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
+    let slot = jobs[wg.z];
     let d = i32(wg.x);
     let plane = i32(wg.y); // 0..32 inclusive
     let lane = i32(lid.x); // this lane's mask row (jv)
@@ -157,10 +149,10 @@ fn mesh_slice(
             var xa = array<i32, 3>(0, 0, 0);
             xa[d] = xd; xa[u] = iu; xa[v] = jv;
             var a = 0u;
-            if (xd >= 0) { a = vox(xa[0], xa[1], xa[2]); }
+            if (xd >= 0) { a = vox(slot, xa[0], xa[1], xa[2]); }
             var b = 0u;
             if (xd < CHUNK - 1) {
-                b = vox(xa[0] + sel(d, 0), xa[1] + sel(d, 1), xa[2] + sel(d, 2));
+                b = vox(slot, xa[0] + sel(d, 0), xa[1] + sel(d, 1), xa[2] + sel(d, 2));
             }
             var m = 0;
             if ((a != 0u) == (b != 0u)) { m = 0; }
@@ -198,9 +190,9 @@ fn mesh_slice(
                         base[1] + cx[1] * ab.x + cy[1] * ab.y,
                         base[2] + cx[2] * ab.x + cy[2] * ab.y,
                     );
-                    let s1 = ao_at(vp, norm, cx, cy, ao_offsets[w]);
-                    let s2 = ao_at(vp, norm, cx, cy, ao_offsets[(w + 2) % 4]);
-                    let cc = ao_at(vp, norm, cx, cy, ao_offsets[(w + 1) % 4]);
+                    let s1 = ao_at(slot, vp, norm, cx, cy, ao_offsets[w]);
+                    let s2 = ao_at(slot, vp, norm, cx, cy, ao_offsets[(w + 2) % 4]);
+                    let cc = ao_at(slot, vp, norm, cx, cy, ao_offsets[(w + 1) % 4]);
                     let lvl = occlusion(s1, s2, cc);
                     packed = packed | (u32(lvl) << (u32(w) * 8u));
                 }
@@ -248,19 +240,10 @@ fn mesh_slice(
                 var block_id = c;
                 if (!positive) { block_id = -c; }
 
-                var du = array<i32, 3>(0, 0, 0);
-                var dv = array<i32, 3>(0, 0, 0);
-                var norm = array<i32, 3>(0, 0, 0);
-                if (positive) {
-                    dv[v] = height; du[u] = width; norm[d] = 1;
-                } else {
-                    du[v] = height; dv[u] = width; norm[d] = -1;
-                }
-
                 var base = array<i32, 3>(0, 0, 0);
                 base[d] = plane; base[u] = i; base[v] = j;
 
-                emit(base, du, dv, norm, u32(block_id), base_key);
+                emit(slot, base, width, height, d, positive, u32(block_id), base_key);
 
                 for (var l = 0; l < height; l = l + 1) {
                     for (var kk = 0; kk < width; kk = kk + 1) {

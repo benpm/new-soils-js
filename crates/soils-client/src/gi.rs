@@ -28,7 +28,7 @@ use bevy::render::storage::{GpuShaderStorageBuffer, ShaderStorageBuffer};
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 use soils_protocol::CHUNK_BIT;
 
-use crate::chunk::{Blocks, ChunkMap, WorldTime};
+use crate::chunk::{Blocks, WorldTime};
 
 /// World volume side, in voxels. Must match `GI_DIM` in radiance.wgsl. Sized
 /// for integrated GPUs (see the note in radiance.wgsl).
@@ -103,12 +103,11 @@ pub struct GiAssets {
     /// material actually samples.
     irradiance: Handle<ShaderStorageBuffer>,
     params: Handle<ShaderStorageBuffer>,
-    /// Pending GPU volume refill: chunk (voxel, padded-light) buffers (both
-    /// GPU-resident for the mesher/material) to blit into the volumes, with
-    /// their offsets relative to the volume origin. Populated on refill
-    /// frames, consumed by the render node (a clear pass runs first so
-    /// unloaded space reads as air under open sky).
-    refill: Vec<(Handle<ShaderStorageBuffer>, Handle<ShaderStorageBuffer>, IVec3)>,
+    /// Pending GPU volume refill: (mesh slot, light slot, offset relative to
+    /// the volume origin) per overlapped chunk, blitted straight out of the
+    /// pooled caches. Populated on refill frames, consumed by the render node
+    /// (a clear pass runs first so unloaded space reads as air under open sky).
+    refill: Vec<(u32, u32, IVec3)>,
     /// Placeholder bound to the unused `far` slot during trace (can't reuse the
     /// write target — a buffer may not be both read-write and read-only in one
     /// dispatch).
@@ -118,9 +117,6 @@ pub struct GiAssets {
     center: Option<IVec3>,
     /// Extracted each frame so the render node can skip work when GI is off.
     enabled: bool,
-    /// Last `(origin, enabled)` pushed into chunk materials, so we only touch
-    /// them (and rebuild their bind groups) when it actually changes.
-    applied: Option<(IVec3, bool)>,
 }
 
 impl GiAssets {
@@ -131,17 +127,15 @@ impl GiAssets {
         self.irradiance.clone()
     }
 
-    /// Force a volume refill and a re-push of origin/enable into every chunk
-    /// material next frame — for when the scene changes in a way the periodic
-    /// refill/sync would otherwise miss for a frame (e.g. a chunk injected
-    /// directly into `ChunkMap`, as the GI demo does).
+    /// Force a volume refill next frame — for when the scene changes in a way
+    /// the periodic refill would otherwise miss (e.g. the GI demo's injected
+    /// chunk).
     pub fn mark_scene_dirty(&mut self) {
         self.center = None;
-        self.applied = None;
     }
 
-    /// Current `(volume origin as world voxel coords, enable flag)` for a chunk
-    /// material's `AtlasParams`.
+    /// Current `(volume origin as world voxel coords, enable flag)` for the
+    /// terrain draw's world params.
     pub fn apply_params(&self) -> (Vec3, f32) {
         let origin = self.center.map(|c| c - IVec3::splat(GI_DIM / 2)).unwrap_or(IVec3::ZERO);
         (origin.as_vec3(), if self.enabled { 1.0 } else { 0.0 })
@@ -212,7 +206,6 @@ fn setup_gi_assets(
         dummy,
         center: None,
         enabled: false,
-        applied: None,
     });
 }
 
@@ -234,12 +227,10 @@ fn selftest_disable_gi(mut settings: ResMut<GiSettings>, mut done: Local<bool>) 
 fn update_gi_volume(
     settings: Res<GiSettings>,
     world_time: Res<WorldTime>,
-    map: Res<ChunkMap>,
-    gpu_chunks: Query<&crate::gpu_mesh::GpuChunk>,
+    slots: Res<crate::pool::ChunkSlots>,
     player: Query<&Transform, With<crate::player::Player>>,
     mut gi: ResMut<GiAssets>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
-    mut materials: ResMut<Assets<crate::material::ChunkMeshMaterial>>,
     mut refill: Local<u32>,
 ) {
     gi.enabled = settings.enabled;
@@ -247,17 +238,9 @@ fn update_gi_volume(
     // system clones them into the render world).
     gi.refill.clear();
 
-    // When GI is off, do zero GPU work — just make sure chunk materials aren't
-    // still flagged to sample a (now un-updated) radiance field, then bail. This
-    // keeps the disabled path free of the volume fill and per-frame buffer
-    // churn, i.e. as close to the pre-GI renderer as possible.
+    // When GI is off, do zero GPU work (the terrain uniform picks the flag up
+    // from apply_params each frame).
     if !settings.enabled {
-        if gi.applied.map(|(_, on)| on) != Some(false) {
-            gi.applied = Some((IVec3::ZERO, false));
-            for (_, m) in materials.iter_mut() {
-                m.params.gi_enabled = 0.0;
-            }
-        }
         return;
     }
 
@@ -297,35 +280,18 @@ fn update_gi_volume(
             for cz in c0.z..=c1.z {
                 for cx in c0.x..=c1.x {
                     let cpos = IVec3::new(cx, cy, cz);
-                    let Some(&e) = map.map.get(&cpos) else { continue };
-                    // Air chunks have no GPU buffer; the clear pass covers them.
-                    let Ok(gc) = gpu_chunks.get(e) else { continue };
-                    gi.refill.push((
-                        gc.voxels.clone(),
-                        gc.light.clone(),
-                        shl(cpos, CHUNK_BIT) - origin,
-                    ));
+                    let Some(s) = slots.get(cpos) else { continue };
+                    // Air chunks blit the zero voxel sentinel but their REAL
+                    // light slot (sky crossing air matters to the trace).
+                    let mesh = if s.mesh == crate::pool::NO_MESH { 0 } else { s.mesh };
+                    gi.refill.push((mesh, s.slot, shl(cpos, CHUNK_BIT) - origin));
                 }
             }
         }
     }
     // The compute shader's own params buffer is rewritten every frame; that's
-    // fine because its bind group is rebuilt every frame. (It must NOT be bound
-    // by the chunk material, whose bind group is cached — see material.rs.)
+    // fine because its bind group is rebuilt every frame.
     write_params(&gi, &mut buffers, origin, day, settings.enabled);
-
-    // Push origin/enable into chunk materials only when they change, so we don't
-    // dirty every material (and rebuild every bind group) each frame.
-    let state = (origin, settings.enabled);
-    if gi.applied != Some(state) {
-        gi.applied = Some(state);
-        let origin_v = origin.as_vec3();
-        let flag = if settings.enabled { 1.0 } else { 0.0 };
-        for (_, m) in materials.iter_mut() {
-            m.params.gi_origin = origin_v;
-            m.params.gi_enabled = flag;
-        }
-    }
 }
 
 
@@ -482,12 +448,14 @@ fn add_render_graph_node(mut render_graph: ResMut<RenderGraph>) {
     render_graph.add_node_edge(GiLabel, bevy::render::graph::CameraDriverLabel);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_bind_groups(
     mut jobs: ResMut<GiJobs>,
     pipeline: Res<GiPipeline>,
     render_device: Res<RenderDevice>,
     pipeline_cache: Res<PipelineCache>,
     gi: Option<Res<GiAssets>>,
+    pools: Option<Res<crate::pool::ChunkPools>>,
     buffers: Res<RenderAssets<GpuShaderStorageBuffer>>,
     mut frame: Local<u32>,
 ) {
@@ -502,25 +470,25 @@ fn prepare_bind_groups(
     }
 
     // Volume refill (independent of the trace throttle): clear occupancy +
-    // light, then blit each queued chunk's buffers into them — all on the GPU.
+    // light, then blit each queued chunk straight out of the pooled caches.
     if !gi.refill.is_empty()
+        && let Some(pools) = &pools
         && let (Some(world_vox), Some(world_light)) =
             (buffers.get(&gi.world_vox), buffers.get(&gi.world_light))
     {
         let blit_layout = pipeline_cache.get_bind_group_layout(&pipeline.blit_layout);
-        for (vox_handle, light_handle, rel) in &gi.refill {
-            let (Some(chunk_buf), Some(light_buf)) =
-                (buffers.get(vox_handle), buffers.get(light_handle))
-            else {
-                continue;
-            };
+        for &(mesh, light_slot, rel) in &gi.refill {
+            let mut bytes = Vec::with_capacity(32);
+            for v in [rel.x, rel.y, rel.z] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [mesh, light_slot, 0, 0, 0] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
             let params = render_device.create_buffer_with_data(
                 &bevy::render::render_resource::BufferInitDescriptor {
                     label: Some("gi_blit_params"),
-                    contents: &[rel.x, rel.y, rel.z, 0i32]
-                        .iter()
-                        .flat_map(|v| v.to_le_bytes())
-                        .collect::<Vec<u8>>(),
+                    contents: &bytes,
                     usage: bevy::render::render_resource::BufferUsages::STORAGE,
                 },
             );
@@ -528,10 +496,10 @@ fn prepare_bind_groups(
                 None,
                 &blit_layout,
                 &BindGroupEntries::sequential((
-                    chunk_buf.buffer.as_entire_buffer_binding(),
+                    pools.voxels.as_entire_buffer_binding(),
                     world_vox.buffer.as_entire_buffer_binding(),
                     params.as_entire_buffer_binding(),
-                    light_buf.buffer.as_entire_buffer_binding(),
+                    pools.light.as_entire_buffer_binding(),
                     world_light.buffer.as_entire_buffer_binding(),
                 )),
             );

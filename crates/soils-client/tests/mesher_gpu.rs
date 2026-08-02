@@ -1,12 +1,14 @@
-//! Headless GPU validation of the compute greedy mesher.
+//! Headless GPU validation of the compute greedy mesher over the POOLED
+//! layout.
 //!
-//! Runs `assets/shaders/voxel_mesh.wgsl` (clear_counter + mesh_slice) on a real
-//! wgpu device over controlled voxel scenes, reads the quad buffer back, and
-//! asserts it matches the CPU oracle `soils_worldgen::greedy_mesh` as a
-//! multiset (GPU emit order is nondeterministic across workgroups). Also pins
-//! the overflow contract: the atomic count keeps incrementing past MAX_QUADS
-//! while writes are dropped, so readers must clamp. Skips gracefully if no GPU
-//! adapter is available.
+//! Runs `assets/shaders/voxel_mesh.wgsl` on a real wgpu device with miniature
+//! pools (2 mesh slots, scene in slot 1 so slot addressing is exercised),
+//! decodes the 8-byte packed quads back to canonical form, and asserts they
+//! match the CPU oracle `soils_worldgen::greedy_mesh` as a multiset (GPU emit
+//! order is nondeterministic across workgroups). Also pins the overflow
+//! contract: the counter keeps incrementing past QUADS_PER_SLOT while writes
+//! are dropped, so finalize clamps. Skips gracefully if no GPU adapter is
+//! available.
 
 use std::collections::HashMap;
 
@@ -14,10 +16,13 @@ use soils_protocol::{CHUNK_SIZE, ChunkVolume};
 use soils_worldgen::greedy_mesh;
 use wgpu::util::DeviceExt;
 
-// Must match voxel_mesh.wgsl / gpu_mesh.rs.
-const MAX_QUADS: u32 = 8192;
-const QUAD_BYTES: usize = 80;
-const QUAD_BUFFER_BYTES: u64 = 16 + MAX_QUADS as u64 * QUAD_BYTES as u64;
+// Must match voxel_mesh.wgsl / pool.rs.
+const QUADS_PER_SLOT: u32 = 4096;
+const QUAD_BYTES: usize = 8;
+/// Mini pools: 2 mesh slots; the scene lives in slot 1.
+const TEST_SLOTS: u64 = 2;
+const TEST_SLOT: u32 = 1;
+const QUAD_POOL_BYTES: u64 = TEST_SLOTS * QUADS_PER_SLOT as u64 * QUAD_BYTES as u64;
 
 /// Canonical quad for exact comparison. AO is stored as the integer occlusion
 /// level 0..3, recovered from the brightness `0.1 + level * 0.3` both sides
@@ -78,16 +83,20 @@ fn cpu_quads(vol: &ChunkVolume) -> Vec<Quad> {
         .collect()
 }
 
-/// Dispatch the full GPU mesher (clear + mesh + finalize) over `vol` and read
-/// back (raw quad count before finalize's clamp, stored quads, indirect args).
+/// Dispatch the full GPU mesher (clear + mesh + finalize) over `vol` (placed
+/// in mesh slot TEST_SLOT of a mini pool) and read back (raw quad count before
+/// finalize's clamp, stored quads, indirect args).
 fn gpu_mesh_chunk(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     vol: &ChunkVolume,
 ) -> (u32, Vec<Quad>, [u32; 4]) {
+    // Voxel pool: slot 0 zeroed, scene at slot 1.
+    let mut pool_bytes = vec![0u8; (TEST_SLOTS * 32768) as usize];
+    pool_bytes[32768..].copy_from_slice(vol.as_bytes());
     let voxels = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("voxels"),
-        contents: vol.as_bytes(),
+        label: Some("voxel_pool"),
+        contents: &pool_bytes,
         usage: wgpu::BufferUsages::STORAGE,
     });
     // Identity faces table: tile == block id whatever the face direction.
@@ -98,21 +107,26 @@ fn gpu_mesh_chunk(
         usage: wgpu::BufferUsages::STORAGE,
     });
     let quads = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("quads"),
-        size: QUAD_BUFFER_BYTES,
+        label: Some("quad_pool"),
+        size: QUAD_POOL_BYTES,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     let indirect = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("indirect"),
-        size: 16,
+        size: TEST_SLOTS * 16,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    // Quad buffer + raw pre-finalize count + post-finalize indirect args.
+    let jobs = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("jobs"),
+        contents: bytemuck::cast_slice(&[TEST_SLOT]),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    // Quad pool + raw pre-finalize count + post-finalize indirect args.
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
-        size: QUAD_BUFFER_BYTES + 4 + 16,
+        size: QUAD_POOL_BYTES + 4 + 16,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -139,7 +153,13 @@ fn gpu_mesh_chunk(
     };
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("mesher_layout"),
-        entries: &[buf_entry(0, true), buf_entry(1, false), buf_entry(2, true), buf_entry(3, false)],
+        entries: &[
+            buf_entry(0, true),
+            buf_entry(1, false),
+            buf_entry(2, true),
+            buf_entry(3, false),
+            buf_entry(4, true),
+        ],
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("mesher_pl"),
@@ -168,6 +188,7 @@ fn gpu_mesh_chunk(
             wgpu::BindGroupEntry { binding: 1, resource: quads.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: faces_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: indirect.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: jobs.as_entire_binding() },
         ],
     });
 
@@ -182,8 +203,9 @@ fn gpu_mesh_chunk(
         pass.set_pipeline(&mesh);
         pass.dispatch_workgroups(3, 33, 1);
     }
-    // Snapshot the raw overflow-capable count before finalize clamps it.
-    encoder.copy_buffer_to_buffer(&quads, 0, &readback, QUAD_BUFFER_BYTES, 4);
+    // Snapshot the raw overflow-capable count (parked in the slot's
+    // vertex_count word) before finalize converts it.
+    encoder.copy_buffer_to_buffer(&indirect, TEST_SLOT as u64 * 16, &readback, QUAD_POOL_BYTES, 4);
     {
         let mut pass = encoder
             .begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
@@ -191,8 +213,8 @@ fn gpu_mesh_chunk(
         pass.set_pipeline(&finalize);
         pass.dispatch_workgroups(1, 1, 1);
     }
-    encoder.copy_buffer_to_buffer(&quads, 0, &readback, 0, QUAD_BUFFER_BYTES);
-    encoder.copy_buffer_to_buffer(&indirect, 0, &readback, QUAD_BUFFER_BYTES + 4, 16);
+    encoder.copy_buffer_to_buffer(&quads, 0, &readback, 0, QUAD_POOL_BYTES);
+    encoder.copy_buffer_to_buffer(&indirect, TEST_SLOT as u64 * 16, &readback, QUAD_POOL_BYTES + 4, 16);
     queue.submit([encoder.finish()]);
 
     let slice = readback.slice(..);
@@ -201,44 +223,71 @@ fn gpu_mesh_chunk(
     let data = slice.get_mapped_range();
 
     let raw_count = u32::from_le_bytes(
-        data[QUAD_BUFFER_BYTES as usize..QUAD_BUFFER_BYTES as usize + 4].try_into().unwrap(),
+        data[QUAD_POOL_BYTES as usize..QUAD_POOL_BYTES as usize + 4].try_into().unwrap(),
     );
-    let clamped_count = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    assert_eq!(clamped_count, raw_count.min(MAX_QUADS), "finalize clamps the stored count");
-    let args_off = QUAD_BUFFER_BYTES as usize + 4;
+    let args_off = QUAD_POOL_BYTES as usize + 4;
     let args: [u32; 4] = std::array::from_fn(|i| {
         u32::from_le_bytes(data[args_off + 4 * i..args_off + 4 * i + 4].try_into().unwrap())
     });
-    let stored = raw_count.min(MAX_QUADS) as usize;
+    let stored = raw_count.min(QUADS_PER_SLOT) as usize;
+    let slot_base = (TEST_SLOT * QUADS_PER_SLOT) as usize * QUAD_BYTES;
     let mut out = Vec::with_capacity(stored);
     for qi in 0..stored {
-        let b = &data[16 + qi * QUAD_BYTES..16 + (qi + 1) * QUAD_BYTES];
-        let f = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-        let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-        out.push(Quad {
-            base: iv([f(0), f(4), f(8)]),
-            id: u(12),
-            du: iv([f(16), f(20), f(24)]),
-            dv: iv([f(32), f(36), f(40)]),
-            norm: iv([f(28), f(44), f(64)]),
-            ao: [ao_level(f(48)), ao_level(f(52)), ao_level(f(56)), ao_level(f(60))],
-        });
+        let b = &data[slot_base + qi * QUAD_BYTES..slot_base + (qi + 1) * QUAD_BYTES];
+        let w0 = u32::from_le_bytes(b[0..4].try_into().unwrap());
+        let w1 = u32::from_le_bytes(b[4..8].try_into().unwrap());
+        out.push(decode_packed(w0, w1));
     }
     drop(data);
     readback.unmap();
     (raw_count, out, args)
 }
 
+/// Decode a packed quad exactly as atlas.wgsl's vertex stage does.
+fn decode_packed(w0: u32, w1: u32) -> Quad {
+    let base = [(w0 & 63) as i32, ((w0 >> 6) & 63) as i32, ((w0 >> 12) & 63) as i32];
+    let w = ((w0 >> 18) & 63) as i32;
+    let h = ((w0 >> 24) & 63) as i32;
+    let d = ((w0 >> 30) & 3) as usize;
+    let positive = w1 & 1 == 1;
+    let tile = (w1 >> 1) & 0xff;
+    let ao2 = (w1 >> 9) & 0xff;
+    let (u_axis, v_axis) = ((d + 1) % 3, (d + 2) % 3);
+    let mut du = [0i32; 3];
+    let mut dv = [0i32; 3];
+    if positive {
+        du[u_axis] = w;
+        dv[v_axis] = h;
+    } else {
+        du[v_axis] = h;
+        dv[u_axis] = w;
+    }
+    let mut norm = [0i32; 3];
+    norm[d] = if positive { 1 } else { -1 };
+    Quad {
+        base,
+        du,
+        dv,
+        norm,
+        id: tile,
+        ao: std::array::from_fn(|i| ((ao2 >> (i * 2)) & 3) as u8),
+    }
+}
+
 fn assert_scene_matches(device: &wgpu::Device, queue: &wgpu::Queue, name: &str, vol: &ChunkVolume) {
     let mut cpu = cpu_quads(vol);
     assert!(
-        cpu.len() < MAX_QUADS as usize,
+        cpu.len() < QUADS_PER_SLOT as usize,
         "{name}: scene overflows ({len} quads); use the overflow test for that",
         len = cpu.len()
     );
     let (raw_count, mut gpu, args) = gpu_mesh_chunk(device, queue, vol);
     assert_eq!(raw_count as usize, cpu.len(), "{name}: quad count mismatch");
-    assert_eq!(args, [cpu.len() as u32 * 6, 1, 0, 0], "{name}: indirect draw args");
+    assert_eq!(
+        args,
+        [cpu.len() as u32 * 6, 1, TEST_SLOT * QUADS_PER_SLOT * 6, TEST_SLOT],
+        "{name}: indirect draw args"
+    );
     cpu.sort_unstable();
     gpu.sort_unstable();
     assert_eq!(cpu, gpu, "{name}: quad multisets differ");
@@ -277,14 +326,14 @@ fn gpu_mesher_matches_cpu_oracle() {
     assert_scene_matches(&device, &queue, "terrain", &terrain);
 
     // Sparse deterministic scatter (LCG): isolated voxels with varied AO
-    // interactions, ids 1..=7.
+    // interactions, ids 1..=7. 2% density stays under QUADS_PER_SLOT.
     let mut scatter = ChunkVolume::empty();
     let mut state = 0x2545_f491_4f6c_dd1du64;
     for x in 0..CHUNK_SIZE {
         for y in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
                 state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                if (state >> 33) % 100 < 3 {
+                if (state >> 33) % 100 < 2 {
                     scatter.set(x, y, z, (1 + (state >> 40) % 7) as u8);
                 }
             }
@@ -294,9 +343,9 @@ fn gpu_mesher_matches_cpu_oracle() {
 }
 
 /// A 3D checkerboard produces 16384 isolated voxels * 6 faces = 98304 quads,
-/// far past MAX_QUADS. The contract: the atomic count reports the true total
-/// (readers clamp), exactly MAX_QUADS quads are stored, and every stored quad
-/// is a real quad from the CPU oracle's multiset.
+/// far past QUADS_PER_SLOT. The contract: the raw count reports the true total
+/// (finalize clamps), exactly QUADS_PER_SLOT quads are stored, and every
+/// stored quad is a real quad from the CPU oracle's multiset.
 #[test]
 fn gpu_mesher_overflow_is_clamped_and_valid() {
     let Some((device, queue)) = init_gpu() else {
@@ -319,8 +368,12 @@ fn gpu_mesher_overflow_is_clamped_and_valid() {
     assert_eq!(cpu.len(), 98304, "checkerboard face count");
     let (raw_count, gpu, args) = gpu_mesh_chunk(&device, &queue, &vol);
     assert_eq!(raw_count as usize, cpu.len(), "raw atomic count reports the true total");
-    assert_eq!(gpu.len(), MAX_QUADS as usize, "stored quads clamp to MAX_QUADS");
-    assert_eq!(args, [MAX_QUADS * 6, 1, 0, 0], "indirect args clamp to MAX_QUADS");
+    assert_eq!(gpu.len(), QUADS_PER_SLOT as usize, "stored quads clamp to QUADS_PER_SLOT");
+    assert_eq!(
+        args,
+        [QUADS_PER_SLOT * 6, 1, TEST_SLOT * QUADS_PER_SLOT * 6, TEST_SLOT],
+        "indirect args clamp to QUADS_PER_SLOT"
+    );
 
     let mut remaining: HashMap<Quad, u32> = HashMap::new();
     for q in &cpu {

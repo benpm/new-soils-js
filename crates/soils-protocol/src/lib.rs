@@ -3,6 +3,7 @@
 //! can be used by both the client and the headless server.
 
 pub mod chunk_codec;
+pub mod chunk_key;
 pub mod coords;
 pub mod discovery;
 pub mod messages;
@@ -10,6 +11,7 @@ pub mod snapshot;
 pub mod voxel;
 
 pub use chunk_codec::{decode_chunk, encode_chunk, payload_is_air};
+pub use chunk_key::{pack_chunk_key, unpack_chunk_key};
 pub use coords::{
     CHUNK_BIT, CHUNK_CLIP, CHUNK_CUBED, CHUNK_SIZE, REGION_SIZE, chunk_of, chunk_origin, local_of,
     voxel_index,

@@ -10,6 +10,10 @@ members = [
     "crates/soils-client",
     "crates/soils-terrainlab",
 ]
+# The SpacetimeDB module is a wasm32 cdylib built by `spacetime publish`, with
+# its own lockfile. Excluded so `cargo test --workspace` doesn't build it for
+# the host.
+exclude = ["stdb/soils-module"]
 
 [workspace.package]
 version = "0.1.0"

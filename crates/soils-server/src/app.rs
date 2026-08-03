@@ -374,7 +374,7 @@ pub(crate) fn run_app(
     .init_resource::<TickCount>()
     .init_resource::<Clock>()
     .init_resource::<ScriptEvents>()
-    .insert_non_send_resource(ScriptRt(script_rt))
+    .insert_non_send(ScriptRt(script_rt))
     .add_systems(Update, check_shutdown)
     .add_systems(
         FixedUpdate,

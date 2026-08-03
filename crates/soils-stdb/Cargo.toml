@@ -1,0 +1,14 @@
+[package]
+name = "soils-stdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+soils-protocol = { workspace = true }
+# Client SDK. Kept in lockstep with the `spacetimedb` version the module in
+# `stdb/soils-module` builds against — the generated bindings in
+# `src/module_bindings` are produced by that exact CLI and assume its ABI.
+spacetimedb-sdk = "2.7.1"
+crossbeam-channel = "0.5"
+log = "0.4"

@@ -8,3 +8,5 @@ scripts/.cache/
 # AssemblyScript toolchain for server scripts (package.json pins the version;
 # run `npm install` to get `asc` so .ts scripts compile).
 node_modules/
+# Locally pinned SpacetimeDB CLI + standalone (see stdb/README).
+.tools/

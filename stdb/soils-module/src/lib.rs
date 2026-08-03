@@ -547,48 +547,60 @@ pub fn save_profile(
     Ok(())
 }
 
-/// Refresh a server's registry row and the presence of its connected players.
+/// Refresh a server's registry row so it stays visible in a server browser and
+/// the reaper doesn't drop it.
+///
+/// Takes a player *count* rather than a list of identities: game players
+/// authenticate to the game server with a name/password and have no
+/// SpacetimeDB identity until the client connects here directly. Per-identity
+/// presence is maintained separately by [`mark_present`] once that exists.
 #[reducer]
 pub fn heartbeat(
     ctx: &ReducerContext,
     server_id: u32,
     name: String,
     addr: String,
-    players: Vec<Identity>,
-    world_id: u16,
+    player_count: u32,
 ) -> Result<(), String> {
     require_server(ctx)?;
-    let row = GameServer {
-        server_id,
-        name,
-        addr,
-        players: players.len() as u32,
-        heartbeat: ctx.timestamp,
-    };
+    let row =
+        GameServer { server_id, name, addr, players: player_count, heartbeat: ctx.timestamp };
     if ctx.db.game_server().server_id().find(server_id).is_some() {
         ctx.db.game_server().server_id().update(row);
     } else {
         ctx.db.game_server().try_insert(row).map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
 
-    for identity in players {
-        if let Some(mut presence) = ctx.db.presence().identity().find(identity) {
-            presence.world_id = world_id;
-            presence.server_id = server_id;
-            presence.heartbeat = ctx.timestamp;
-            ctx.db.presence().identity().update(presence);
-        } else {
-            ctx.db
-                .presence()
-                .try_insert(Presence {
-                    identity,
-                    world_id,
-                    server_id,
-                    connected_at: ctx.timestamp,
-                    heartbeat: ctx.timestamp,
-                })
-                .map_err(|e| e.to_string())?;
-        }
+/// Record that an identity is online on `server_id` in `world_id`.
+///
+/// Separate from [`heartbeat`] because presence is per-identity and only
+/// becomes meaningful once clients authenticate to SpacetimeDB themselves.
+#[reducer]
+pub fn mark_present(
+    ctx: &ReducerContext,
+    identity: Identity,
+    server_id: u32,
+    world_id: u16,
+) -> Result<(), String> {
+    require_server(ctx)?;
+    if let Some(mut presence) = ctx.db.presence().identity().find(identity) {
+        presence.world_id = world_id;
+        presence.server_id = server_id;
+        presence.heartbeat = ctx.timestamp;
+        ctx.db.presence().identity().update(presence);
+    } else {
+        ctx.db
+            .presence()
+            .try_insert(Presence {
+                identity,
+                world_id,
+                server_id,
+                connected_at: ctx.timestamp,
+                heartbeat: ctx.timestamp,
+            })
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }

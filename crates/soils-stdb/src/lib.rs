@@ -21,6 +21,7 @@ use module_bindings::{DbConnection, RemoteReducers, chunk_blob_table::ChunkBlobT
 // Each reducer is generated as its own snake_case extension trait; they must be
 // in scope for `reducers.<name>(..)` to resolve.
 use module_bindings::{
+    mark_present,
     heartbeat, prune_edits, put_chunk_blob, save_profile, submit_edits, upsert_world,
 };
 
@@ -62,14 +63,11 @@ pub enum StdbCmd {
         yaw: f32,
         view_radius: u8,
     },
-    /// Refresh the server registry row and connected players' presence.
-    Heartbeat {
-        server_id: u32,
-        name: String,
-        addr: String,
-        players: Vec<Identity>,
-        world_id: u16,
-    },
+    /// Refresh this server's registry row (server browser + liveness).
+    Heartbeat { server_id: u32, name: String, addr: String, player_count: u32 },
+    /// Record an identity as online. Only meaningful once clients authenticate
+    /// to SpacetimeDB themselves.
+    MarkPresent { identity: Identity, server_id: u32, world_id: u16 },
 }
 
 /// Notifications from the SpacetimeDB thread.
@@ -247,8 +245,11 @@ fn apply(reducers: &RemoteReducers, cmd: StdbCmd, event_tx: &Sender<StdbEvent>) 
             "save_profile",
             reducers.save_profile(identity, world_id, x, y, z, yaw, view_radius),
         ),
-        StdbCmd::Heartbeat { server_id, name, addr, players, world_id } => {
-            report("heartbeat", reducers.heartbeat(server_id, name, addr, players, world_id))
+        StdbCmd::Heartbeat { server_id, name, addr, player_count } => {
+            report("heartbeat", reducers.heartbeat(server_id, name, addr, player_count))
+        }
+        StdbCmd::MarkPresent { identity, server_id, world_id } => {
+            report("mark_present", reducers.mark_present(identity, server_id, world_id))
         }
     }
 }

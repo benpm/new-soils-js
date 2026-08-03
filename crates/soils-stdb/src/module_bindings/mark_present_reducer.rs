@@ -6,61 +6,57 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct HeartbeatArgs {
+pub(super) struct MarkPresentArgs {
+    pub identity: __sdk::Identity,
     pub server_id: u32,
-    pub name: String,
-    pub addr: String,
-    pub player_count: u32,
+    pub world_id: u16,
 }
 
-impl From<HeartbeatArgs> for super::Reducer {
-    fn from(args: HeartbeatArgs) -> Self {
-        Self::Heartbeat {
+impl From<MarkPresentArgs> for super::Reducer {
+    fn from(args: MarkPresentArgs) -> Self {
+        Self::MarkPresent {
+            identity: args.identity,
             server_id: args.server_id,
-            name: args.name,
-            addr: args.addr,
-            player_count: args.player_count,
+            world_id: args.world_id,
         }
     }
 }
 
-impl __sdk::InModule for HeartbeatArgs {
+impl __sdk::InModule for MarkPresentArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `heartbeat`.
+/// Extension trait for access to the reducer `mark_present`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait heartbeat {
-    /// Request that the remote module invoke the reducer `heartbeat` to run as soon as possible.
+pub trait mark_present {
+    /// Request that the remote module invoke the reducer `mark_present` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`heartbeat:heartbeat_then`] to run a callback after the reducer completes.
-    fn heartbeat(
+    /// /// Use [`mark_present:mark_present_then`] to run a callback after the reducer completes.
+    fn mark_present(
         &self,
+        identity: __sdk::Identity,
         server_id: u32,
-        name: String,
-        addr: String,
-        player_count: u32,
+        world_id: u16,
     ) -> __sdk::Result<()> {
-        self.heartbeat_then(server_id, name, addr, player_count, |_, _| {})
+        self.mark_present_then(identity, server_id, world_id, |_, _| {})
     }
 
-    /// Request that the remote module invoke the reducer `heartbeat` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `mark_present` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn heartbeat_then(
+    fn mark_present_then(
         &self,
+        identity: __sdk::Identity,
         server_id: u32,
-        name: String,
-        addr: String,
-        player_count: u32,
+        world_id: u16,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
@@ -68,24 +64,22 @@ pub trait heartbeat {
     ) -> __sdk::Result<()>;
 }
 
-impl heartbeat for super::RemoteReducers {
-    fn heartbeat_then(
+impl mark_present for super::RemoteReducers {
+    fn mark_present_then(
         &self,
+        identity: __sdk::Identity,
         server_id: u32,
-        name: String,
-        addr: String,
-        player_count: u32,
+        world_id: u16,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
-            HeartbeatArgs {
+            MarkPresentArgs {
+                identity,
                 server_id,
-                name,
-                addr,
-                player_count,
+                world_id,
             },
             callback,
         )

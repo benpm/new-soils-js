@@ -18,6 +18,7 @@ pub mod game_server_table;
 pub mod game_server_type;
 pub mod grant_server_reducer;
 pub mod heartbeat_reducer;
+pub mod mark_present_reducer;
 pub mod packed_edit_type;
 pub mod player_profile_table;
 pub mod player_profile_type;
@@ -47,6 +48,7 @@ pub use game_server_table::*;
 pub use game_server_type::GameServer;
 pub use grant_server_reducer::grant_server;
 pub use heartbeat_reducer::heartbeat;
+pub use mark_present_reducer::mark_present;
 pub use packed_edit_type::PackedEdit;
 pub use player_profile_table::*;
 pub use player_profile_type::PlayerProfile;
@@ -79,7 +81,11 @@ pub enum Reducer {
         server_id: u32,
         name: String,
         addr: String,
-        players: Vec<__sdk::Identity>,
+        player_count: u32,
+    },
+    MarkPresent {
+        identity: __sdk::Identity,
+        server_id: u32,
         world_id: u16,
     },
     PruneEdits {
@@ -131,6 +137,7 @@ impl __sdk::Reducer for Reducer {
         match self {
             Reducer::GrantServer { .. } => "grant_server",
             Reducer::Heartbeat { .. } => "heartbeat",
+            Reducer::MarkPresent { .. } => "mark_present",
             Reducer::PruneEdits { .. } => "prune_edits",
             Reducer::PutChunkBlob { .. } => "put_chunk_blob",
             Reducer::RegisterAccount { .. } => "register_account",
@@ -153,13 +160,20 @@ impl __sdk::Reducer for Reducer {
                 server_id,
                 name,
                 addr,
-                players,
-                world_id,
+                player_count,
             } => __sats::bsatn::to_vec(&heartbeat_reducer::HeartbeatArgs {
                 server_id: server_id.clone(),
                 name: name.clone(),
                 addr: addr.clone(),
-                players: players.clone(),
+                player_count: player_count.clone(),
+            }),
+            Reducer::MarkPresent {
+                identity,
+                server_id,
+                world_id,
+            } => __sats::bsatn::to_vec(&mark_present_reducer::MarkPresentArgs {
+                identity: identity.clone(),
+                server_id: server_id.clone(),
                 world_id: world_id.clone(),
             }),
             Reducer::PruneEdits { key, up_to_id } => {

@@ -247,6 +247,20 @@ struct Clock {
 #[derive(Resource)]
 struct Clients(HashMap<u16, Client>);
 
+/// How often the server refreshes its `game_server` registry row. Must stay
+/// comfortably under the module's `LIVENESS_TTL` or the reaper will drop a
+/// live server.
+const HEARTBEAT_SECS: f32 = 5.0;
+
+/// The SpacetimeDB mirror plus this server's registry identity, when enabled.
+#[derive(Resource)]
+struct StdbMirror {
+    link: Arc<soils_stdb::StdbLink>,
+    server_id: u32,
+    name: String,
+    addr: String,
+}
+
 #[derive(Resource)]
 struct Worlds {
     map: HashMap<String, World>,
@@ -349,7 +363,24 @@ pub(crate) fn run_app(
     scripts_dir: Option<PathBuf>,
     physics_enabled: bool,
     stdb: Option<Arc<soils_stdb::StdbLink>>,
+    server_name: String,
+    bind_addr: String,
 ) {
+    let mirror = stdb.clone().map(|link| StdbMirror {
+        link,
+        // Stable per (name, bind) so a restart refreshes its own row instead of
+        // leaving an orphan for the reaper.
+        server_id: {
+            let mut h: u32 = 2166136261;
+            for b in server_name.bytes().chain(bind_addr.bytes()) {
+                h ^= b as u32;
+                h = h.wrapping_mul(16777619);
+            }
+            h
+        },
+        name: server_name,
+        addr: bind_addr,
+    });
     let mut worlds = Worlds { map: HashMap::new(), data_dir, persist, stdb };
     // Pre-create the default world so it's ready before the first client.
     worlds.get_or_create(DEFAULT_WORLD);
@@ -411,6 +442,7 @@ pub(crate) fn run_app(
             pump_chunk_jobs,
             replicate_entities,
             tick_clock,
+            stdb_heartbeat,
             world_lifecycle,
         )
             .chain(),
@@ -437,6 +469,10 @@ pub(crate) fn run_app(
                 .after(drain_inboxes)
                 .before(replicate_entities),
         );
+    }
+
+    if let Some(mirror) = mirror {
+        app.insert_resource(mirror);
     }
 
     app.run();
@@ -1611,6 +1647,34 @@ fn replicate_entities(
 
 /// Advance and broadcast the day/night clock once per second (global, all
 /// worlds — and, like the old broadcast forwarder, all connections).
+/// Registry heartbeat: keeps this server's `game_server` row fresh so it shows
+/// up in a server browser, and lets the module's reaper drop it if we crash.
+///
+/// The `players` list is empty for now: presence is per-*identity*, and game
+/// players authenticate to the game server with a name/password, so they have
+/// no SpacetimeDB identity until the client connects to SpacetimeDB itself.
+/// Wiring real presence therefore waits on the client-side identity work; the
+/// player *count* still travels, which is what a browser actually shows.
+fn stdb_heartbeat(
+    time: Res<Time>,
+    mut acc: Local<f32>,
+    stdb: Option<Res<StdbMirror>>,
+    clients: Res<Clients>,
+) {
+    let Some(stdb) = stdb else { return };
+    *acc += time.delta_secs();
+    if *acc < HEARTBEAT_SECS {
+        return;
+    }
+    *acc = 0.0;
+    let _ = stdb.link.send(soils_stdb::StdbCmd::Heartbeat {
+        server_id: stdb.server_id,
+        name: stdb.name.clone(),
+        addr: stdb.addr.clone(),
+        player_count: clients.0.values().filter(|c| c.authenticated).count() as u32,
+    });
+}
+
 fn tick_clock(time: Res<Time>, mut clock: ResMut<Clock>, clients: Res<Clients>) {
     clock.acc += time.delta_secs();
     if clock.acc < 1.0 {

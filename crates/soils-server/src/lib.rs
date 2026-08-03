@@ -371,10 +371,12 @@ async fn serve(
         let scripts_dir = config.scripts_dir.clone();
         let physics = config.physics;
         let stdb = stdb.clone();
+        let server_name = config.name.clone();
+        let bind_addr = config.bind.clone();
         std::thread::Builder::new().name("soils-ecs".into()).spawn(move || {
             app::run_app(
                 conns_rx, shutdown, data_dir, persist, accounts, player_count, critters,
-                scripts_dir, physics, stdb,
+                scripts_dir, physics, stdb, server_name, bind_addr,
             );
         })?
     };

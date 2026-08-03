@@ -7,7 +7,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub(super) struct SaveProfileArgs {
-    pub identity: __sdk::Identity,
+    pub account: String,
     pub world_id: u16,
     pub x: f32,
     pub y: f32,
@@ -19,7 +19,7 @@ pub(super) struct SaveProfileArgs {
 impl From<SaveProfileArgs> for super::Reducer {
     fn from(args: SaveProfileArgs) -> Self {
         Self::SaveProfile {
-            identity: args.identity,
+            account: args.account,
             world_id: args.world_id,
             x: args.x,
             y: args.y,
@@ -47,7 +47,7 @@ pub trait save_profile {
     /// /// Use [`save_profile:save_profile_then`] to run a callback after the reducer completes.
     fn save_profile(
         &self,
-        identity: __sdk::Identity,
+        account: String,
         world_id: u16,
         x: f32,
         y: f32,
@@ -55,7 +55,7 @@ pub trait save_profile {
         yaw: f32,
         view_radius: u8,
     ) -> __sdk::Result<()> {
-        self.save_profile_then(identity, world_id, x, y, z, yaw, view_radius, |_, _| {})
+        self.save_profile_then(account, world_id, x, y, z, yaw, view_radius, |_, _| {})
     }
 
     /// Request that the remote module invoke the reducer `save_profile` to run as soon as possible,
@@ -66,7 +66,7 @@ pub trait save_profile {
     ///  and its status can be observed with the `callback`.
     fn save_profile_then(
         &self,
-        identity: __sdk::Identity,
+        account: String,
         world_id: u16,
         x: f32,
         y: f32,
@@ -83,7 +83,7 @@ pub trait save_profile {
 impl save_profile for super::RemoteReducers {
     fn save_profile_then(
         &self,
-        identity: __sdk::Identity,
+        account: String,
         world_id: u16,
         x: f32,
         y: f32,
@@ -97,7 +97,7 @@ impl save_profile for super::RemoteReducers {
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
             SaveProfileArgs {
-                identity,
+                account,
                 world_id,
                 x,
                 y,

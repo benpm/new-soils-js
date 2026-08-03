@@ -17,7 +17,11 @@ use std::time::{Duration, Instant};
 use common::{Client, TestServer};
 use soils_protocol::chunk_key::{pack_chunk_key, world_id_for};
 use soils_server::StdbConfig;
-use soils_stdb::module_bindings::{DbConnection, chunk_blob_table::ChunkBlobTableAccess};
+use soils_stdb::module_bindings::{
+    DbConnection, chunk_blob_table::ChunkBlobTableAccess,
+    game_server_table::GameServerTableAccess, player_profile_table::PlayerProfileTableAccess,
+    presence_table::PresenceTableAccess,
+};
 use spacetimedb_sdk::{DbContext, Table};
 
 /// Matches `soils_server`'s `DEFAULT_WORLD`.
@@ -35,7 +39,12 @@ fn observer(cfg: &StdbConfig) -> Option<DbConnection> {
     }
     let conn = b.build().ok()?;
     conn.run_threaded();
-    conn.subscription_builder().subscribe(["SELECT * FROM chunk_blob".to_string()]);
+    conn.subscription_builder().subscribe([
+        "SELECT * FROM chunk_blob".to_string(),
+        "SELECT * FROM player_profile".to_string(),
+        "SELECT * FROM presence".to_string(),
+        "SELECT * FROM game_server".to_string(),
+    ]);
     std::thread::sleep(Duration::from_millis(400));
     Some(conn)
 }
@@ -86,8 +95,20 @@ async fn an_edit_reaches_spacetimedb() {
         })
         .await;
 
-    // Push the dirty chunk through the persistence path (which is what mirrors
-    // it) instead of waiting on the 30 s flush interval.
+    // The server registers itself in the browser registry on its first tick.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while obs.db().game_server().iter().next().is_none() {
+        assert!(Instant::now() < deadline, "server never registered a game_server row");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // Disconnect first so the server observes the logout and runs the profile /
+    // presence path; shutting down with the client still attached would skip it.
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Then push the dirty chunk through the persistence path (which is what
+    // mirrors it) instead of waiting on the 30 s flush interval.
     server.handle.shutdown();
 
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -115,4 +136,31 @@ async fn an_edit_reaches_spacetimedb() {
     let volume = soils_protocol::decode_chunk(&row.payload).expect("mirrored payload decodes");
     let (lx, ly, lz) = (NEAR_VOXEL[0] & 31, NEAR_VOXEL[1] & 31, NEAR_VOXEL[2] & 31);
     assert_eq!(volume.get(lx, ly, lz), 1, "the mirrored chunk should carry the edited voxel");
+
+    // Disconnecting saves the player's last position and clears presence.
+    let profile = {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(p) = obs.db().player_profile().iter().find(|p| p.account == "mirror") {
+                break p;
+            }
+            assert!(Instant::now() < deadline, "no player_profile row for 'mirror' after logout");
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    };
+    assert_eq!(profile.world_id, world_id_for(DEFAULT_WORLD));
+    assert!(
+        profile.y > 0.0,
+        "profile should carry a real position, got ({}, {}, {})",
+        profile.x,
+        profile.y,
+        profile.z
+    );
+
+    // Presence is dropped on a clean disconnect (the reaper only covers crashes).
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while obs.db().presence().iter().any(|p| p.account == "mirror") {
+        assert!(Instant::now() < deadline, "presence row for 'mirror' outlived a clean logout");
+        std::thread::sleep(Duration::from_millis(150));
+    }
 }

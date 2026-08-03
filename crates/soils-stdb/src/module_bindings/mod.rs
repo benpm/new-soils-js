@@ -18,6 +18,8 @@ pub mod game_server_table;
 pub mod game_server_type;
 pub mod grant_server_reducer;
 pub mod heartbeat_reducer;
+pub mod link_identity_reducer;
+pub mod mark_absent_reducer;
 pub mod mark_present_reducer;
 pub mod packed_edit_type;
 pub mod player_profile_table;
@@ -48,6 +50,8 @@ pub use game_server_table::*;
 pub use game_server_type::GameServer;
 pub use grant_server_reducer::grant_server;
 pub use heartbeat_reducer::heartbeat;
+pub use link_identity_reducer::link_identity;
+pub use mark_absent_reducer::mark_absent;
 pub use mark_present_reducer::mark_present;
 pub use packed_edit_type::PackedEdit;
 pub use player_profile_table::*;
@@ -83,8 +87,14 @@ pub enum Reducer {
         addr: String,
         player_count: u32,
     },
+    LinkIdentity {
+        account: String,
+    },
+    MarkAbsent {
+        account: String,
+    },
     MarkPresent {
-        identity: __sdk::Identity,
+        account: String,
         server_id: u32,
         world_id: u16,
     },
@@ -102,7 +112,7 @@ pub enum Reducer {
         name: String,
     },
     SaveProfile {
-        identity: __sdk::Identity,
+        account: String,
         world_id: u16,
         x: f32,
         y: f32,
@@ -137,6 +147,8 @@ impl __sdk::Reducer for Reducer {
         match self {
             Reducer::GrantServer { .. } => "grant_server",
             Reducer::Heartbeat { .. } => "heartbeat",
+            Reducer::LinkIdentity { .. } => "link_identity",
+            Reducer::MarkAbsent { .. } => "mark_absent",
             Reducer::MarkPresent { .. } => "mark_present",
             Reducer::PruneEdits { .. } => "prune_edits",
             Reducer::PutChunkBlob { .. } => "put_chunk_blob",
@@ -167,12 +179,22 @@ impl __sdk::Reducer for Reducer {
                 addr: addr.clone(),
                 player_count: player_count.clone(),
             }),
+            Reducer::LinkIdentity { account } => {
+                __sats::bsatn::to_vec(&link_identity_reducer::LinkIdentityArgs {
+                    account: account.clone(),
+                })
+            }
+            Reducer::MarkAbsent { account } => {
+                __sats::bsatn::to_vec(&mark_absent_reducer::MarkAbsentArgs {
+                    account: account.clone(),
+                })
+            }
             Reducer::MarkPresent {
-                identity,
+                account,
                 server_id,
                 world_id,
             } => __sats::bsatn::to_vec(&mark_present_reducer::MarkPresentArgs {
-                identity: identity.clone(),
+                account: account.clone(),
                 server_id: server_id.clone(),
                 world_id: world_id.clone(),
             }),
@@ -199,7 +221,7 @@ impl __sdk::Reducer for Reducer {
                 })
             }
             Reducer::SaveProfile {
-                identity,
+                account,
                 world_id,
                 x,
                 y,
@@ -207,7 +229,7 @@ impl __sdk::Reducer for Reducer {
                 yaw,
                 view_radius,
             } => __sats::bsatn::to_vec(&save_profile_reducer::SaveProfileArgs {
-                identity: identity.clone(),
+                account: account.clone(),
                 world_id: world_id.clone(),
                 x: x.clone(),
                 y: y.clone(),
@@ -334,10 +356,10 @@ impl __sdk::DbUpdate for DbUpdate {
             .with_updates_by_pk(|row| &row.server_id);
         diff.player_profile = cache
             .apply_diff_to_table::<PlayerProfile>("player_profile", &self.player_profile)
-            .with_updates_by_pk(|row| &row.identity);
+            .with_updates_by_pk(|row| &row.account);
         diff.presence = cache
             .apply_diff_to_table::<Presence>("presence", &self.presence)
-            .with_updates_by_pk(|row| &row.identity);
+            .with_updates_by_pk(|row| &row.account);
         diff.world = cache
             .apply_diff_to_table::<World>("world", &self.world)
             .with_updates_by_pk(|row| &row.world_id);

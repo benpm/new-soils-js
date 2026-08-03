@@ -7,7 +7,8 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub struct PlayerProfile {
-    pub identity: __sdk::Identity,
+    pub account: String,
+    pub identity: Option<__sdk::Identity>,
     pub world_id: u16,
     pub x: f32,
     pub y: f32,
@@ -25,7 +26,8 @@ impl __sdk::InModule for PlayerProfile {
 ///
 /// Provides typed access to columns for query building.
 pub struct PlayerProfileCols {
-    pub identity: __sdk::__query_builder::Col<PlayerProfile, __sdk::Identity>,
+    pub account: __sdk::__query_builder::Col<PlayerProfile, String>,
+    pub identity: __sdk::__query_builder::Col<PlayerProfile, Option<__sdk::Identity>>,
     pub world_id: __sdk::__query_builder::Col<PlayerProfile, u16>,
     pub x: __sdk::__query_builder::Col<PlayerProfile, f32>,
     pub y: __sdk::__query_builder::Col<PlayerProfile, f32>,
@@ -39,6 +41,7 @@ impl __sdk::__query_builder::HasCols for PlayerProfile {
     type Cols = PlayerProfileCols;
     fn cols(table_name: &'static str) -> Self::Cols {
         PlayerProfileCols {
+            account: __sdk::__query_builder::Col::new(table_name, "account"),
             identity: __sdk::__query_builder::Col::new(table_name, "identity"),
             world_id: __sdk::__query_builder::Col::new(table_name, "world_id"),
             x: __sdk::__query_builder::Col::new(table_name, "x"),
@@ -55,14 +58,14 @@ impl __sdk::__query_builder::HasCols for PlayerProfile {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct PlayerProfileIxCols {
-    pub identity: __sdk::__query_builder::IxCol<PlayerProfile, __sdk::Identity>,
+    pub account: __sdk::__query_builder::IxCol<PlayerProfile, String>,
 }
 
 impl __sdk::__query_builder::HasIxCols for PlayerProfile {
     type IxCols = PlayerProfileIxCols;
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         PlayerProfileIxCols {
-            identity: __sdk::__query_builder::IxCol::new(table_name, "identity"),
+            account: __sdk::__query_builder::IxCol::new(table_name, "account"),
         }
     }
 }

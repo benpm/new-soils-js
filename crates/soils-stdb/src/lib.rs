@@ -21,7 +21,7 @@ use module_bindings::{DbConnection, RemoteReducers, chunk_blob_table::ChunkBlobT
 // Each reducer is generated as its own snake_case extension trait; they must be
 // in scope for `reducers.<name>(..)` to resolve.
 use module_bindings::{
-    mark_present,
+    mark_absent, mark_present,
     heartbeat, prune_edits, put_chunk_blob, save_profile, submit_edits, upsert_world,
 };
 
@@ -53,9 +53,9 @@ pub enum StdbCmd {
     PutChunkBlob { key: u64, payload: Vec<u8>, version: u32, edits_through: u64 },
     /// Drop journal rows already folded into a blob.
     PruneEdits { key: u64, up_to_id: u64 },
-    /// Persist a player's last known position.
+    /// Persist a player's last known position, keyed by account name.
     SaveProfile {
-        identity: Identity,
+        account: String,
         world_id: u16,
         x: f32,
         y: f32,
@@ -65,9 +65,10 @@ pub enum StdbCmd {
     },
     /// Refresh this server's registry row (server browser + liveness).
     Heartbeat { server_id: u32, name: String, addr: String, player_count: u32 },
-    /// Record an identity as online. Only meaningful once clients authenticate
-    /// to SpacetimeDB themselves.
-    MarkPresent { identity: Identity, server_id: u32, world_id: u16 },
+    /// Record an account as online on this server.
+    MarkPresent { account: String, server_id: u32, world_id: u16 },
+    /// Drop an account's presence row on a clean disconnect.
+    MarkAbsent { account: String },
 }
 
 /// Notifications from the SpacetimeDB thread.
@@ -241,15 +242,18 @@ fn apply(reducers: &RemoteReducers, cmd: StdbCmd, event_tx: &Sender<StdbEvent>) 
         StdbCmd::PruneEdits { key, up_to_id } => {
             report("prune_edits", reducers.prune_edits(key, up_to_id))
         }
-        StdbCmd::SaveProfile { identity, world_id, x, y, z, yaw, view_radius } => report(
+        StdbCmd::SaveProfile { account, world_id, x, y, z, yaw, view_radius } => report(
             "save_profile",
-            reducers.save_profile(identity, world_id, x, y, z, yaw, view_radius),
+            reducers.save_profile(account, world_id, x, y, z, yaw, view_radius),
         ),
         StdbCmd::Heartbeat { server_id, name, addr, player_count } => {
             report("heartbeat", reducers.heartbeat(server_id, name, addr, player_count))
         }
-        StdbCmd::MarkPresent { identity, server_id, world_id } => {
-            report("mark_present", reducers.mark_present(identity, server_id, world_id))
+        StdbCmd::MarkPresent { account, server_id, world_id } => {
+            report("mark_present", reducers.mark_present(account, server_id, world_id))
+        }
+        StdbCmd::MarkAbsent { account } => {
+            report("mark_absent", reducers.mark_absent(account))
         }
     }
 }

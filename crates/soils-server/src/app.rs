@@ -90,6 +90,9 @@ pub(crate) struct Client {
     /// are just never acked. Everything else stays on the reliable `outbox`.
     snapshot: watch::Sender<Option<ServerMsg>>,
     authenticated: bool,
+    /// Account name this connection authenticated as; keys the SpacetimeDB
+    /// profile/presence rows.
+    account: String,
     world: String,
     /// This client's player entity (spawned on login) and its NetId.
     entity: Option<Entity>,
@@ -704,6 +707,7 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 outbox: conn.outbox,
                 snapshot: conn.snapshot,
                 authenticated: false,
+                account: String::new(),
                 world: DEFAULT_WORLD.to_string(),
                 entity: None,
                 self_net: 0,
@@ -763,6 +767,7 @@ fn drain_inboxes(
     mut script_events: ResMut<ScriptEvents>,
     physics: Res<PhysicsCfg>,
     mut sims: Query<(&mut SimState, &mut Yaw, &mut InWorld)>,
+    stdb: Option<Res<StdbMirror>>,
 ) {
     // Phase 1: refill rate buckets and pull everything out of the inboxes.
     let dt = time.delta_secs();
@@ -809,6 +814,14 @@ fn drain_inboxes(
                             player_count.0.fetch_add(1, Ordering::Relaxed);
                         }
                         c.authenticated = true;
+                        c.account = name.clone();
+                        if let Some(stdb) = &stdb {
+                            let _ = stdb.link.send(soils_stdb::StdbCmd::MarkPresent {
+                                account: name.clone(),
+                                server_id: stdb.server_id,
+                                world_id: soils_protocol::chunk_key::world_id_for(&c.world),
+                            });
+                        }
                         let world_name = c.world.clone();
                         let world = worlds.get_or_create(&world_name);
                         let (spawn, worldgen) = (world.spawn, world.gen_params());
@@ -1059,6 +1072,24 @@ fn drain_inboxes(
                 commands.entity(entity).despawn();
             }
             if c.authenticated {
+                if let Some(stdb) = &stdb {
+                    // Last known position, so a returning player resumes where
+                    // they left off rather than at spawn.
+                    if let Some((sim, yaw, _)) = c.entity.and_then(|e| sims.get(e).ok()) {
+                        let _ = stdb.link.send(soils_stdb::StdbCmd::SaveProfile {
+                            account: c.account.clone(),
+                            world_id: soils_protocol::chunk_key::world_id_for(&c.world),
+                            x: sim.0.pos.x,
+                            y: sim.0.pos.y,
+                            z: sim.0.pos.z,
+                            yaw: yaw.0,
+                            view_radius: c.radius.clamp(0, u8::MAX as i32) as u8,
+                        });
+                    }
+                    let _ = stdb
+                        .link
+                        .send(soils_stdb::StdbCmd::MarkAbsent { account: c.account.clone() });
+                }
                 player_count.0.fetch_sub(1, Ordering::Relaxed);
                 script_events.0.push(ScriptEvent::PlayerLeave { netid: c.self_net as u32 });
                 let world = worlds.get_or_create(&c.world);
@@ -1657,16 +1688,19 @@ fn replicate_entities(
 /// player *count* still travels, which is what a browser actually shows.
 fn stdb_heartbeat(
     time: Res<Time>,
-    mut acc: Local<f32>,
+    mut acc: Local<Option<f32>>,
     stdb: Option<Res<StdbMirror>>,
     clients: Res<Clients>,
 ) {
     let Some(stdb) = stdb else { return };
-    *acc += time.delta_secs();
-    if *acc < HEARTBEAT_SECS {
+    // Seeded at the interval so the very first tick registers the server: a
+    // browser should see it immediately, not `HEARTBEAT_SECS` later.
+    let elapsed = acc.get_or_insert(HEARTBEAT_SECS);
+    *elapsed += time.delta_secs();
+    if *elapsed < HEARTBEAT_SECS {
         return;
     }
-    *acc = 0.0;
+    *elapsed = 0.0;
     let _ = stdb.link.send(soils_stdb::StdbCmd::Heartbeat {
         server_id: stdb.server_id,
         name: stdb.name.clone(),

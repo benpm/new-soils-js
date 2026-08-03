@@ -122,10 +122,16 @@ pub struct ChunkBlob {
 }
 
 /// Where a player was when they last logged out.
+///
+/// Keyed by **account name**, not `Identity`: players authenticate to the game
+/// server with a name/password, so the account is what durably identifies them.
+/// `identity` is populated only once a player's own client authenticates to
+/// SpacetimeDB directly, and exists to link the two.
 #[table(accessor = player_profile, public)]
 pub struct PlayerProfile {
     #[primary_key]
-    pub identity: Identity,
+    pub account: String,
+    pub identity: Option<Identity>,
     pub world_id: u16,
     pub x: f32,
     pub y: f32,
@@ -135,11 +141,12 @@ pub struct PlayerProfile {
     pub last_seen: Timestamp,
 }
 
-/// Who is online, and on which game server.
+/// Who is online, and on which game server. Keyed by account name for the same
+/// reason as [`PlayerProfile`].
 #[table(accessor = presence, public)]
 pub struct Presence {
     #[primary_key]
-    pub identity: Identity,
+    pub account: String,
     pub world_id: u16,
     #[index(btree)]
     pub server_id: u32,
@@ -250,7 +257,19 @@ pub fn init(ctx: &ReducerContext) -> Result<(), String> {
 
 #[reducer(client_disconnected)]
 pub fn on_disconnect(ctx: &ReducerContext) -> Result<(), String> {
-    ctx.db.presence().identity().delete(ctx.sender());
+    // Presence is keyed by account, and a disconnecting *identity* is usually
+    // the game server itself rather than a player. Drop only a presence row
+    // whose account has been linked to this identity.
+    let mine: Vec<String> = ctx
+        .db
+        .player_profile()
+        .iter()
+        .filter(|p| p.identity == Some(ctx.sender()))
+        .map(|p| p.account)
+        .collect();
+    for account in mine {
+        ctx.db.presence().account().delete(&account);
+    }
     Ok(())
 }
 
@@ -269,22 +288,17 @@ pub fn reap_stale(ctx: &ReducerContext, _timer: ReapTimer) -> Result<(), String>
         .collect();
     for server_id in dead {
         ctx.db.game_server().server_id().delete(server_id);
-        let orphaned: Vec<Identity> =
-            ctx.db.presence().server_id().filter(server_id).map(|p| p.identity).collect();
-        for identity in orphaned {
-            ctx.db.presence().identity().delete(identity);
+        let orphaned: Vec<String> =
+            ctx.db.presence().server_id().filter(server_id).map(|p| p.account).collect();
+        for account in orphaned {
+            ctx.db.presence().account().delete(&account);
         }
     }
 
-    let stale: Vec<Identity> = ctx
-        .db
-        .presence()
-        .iter()
-        .filter(|p| p.heartbeat < cutoff)
-        .map(|p| p.identity)
-        .collect();
-    for identity in stale {
-        ctx.db.presence().identity().delete(identity);
+    let stale: Vec<String> =
+        ctx.db.presence().iter().filter(|p| p.heartbeat < cutoff).map(|p| p.account).collect();
+    for account in stale {
+        ctx.db.presence().account().delete(&account);
     }
     Ok(())
 }
@@ -520,7 +534,7 @@ pub fn prune_edits(ctx: &ReducerContext, key: u64, up_to_id: u64) -> Result<(), 
 #[reducer]
 pub fn save_profile(
     ctx: &ReducerContext,
-    identity: Identity,
+    account: String,
     world_id: u16,
     x: f32,
     y: f32,
@@ -529,7 +543,12 @@ pub fn save_profile(
     view_radius: u8,
 ) -> Result<(), String> {
     require_server(ctx)?;
+    // Preserve any linked identity across position updates.
+    let identity = ctx.db.player_profile().account().find(&account).and_then(|p| p.identity);
+    let existed = identity.is_some()
+        || ctx.db.player_profile().account().find(&account).is_some();
     let profile = PlayerProfile {
+        account,
         identity,
         world_id,
         x,
@@ -539,8 +558,8 @@ pub fn save_profile(
         view_radius,
         last_seen: ctx.timestamp,
     };
-    if ctx.db.player_profile().identity().find(identity).is_some() {
-        ctx.db.player_profile().identity().update(profile);
+    if existed {
+        ctx.db.player_profile().account().update(profile);
     } else {
         ctx.db.player_profile().try_insert(profile).map_err(|e| e.to_string())?;
     }
@@ -573,28 +592,26 @@ pub fn heartbeat(
     Ok(())
 }
 
-/// Record that an identity is online on `server_id` in `world_id`.
-///
-/// Separate from [`heartbeat`] because presence is per-identity and only
-/// becomes meaningful once clients authenticate to SpacetimeDB themselves.
+/// Record that `account` is online on `server_id` in `world_id`, refreshing its
+/// heartbeat. Separate from [`heartbeat`], which covers the server itself.
 #[reducer]
 pub fn mark_present(
     ctx: &ReducerContext,
-    identity: Identity,
+    account: String,
     server_id: u32,
     world_id: u16,
 ) -> Result<(), String> {
     require_server(ctx)?;
-    if let Some(mut presence) = ctx.db.presence().identity().find(identity) {
+    if let Some(mut presence) = ctx.db.presence().account().find(&account) {
         presence.world_id = world_id;
         presence.server_id = server_id;
         presence.heartbeat = ctx.timestamp;
-        ctx.db.presence().identity().update(presence);
+        ctx.db.presence().account().update(presence);
     } else {
         ctx.db
             .presence()
             .try_insert(Presence {
-                identity,
+                account,
                 world_id,
                 server_id,
                 connected_at: ctx.timestamp,
@@ -602,5 +619,36 @@ pub fn mark_present(
             })
             .map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+/// Drop `account`'s presence row on a clean disconnect. The reaper covers
+/// unclean ones, but only after `LIVENESS_TTL`.
+#[reducer]
+pub fn mark_absent(ctx: &ReducerContext, account: String) -> Result<(), String> {
+    require_server(ctx)?;
+    ctx.db.presence().account().delete(&account);
+    Ok(())
+}
+
+/// Link a SpacetimeDB identity to an account, for when a player's own client
+/// authenticates to SpacetimeDB directly (chat, social reads).
+#[reducer]
+pub fn link_identity(ctx: &ReducerContext, account: String) -> Result<(), String> {
+    let sender = ctx.sender();
+    let mut profile = ctx
+        .db
+        .player_profile()
+        .account()
+        .find(&account)
+        .ok_or_else(|| format!("no profile for account '{account}'"))?;
+    // Only the account's own identity may claim it, and only once.
+    if let Some(existing) = profile.identity
+        && existing != sender
+    {
+        return Err(format!("account '{account}' is already linked to another identity"));
+    }
+    profile.identity = Some(sender);
+    ctx.db.player_profile().account().update(profile);
     Ok(())
 }

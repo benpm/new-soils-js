@@ -6,52 +6,46 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct MarkPresentArgs {
+pub(super) struct LinkIdentityArgs {
     pub account: String,
-    pub server_id: u32,
-    pub world_id: u16,
 }
 
-impl From<MarkPresentArgs> for super::Reducer {
-    fn from(args: MarkPresentArgs) -> Self {
-        Self::MarkPresent {
+impl From<LinkIdentityArgs> for super::Reducer {
+    fn from(args: LinkIdentityArgs) -> Self {
+        Self::LinkIdentity {
             account: args.account,
-            server_id: args.server_id,
-            world_id: args.world_id,
         }
     }
 }
 
-impl __sdk::InModule for MarkPresentArgs {
+impl __sdk::InModule for LinkIdentityArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `mark_present`.
+/// Extension trait for access to the reducer `link_identity`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait mark_present {
-    /// Request that the remote module invoke the reducer `mark_present` to run as soon as possible.
+pub trait link_identity {
+    /// Request that the remote module invoke the reducer `link_identity` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`mark_present:mark_present_then`] to run a callback after the reducer completes.
-    fn mark_present(&self, account: String, server_id: u32, world_id: u16) -> __sdk::Result<()> {
-        self.mark_present_then(account, server_id, world_id, |_, _| {})
+    /// /// Use [`link_identity:link_identity_then`] to run a callback after the reducer completes.
+    fn link_identity(&self, account: String) -> __sdk::Result<()> {
+        self.link_identity_then(account, |_, _| {})
     }
 
-    /// Request that the remote module invoke the reducer `mark_present` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `link_identity` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn mark_present_then(
+    fn link_identity_then(
         &self,
         account: String,
-        server_id: u32,
-        world_id: u16,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
@@ -59,24 +53,16 @@ pub trait mark_present {
     ) -> __sdk::Result<()>;
 }
 
-impl mark_present for super::RemoteReducers {
-    fn mark_present_then(
+impl link_identity for super::RemoteReducers {
+    fn link_identity_then(
         &self,
         account: String,
-        server_id: u32,
-        world_id: u16,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
     ) -> __sdk::Result<()> {
-        self.imp.invoke_reducer_with_callback(
-            MarkPresentArgs {
-                account,
-                server_id,
-                world_id,
-            },
-            callback,
-        )
+        self.imp
+            .invoke_reducer_with_callback(LinkIdentityArgs { account }, callback)
     }
 }

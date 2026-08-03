@@ -317,6 +317,9 @@ pub struct World {
     /// lifecycle with the right count.
     refs: HashMap<IVec3, u32>,
     regions_dir: PathBuf,
+    /// Stable id this world's chunks are keyed under when SpacetimeDB
+    /// mirroring is on; `None` leaves persistence disk-only.
+    stdb_world_id: Option<u16>,
     /// Handle to the background writer: chunk saves are enqueued here instead
     /// of being written on the tick path.
     persist: PersistHandle,
@@ -351,6 +354,18 @@ pub struct World {
 }
 
 impl World {
+    /// Turn on SpacetimeDB mirroring for this world's chunk saves.
+    pub fn enable_stdb(&mut self, world_id: u16) {
+        self.stdb_world_id = Some(world_id);
+    }
+
+    /// The chunk key this position mirrors under, if mirroring is on and the
+    /// position is representable.
+    fn stdb_key(&self, pos: IVec3) -> Option<u64> {
+        let id = self.stdb_world_id?;
+        soils_protocol::chunk_key::pack_chunk_key(id, pos.x, pos.y, pos.z)
+    }
+
     /// Create (or open) a named world under `data_dir`. Each world persists to
     /// its own region directory and generates from its own `seed`, so different
     /// names yield different terrain.
@@ -372,6 +387,7 @@ impl World {
             light_queue: Vec::new(),
             light_inflight: None,
             regions_dir,
+            stdb_world_id: None,
             persist,
             header_cache: HashMap::new(),
             navs: HashMap::new(),
@@ -736,14 +752,21 @@ impl World {
     /// Enqueue every dirty chunk for background persistence. Called on an
     /// interval and at shutdown.
     pub fn flush_dirty(&mut self) {
+        // `stdb_key` borrows self immutably, so resolve keys before the
+        // mutable iteration.
+        let world_id = self.stdb_world_id;
+        let dir = self.regions_dir.clone();
         for (pos, entry) in self.chunks.iter_mut() {
             if entry.dirty {
                 entry.dirty = false;
-                self.persist.enqueue(
-                    self.regions_dir.clone(),
+                let key = world_id
+                    .and_then(|id| soils_protocol::chunk_key::pack_chunk_key(id, pos.x, pos.y, pos.z));
+                self.persist.enqueue_with_key(
+                    dir.clone(),
                     *pos,
                     entry.volume.clone(),
                     entry.edited,
+                    key,
                 );
             }
         }
@@ -761,7 +784,14 @@ impl World {
         for pos in expired {
             let entry = self.chunks.remove(&pos).expect("collected above");
             if entry.dirty {
-                self.persist.enqueue(self.regions_dir.clone(), pos, entry.volume, entry.edited);
+                let key = self.stdb_key(pos);
+                self.persist.enqueue_with_key(
+                    self.regions_dir.clone(),
+                    pos,
+                    entry.volume,
+                    entry.edited,
+                    key,
+                );
             }
             // The background writer will rewrite this chunk's region header;
             // the memoised copy is stale the moment the write lands.

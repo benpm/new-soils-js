@@ -10,7 +10,11 @@
 
 use std::time::{Duration, Instant};
 
-use soils_protocol::{ChunkVolume, chunk_key::pack_chunk_key, encode_chunk};
+use soils_protocol::{
+    ChunkVolume,
+    chunk_key::{pack_chunk_key, world_id_for},
+    encode_chunk,
+};
 use soils_stdb::module_bindings::{
     DbConnection, chunk_blob_table::ChunkBlobTableAccess, put_chunk_blob, upsert_world,
     world_table::WorldTableAccess,
@@ -89,7 +93,7 @@ fn large_chunk_payload_round_trips() {
     subscribe_all(&conn);
 
     conn.reducers
-        .upsert_world(WORLD.into(), 4242, 0, 7, 0.25)
+        .upsert_world(world_id_for(WORLD), WORLD.into(), 4242, 0, 7, 0.25)
         .expect("upsert_world queued");
     assert!(
         wait_for(&conn, Duration::from_secs(10), |c| {
@@ -139,7 +143,7 @@ fn identical_payloads_are_accepted_under_distinct_keys() {
     subscribe_all(&conn);
 
     conn.reducers
-        .upsert_world(WORLD.into(), 4242, 0, 7, 0.25)
+        .upsert_world(world_id_for(WORLD), WORLD.into(), 4242, 0, 7, 0.25)
         .expect("upsert_world queued");
     assert!(wait_for(&conn, Duration::from_secs(10), |c| {
         c.db().world().iter().any(|w| w.name == WORLD)
@@ -177,7 +181,7 @@ fn stale_version_write_is_rejected() {
     };
     subscribe_all(&conn);
 
-    conn.reducers.upsert_world(WORLD.into(), 4242, 0, 7, 0.25).unwrap();
+    conn.reducers.upsert_world(world_id_for(WORLD), WORLD.into(), 4242, 0, 7, 0.25).unwrap();
     assert!(wait_for(&conn, Duration::from_secs(10), |c| {
         c.db().world().iter().any(|w| w.name == WORLD)
     }));

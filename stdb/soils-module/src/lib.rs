@@ -60,8 +60,13 @@ pub struct Account {
 /// `soils_protocol::GenParams` so a client can reproduce terrain locally.
 #[table(accessor = world, public)]
 pub struct World {
+    /// Chosen by the *server* as a stable hash of `name` (see
+    /// `soils_protocol::chunk_key::world_id_for`) rather than auto-assigned,
+    /// so the server can pack chunk keys immediately on startup without a
+    /// round-trip. [`upsert_world`] rejects an id already held by a different
+    /// name, turning the (unlikely) 16-bit collision into a hard error instead
+    /// of two worlds silently sharing chunk storage.
     #[primary_key]
-    #[auto_inc]
     pub world_id: u16,
     #[unique]
     pub name: String,
@@ -362,6 +367,7 @@ pub fn send_chat(ctx: &ReducerContext, world_id: u16, text: String) -> Result<()
 #[reducer]
 pub fn upsert_world(
     ctx: &ReducerContext,
+    world_id: u16,
     name: String,
     seed: i64,
     world_type: u8,
@@ -369,7 +375,14 @@ pub fn upsert_world(
     daytime: f32,
 ) -> Result<(), String> {
     require_server(ctx)?;
-    if let Some(mut world) = ctx.db.world().name().find(&name) {
+    if let Some(mut world) = ctx.db.world().world_id().find(world_id) {
+        // Two names hashing to one id would share chunk storage. Refuse.
+        if world.name != name {
+            return Err(format!(
+                "world_id {world_id} collision: already held by '{}', refused for '{name}'",
+                world.name
+            ));
+        }
         // Generator identity changing under a live world would invalidate every
         // stored chunk, so refuse rather than silently corrupt it.
         if world.seed != seed || world.world_type != world_type || world.graph_hash != graph_hash {
@@ -382,10 +395,13 @@ pub fn upsert_world(
         ctx.db.world().world_id().update(world);
         return Ok(());
     }
+    if ctx.db.world().name().find(&name).is_some() {
+        return Err(format!("world '{name}' already exists under a different world_id"));
+    }
     ctx.db
         .world()
         .try_insert(World {
-            world_id: 0,
+            world_id,
             name,
             seed,
             world_type,

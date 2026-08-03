@@ -10,6 +10,7 @@ soils-sim = { workspace = true }
 soils-worldgen = { workspace = true }
 soils-script = { workspace = true }
 soils-physics = { workspace = true }
+soils-stdb = { workspace = true }
 avian3d = { workspace = true }
 glam = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
@@ -24,3 +25,7 @@ rayon = "1"
 # dangerous-configuration: `with_no_cert_validation` for the LAN/test client
 # path (the server side uses a per-boot self-signed identity).
 wtransport = { version = "0.7.1", features = ["dangerous-configuration"] }
+
+[dev-dependencies]
+# The mirror test observes the database directly, independently of the server.
+spacetimedb-sdk = "2.7.1"

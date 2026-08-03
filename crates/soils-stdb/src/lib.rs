@@ -37,7 +37,15 @@ pub const MAX_EDITS_PER_CALL: usize = 4096;
 pub enum StdbCmd {
     /// Create-or-refresh a world; the module rejects a generator change under
     /// an existing name rather than silently invalidating stored chunks.
-    UpsertWorld { name: String, seed: i64, world_type: u8, graph_hash: u64, daytime: f32 },
+    UpsertWorld {
+        /// Server-chosen stable id (`soils_protocol::chunk_key::world_id_for`).
+        world_id: u16,
+        name: String,
+        seed: i64,
+        world_type: u8,
+        graph_hash: u64,
+        daytime: f32,
+    },
     /// Append voxel edits to the journal.
     SubmitEdits { tick: u64, edits: Vec<PackedEdit> },
     /// Write a coalesced chunk payload (`soils_protocol::chunk_codec` bytes).
@@ -153,23 +161,51 @@ fn worker(
     // Drives the connection's I/O on its own thread; `conn` stays usable here.
     let handle = conn.run_threaded();
 
-    match conn.try_identity() {
+    // The identity lands once the handshake completes, which is *after*
+    // `build()` returns — so poll briefly rather than declaring failure on the
+    // first look.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let identity = loop {
+        if let Some(id) = conn.try_identity() {
+            break Some(id);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    match identity {
         Some(id) => {
             let _ = event_tx.send(StdbEvent::Connected(id));
         }
         None => {
-            let _ = event_tx.send(StdbEvent::ConnectError("no identity after build".into()));
+            let _ = event_tx
+                .send(StdbEvent::ConnectError("handshake did not yield an identity".into()));
         }
     }
 
-    while running.load(Ordering::Relaxed) {
+    // Run until every sender is gone, then drain what's left. Exiting purely on
+    // the `running` flag would discard commands already queued — and the flush
+    // that matters most is the one at shutdown, where the server pushes its
+    // dirty chunks out on the way down.
+    loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(cmd) => apply(conn.reducers(), cmd, &event_tx),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        apply(conn.reducers(), cmd, &event_tx);
+    }
 
+    // Reducer calls are queued on the connection, so let them reach the host
+    // before tearing it down; otherwise a shutdown flush is sent and dropped.
+    std::thread::sleep(std::time::Duration::from_millis(250));
     let _ = conn.disconnect();
     let _ = handle.join();
     running.store(false, Ordering::Relaxed);
@@ -189,9 +225,9 @@ fn apply(reducers: &RemoteReducers, cmd: StdbCmd, event_tx: &Sender<StdbEvent>) 
     let report = |reducer, r| report(event_tx, reducer, r);
 
     match cmd {
-        StdbCmd::UpsertWorld { name, seed, world_type, graph_hash, daytime } => report(
+        StdbCmd::UpsertWorld { world_id, name, seed, world_type, graph_hash, daytime } => report(
             "upsert_world",
-            reducers.upsert_world(name, seed, world_type, graph_hash, daytime),
+            reducers.upsert_world(world_id, name, seed, world_type, graph_hash, daytime),
         ),
         StdbCmd::SubmitEdits { tick, edits } => {
             // Split oversized batches rather than letting the module reject

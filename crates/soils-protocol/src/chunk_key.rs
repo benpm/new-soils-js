@@ -21,6 +21,23 @@
 //! coordinates are rejected rather than silently wrapped, because a wrapped
 //! key would alias two distinct chunks onto one row and corrupt the world.
 
+/// Stable 16-bit id for a world name.
+///
+/// The server picks this itself rather than letting SpacetimeDB auto-assign,
+/// so chunk keys can be packed at startup with no round-trip and survive a
+/// server restart unchanged. FNV-1a, folded to 16 bits, with 0 reserved as a
+/// "no world" sentinel. Collisions are possible but are *detected*: the
+/// module's `upsert_world` refuses an id already held by another name.
+pub fn world_id_for(name: &str) -> u16 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    let folded = ((hash >> 48) ^ (hash >> 32) ^ (hash >> 16) ^ hash) as u16;
+    if folded == 0 { 1 } else { folded }
+}
+
 const WORLD_BITS: u32 = 16;
 const CX_BITS: u32 = 20;
 const CY_BITS: u32 = 8;
@@ -150,5 +167,22 @@ mod tests {
     #[test]
     fn world_id_separates_keys() {
         assert_ne!(pack_chunk_key(0, 5, 5, 5), pack_chunk_key(1, 5, 5, 5));
+    }
+
+    #[test]
+    fn world_ids_are_stable_and_distinct() {
+        // Stability is the contract: a restart must reproduce the same id or
+        // every stored chunk key becomes unreachable.
+        assert_eq!(world_id_for("overworld"), world_id_for("overworld"));
+        assert_ne!(world_id_for("overworld"), world_id_for("nether"));
+        assert_ne!(world_id_for("a"), world_id_for("b"));
+    }
+
+    /// 0 is reserved, so no name may map to it.
+    #[test]
+    fn world_id_is_never_zero() {
+        for name in ["", "a", "overworld", "singleplayer", "test-world-123"] {
+            assert_ne!(world_id_for(name), 0, "{name} mapped to the reserved 0");
+        }
     }
 }

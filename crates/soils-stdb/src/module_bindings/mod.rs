@@ -113,6 +113,7 @@ pub enum Reducer {
         edits: Vec<PackedEdit>,
     },
     UpsertWorld {
+        world_id: u16,
         name: String,
         seed: i64,
         world_type: u8,
@@ -213,12 +214,14 @@ impl __sdk::Reducer for Reducer {
                 })
             }
             Reducer::UpsertWorld {
+                world_id,
                 name,
                 seed,
                 world_type,
                 graph_hash,
                 daytime,
             } => __sats::bsatn::to_vec(&upsert_world_reducer::UpsertWorldArgs {
+                world_id: world_id.clone(),
                 name: name.clone(),
                 seed: seed.clone(),
                 world_type: world_type.clone(),

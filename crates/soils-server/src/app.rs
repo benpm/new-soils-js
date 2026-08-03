@@ -252,13 +252,35 @@ struct Worlds {
     map: HashMap<String, World>,
     data_dir: PathBuf,
     persist: PersistHandle,
+    /// SpacetimeDB mirror, when enabled. Each world registers itself here on
+    /// first open and then keys its chunk saves by `world_id_for(name)`.
+    stdb: Option<Arc<soils_stdb::StdbLink>>,
 }
 
 impl Worlds {
     /// Fetch a world by name, creating (opening) it on first request.
     fn get_or_create(&mut self, name: &str) -> &mut World {
         if !self.map.contains_key(name) {
-            let world = World::new(&self.data_dir, name, world_seed(name), self.persist.clone());
+            let mut world = World::new(&self.data_dir, name, world_seed(name), self.persist.clone());
+            if let Some(stdb) = &self.stdb {
+                // The id is a stable hash of the name, so this needs no
+                // round-trip and survives restarts; the module rejects a
+                // collision rather than merging two worlds' chunks.
+                let world_id = soils_protocol::chunk_key::world_id_for(name);
+                let params = world.gen_params();
+                if let Err(e) = stdb.send(soils_stdb::StdbCmd::UpsertWorld {
+                    world_id,
+                    name: name.to_string(),
+                    seed: params.seed,
+                    world_type: params.world_type,
+                    graph_hash: params.graph_hash,
+                    daytime: 0.0,
+                }) {
+                    eprintln!("spacetimedb: could not register world '{name}': {e}");
+                } else {
+                    world.enable_stdb(world_id);
+                }
+            }
             self.map.insert(name.to_string(), world);
         }
         self.map.get_mut(name).unwrap()
@@ -326,8 +348,9 @@ pub(crate) fn run_app(
     critters: u16,
     scripts_dir: Option<PathBuf>,
     physics_enabled: bool,
+    stdb: Option<Arc<soils_stdb::StdbLink>>,
 ) {
-    let mut worlds = Worlds { map: HashMap::new(), data_dir, persist };
+    let mut worlds = Worlds { map: HashMap::new(), data_dir, persist, stdb };
     // Pre-create the default world so it's ready before the first client.
     worlds.get_or_create(DEFAULT_WORLD);
 

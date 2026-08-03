@@ -7,6 +7,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub(super) struct UpsertWorldArgs {
+    pub world_id: u16,
     pub name: String,
     pub seed: i64,
     pub world_type: u8,
@@ -17,6 +18,7 @@ pub(super) struct UpsertWorldArgs {
 impl From<UpsertWorldArgs> for super::Reducer {
     fn from(args: UpsertWorldArgs) -> Self {
         Self::UpsertWorld {
+            world_id: args.world_id,
             name: args.name,
             seed: args.seed,
             world_type: args.world_type,
@@ -43,13 +45,22 @@ pub trait upsert_world {
     /// /// Use [`upsert_world:upsert_world_then`] to run a callback after the reducer completes.
     fn upsert_world(
         &self,
+        world_id: u16,
         name: String,
         seed: i64,
         world_type: u8,
         graph_hash: u64,
         daytime: f32,
     ) -> __sdk::Result<()> {
-        self.upsert_world_then(name, seed, world_type, graph_hash, daytime, |_, _| {})
+        self.upsert_world_then(
+            world_id,
+            name,
+            seed,
+            world_type,
+            graph_hash,
+            daytime,
+            |_, _| {},
+        )
     }
 
     /// Request that the remote module invoke the reducer `upsert_world` to run as soon as possible,
@@ -60,6 +71,7 @@ pub trait upsert_world {
     ///  and its status can be observed with the `callback`.
     fn upsert_world_then(
         &self,
+        world_id: u16,
         name: String,
         seed: i64,
         world_type: u8,
@@ -75,6 +87,7 @@ pub trait upsert_world {
 impl upsert_world for super::RemoteReducers {
     fn upsert_world_then(
         &self,
+        world_id: u16,
         name: String,
         seed: i64,
         world_type: u8,
@@ -87,6 +100,7 @@ impl upsert_world for super::RemoteReducers {
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
             UpsertWorldArgs {
+                world_id,
                 name,
                 seed,
                 world_type,

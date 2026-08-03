@@ -95,6 +95,79 @@ pub struct ServerConfig {
     /// Enable Avian rigid-body physics (authoritative world + demo props).
     /// `SOILS_PHYSICS=1` on the dedicated binary.
     pub physics: bool,
+    /// SpacetimeDB mirroring. `None` (the default) keeps persistence entirely
+    /// on region files, so single-player and offline play need no database.
+    /// Set via `SOILS_STDB_URI` / `SOILS_STDB_DB` / `SOILS_STDB_TOKEN`.
+    pub stdb: Option<StdbConfig>,
+}
+
+/// Where to mirror world state. Region files remain the source of truth; this
+/// is a mirror written after a successful disk write (see [`persist`]).
+#[derive(Clone, Debug)]
+pub struct StdbConfig {
+    pub uri: String,
+    pub database: String,
+    /// Identity token. Must be present in the module's `server_identity`
+    /// allowlist, since the server calls server-only reducers.
+    pub token: Option<String>,
+}
+
+impl StdbConfig {
+    /// Read from the environment, returning `None` unless `SOILS_STDB_URI` is
+    /// set — so mirroring is strictly opt-in.
+    pub fn from_env() -> Option<Self> {
+        let uri = std::env::var("SOILS_STDB_URI").ok().filter(|v| !v.is_empty())?;
+        Some(Self {
+            uri,
+            database: std::env::var("SOILS_STDB_DB")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "soils".into()),
+            token: std::env::var("SOILS_STDB_TOKEN").ok().filter(|v| !v.is_empty()),
+        })
+    }
+}
+
+/// Open the SpacetimeDB mirror, if configured.
+///
+/// Failure is non-fatal by design: the server keeps running on region files
+/// alone, because losing the database must never take the game down.
+pub(crate) fn connect_stdb(cfg: Option<&StdbConfig>) -> Option<Arc<soils_stdb::StdbLink>> {
+    let cfg = cfg?;
+    let link = Arc::new(soils_stdb::StdbLink::connect(&cfg.uri, &cfg.database, cfg.token.clone()));
+    println!("spacetimedb mirror: connecting to {} / {}", cfg.uri, cfg.database);
+
+    // Nothing else drains the event channel, and a silently-swallowed reducer
+    // rejection (a stale write, or an identity missing from `server_identity`)
+    // is exactly the failure that looks like "mirroring silently does nothing".
+    // Log it instead.
+    let watch = Arc::downgrade(&link);
+    std::thread::Builder::new()
+        .name("soils-stdb-log".into())
+        .spawn(move || {
+            while let Some(link) = watch.upgrade() {
+                for event in link.drain() {
+                    match event {
+                        soils_stdb::StdbEvent::Connected(id) => {
+                            println!("spacetimedb mirror: connected as {id}")
+                        }
+                        soils_stdb::StdbEvent::Disconnected(e) => {
+                            eprintln!("spacetimedb mirror: disconnected ({e:?})")
+                        }
+                        soils_stdb::StdbEvent::ConnectError(e) => {
+                            eprintln!("spacetimedb mirror: connect failed: {e}")
+                        }
+                        soils_stdb::StdbEvent::ReducerFailed { reducer, error } => {
+                            eprintln!("spacetimedb mirror: {reducer} rejected: {error}")
+                        }
+                    }
+                }
+                drop(link);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+        .ok()?;
+    Some(link)
 }
 
 impl Default for ServerConfig {
@@ -109,6 +182,7 @@ impl Default for ServerConfig {
             critters: 0,
             scripts_dir: None,
             physics: false,
+            stdb: None,
         }
     }
 }
@@ -186,7 +260,8 @@ pub(crate) fn world_seed(name: &str) -> u32 {
 pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     let listener = TcpListener::bind(&config.bind).await?;
     println!("new-soils server listening on ws://{}", config.bind);
-    let persister = Persister::new();
+    let stdb = connect_stdb(config.stdb.as_ref());
+    let persister = Persister::with_stdb(stdb.clone());
     // Never-firing shutdown/discovery senders: they stay alive in this frame
     // for the whole await, so `changed()` pends forever and the initial
     // discovery state holds until process exit.
@@ -194,7 +269,15 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     let (discovery_tx, discovery_rx) = watch::channel(config.enable_discovery);
     let (discovery_port_tx, _discovery_port_rx) = watch::channel(None);
     let result =
-        serve(listener, config, persister.handle(), shutdown_rx, discovery_rx, discovery_port_tx)
+        serve(
+            listener,
+            config,
+            persister.handle(),
+            stdb,
+            shutdown_rx,
+            discovery_rx,
+            discovery_port_tx,
+        )
             .await;
     // The ECS app has exited (joined inside `serve`); flush queued chunk writes.
     persister.shutdown();
@@ -232,11 +315,13 @@ pub fn spawn(config: ServerConfig) -> std::io::Result<ServerHandle> {
                     }
                 };
                 let _ = tx.send(Ok(addr));
-                let persister = Persister::new();
+                let stdb = connect_stdb(config.stdb.as_ref());
+                let persister = Persister::with_stdb(stdb.clone());
                 let _ = serve(
                     listener,
                     config,
                     persister.handle(),
+                    stdb,
                     shutdown_rx,
                     discovery_rx,
                     discovery_port_tx,
@@ -266,6 +351,7 @@ async fn serve(
     listener: TcpListener,
     config: ServerConfig,
     persist: PersistHandle,
+    stdb: Option<Arc<soils_stdb::StdbLink>>,
     mut shutdown: watch::Receiver<bool>,
     discovery: watch::Receiver<bool>,
     discovery_port_tx: watch::Sender<Option<u16>>,
@@ -284,10 +370,11 @@ async fn serve(
         let critters = config.critters;
         let scripts_dir = config.scripts_dir.clone();
         let physics = config.physics;
+        let stdb = stdb.clone();
         std::thread::Builder::new().name("soils-ecs".into()).spawn(move || {
             app::run_app(
                 conns_rx, shutdown, data_dir, persist, accounts, player_count, critters,
-                scripts_dir, physics,
+                scripts_dir, physics, stdb,
             );
         })?
     };

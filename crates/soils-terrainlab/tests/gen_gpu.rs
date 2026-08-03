@@ -67,8 +67,8 @@ fn gpu_chunk_gen_matches_cpu_bit_exactly() {
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("gen-layout"),
-        bind_group_layouts: &[&bgl],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
     });
     let mk_pipeline = |entry: &str| {
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -189,7 +189,7 @@ fn gpu_chunk_gen_matches_cpu_bit_exactly() {
 }
 
 fn init_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,

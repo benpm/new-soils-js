@@ -10,6 +10,7 @@ use bevy::ecs::query::ROQueryItem;
 use bevy::ecs::system::SystemParamItem;
 use bevy::ecs::system::lifetimeless::SRes;
 use bevy::pbr::{
+    MeshPipelineSystems,
     MeshPipelineViewLayoutKey, MeshPipelineViewLayouts, SetMeshViewBindGroup,
     SetMeshViewBindingArrayBindGroup,
 };
@@ -35,7 +36,7 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::texture::GpuImage;
 use bevy::render::view::{ExtractedView, RenderVisibleEntities};
-use bevy::render::{Render, RenderApp, RenderSystems};
+use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 
 use crate::gi::GiAssets;
 use crate::light::SkyTerm;
@@ -137,6 +138,7 @@ impl Plugin for WorldDrawPlugin {
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app
             .add_render_command::<Opaque3d, DrawTerrainCommands>()
+            .add_systems(RenderStartup, init_terrain_pipeline.after(MeshPipelineSystems))
             .add_systems(
                 Render,
                 (
@@ -144,12 +146,6 @@ impl Plugin for WorldDrawPlugin {
                     queue_terrain.in_set(RenderSystems::Queue),
                 ),
             );
-    }
-
-    fn finish(&self, app: &mut App) {
-        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.init_resource::<TerrainPipeline>();
-        }
     }
 }
 
@@ -215,11 +211,20 @@ pub struct TerrainPipeline {
     pub world_layout: BindGroupLayoutDescriptor,
 }
 
-impl FromWorld for TerrainPipeline {
-    fn from_world(world: &mut World) -> Self {
-        let asset_server = world.resource::<AssetServer>();
+/// Build the terrain pipeline.
+///
+/// This runs in `RenderStartup` after [`MeshPipelineSystems`] rather than as a
+/// `FromWorld` in `Plugin::finish`: Bevy 0.19 moved `MeshPipelineViewLayouts`
+/// creation into `RenderStartup`, so reading it at plugin-finish time panics
+/// with "resource does not exist".
+fn init_terrain_pipeline(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    view_layouts: Res<MeshPipelineViewLayouts>,
+) {
+    let terrain = {
         let shader = asset_server.load("shaders/atlas.wgsl");
-        let view_layouts = world.resource::<MeshPipelineViewLayouts>().clone();
+        let view_layouts = view_layouts.clone();
 
         let world_layout = BindGroupLayoutDescriptor::new(
             "terrain_world_layout",
@@ -266,14 +271,15 @@ impl FromWorld for TerrainPipeline {
         let mut base = base;
         base.primitive.cull_mode = Some(Face::Back);
 
-        Self {
+        TerrainPipeline {
             variants: Variants::new(
                 TerrainSpecializer { view_layouts, world_layout: world_layout.clone() },
                 base,
             ),
             world_layout,
         }
-    }
+    };
+    commands.insert_resource(terrain);
 }
 
 // ---------------- Bind group + uniform ----------------

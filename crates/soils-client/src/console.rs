@@ -37,7 +37,7 @@ pub fn setup_console(mut commands: Commands) {
         ConsoleBar,
         Visibility::Hidden,
         Text::new(""),
-        TextFont { font_size: 16.0, ..default() },
+        TextFont { font_size: 16.0.into(), ..default() },
         TextColor(Color::WHITE),
         Node {
             position_type: PositionType::Absolute,

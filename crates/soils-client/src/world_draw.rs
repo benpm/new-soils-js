@@ -6,7 +6,6 @@
 
 use bevy::camera::visibility::{self, NoFrustumCulling, VisibilityClass};
 use bevy::core_pipeline::core_3d::{CORE_3D_DEPTH_FORMAT, Opaque3d, Opaque3dBatchSetKey, Opaque3dBinKey};
-use bevy::ecs::change_detection::Tick;
 use bevy::ecs::query::ROQueryItem;
 use bevy::ecs::system::SystemParamItem;
 use bevy::ecs::system::lifetimeless::SRes;
@@ -163,7 +162,11 @@ fn spawn_terrain_entity(mut commands: Commands) {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, SpecializerKey)]
 pub struct TerrainPipelineKey {
     msaa: Msaa,
-    hdr: bool,
+    /// The format this view renders to. Bevy 0.19 deprecated
+    /// `TextureFormat::bevy_default()` in favour of sourcing the real format
+    /// from `ExtractedView::target_format` and specializing on it, which also
+    /// covers targets that aren't the default sRGB surface.
+    format: TextureFormat,
     /// The camera renders the `Atmosphere`, which grows the view bind group.
     atmosphere: bool,
 }
@@ -197,11 +200,7 @@ impl Specializer<RenderPipeline> for TerrainSpecializer {
         descriptor.multisample.count = key.msaa.samples();
         if let Some(fragment) = &mut descriptor.fragment {
             fragment.targets = vec![Some(ColorTargetState {
-                format: if key.hdr {
-                    TextureFormat::Rgba16Float
-                } else {
-                    TextureFormat::bevy_default()
-                },
+                format: key.format,
                 blend: None,
                 write_mask: ColorWrites::ALL,
             })];
@@ -245,8 +244,10 @@ impl FromWorld for TerrainPipeline {
             vertex: VertexState { shader: shader.clone(), buffers: vec![], ..default() },
             fragment: Some(FragmentState {
                 shader,
+                // Placeholder: `specialize` always overwrites this with the
+                // view's real `target_format`.
                 targets: vec![Some(ColorTargetState {
-                    format: TextureFormat::bevy_default(),
+                    format: TextureFormat::Rgba8UnormSrgb,
                     blend: None,
                     write_mask: ColorWrites::ALL,
                 })],
@@ -254,9 +255,9 @@ impl FromWorld for TerrainPipeline {
             }),
             depth_stencil: Some(DepthStencilState {
                 format: CORE_3D_DEPTH_FORMAT,
-                depth_write_enabled: true,
+                depth_write_enabled: Some(true),
                 // Bevy uses reverse-Z.
-                depth_compare: CompareFunction::GreaterEqual,
+                depth_compare: Some(CompareFunction::GreaterEqual),
                 stencil: default(),
                 bias: default(),
             }),
@@ -295,7 +296,7 @@ fn prepare_world_bind_group(
     atlas: Option<Res<ExtractedAtlas>>,
     gi: Option<Res<GiAssets>>,
     images: Res<RenderAssets<GpuImage>>,
-    ssbos: Res<RenderAssets<bevy::render::storage::GpuShaderStorageBuffer>>,
+    ssbos: Res<RenderAssets<bevy::render::storage::GpuShaderBuffer>>,
     params: Option<Res<TerrainParams>>,
 ) {
     // The uniform is rewritten every frame; the bind group is built once (all
@@ -406,7 +407,6 @@ fn queue_terrain(
         &Msaa,
         Has<bevy::pbr::ExtractedAtmosphere>,
     )>,
-    mut next_tick: Local<Tick>,
 ) {
     if world_bg.is_none() {
         return; // pools/atlas not ready yet
@@ -415,29 +415,31 @@ fn queue_terrain(
 
     for (view, visible, msaa, atmosphere) in views.iter() {
         let Some(phase) = opaque_phases.get_mut(&view.retained_view_entity) else { continue };
-        for &entity in visible.get::<TerrainDraw>().iter() {
+        // 0.19 split the visible-entity list into CPU- and GPU-culled tables.
+        // The terrain entity carries `NoFrustumCulling` (not `NoCpuCulling`),
+        // so it lives in the CPU-culled list.
+        let Some(class) = visible.get::<TerrainDraw>() else { continue };
+        for &entity in &class.entities_cpu_culling {
             let Ok(pipeline_id) = pipeline.variants.specialize(
                 &pipeline_cache,
-                TerrainPipelineKey { msaa: *msaa, hdr: view.hdr, atmosphere },
+                TerrainPipelineKey { msaa: *msaa, format: view.target_format, atmosphere },
             ) else {
                 continue;
             };
-            let this_tick = next_tick.get() + 1;
-            next_tick.set(this_tick);
             phase.add(
                 Opaque3dBatchSetKey {
                     draw_function: draw_terrain,
                     pipeline: pipeline_id,
                     material_bind_group_index: None,
                     lightmap_slab: None,
-                    vertex_slab: default(),
-                    index_slab: None,
+                    // Non-mesh item: slab 0 is correct because the terrain is
+                    // a single multi-drawn entity (see MeshSlabs docs).
+                    slabs: default(),
                 },
                 Opaque3dBinKey { asset_id: AssetId::<Mesh>::invalid().untyped() },
                 entity,
                 InputUniformIndex::default(),
                 BinnedRenderPhaseType::NonMesh,
-                *next_tick,
             );
         }
     }

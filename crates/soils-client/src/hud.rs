@@ -18,7 +18,7 @@ pub fn setup_hud(mut commands: Commands) {
     commands.spawn((
         DebugHud,
         Text::new(""),
-        TextFont { font_size: 13.0, ..default() },
+        TextFont { font_size: 13.0.into(), ..default() },
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.92)),
         Node {
             position_type: PositionType::Absolute,

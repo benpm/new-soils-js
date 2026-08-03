@@ -118,7 +118,7 @@ pub fn setup_login(mut commands: Commands) {
             .with_children(|panel| {
                 panel.spawn((
                     Text::new("new-soils"),
-                    TextFont { font_size: 30.0, ..default() },
+                    TextFont { font_size: 30.0.into(), ..default() },
                     TextColor(Color::WHITE),
                 ));
                 // Local-first path: no server, no account details needed.
@@ -148,7 +148,7 @@ pub fn setup_login(mut commands: Commands) {
                     });
                 panel.spawn((
                     Text::new("click a field, then type"),
-                    TextFont { font_size: 14.0, ..default() },
+                    TextFont { font_size: 14.0.into(), ..default() },
                     TextColor(Color::srgb(0.8, 0.7, 0.5)),
                     StatusText,
                 ));
@@ -162,7 +162,7 @@ fn field(parent: &mut ChildSpawnerCommands, label: &str, kind: LoginButton, mark
         .with_children(|row| {
             row.spawn((
                 Text::new(format!("{label}:")),
-                TextFont { font_size: 18.0, ..default() },
+                TextFont { font_size: 18.0.into(), ..default() },
                 TextColor(Color::WHITE),
             ));
             row.spawn((
@@ -174,7 +174,7 @@ fn field(parent: &mut ChildSpawnerCommands, label: &str, kind: LoginButton, mark
             .with_children(|f| {
                 f.spawn((
                     Text::new(""),
-                    TextFont { font_size: 18.0, ..default() },
+                    TextFont { font_size: 18.0.into(), ..default() },
                     TextColor(Color::WHITE),
                     marker,
                 ));
@@ -193,7 +193,7 @@ fn action(parent: &mut ChildSpawnerCommands, label: &str, kind: LoginButton) {
         .with_children(|b| {
             b.spawn((
                 Text::new(label),
-                TextFont { font_size: 18.0, ..default() },
+                TextFont { font_size: 18.0.into(), ..default() },
                 TextColor(Color::WHITE),
             ));
         });
@@ -373,7 +373,7 @@ pub fn update_server_list(
         if servers.list.is_empty() {
             list.spawn((
                 Text::new("searching for LAN servers…"),
-                TextFont { font_size: 14.0, ..default() },
+                TextFont { font_size: 14.0.into(), ..default() },
                 TextColor(Color::srgb(0.55, 0.55, 0.55)),
             ));
             return;
@@ -389,7 +389,7 @@ pub fn update_server_list(
             .with_children(|b| {
                 b.spawn((
                     Text::new(format!("{} ({}) — {}", s.name, s.players, addr)),
-                    TextFont { font_size: 14.0, ..default() },
+                    TextFont { font_size: 14.0.into(), ..default() },
                     TextColor(Color::WHITE),
                 ));
             });

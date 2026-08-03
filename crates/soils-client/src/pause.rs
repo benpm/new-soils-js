@@ -92,7 +92,7 @@ pub fn setup_pause_menu(mut commands: Commands) {
             .with_children(|panel| {
                 panel.spawn((
                     Text::new("Paused"),
-                    TextFont { font_size: 26.0, ..default() },
+                    TextFont { font_size: 26.0.into(), ..default() },
                     TextColor(Color::WHITE),
                 ));
 
@@ -108,7 +108,7 @@ pub fn setup_pause_menu(mut commands: Commands) {
                         button(row, "-", MenuButton::RadiusDown);
                         row.spawn((
                             Text::new("Load radius: 4"),
-                            TextFont { font_size: 18.0, ..default() },
+                            TextFont { font_size: 18.0.into(), ..default() },
                             TextColor(Color::WHITE),
                             RadiusLabel,
                         ));
@@ -138,7 +138,7 @@ pub fn setup_pause_menu(mut commands: Commands) {
                     .with_children(|b| {
                         b.spawn((
                             Text::new("LAN discovery: OFF"),
-                            TextFont { font_size: 18.0, ..default() },
+                            TextFont { font_size: 18.0.into(), ..default() },
                             TextColor(Color::WHITE),
                             DiscoveryLabel,
                         ));
@@ -166,7 +166,7 @@ fn button(parent: &mut ChildSpawnerCommands, label: &str, kind: MenuButton) {
         .with_children(|b| {
             b.spawn((
                 Text::new(label),
-                TextFont { font_size: 18.0, ..default() },
+                TextFont { font_size: 18.0.into(), ..default() },
                 TextColor(Color::WHITE),
             ));
         });
@@ -194,7 +194,7 @@ fn labelled_button(
         .with_children(|b| {
             b.spawn((
                 Text::new(label),
-                TextFont { font_size: 18.0, ..default() },
+                TextFont { font_size: 18.0.into(), ..default() },
                 TextColor(Color::WHITE),
                 marker,
             ));

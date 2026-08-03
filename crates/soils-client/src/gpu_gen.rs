@@ -19,7 +19,6 @@ use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::gpu_readback::{Readback, ReadbackComplete};
 use bevy::render::render_asset::RenderAssets;
-use bevy::render::render_graph::{self, RenderGraph, RenderLabel};
 use bevy::render::render_resource::binding_types::{
     storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer_sized,
 };
@@ -28,8 +27,10 @@ use bevy::render::render_resource::{
     BufferDescriptor, BufferUsages, CachedComputePipelineId, ComputePassDescriptor,
     ComputePipelineDescriptor, PipelineCache, RawBufferVec, ShaderStages,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
-use bevy::render::storage::{GpuShaderStorageBuffer, ShaderStorageBuffer};
+use bevy::render::renderer::{
+    RenderContext, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue,
+};
+use bevy::render::storage::{GpuShaderBuffer, ShaderBuffer};
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 
 use crate::chunk::{Blocks, ChunkMap};
@@ -80,7 +81,7 @@ pub struct GenBatches {
 
 /// Handle to the tagged occupancy buffer ([tag, per-job counts]).
 #[derive(Resource, Clone, ExtractResource)]
-pub struct GenOccBuffer(pub Handle<ShaderStorageBuffer>);
+pub struct GenOccBuffer(pub Handle<ShaderBuffer>);
 
 /// Mirrored render→main once the gen pipelines have compiled.
 #[derive(Resource, Clone, Copy)]
@@ -102,9 +103,13 @@ impl Plugin for GpuGenPlugin {
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app
+            .add_systems(RenderStartup, init_gen)
+            // Voxels must exist before the mesher (and thus the light flood).
             .add_systems(
-                RenderStartup,
-                (init_gen, add_render_graph_node.after(crate::gpu_mesh::add_render_graph_node)),
+                RenderGraph,
+                gen_pass
+                    .in_set(RenderGraphSystems::Render)
+                    .before(crate::gpu_mesh::voxel_mesh_pass),
             )
             .add_systems(bevy::render::ExtractSchedule, mirror_ready)
             .add_systems(
@@ -117,8 +122,8 @@ impl Plugin for GpuGenPlugin {
     }
 }
 
-fn setup_occ_buffer(mut commands: Commands, mut buffers: ResMut<Assets<ShaderStorageBuffer>>) {
-    let mut buf = ShaderStorageBuffer::from(vec![0u32; 1 + GEN_BUDGET]);
+fn setup_occ_buffer(mut commands: Commands, mut buffers: ResMut<Assets<ShaderBuffer>>) {
+    let mut buf = ShaderBuffer::from(vec![0u32; 1 + GEN_BUDGET]);
     buf.buffer_description.usage = BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST;
     let handle = buffers.add(buf);
     commands.insert_resource(GenOccBuffer(handle.clone()));
@@ -178,7 +183,7 @@ pub fn flush_gen_batch(
     mut batch: ResMut<GpuGenBatch>,
     mut batches: ResMut<GenBatches>,
     occ: Option<Res<GenOccBuffer>>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
 ) {
     batch.jobs.clear();
     if queue.0.is_empty() {
@@ -190,7 +195,7 @@ pub fn flush_gen_batch(
     let tag = batches.next_id;
     let mut data = vec![0u32; 1 + GEN_BUDGET];
     data[0] = tag;
-    if let Some(buf) = buffers.get_mut(&occ.0) {
+    if let Some(mut buf) = buffers.get_mut(&occ.0) {
         buf.set_data(data);
     }
     for (cpos, mesh) in &list {
@@ -260,7 +265,7 @@ fn mirror_ready(
 // ---------------- Render world ----------------
 
 #[derive(Resource)]
-struct GenPipelines {
+pub(crate) struct GenPipelines {
     layout: BindGroupLayoutDescriptor,
     lattice: Option<CachedComputePipelineId>,
     fill: Option<CachedComputePipelineId>,
@@ -270,15 +275,12 @@ struct GenPipelines {
 }
 
 #[derive(Resource, Default)]
-struct GenJobsGpu {
+pub(crate) struct GenJobsGpu {
     p: Option<RawBufferVec<i32>>,
     jobs: Option<RawBufferVec<i32>>,
     bind_group: Option<BindGroup>,
     count: u32,
 }
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-pub struct GenLabel;
 
 fn init_gen(mut commands: Commands, device: Res<RenderDevice>) {
     let layout = BindGroupLayoutDescriptor::new(
@@ -318,11 +320,6 @@ fn init_gen(mut commands: Commands, device: Res<RenderDevice>) {
     commands.insert_resource(GenJobsGpu::default());
 }
 
-fn add_render_graph_node(mut render_graph: ResMut<RenderGraph>) {
-    render_graph.add_node(GenLabel, GenNode);
-    // Voxels must exist before the mesher (and thus the light flood) runs.
-    render_graph.add_node_edge(GenLabel, crate::gpu_mesh::VoxelMeshLabel);
-}
 
 /// Queue the compute pipelines once the generated shader arrives (the source
 /// is runtime-built from the server's world identity).
@@ -363,7 +360,7 @@ fn prepare_gen(
     occ: Option<Res<GenOccBuffer>>,
     device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    buffers: Res<RenderAssets<GpuShaderStorageBuffer>>,
+    buffers: Res<RenderAssets<GpuShaderBuffer>>,
     pipeline_cache: Res<PipelineCache>,
 ) {
     jobs.bind_group = None;
@@ -422,36 +419,31 @@ fn prepare_gen(
     jobs.count = batch.jobs.len() as u32;
 }
 
-struct GenNode;
-
-impl render_graph::Node for GenNode {
-    fn run(
-        &self,
-        _graph: &mut render_graph::RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), render_graph::NodeRunError> {
-        let pipeline_cache = world.resource::<PipelineCache>();
-        let Some(pipelines) = world.get_resource::<GenPipelines>() else { return Ok(()) };
-        let Some(jobs) = world.get_resource::<GenJobsGpu>() else { return Ok(()) };
-        let Some(bind_group) = &jobs.bind_group else { return Ok(()) };
-        let (Some(lattice_id), Some(fill_id)) = (pipelines.lattice, pipelines.fill) else {
-            return Ok(());
-        };
-        let (Some(lattice), Some(fill)) = (
-            pipeline_cache.get_compute_pipeline(lattice_id),
-            pipeline_cache.get_compute_pipeline(fill_id),
-        ) else {
-            return Ok(());
-        };
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor { label: Some("gpu_gen"), ..default() });
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.set_pipeline(lattice);
-        pass.dispatch_workgroups(1, jobs.count, 1);
-        pass.set_pipeline(fill);
-        pass.dispatch_workgroups(1, 4, jobs.count);
-        Ok(())
-    }
+/// Generate voxels for GPU-born chunks straight into the pooled voxel cache.
+pub(crate) fn gen_pass(
+    mut render_context: RenderContext,
+    pipeline_cache: Res<PipelineCache>,
+    pipelines: Option<Res<GenPipelines>>,
+    jobs: Option<Res<GenJobsGpu>>,
+) {
+    let Some(pipelines) = pipelines else { return };
+    let Some(jobs) = jobs else { return };
+    let Some(bind_group) = &jobs.bind_group else { return };
+    let (Some(lattice_id), Some(fill_id)) = (pipelines.lattice, pipelines.fill) else {
+        return;
+    };
+    let (Some(lattice), Some(fill)) = (
+        pipeline_cache.get_compute_pipeline(lattice_id),
+        pipeline_cache.get_compute_pipeline(fill_id),
+    ) else {
+        return;
+    };
+    let mut pass = render_context
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor { label: Some("gpu_gen"), ..default() });
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.set_pipeline(lattice);
+    pass.dispatch_workgroups(1, jobs.count, 1);
+    pass.set_pipeline(fill);
+    pass.dispatch_workgroups(1, 4, jobs.count);
 }

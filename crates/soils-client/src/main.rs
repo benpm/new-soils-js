@@ -34,8 +34,12 @@ mod singleplayer;
 use bevy::app::{RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
-use bevy::light::{AtmosphereEnvironmentMapLight, light_consts::lux};
-use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
+// Bevy 0.19 moved the atmosphere *description* types into `bevy_light`; the
+// render-side `AtmosphereSettings` stayed in `bevy_pbr`.
+use bevy::light::{
+    Atmosphere, AtmosphereEnvironmentMapLight, atmosphere::ScatteringMedium, light_consts::lux,
+};
+use bevy::pbr::AtmosphereSettings;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use soils_protocol::ClientMsg;
@@ -405,7 +409,7 @@ fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) 
         // NOTE: no `Bloom` — with our unlit, manually-exposed terrain the bright
         // HDR sky bloom washes the whole frame to a flat haze regardless of
         // prefilter threshold; the atmosphere still draws the sun disc itself.
-        Atmosphere::earthlike(mediums.add(ScatteringMedium::default())),
+        Atmosphere::earth(mediums.add(ScatteringMedium::default())),
         AtmosphereSettings::default(),
         AtmosphereEnvironmentMapLight::default(),
         Exposure { ev100: EV100_DAY },
@@ -416,7 +420,7 @@ fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) 
         Sun,
         // RAW (pre-atmosphere) sunlight is the correct input for the atmosphere
         // to filter; `day_night` rotates it and dims it toward night.
-        DirectionalLight { illuminance: lux::RAW_SUNLIGHT, shadows_enabled: false, ..default() },
+        DirectionalLight { illuminance: lux::RAW_SUNLIGHT, shadow_maps_enabled: false, ..default() },
         Transform::default(),
     ));
 }

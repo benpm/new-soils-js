@@ -96,6 +96,24 @@ cargo test -p soils-stdb                          # blob round-trip, dedup, stal
 cargo test -p soils-server --test stdb_mirror     # a real edit reaches the database
 ```
 
+## What is stored
+
+| Table | Keyed by | Written by |
+|---|---|---|
+| `world` | server-chosen `world_id` (`world_id_for(name)`) | server, on world open |
+| `chunk_blob` | packed `chunk_key` | server, after a successful region write |
+| `chunk_edit` | auto id | server (journal, pruned once folded into a blob) |
+| `player_profile` | **account name** | server, on logout |
+| `presence` | **account name** | server, on login / logout |
+| `game_server` | `server_id` (hash of name+bind) | server, every 5 s |
+| `account`, `chat_message` | Identity / auto id | players |
+
+`player_profile` and `presence` are keyed by *account*, not `Identity`: players
+authenticate to the game server with a name/password, so the account is what
+durably identifies them. `player_profile.identity` is filled in by the
+`link_identity` reducer once a player's own client authenticates to SpacetimeDB
+directly — only that account's own identity may claim it, and only once.
+
 ## Gotchas
 
 - **The `world_id` is chosen by the server**, not auto-assigned: it is a stable

@@ -32,7 +32,7 @@ mod server_msg;
 mod singleplayer;
 
 use bevy::app::{RunFixedMainLoop, RunFixedMainLoopSystems};
-use bevy::camera::Exposure;
+use bevy::camera::{Exposure, Hdr};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 // Bevy 0.19 moved the atmosphere *description* types into `bevy_light`; the
 // render-side `AtmosphereSettings` stayed in `bevy_pbr`.
@@ -401,20 +401,29 @@ fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) 
         Transform::from_translation(PROVISIONAL_SPAWN)
             .with_rotation(Quat::from_axis_angle(Vec3::X, -0.5)),
         Player::at(PROVISIONAL_SPAWN),
-        // Physically-based sky. `Atmosphere` requires (and auto-inserts) `Hdr`;
-        // pair it with a tonemapper, an exposure the day/night cycle drives, and
-        // sky-derived image-based lighting for the lit actors. 1 world unit ==
-        // 1 block ~= 1 metre, so the default `scene_units_to_m` is correct.
+        // Physically-based sky. Bevy 0.19 split this in two: `Atmosphere`
+        // describes a *planet* and lives on its own entity (spawned below),
+        // while the camera opts in with `AtmosphereSettings`. Pair it with a
+        // tonemapper, an exposure the day/night cycle drives, and sky-derived
+        // image-based lighting for the lit actors. 1 world unit == 1 block
+        // ~= 1 metre, so the default `scene_units_to_m` is correct.
         //
         // NOTE: no `Bloom` — with our unlit, manually-exposed terrain the bright
         // HDR sky bloom washes the whole frame to a flat haze regardless of
         // prefilter threshold; the atmosphere still draws the sun disc itself.
-        Atmosphere::earth(mediums.add(ScatteringMedium::default())),
+        Hdr,
         AtmosphereSettings::default(),
         AtmosphereEnvironmentMapLight::default(),
         Exposure { ev100: EV100_DAY },
         Tonemapping::AcesFitted,
     ));
+
+    // The planet. Its `GlobalTransform` *is* the planet centre, so this must be
+    // its own entity: left on the camera (which carries a real `Transform`) the
+    // `on_add` hook that sinks the planet to `-inner_radius` on Y is skipped,
+    // the centre lands on the camera, and the sky renders as a flat haze with
+    // black aerial-perspective artefacts above the horizon.
+    commands.spawn(Atmosphere::earth(mediums.add(ScatteringMedium::default())));
 
     commands.spawn((
         Sun,

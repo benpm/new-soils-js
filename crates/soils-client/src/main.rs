@@ -76,6 +76,16 @@ fn main() {
             } else {
                 bevy::window::PresentMode::AutoVsync
             },
+            // `SOILS_NOFOCUS=1` spawns the window visible but without taking
+            // focus, so a perf run doesn't steal the desktop while you work.
+            // Prefer this over `SOILS_HEADLESS` for measurements: the window
+            // still presents through the normal swapchain path.
+            focused: std::env::var("SOILS_NOFOCUS").as_deref() != Ok("1"),
+            // `SOILS_HEADLESS=1` leaves the window unmapped entirely. Rendering
+            // and `Screenshot::primary_window` still work (useful for CI), but
+            // an unmapped window takes a different present path and measured
+            // ~2 ms/frame slower here — do NOT use it for perf numbers.
+            visible: std::env::var("SOILS_HEADLESS").as_deref() != Ok("1"),
             ..default()
         }),
         ..default()
@@ -386,7 +396,8 @@ fn env_secs(key: &str, default: f32) -> f32 {
 
 /// Spawn the camera/player and the sun.
 fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) {
-    commands.spawn((
+    let camera = commands
+        .spawn((
         Camera3d::default(),
         Projection::from(PerspectiveProjection {
             fov: 65.0_f32.to_radians(),
@@ -412,11 +423,18 @@ fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) 
         // HDR sky bloom washes the whole frame to a flat haze regardless of
         // prefilter threshold; the atmosphere still draws the sun disc itself.
         Hdr,
-        AtmosphereSettings::default(),
-        AtmosphereEnvironmentMapLight::default(),
         Exposure { ev100: EV100_DAY },
         Tonemapping::AcesFitted,
-    ));
+        ))
+        .id();
+
+    // Sky + sky-derived image-based lighting for the lit actors. Measured
+    // ~0.7 ms/frame combined on an RTX 5070 (0.55 env-map + 0.16 sky), and the
+    // env-map cost is *not* resolution-bound — dropping `size` from 512 to 64
+    // changed nothing, so it is fixed per-frame probe overhead.
+    commands
+        .entity(camera)
+        .insert((AtmosphereSettings::default(), AtmosphereEnvironmentMapLight::default()));
 
     // The planet. Its `GlobalTransform` *is* the planet centre, so this must be
     // its own entity: left on the camera (which carries a real `Transform`) the

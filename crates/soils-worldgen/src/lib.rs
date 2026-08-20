@@ -4,11 +4,12 @@
 pub mod blocks;
 pub mod graph;
 pub mod greedy;
+pub mod noise_modes;
 pub mod radiance;
 pub mod terrain;
 
 pub use blocks::{BlockDef, BlockRegistry};
-pub use graph::{CaveParams, ColumnSample, NodeKind, TerrainGraph};
+pub use graph::{CaveParams, ColumnSample, NodeKind, NoiseMode, TerrainGraph};
 pub use greedy::{MeshData, greedy_mesh};
 pub use radiance::{LightGrid, Radiance};
 pub use terrain::{TerrainGen, WorldType};

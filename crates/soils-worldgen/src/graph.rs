@@ -35,6 +35,78 @@ pub enum Axis {
     Z,
 }
 
+/// A base noise function for [`NodeKind::Noise`] / [`NodeKind::FractalNoise`],
+/// ported from `noise.glsl` to both the CPU ([`crate::noise_modes`]) and the
+/// GPU (`soils-terrainlab::wgsl_gen`) so the two agree. All output signed
+/// `~[-1, 1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoiseMode {
+    /// Smooth value noise (Hermite-interpolated cell hashes).
+    Value,
+    /// Classic Perlin gradient noise.
+    Perlin,
+    /// Hash-based simplex noise.
+    Simplex,
+    /// Cellular / Worley F1 (nearest feature-point distance).
+    Worley,
+    /// Smooth Voronoi; `param` is edge smoothness (default 0.5).
+    Voronoi,
+    /// Sinusoidal Gabor-like bands.
+    Gabor,
+    /// Impact-crater field (rings).
+    Crater,
+    /// Fibrous derivative noise.
+    Wool,
+    /// Domain-warped fBm (rock/stone look).
+    Stone,
+    /// Rotated wavelet noise; `param` is phase (default 0). NB: discontinuous
+    /// (per-cell random rotation), so its GPU 3D preview can differ from the CPU
+    /// map by ~0.02 at cell boundaries — the only mode not held to GPU/CPU parity.
+    Wavelet,
+}
+
+impl NoiseMode {
+    /// All modes, in palette/dropdown order.
+    pub const ALL: [NoiseMode; 10] = [
+        NoiseMode::Value,
+        NoiseMode::Perlin,
+        NoiseMode::Simplex,
+        NoiseMode::Worley,
+        NoiseMode::Voronoi,
+        NoiseMode::Gabor,
+        NoiseMode::Crater,
+        NoiseMode::Wool,
+        NoiseMode::Stone,
+        NoiseMode::Wavelet,
+    ];
+
+    /// Human-readable name (used for node titles and the editor dropdown).
+    pub fn label(self) -> &'static str {
+        match self {
+            NoiseMode::Value => "Value",
+            NoiseMode::Perlin => "Perlin",
+            NoiseMode::Simplex => "Simplex",
+            NoiseMode::Worley => "Worley",
+            NoiseMode::Voronoi => "Voronoi",
+            NoiseMode::Gabor => "Gabor",
+            NoiseMode::Crater => "Crater",
+            NoiseMode::Wool => "Wool",
+            NoiseMode::Stone => "Stone",
+            NoiseMode::Wavelet => "Wavelet",
+        }
+    }
+
+    /// Label for the mode-specific `param` slider, or `None` if the mode ignores
+    /// `param`.
+    pub fn param_label(self) -> Option<&'static str> {
+        match self {
+            NoiseMode::Voronoi => Some("smoothness"),
+            NoiseMode::Wavelet => Some("phase"),
+            _ => None,
+        }
+    }
+}
+
 /// An input slot on a node: either wired to another node's output, or left
 /// unwired (in which case `default` is used). Keeping a literal fallback on
 /// every slot means a partially-wired graph still evaluates, which matches how
@@ -74,6 +146,21 @@ pub enum NodeKind {
     /// Fractal Brownian motion: `octaves` of simplex with `lacunarity` /
     /// `persistence`, the node the original `terrain.rs` hand-unrolled.
     Fbm { octaves: u32, base_frequency: f32, lacunarity: f32, persistence: f32, offset: [f32; 2] },
+    /// One of the [`NoiseMode`] functions sampled at `(x, z) * frequency +
+    /// offset`. `param` is the mode's extra scalar (Voronoi smoothness / Wavelet
+    /// phase), ignored by other modes.
+    Noise { mode: NoiseMode, frequency: f32, offset: [f32; 2], param: f32 },
+    /// Fractal stack of a [`NoiseMode`] — like [`NodeKind::Fbm`] but over any
+    /// ported mode.
+    FractalNoise {
+        mode: NoiseMode,
+        octaves: u32,
+        base_frequency: f32,
+        lacunarity: f32,
+        persistence: f32,
+        offset: [f32; 2],
+        param: f32,
+    },
     /// Radial island falloff: `1` near `center`, decaying to `0` past `radius`
     /// with the given `exponent`. Multiply into height for islands.
     RadialFalloff { center: [f32; 2], radius: f32, exponent: f32 },
@@ -249,6 +336,35 @@ impl TerrainGraph {
                 }
                 sum
             }
+            // Ported hash noise is computed in f32 (see `noise_modes` docs) so it
+            // stays character-identical to the WGSL GPU port; `sim`/seed is not
+            // used (features decorrelate via `offset`, matching the GPU path).
+            NodeKind::Noise { mode, frequency, offset, param } => {
+                let px = x as f32 * frequency + offset[0];
+                let pz = z as f32 * frequency + offset[1];
+                crate::noise_modes::eval_mode(*mode, px, pz, *param) as f64
+            }
+            NodeKind::FractalNoise {
+                mode,
+                octaves,
+                base_frequency,
+                lacunarity,
+                persistence,
+                offset,
+                param,
+            } => {
+                let mut freq = *base_frequency;
+                let mut amp = 1.0f32;
+                let mut sum = 0.0f32;
+                for _ in 0..*octaves {
+                    let px = x as f32 * freq + offset[0];
+                    let pz = z as f32 * freq + offset[1];
+                    sum += amp * crate::noise_modes::eval_mode(*mode, px, pz, *param);
+                    freq *= lacunarity;
+                    amp *= persistence;
+                }
+                sum as f64
+            }
             NodeKind::RadialFalloff { center, radius, exponent } => {
                 let dx = x - center[0] as f64;
                 let dz = z - center[1] as f64;
@@ -357,6 +473,8 @@ impl NodeKind {
             | NodeKind::Coord { .. }
             | NodeKind::Simplex2 { .. }
             | NodeKind::Fbm { .. }
+            | NodeKind::Noise { .. }
+            | NodeKind::FractalNoise { .. }
             | NodeKind::RadialFalloff { .. } => vec![],
             NodeKind::Abs { input }
             | NodeKind::ScaleBias { input, .. }

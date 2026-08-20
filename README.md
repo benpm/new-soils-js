@@ -1,9 +1,11 @@
-# new-soils (Rust + Bevy port)
+# New Soils
 
 A Rust/[Bevy](https://bevyengine.org) port of the original Node.js + Three.js
 `new-soils` voxel sandbox. This is a **playable vertical slice** with a
 client/server split: a headless authoritative server generates and serves
 terrain, and a Bevy client streams, meshes, renders, and edits it.
+
+<!-- TODO: Add screenshots! -->
 
 What works today:
 

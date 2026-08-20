@@ -128,7 +128,30 @@ struct LabState {
 
 impl Default for LabState {
     fn default() -> Self {
-        let graph = TerrainGraph::default_soils();
+        // `SOILS_LAB_OPEN=<path.ron>` loads a graph at startup — handy for
+        // scripted verification and for opening a graph directly from the CLI.
+        // A failed load falls back to the default terrain but must SAY so:
+        // a silent fallback would let a scripted run "verify" the wrong graph.
+        let (graph, status, path) = match std::env::var("SOILS_LAB_OPEN") {
+            Ok(p) => {
+                let load = std::fs::read_to_string(&p)
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| ron::from_str::<TerrainGraph>(&text).map_err(|e| e.to_string()))
+                    .and_then(|g| g.validate().map(|_| g));
+                match load {
+                    Ok(g) => (g, format!("Loaded {p}"), Some(std::path::PathBuf::from(p))),
+                    Err(e) => {
+                        eprintln!("SOILS_LAB_OPEN: failed to load {p}: {e}");
+                        (
+                            TerrainGraph::default_soils(),
+                            format!("FAILED to load {p} ({e}); showing default terrain."),
+                            None,
+                        )
+                    }
+                }
+            }
+            Err(_) => (TerrainGraph::default_soils(), "Loaded default terrain.".into(), None),
+        };
         Self {
             edit: EditorGraph::from_terrain_graph(&graph),
             history: History::default(),
@@ -136,8 +159,8 @@ impl Default for LabState {
             previews: NodePreviews::default(),
             graph,
             seed: 0,
-            status: "Loaded default terrain.".into(),
-            path: None,
+            status,
+            path,
             preview: None,
             preview_key: String::new(),
             hmin: 0.0,

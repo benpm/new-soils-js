@@ -1,17 +1,25 @@
 //! Headless proof that the WGSL codegen matches the CPU oracle.
 //!
-//! Builds a **noise-free** terrain graph (Coord/Constant/ScaleBias/Add/Abs/
-//! Clamp/Min/Max/Lerp/Terrace/Power/DomainWarp), generates its compute shader,
-//! runs it on a real wgpu device over a grid of world columns, and compares the
-//! Height buffer to `TerrainGraph::eval_columns` entry-for-entry. Noise nodes
-//! are excluded on purpose: the GPU simplex is only character-equivalent to the
-//! `noise` crate, but every *combinator/modulator* must match exactly — which
-//! is what proves the code generator itself is correct.
+//! Builds a terrain graph exercising the combinators/modulators (Coord/Constant/
+//! ScaleBias/Add/Abs/Clamp/Min/Max/Lerp/Terrace/DomainWarp) *plus* the ported
+//! hash-noise `Noise` modes, generates its compute shader, runs it on a
+//! real wgpu device over a grid of world columns, and compares the Height buffer
+//! to `TerrainGraph::eval_columns` entry-for-entry.
+//!
+//! The `noise` crate `Simplex2`/`Fbm` nodes are still excluded — their GPU
+//! Ashima simplex is only character-equivalent. But the `Noise` modes are
+//! ported to *both* sides in `f32` from the same source, so they must match:
+//! this is what makes the 3D preview agree with the 2D map. We assert every
+//! *continuous* mode (Value/Perlin/Simplex/Worley/Voronoi/Gabor/Crater/Wool/
+//! Stone) with a small tolerance for f32 rounding; the discontinuous `Wavelet`
+//! mode is excluded (see below).
 //!
 //! Skips gracefully when no GPU adapter is available.
 
 use noise::Simplex;
-use soils_worldgen::graph::{Axis, CaveParams, In, Node, NodeKind, Outputs, TerrainGraph};
+use soils_worldgen::graph::{
+    Axis, CaveParams, In, Node, NodeKind, NoiseMode, Outputs, TerrainGraph,
+};
 use wgpu::util::DeviceExt;
 
 // Path hack: pull the codegen straight from the binary crate's source. Keeping
@@ -44,10 +52,37 @@ fn build_graph() -> TerrainGraph {
         node(11, NodeKind::ScaleBias { input: In::from(0), scale: 0.02, bias: 0.0 }),
         node(12, NodeKind::Terrace { input: In::from(11), steps: 4.0 }),
         node(13, NodeKind::Clamp { input: In::from(12), min: 0.0, max: 1.0 }),
+        // Every continuous ported hash-noise mode — CPU/GPU agree to within
+        // f32 rounding. Non-round frequencies keep sample coords off exact
+        // integer cell boundaries.
+        node(14, NodeKind::Noise { mode: NoiseMode::Value, frequency: 0.037, offset: [0.0, 0.0], param: 0.5 }),
+        node(15, NodeKind::Noise { mode: NoiseMode::Perlin, frequency: 0.041, offset: [11.0, -7.0], param: 0.5 }),
+        node(16, NodeKind::Noise { mode: NoiseMode::Gabor, frequency: 0.029, offset: [0.0, 0.0], param: 0.5 }),
+        node(17, NodeKind::Noise { mode: NoiseMode::Worley, frequency: 0.033, offset: [3.0, 5.0], param: 0.5 }),
+        // NB: `Wavelet` is deliberately NOT here — it is *discontinuous* (a
+        // per-cell random rotation with hard cell boundaries), so a 1-ULP coord
+        // difference flips a cell and the value can differ by ~0.02 at boundaries.
+        // That is intrinsic to the algorithm, not a codegen bug; it is validated
+        // by the CPU `modes_are_finite_and_bounded` test + visual screenshots.
+        // Fold the noise into the height so it is read back and compared.
+        node(18, NodeKind::Add { a: In::from(10), b: In::from(14) }),
+        node(19, NodeKind::Add { a: In::from(18), b: In::from(15) }),
+        node(20, NodeKind::Add { a: In::from(19), b: In::from(16) }),
+        node(21, NodeKind::Add { a: In::from(20), b: In::from(17) }),
+        node(22, NodeKind::Noise { mode: NoiseMode::Simplex, frequency: 0.043, offset: [-2.0, 9.0], param: 0.5 }),
+        node(23, NodeKind::Noise { mode: NoiseMode::Voronoi, frequency: 0.031, offset: [0.0, 0.0], param: 0.4 }),
+        node(24, NodeKind::Noise { mode: NoiseMode::Crater, frequency: 0.027, offset: [1.0, -4.0], param: 0.5 }),
+        node(25, NodeKind::Noise { mode: NoiseMode::Wool, frequency: 0.023, offset: [0.0, 0.0], param: 0.5 }),
+        node(26, NodeKind::Noise { mode: NoiseMode::Stone, frequency: 0.021, offset: [6.0, 2.0], param: 0.5 }),
+        node(27, NodeKind::Add { a: In::from(21), b: In::from(22) }),
+        node(28, NodeKind::Add { a: In::from(27), b: In::from(23) }),
+        node(29, NodeKind::Add { a: In::from(28), b: In::from(24) }),
+        node(30, NodeKind::Add { a: In::from(29), b: In::from(25) }),
+        node(31, NodeKind::Add { a: In::from(30), b: In::from(26) }),
     ];
     TerrainGraph {
         nodes,
-        outputs: Outputs { height: In::from(10), rock: None, structure: Some(In::from(13)) },
+        outputs: Outputs { height: In::from(31), rock: None, structure: Some(In::from(13)) },
         caves: CaveParams::default(),
     }
 }
@@ -146,7 +181,9 @@ fn gpu_codegen_matches_cpu_oracle() {
     let gpu: &[f32] = bytemuck::cast_slice(&data);
 
     // --- compare to CPU oracle ---
-    let sim = Simplex::new(0); // unused (no noise nodes) but required by the API
+    // Only the `noise` crate nodes read this; the ported `Noise` modes are
+    // seedless. Still required by the eval API.
+    let sim = Simplex::new(0);
     let mut compared = 0;
     for j in 0..RES {
         for i in 0..RES {

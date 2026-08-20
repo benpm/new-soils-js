@@ -18,7 +18,24 @@
 
 use std::fmt::Write;
 
-use soils_worldgen::graph::{Axis, In, NodeKind, TerrainGraph};
+use soils_worldgen::graph::{Axis, In, NodeKind, NoiseMode, TerrainGraph};
+
+/// The WGSL function name (in `NOISE_PRELUDE`) for a noise mode. Each returns
+/// signed `~[-1, 1]`, matching `soils_worldgen::noise_modes::eval_mode`.
+fn mode_fn(mode: NoiseMode) -> &'static str {
+    match mode {
+        NoiseMode::Value => "nmode_value",
+        NoiseMode::Perlin => "nmode_perlin",
+        NoiseMode::Simplex => "nmode_simplex",
+        NoiseMode::Worley => "nmode_worley",
+        NoiseMode::Voronoi => "nmode_voronoi",
+        NoiseMode::Gabor => "nmode_gabor",
+        NoiseMode::Crater => "nmode_crater",
+        NoiseMode::Wool => "nmode_wool",
+        NoiseMode::Stone => "nmode_stone",
+        NoiseMode::Wavelet => "nmode_wavelet",
+    }
+}
 
 /// The tunable f32 parameters of a node, in the fixed order the shader indexes.
 /// Structural choices (node kind, `Coord` axis, `Fbm` octaves, wiring) are NOT
@@ -30,6 +47,12 @@ pub fn node_params(kind: &NodeKind) -> Vec<f32> {
         NodeKind::Simplex2 { frequency, offset } => vec![frequency, offset[0], offset[1]],
         NodeKind::Fbm { base_frequency, lacunarity, persistence, offset, .. } => {
             vec![base_frequency, lacunarity, persistence, offset[0], offset[1]]
+        }
+        NodeKind::Noise { frequency, offset, param, .. } => {
+            vec![frequency, offset[0], offset[1], param]
+        }
+        NodeKind::FractalNoise { base_frequency, lacunarity, persistence, offset, param, .. } => {
+            vec![base_frequency, lacunarity, persistence, offset[0], offset[1], param]
         }
         NodeKind::RadialFalloff { center, radius, exponent } => {
             vec![center[0], center[1], radius, exponent]
@@ -95,6 +118,9 @@ fn emit_functions(graph: &TerrainGraph) -> String {
 pub fn generate(graph: &TerrainGraph) -> String {
     let mut s = String::new();
     s.push_str(NOISE_PRELUDE);
+    if uses_hash_noise(graph) {
+        s.push_str(HASH_NOISE_PRELUDE);
+    }
     s.push_str("struct View { p: vec4<f32> };\n");
     s.push_str("@group(0) @binding(0) var<uniform> view: View;\n");
     s.push_str("@group(0) @binding(1) var<storage, read> P: array<f32>;\n");
@@ -113,10 +139,22 @@ pub fn generate(graph: &TerrainGraph) -> String {
 pub fn generate_material(graph: &TerrainGraph) -> String {
     let mut s = String::new();
     s.push_str(NOISE_PRELUDE);
+    if uses_hash_noise(graph) {
+        s.push_str(HASH_NOISE_PRELUDE);
+    }
     s.push_str(MATERIAL_HEADER);
     s.push_str(&emit_functions(graph));
     s.push_str(MATERIAL_BODY);
     s
+}
+
+/// Whether any node needs the ported hash-noise library — the ~230-line
+/// `HASH_NOISE_PRELUDE` is only worth parsing when something calls into it.
+fn uses_hash_noise(graph: &TerrainGraph) -> bool {
+    graph
+        .nodes
+        .iter()
+        .any(|n| matches!(n.kind, NodeKind::Noise { .. } | NodeKind::FractalNoise { .. }))
 }
 
 /// Emit `fn node_i(x, z) -> f32 { ... }`.
@@ -141,6 +179,29 @@ fn emit_node(s: &mut String, graph: &TerrainGraph, i: usize, b: usize) {
             b + 1,
             b + 2,
         ),
+        NodeKind::Noise { mode, .. } => {
+            let f = mode_fn(*mode);
+            format!(
+                "return {f}(vec2<f32>(x * P[{b}] + P[{}], z * P[{b}] + P[{}]), P[{}]);",
+                b + 1,
+                b + 2,
+                b + 3,
+            )
+        }
+        NodeKind::FractalNoise { mode, octaves, .. } => {
+            let f = mode_fn(*mode);
+            format!(
+                "var ff = P[{b}]; var amp = 1.0; var acc = 0.0; \
+                 for (var o = 0u; o < {octaves}u; o = o + 1u) {{ \
+                 acc = acc + amp * {f}(vec2<f32>(x * ff + P[{}], z * ff + P[{}]), P[{}]); \
+                 ff = ff * P[{}]; amp = amp * P[{}]; }} return acc;",
+                b + 3,
+                b + 4,
+                b + 5,
+                b + 1,
+                b + 2,
+            )
+        }
         NodeKind::RadialFalloff { .. } => format!(
             "let dx = x - P[{b}]; let dz = z - P[{}]; \
              let d = sqrt(dx * dx + dz * dz) / max(P[{}], 1e-6); \
@@ -274,6 +335,239 @@ fn snoise2(v: vec2<f32>) -> f32 {
     g.y = gyz.x; g.z = gyz.y;
     return 130.0 * dot(m, g);
 }
+"#;
+
+/// Hash-based noise ported from `noise.glsl` — the WGSL twin of
+/// `soils_worldgen::noise_modes`. Computed in `f32` with an integer-lattice hash
+/// (`nm_ihash`), so it is character-identical to the CPU oracle down to f32
+/// rounding (see that module's docs for why the GLSL `floatBitsToUint` scheme is
+/// avoided). Each `nmode_*` wrapper returns signed `~[-1, 1]`; `emit_node` calls
+/// the one the node's `NoiseMode` selects.
+const HASH_NOISE_PRELUDE: &str = r#"
+const NM_INV_U32: f32 = 1.0 / 4294967296.0;
+fn nm_ihash(ix: i32, iy: i32) -> u32 {
+    var h = bitcast<u32>(ix) * 3242174889u + bitcast<u32>(iy) * 2447445413u;
+    h = h ^ (h >> 16u);
+    h = h * 2246822507u;
+    h = h ^ (h >> 13u);
+    h = h * 3266489909u;
+    h = h ^ (h >> 16u);
+    return h;
+}
+fn nm_lcg(h: u32) -> u32 { return h * 1664525u + 1013904223u; }
+fn nm_hash12(p: vec2<f32>) -> f32 {
+    return f32(nm_ihash(i32(p.x), i32(p.y))) * NM_INV_U32;
+}
+fn nm_hash22(p: vec2<f32>) -> vec2<f32> {
+    let h = nm_ihash(i32(p.x), i32(p.y));
+    return vec2<f32>(f32(h), f32(nm_lcg(h))) * NM_INV_U32;
+}
+fn nm_hash32(p: vec2<f32>) -> vec3<f32> {
+    let h = nm_ihash(i32(p.x), i32(p.y));
+    let h2 = nm_lcg(h);
+    let h3 = nm_lcg(h2);
+    return vec3<f32>(f32(h), f32(h2), f32(h3)) * NM_INV_U32;
+}
+fn nm_sstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+fn nm_value12(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    var f = p - i;
+    f = f * f * (vec2<f32>(3.0) - 2.0 * f);
+    return mix(mix(nm_hash12(i), nm_hash12(i + vec2<f32>(1.0, 0.0)), f.x),
+               mix(nm_hash12(i + vec2<f32>(0.0, 1.0)), nm_hash12(i + vec2<f32>(1.0, 1.0)), f.x), f.y);
+}
+fn nm_perlin12(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = p - i;
+    let u = f * f * f * (vec2<f32>(10.0) + f * (6.0 * f - 15.0));
+    let ga = normalize(nm_hash22(i + vec2<f32>(0.0, 0.0)) - 0.5);
+    let gb = normalize(nm_hash22(i + vec2<f32>(1.0, 0.0)) - 0.5);
+    let gc = normalize(nm_hash22(i + vec2<f32>(0.0, 1.0)) - 0.5);
+    let gd = normalize(nm_hash22(i + vec2<f32>(1.0, 1.0)) - 0.5);
+    let a = dot(ga, f - vec2<f32>(0.0, 0.0));
+    let b = dot(gb, f - vec2<f32>(1.0, 0.0));
+    let c = dot(gc, f - vec2<f32>(0.0, 1.0));
+    let d = dot(gd, f - vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y) * 0.7 + 0.5;
+}
+fn nm_perlin12d(p: vec2<f32>) -> vec3<f32> {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+    let ga = nm_hash22(i + vec2<f32>(0.0, 0.0)) * 2.0 - 1.0;
+    let gb = nm_hash22(i + vec2<f32>(1.0, 0.0)) * 2.0 - 1.0;
+    let gc = nm_hash22(i + vec2<f32>(0.0, 1.0)) * 2.0 - 1.0;
+    let gd = nm_hash22(i + vec2<f32>(1.0, 1.0)) * 2.0 - 1.0;
+    let va = dot(ga, f - vec2<f32>(0.0, 0.0));
+    let vb = dot(gb, f - vec2<f32>(1.0, 0.0));
+    let vc = dot(gc, f - vec2<f32>(0.0, 1.0));
+    let vd = dot(gd, f - vec2<f32>(1.0, 1.0));
+    let value = va + u.x * (vb - va) + u.y * (vc - va) + u.x * u.y * (va - vb - vc + vd);
+    let k = va - vb - vc + vd;
+    let deriv = ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd)
+        + du * (u.yx * k + vec2<f32>(vb, vc) - va);
+    return vec3<f32>(value, deriv.x, deriv.y);
+}
+fn nm_simplex12(p: vec2<f32>) -> f32 {
+    let i = floor(p + (p.x + p.y) * 0.366025);
+    let a = p - i + (i.x + i.y) * 0.211324;
+    let m = step(a.y, a.x);
+    let o = vec2<f32>(m, 1.0 - m);
+    let b = a - o + 0.211324;
+    let c = a - 0.577351;
+    let h = max(vec3<f32>(0.5) - vec3<f32>(dot(a, a), dot(b, b), dot(c, c)), vec3<f32>(0.0));
+    let n = h * h * h * h * vec3<f32>(dot(a, nm_hash22(i) - 0.5),
+                                      dot(b, nm_hash22(i + o) - 0.5),
+                                      dot(c, nm_hash22(i + 1.0) - 0.5));
+    return dot(n, vec3<f32>(70.0)) + 0.5;
+}
+fn nm_worley12(pp: vec2<f32>) -> f32 {
+    let i = floor(pp);
+    let p = pp - i;
+    var w = 1e6;
+    for (var x = -1; x <= 1; x = x + 1) {
+        for (var y = -1; y <= 1; y = y + 1) {
+            let g = vec2<f32>(f32(x), f32(y));
+            let hh = nm_hash12(i + g);
+            let c = p - g - vec2<f32>(hh);
+            w = min(w, dot(c, c));
+        }
+    }
+    return 1.0 - sqrt(w);
+}
+fn nm_voronoi12(x: vec2<f32>, sm: f32) -> f32 {
+    let s = 1.0 / max(sm, 1e-3);
+    let p = floor(x);
+    let f = x - p;
+    var va = 0.0;
+    var wt = 0.0;
+    for (var xi = -1; xi <= 1; xi = xi + 1) {
+        for (var yi = -1; yi <= 1; yi = yi + 1) {
+            let g = vec2<f32>(f32(xi), f32(yi));
+            let o = nm_hash32(p + g);
+            let d = length(g - f + o.xy);
+            let ww = pow(nm_sstep(1.414, 0.0, d), s);
+            va = va + o.z * ww;
+            wt = wt + ww;
+        }
+    }
+    return va / max(wt, 1e-6);
+}
+fn nm_sinr(a: f32) -> f32 {
+    return sin(a - round(a * 0.15915494) * 6.2831855);
+}
+fn nm_gabor12(p: vec2<f32>) -> f32 {
+    let kF = 8.0;
+    let i = floor(p);
+    var f = p - i;
+    f = f * f * (vec2<f32>(3.0) - 2.0 * f);
+    let s00 = nm_sinr(kF * dot(p, nm_hash22(i + vec2<f32>(0.0, 0.0))));
+    let s10 = nm_sinr(kF * dot(p, nm_hash22(i + vec2<f32>(1.0, 0.0))));
+    let s01 = nm_sinr(kF * dot(p, nm_hash22(i + vec2<f32>(0.0, 1.0))));
+    let s11 = nm_sinr(kF * dot(p, nm_hash22(i + vec2<f32>(1.0, 1.0))));
+    return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
+}
+fn nm_crater12(pin: vec2<f32>) -> f32 {
+    let f = fract(pin);
+    let p = floor(pin);
+    var va = 0.0;
+    var wt = 0.0;
+    for (var i = -2; i <= 2; i = i + 1) {
+        for (var j = -2; j <= 2; j = j + 1) {
+            let g = vec2<f32>(f32(i), f32(j));
+            let o = nm_hash22(p + g);
+            let d = length(f - g - o);
+            let w = exp(-4.0 * d);
+            va = va + w * sin(6.28 * sqrt(max(d, 0.06)));
+            wt = wt + w;
+        }
+    }
+    return abs(va / wt);
+}
+fn nm_fbm_wool(pin: vec2<f32>) -> vec2<f32> {
+    var p = pin;
+    var s = vec2<f32>(0.0);
+    var m = 0.0;
+    var a = 1.0;
+    for (var i = 0; i < 6; i = i + 1) {
+        let nd = nm_perlin12d(p);
+        s = s + a * nd.yz;
+        m = m + a;
+        a = a * 0.5;
+        p = p * 2.0;
+    }
+    return s / m;
+}
+fn nm_wool12(p: vec2<f32>) -> f32 {
+    let n = nm_fbm_wool(p);
+    return max(abs(n.x), abs(n.y));
+}
+fn nm_fbm_stone(pin: vec2<f32>) -> vec3<f32> {
+    var p = pin;
+    var s = vec3<f32>(0.0);
+    var a = 1.0;
+    for (var i = 0; i < 6; i = i + 1) {
+        s = s + a * nm_perlin12d(p);
+        a = a * 0.5;
+        p = p * 2.0;
+    }
+    return s;
+}
+fn nm_fbm12(pin: vec2<f32>, octaves: i32) -> f32 {
+    var p = pin;
+    var s = 0.0;
+    var m = 0.0;
+    var a = 1.0;
+    for (var i = 0; i < octaves; i = i + 1) {
+        s = s + a * nm_perlin12(p);
+        m = m + a;
+        a = a * 0.5;
+        p = p * 2.0;
+    }
+    return s / m;
+}
+fn nm_stone12(p: vec2<f32>) -> f32 {
+    let d = nm_fbm_stone(p);
+    return nm_fbm12(p + d.yz * 0.4, 6);
+}
+fn nm_wavelet12(pin: vec2<f32>, phase: f32) -> f32 {
+    let scale = 1.24;
+    var p = pin;
+    var d = 0.0;
+    var s = 1.0;
+    var m = 0.0;
+    for (var i = 0; i < 4; i = i + 1) {
+        let fi = f32(i);
+        let q0 = p * s;
+        var g = fract(floor(q0) * vec2<f32>(123.34, 233.53));
+        let gd = dot(g, g + vec2<f32>(23.234));
+        g = g + vec2<f32>(gd);
+        let a = fract(g.x * g.y) * 1000.0;
+        let ca = cos(a);
+        let sa = sin(a);
+        let r = fract(q0) - vec2<f32>(0.5);
+        let q = vec2<f32>(r.x * ca - r.y * sa, r.x * sa + r.y * ca);
+        d = d + sin(q.x * 10.0 + phase) * nm_sstep(0.25, 0.0, dot(q, q)) / s;
+        p = vec2<f32>(0.54 * p.x - 0.84 * p.y + fi, 0.84 * p.x + 0.54 * p.y + fi);
+        m = m + 1.0 / s;
+        s = s * scale;
+    }
+    return d / m;
+}
+fn nmode_value(p: vec2<f32>, prm: f32) -> f32 { return nm_value12(p) * 2.0 - 1.0; }
+fn nmode_perlin(p: vec2<f32>, prm: f32) -> f32 { return nm_perlin12(p) * 2.0 - 1.0; }
+fn nmode_simplex(p: vec2<f32>, prm: f32) -> f32 { return nm_simplex12(p) * 2.0 - 1.0; }
+fn nmode_worley(p: vec2<f32>, prm: f32) -> f32 { return nm_worley12(p) * 2.0 - 1.0; }
+fn nmode_voronoi(p: vec2<f32>, prm: f32) -> f32 { return nm_voronoi12(p, prm) * 2.0 - 1.0; }
+fn nmode_gabor(p: vec2<f32>, prm: f32) -> f32 { return nm_gabor12(p); }
+fn nmode_crater(p: vec2<f32>, prm: f32) -> f32 { return nm_crater12(p) * 2.0 - 1.0; }
+fn nmode_wool(p: vec2<f32>, prm: f32) -> f32 { return nm_wool12(p) * 2.0 - 1.0; }
+fn nmode_stone(p: vec2<f32>, prm: f32) -> f32 { return nm_stone12(p) * 2.0 - 1.0; }
+fn nmode_wavelet(p: vec2<f32>, prm: f32) -> f32 { return nm_wavelet12(p, prm); }
 "#;
 
 /// The compute entry point. Fixed regardless of graph. Used by [`generate`].

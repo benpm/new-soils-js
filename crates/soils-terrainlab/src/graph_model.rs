@@ -326,6 +326,26 @@ fn build_kind(node: &EditorNode, input: impl Fn(usize) -> In) -> NodeKind {
         EditorNode::Fbm { octaves, base_frequency, lacunarity, persistence, offset } => {
             NodeKind::Fbm { octaves, base_frequency, lacunarity, persistence, offset }
         }
+        EditorNode::Noise { mode, frequency, offset, param } => {
+            NodeKind::Noise { mode, frequency, offset, param }
+        }
+        EditorNode::FractalNoise {
+            mode,
+            octaves,
+            base_frequency,
+            lacunarity,
+            persistence,
+            offset,
+            param,
+        } => NodeKind::FractalNoise {
+            mode,
+            octaves,
+            base_frequency,
+            lacunarity,
+            persistence,
+            offset,
+            param,
+        },
         EditorNode::RadialFalloff { center, radius, exponent } => {
             NodeKind::RadialFalloff { center, radius, exponent }
         }
@@ -355,6 +375,26 @@ fn editor_from_kind(kind: &NodeKind) -> EditorNode {
         NodeKind::Fbm { octaves, base_frequency, lacunarity, persistence, offset } => {
             EditorNode::Fbm { octaves, base_frequency, lacunarity, persistence, offset }
         }
+        NodeKind::Noise { mode, frequency, offset, param } => {
+            EditorNode::Noise { mode, frequency, offset, param }
+        }
+        NodeKind::FractalNoise {
+            mode,
+            octaves,
+            base_frequency,
+            lacunarity,
+            persistence,
+            offset,
+            param,
+        } => EditorNode::FractalNoise {
+            mode,
+            octaves,
+            base_frequency,
+            lacunarity,
+            persistence,
+            offset,
+            param,
+        },
         NodeKind::RadialFalloff { center, radius, exponent } => {
             EditorNode::RadialFalloff { center, radius, exponent }
         }

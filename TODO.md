@@ -1,4 +1,8 @@
-# Todo
+# Todo - main
+Commit each task. Test before commit. Each header is a different project, likely needing its own branch. After completing tasks, move them to CHANGELOG.md
+
+Other todo files:
+- [`crates/soils-terrainlab/TODO.md`](crates/soils-terrainlab/TODO.md)
 
 ## BigRefactor
 

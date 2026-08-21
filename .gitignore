@@ -7,4 +7,4 @@ data/
 scripts/.cache/
 # AssemblyScript toolchain for server scripts (package.json pins the version;
 # run `npm install` to get `asc` so .ts scripts compile).
-node_modules/
+node_modules/*.stackdump

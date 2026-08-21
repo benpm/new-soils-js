@@ -1,5 +1,11 @@
 # Plan: rendering & lighting — baked + dynamic split, cheap server-side lighting
 
+> **Status (2026-07-04): implemented.** L0 baked light, renderer hygiene, server-side
+> lighting queries, and RC GI upgrades 1/2/4/5 all shipped (TODO phases 2–3, 9, 12);
+> RC items 3 (3D-texture + DDA) and default-on are deferred with rationale in
+> `TODO.md`. Current state: `architecture.md`; measurements: `perf-report.md`.
+> The "current state" described below is the *pre-plan* snapshot, kept for context.
+
 Separate note from `plan-game-systems.md`. Current state (details in `analysis.md`): terrain is
 unlit with a constant 45 klux brightness, day/night is exposure-only, shadows are off, AO is
 meshed-in, and the *only* real light transport is the opt-in radiance-cascades (RC) GI — a 64³

@@ -33,11 +33,13 @@ async fn spawn_login_and_stream_chunks() {
     .await;
 
     assert!(server.data_dir.join("accounts.bin").is_file());
-    // Generated + edited chunks persist ASYNCHRONOUSLY on the background
-    // writer, so poll for the region file rather than asserting immediately.
+    // Pristine chunks are never persisted (worldgen v2 regenerates them);
+    // the edit above persists via the dirty flush, which is guaranteed to
+    // have run once the server shuts down.
     let regions = server.data_dir.join("worlds").join("default").join("regions");
+    server.handle.shutdown_and_wait();
     assert!(
         wait_until(|| regions.is_dir(), Duration::from_secs(3)),
-        "generated/edited chunks should persist to a region file"
+        "edited chunks should persist to a region file by shutdown"
     );
 }

@@ -4,13 +4,11 @@
 //! `soils-sim`, shared with (future) server-side validation.
 
 use bevy::prelude::*;
-use bevy::render::storage::ShaderStorageBuffer;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use soils_protocol::{CHUNK_BIT, CHUNK_CLIP, ClientMsg};
 use soils_sim::{raycast_voxel, validate_edit};
 
 use crate::chunk::{Blocks, ChunkMap, VoxelChunk, voxel_at};
-use crate::gpu_mesh::{self, GpuChunk};
 use crate::light::LightQueue;
 use crate::net::NetClient;
 use crate::player::Player;
@@ -126,9 +124,11 @@ pub fn edit_blocks(
     registry: Res<Blocks>,
     hotbar: Res<Hotbar>,
     map: Res<ChunkMap>,
+    mut directory: ResMut<crate::demand::ChunkDirectory>,
     mut chunks: Query<&mut VoxelChunk>,
-    mut gpu_chunks: Query<&mut GpuChunk>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut slots: ResMut<crate::pool::ChunkSlots>,
+    mut pool_ops: ResMut<crate::pool::PoolOpQueue>,
+    mut dirty_mesh: ResMut<crate::pool::DirtyMesh>,
     mut light_queue: ResMut<LightQueue>,
     mut pending: ResMut<PendingEdits>,
     camera: Query<&Transform, With<Player>>,
@@ -173,7 +173,12 @@ pub fn edit_blocks(
         let ro = chunks.as_readonly();
         voxel_at(&map, &ro, target)
     };
-    apply_edit(&map, &mut chunks, &mut gpu_chunks, &mut buffers, target, value);
+    directory.edited.insert(IVec3::new(
+        target.x >> CHUNK_BIT,
+        target.y >> CHUNK_BIT,
+        target.z >> CHUNK_BIT,
+    ));
+    apply_edit(&map, &mut chunks, &mut slots, &mut pool_ops, &mut dirty_mesh, target, value);
     light_queue.edits.push(target);
     pending.next_seq += 1;
     let seq = pending.next_seq;
@@ -188,8 +193,9 @@ pub fn apply_edit_acks(
     mut pending: ResMut<PendingEdits>,
     map: Res<ChunkMap>,
     mut chunks: Query<&mut VoxelChunk>,
-    mut gpu_chunks: Query<&mut GpuChunk>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut slots: ResMut<crate::pool::ChunkSlots>,
+    mut pool_ops: ResMut<crate::pool::PoolOpQueue>,
+    mut dirty_mesh: ResMut<crate::pool::DirtyMesh>,
     mut light_queue: ResMut<LightQueue>,
 ) {
     for msg in reader.read() {
@@ -200,28 +206,58 @@ pub fn apply_edit_acks(
         }
         // Roll back unless a later pending edit owns this voxel now.
         if !pending.list.iter().any(|(_, p, _)| *p == pos) {
-            apply_edit(&map, &mut chunks, &mut gpu_chunks, &mut buffers, pos, prev);
+            apply_edit(&map, &mut chunks, &mut slots, &mut pool_ops, &mut dirty_mesh, pos, prev);
             light_queue.edits.push(pos);
         }
     }
 }
 
-/// Apply an edit to a local chunk: update the CPU voxels, re-upload the GPU
-/// voxel buffer, and mark the chunk dirty so the compute mesher regenerates it.
+/// Apply an edit to a local chunk: update the CPU voxels, write the changed
+/// u32 word through to the pooled voxel buffer, and queue a remesh of the
+/// chunk (plus AO-visible neighbors when the voxel touches a border).
 pub fn apply_edit(
     map: &ChunkMap,
     chunks: &mut Query<&mut VoxelChunk>,
-    gpu_chunks: &mut Query<&mut GpuChunk>,
-    buffers: &mut Assets<ShaderStorageBuffer>,
+    slots: &mut crate::pool::ChunkSlots,
+    pool_ops: &mut crate::pool::PoolOpQueue,
+    dirty_mesh: &mut crate::pool::DirtyMesh,
     v: IVec3,
     value: u8,
 ) {
     let cpos = IVec3::new(v.x >> CHUNK_BIT, v.y >> CHUNK_BIT, v.z >> CHUNK_BIT);
     let Some(&e) = map.map.get(&cpos) else { return };
     let Ok(mut chunk) = chunks.get_mut(e) else { return };
-    chunk.volume.set(v.x & CHUNK_CLIP, v.y & CHUNK_CLIP, v.z & CHUNK_CLIP, value);
-    let vol = chunk.volume.clone();
-    if let Ok(mut gc) = gpu_chunks.get_mut(e) {
-        gpu_mesh::refresh_gpu_chunk(buffers, &mut gc, &vol);
-    }
+    let l = IVec3::new(v.x & CHUNK_CLIP, v.y & CHUNK_CLIP, v.z & CHUNK_CLIP);
+    chunk.volume.set(l.x, l.y, l.z, value);
+
+    // An air chunk gaining its first solid voxel needs a mesh slot now.
+    let mesh = match slots.get(cpos) {
+        Some(s) if s.mesh != crate::pool::NO_MESH => s.mesh,
+        Some(_) => match slots.ensure_mesh(cpos) {
+            Some(m) => {
+                let s = slots.get(cpos).expect("just ensured");
+                pool_ops.push(crate::pool::PoolOp::UploadVoxels {
+                    mesh: m,
+                    volume: chunk.volume.clone(),
+                });
+                pool_ops.push(crate::pool::PoolOp::WriteMeshInfo { mesh: m, cpos, slot: s.slot });
+                pool_ops.push(crate::pool::PoolOp::WriteDesc { slot: s.slot, cpos, mesh: m });
+                dirty_mesh.0.push(m);
+                return;
+            }
+            None => return,
+        },
+        None => return,
+    };
+    let idx = ((l.y + l.z * 32) * 32 + l.x) as u32;
+    let word_idx = idx >> 2;
+    let base = (word_idx * 4) as usize;
+    let bytes = chunk.volume.as_bytes();
+    let word = u32::from_le_bytes([bytes[base], bytes[base + 1], bytes[base + 2], bytes[base + 3]]);
+    pool_ops.push(crate::pool::PoolOp::WriteVoxelWord { mesh, word_idx, word });
+    dirty_mesh.0.push(mesh);
+    // The mesher's AO probes read 1 voxel out-of-chunk (air today), but the
+    // CPU volumes are per-chunk; border edits still change *this* chunk's own
+    // faces only, so only it remeshes. (Neighbor-aware meshing is a later
+    // phase.)
 }

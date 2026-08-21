@@ -38,23 +38,29 @@ async fn stream_around(_tx: &mut Tx, rx: &mut Rx, spawn: [f32; 3]) -> (usize, us
 
     let mut received = 0;
     let mut solid = 0usize;
-    let mut count = |c: soils_protocol::ChunkData, want: &mut std::collections::HashSet<_>| {
-        if want.remove(&c.pos) {
+    let tg = soils_worldgen::TerrainGen::new(0, soils_worldgen::WorldType::Normal);
+    let registry = soils_worldgen::default_registry();
+    let mut count = |c: soils_protocol::ChunkInfo, want: &mut std::collections::HashSet<_>| {
+        if want.remove(&c.pos()) {
             received += 1;
-            let vol = soils_protocol::decode_chunk(&c.payload).expect("payload decodes");
+            let vol = match c {
+                soils_protocol::ChunkInfo::Edited { payload, .. } => {
+                    soils_protocol::decode_chunk(&payload).expect("payload decodes")
+                }
+                soils_protocol::ChunkInfo::Pristine { pos } => {
+                    tg.generate(glam::IVec3::from_array(pos), &registry)
+                }
+            };
             solid += vol.as_bytes().iter().filter(|&&v| v != 0).count();
         }
     };
     while !want.is_empty() {
         let Some(Ok(Message::Binary(b))) = rx.next().await else { break };
         match decode(b.as_ref()) {
-            Some(ServerMsg::Bundle { chunks }) => {
+            Some(ServerMsg::Manifest { chunks }) => {
                 for c in chunks {
                     count(c, &mut want);
                 }
-            }
-            Some(ServerMsg::Chunk { pos, payload }) => {
-                count(soils_protocol::ChunkData { pos, payload }, &mut want);
             }
             _ => {} // ignore Time / ActorUpdate while streaming
         }
@@ -70,12 +76,12 @@ async fn main() {
     let (mut tx, mut rx) = ws.split();
 
     // Sign up (idempotent for matching credentials, so this also "logs in").
-    send(&mut tx, ClientMsg::Login { name: "smoke".into(), password: "pw".into(), signup: true }).await;
+    send(&mut tx, ClientMsg::Login { name: "smoke".into(), password: "pw".into(), signup: true, protocol: soils_protocol::PROTOCOL_VERSION }).await;
     let mut spawn = [0.0f32; 3];
     while let Some(Ok(Message::Binary(b))) = rx.next().await {
         match decode(b.as_ref()) {
-            Some(ServerMsg::Init { id, spawn: s, seed, daytime, .. }) => {
-                println!("Init: id={id} spawn={s:?} seed={seed} daytime={daytime}");
+            Some(ServerMsg::Init { id, spawn: s, worldgen, daytime, .. }) => {
+                println!("Init: id={id} spawn={s:?} gen={worldgen:?} daytime={daytime}");
                 spawn = s;
                 break;
             }
@@ -94,7 +100,7 @@ async fn main() {
     send(&mut tx, ClientMsg::Warp { world: "smoke-nether".into() }).await;
     let mut warp_spawn = spawn;
     while let Some(Ok(Message::Binary(b))) = rx.next().await {
-        if let Some(ServerMsg::Warp { spawn: s, daytime }) = decode(b.as_ref()) {
+        if let Some(ServerMsg::Warp { spawn: s, daytime, .. }) = decode(b.as_ref()) {
             println!("Warp: spawn={s:?} daytime={daytime}");
             warp_spawn = s;
             break;

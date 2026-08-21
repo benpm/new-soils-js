@@ -48,6 +48,7 @@ pub struct PreviewInput {
     pub graph: Option<TerrainGraph>,
     pub hmin: f32,
     pub hmax: f32,
+    pub seed: u32,
 }
 
 #[derive(Clone, ShaderType)]
@@ -133,7 +134,7 @@ fn setup(
         Shader::from_wgsl(wgsl_gen::generate_material(&flat), "terrain_preview.wgsl"),
     );
 
-    let params = buffers.add(ShaderStorageBuffer::from(vec![0.0f32]));
+    let params = buffers.add(ShaderStorageBuffer::from(vec![0i32]));
     let step = SPAN / RES as f32;
     let material = materials.add(TerrainMaterial {
         params: params.clone(),
@@ -198,16 +199,17 @@ fn sync_terrain(
     // Params buffer (values only).
     let mut params = wgsl_gen::collect_params(graph);
     if params.is_empty() {
-        params.push(0.0);
+        params.push(0);
     }
     if let Some(buf) = buffers.get_mut(&state.params) {
         buf.data = Some(bytemuck::cast_slice(&params).to_vec());
     }
 
-    // Colour range.
+    // Colour range + seed (bit-passed through the f32 uniform).
     if let Some(mat) = materials.get_mut(&state.material) {
         mat.pv.b.x = input.hmin;
         mat.pv.b.y = input.hmax.max(input.hmin + 1.0);
+        mat.pv.b.z = f32::from_bits(input.seed);
     }
 }
 

@@ -19,7 +19,6 @@ use std::collections::{HashMap, HashSet};
 
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 use bevy_egui::egui;
-use noise::Simplex;
 use soils_worldgen::graph::TerrainGraph;
 
 /// Thumbnail resolution (computed and displayed square).
@@ -105,10 +104,9 @@ impl NodePreviews {
                 let graph = graph.clone();
                 let pool = AsyncComputeTaskPool::get();
                 self.task = Some(pool.spawn(async move {
-                    let sim = Simplex::new(seed);
                     stale
                         .into_iter()
-                        .map(|(sig, node)| (sig, render_field(&graph, &sim, node)))
+                        .map(|(sig, node)| (sig, render_field(&graph, seed, node)))
                         .collect()
                 }));
             }
@@ -120,15 +118,23 @@ impl NodePreviews {
 
 /// Sample a node's field on a `PREVIEW_N`² grid, normalise to its own min→max,
 /// and write grayscale RGBA. Pure CPU — runs inside the background task.
-fn render_field(graph: &TerrainGraph, sim: &Simplex, node: usize) -> Vec<u8> {
+fn render_field(graph: &TerrainGraph, seed: u32, node: usize) -> Vec<u8> {
     let n = PREVIEW_N;
+    let compiled = graph.compile().ok();
     let mut vals = vec![0f64; n * n];
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for j in 0..n {
         for i in 0..n {
             let x = (i as f64 / (n - 1) as f64 - 0.5) * PREVIEW_SPAN;
             let z = (j as f64 / (n - 1) as f64 - 0.5) * PREVIEW_SPAN;
-            let s = graph.field_at(sim, node, x, z);
+            let s = compiled.as_ref().map_or(0.0, |c| {
+                soils_worldgen::fx::to_f32(c.node_fx(
+                    seed,
+                    node,
+                    (x * 65536.0).round() as i32,
+                    (z * 65536.0).round() as i32,
+                )) as f64
+            });
             let s = if s.is_finite() { s } else { 0.0 };
             vals[j * n + i] = s;
             lo = lo.min(s);

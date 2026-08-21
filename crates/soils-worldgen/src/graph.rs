@@ -1,6 +1,7 @@
-//! A serializable node graph describing terrain generation, plus a CPU
-//! evaluator that is the **oracle** for the GPU codegen in `soils-terrainlab`
-//! (exactly as `greedy.rs` is the oracle for `voxel_mesh.wgsl`).
+//! A serializable node graph describing terrain generation, plus the compiled
+//! fixed-point evaluator ([`CompiledGraph`]) that is **bit-exact** with the
+//! WGSL codegen in [`crate::wgsl`] — CPU (client + server) and GPU generate
+//! identical chunks from a seed (worldgen v2).
 //!
 //! # Model
 //!
@@ -18,11 +19,13 @@
 //! simplex carve ([`CaveParams`]) because the node graph itself is 2D.
 //!
 //! [`TerrainGraph::default_soils`] reconstructs the original hardcoded
-//! `terrain.rs` formulas node-for-node, so the shipped game is byte-identical
-//! after the refactor.
+//! `terrain.rs` formulas node-for-node (character-equivalent under the v2
+//! noise core).
 
-use noise::{NoiseFn, Simplex};
 use serde::{Deserialize, Serialize};
+
+use crate::fx::{self, Fx};
+use crate::noise_det;
 
 /// Index of a node within [`TerrainGraph::nodes`]. The canonical form keeps
 /// `nodes[i].id == i`; [`TerrainGraph::validate`] enforces this.
@@ -37,8 +40,9 @@ pub enum Axis {
 
 /// A base noise function for [`NodeKind::Noise`] / [`NodeKind::FractalNoise`],
 /// ported from `noise.glsl` to both the CPU ([`crate::noise_modes`]) and the
-/// GPU (`soils-terrainlab::wgsl_gen`) so the two agree. All output signed
-/// `~[-1, 1]`.
+/// GPU (`crate::wgsl`'s `HASH_NOISE`) so the two agree. All output signed
+/// `~[-1, 1]`. Design-tool only for now: f32-evaluated, so not bit-exact
+/// across devices — see [`TerrainGraph::deterministic`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NoiseMode {
     /// Smooth value noise (Hermite-interpolated cell hashes).
@@ -139,9 +143,10 @@ pub enum NodeKind {
     Constant { value: f32 },
     /// The world coordinate along `axis`.
     Coord { axis: Axis },
-    /// 2D simplex sampled at `(x, z) * frequency + offset`. `offset` gives a
-    /// cheap way to decorrelate octaves/features without reseeding the shared
-    /// `Simplex` (which the game seeds once).
+    /// 2D gradient noise sampled at `(x, z) * frequency + offset`. `offset`
+    /// gives a cheap way to decorrelate octaves/features without a second
+    /// seed. (Named for the original simplex implementation; v2 evaluates
+    /// `noise_det::noise2`, the deterministic fixed-point core.)
     Simplex2 { frequency: f32, offset: [f32; 2] },
     /// Fractal Brownian motion: `octaves` of simplex with `lacunarity` /
     /// `persistence`, the node the original `terrain.rs` hand-unrolled.
@@ -220,8 +225,11 @@ pub struct CaveParams {
 
 impl Default for CaveParams {
     fn default() -> Self {
-        // Mirrors the original: n3(gx/45, gy/45, gz/45).abs() > 0.7.
-        Self { enabled: true, frequency: 1.0 / 45.0, threshold: 0.7 }
+        // Wavelength ~45 voxels like the original. The threshold is tuned to
+        // the v2 noise's amplitude distribution: measured densities over deep
+        // chunks (see terrain::tests::measure_cave_density) — 0.50 → 2.2%,
+        // 0.52 → ~1.5%, 0.55 → 0.9% — targeting the original's ~1-2%.
+        Self { enabled: true, frequency: 1.0 / 45.0, threshold: 0.52 }
     }
 }
 
@@ -247,8 +255,9 @@ pub struct ColumnSample {
 }
 
 impl TerrainGraph {
-    /// Check the canonical invariant (`nodes[i].id == i`) and that every wired
-    /// input references an existing node. Returns the first problem found.
+    /// Check the canonical invariant (`nodes[i].id == i`), that every wired
+    /// input references an existing node, and that every node kind is
+    /// supported by the deterministic v2 evaluator. Returns the first problem.
     pub fn validate(&self) -> Result<(), String> {
         for (i, n) in self.nodes.iter().enumerate() {
             if n.id != i {
@@ -263,6 +272,14 @@ impl TerrainGraph {
             }
         };
         for node in &self.nodes {
+            // Power / RadialFalloff need pow/sqrt, which have no fixed-point
+            // WGSL mirror yet (worldgen v2 must be bit-exact CPU==GPU).
+            if matches!(node.kind, NodeKind::Power { .. } | NodeKind::RadialFalloff { .. }) {
+                return Err(format!(
+                    "node {} kind is not supported by deterministic worldgen v2 yet",
+                    node.id
+                ));
+            }
             for slot in node.kind.inputs() {
                 check(slot)?;
             }
@@ -277,133 +294,150 @@ impl TerrainGraph {
         Ok(())
     }
 
-    /// Evaluate a single node's output field at world column `(x, z)`. Lets a
-    /// design tool preview intermediate nodes, not just the named outputs.
-    /// `node` is an index into [`Self::nodes`].
-    pub fn field_at(&self, sim: &Simplex, node: NodeId, x: f64, z: f64) -> f64 {
-        self.eval_node(sim, node, x, z)
-    }
-
-    /// Evaluate the surface channels at world column `(x, z)`.
-    pub fn eval_columns(&self, sim: &Simplex, x: f64, z: f64) -> ColumnSample {
-        ColumnSample {
-            height: self.eval_in(sim, &self.outputs.height, x, z),
-            rock: self.outputs.rock.as_ref().map_or(0.0, |s| self.eval_in(sim, s, x, z)),
-            structure: self.outputs.structure.as_ref().map_or(0.0, |s| self.eval_in(sim, s, x, z)),
-        }
-    }
-
-    /// True if a cave should carve air at world voxel `(x, y, z)`.
-    pub fn cave_carves(&self, sim: &Simplex, x: f64, y: f64, z: f64) -> bool {
-        let c = self.caves;
-        if !c.enabled {
-            return false;
-        }
-        let f = c.frequency as f64;
-        sim.get([x * f, y * f, z * f]).abs() > c.threshold as f64
-    }
-
-    /// Evaluate an input slot: its wired node, or its literal fallback.
-    fn eval_in(&self, sim: &Simplex, slot: &In, x: f64, z: f64) -> f64 {
-        match slot.node {
-            Some(id) => self.eval_node(sim, id, x, z),
-            None => slot.default as f64,
-        }
-    }
-
-    /// Recursively evaluate node `id` at coordinate `(x, z)`. The graph is a
-    /// DAG, so recursion terminates; `validate` guards the id references.
-    fn eval_node(&self, sim: &Simplex, id: NodeId, x: f64, z: f64) -> f64 {
-        let ev = |slot: &In, x: f64, z: f64| self.eval_in(sim, slot, x, z);
-        match &self.nodes[id].kind {
-            NodeKind::Constant { value } => *value as f64,
-            NodeKind::Coord { axis } => match axis {
-                Axis::X => x,
-                Axis::Z => z,
-            },
-            NodeKind::Simplex2 { frequency, offset } => {
-                let f = *frequency as f64;
-                sim.get([x * f + offset[0] as f64, z * f + offset[1] as f64])
+    /// The stricter gate for the *game* path (chunk generation, `graph_hash`
+    /// negotiation): everything [`Self::validate`] checks, plus rejection of
+    /// node kinds whose evaluation is not **bit-exact** across CPU and GPU.
+    /// The ported f32 hash-noise nodes ([`NodeKind::Noise`] /
+    /// [`NodeKind::FractalNoise`]) compile and preview fine in the design tool
+    /// — CPU and GPU agree to within f32 rounding — but worldgen v2 requires
+    /// byte-identical chunks from a seed on every device, which f32 cannot
+    /// promise (drivers may contract/reassociate float math). They stay
+    /// design-only until they get a fixed-point port.
+    pub fn deterministic(&self) -> Result<(), String> {
+        self.validate()?;
+        for node in &self.nodes {
+            if matches!(node.kind, NodeKind::Noise { .. } | NodeKind::FractalNoise { .. }) {
+                return Err(format!(
+                    "node {} ({}) is a design-tool noise node: f32-evaluated, not bit-exact \
+                     across devices, so it cannot drive deterministic worldgen v2 yet",
+                    node.id,
+                    match &node.kind {
+                        NodeKind::Noise { mode, .. } => format!("Noise/{}", mode.label()),
+                        NodeKind::FractalNoise { mode, .. } => format!("Fractal/{}", mode.label()),
+                        _ => unreachable!(),
+                    }
+                ));
             }
-            NodeKind::Fbm { octaves, base_frequency, lacunarity, persistence, offset } => {
-                let mut freq = *base_frequency as f64;
-                let mut amp = 1.0;
-                let mut sum = 0.0;
-                for _ in 0..*octaves {
-                    sum += amp * sim.get([x * freq + offset[0] as f64, z * freq + offset[1] as f64]);
-                    freq *= *lacunarity as f64;
-                    amp *= *persistence as f64;
+        }
+        Ok(())
+    }
+
+    /// Quantize parameters to Q16.16 and precompute inverses: the form both
+    /// the CPU evaluator and the WGSL codegen consume. Call once, evaluate
+    /// many. Errors on graphs that fail [`Self::validate`] (e.g. node kinds
+    /// the deterministic evaluator doesn't support yet).
+    pub fn compile(&self) -> Result<CompiledGraph, String> {
+        self.validate()?;
+        let cin = |s: &In| match s.node {
+            Some(id) => CIn::Node(id),
+            None => CIn::Const(fx::from_f32(s.default)),
+        };
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|n| match &n.kind {
+                NodeKind::Constant { value } => CKind::Constant(fx::from_f32(*value)),
+                NodeKind::Coord { axis } => CKind::Coord(*axis),
+                NodeKind::Simplex2 { frequency, offset } => CKind::Noise2 {
+                    freq: fx::from_f32(*frequency),
+                    off: [fx::from_f32(offset[0]), fx::from_f32(offset[1])],
+                },
+                NodeKind::Fbm { octaves, base_frequency, lacunarity, persistence, offset } => {
+                    CKind::Fbm {
+                        octaves: *octaves,
+                        base: fx::from_f32(*base_frequency),
+                        lac: fx::from_f32(*lacunarity),
+                        per: fx::from_f32(*persistence),
+                        off: [fx::from_f32(offset[0]), fx::from_f32(offset[1])],
+                    }
                 }
-                sum
-            }
-            // Ported hash noise is computed in f32 (see `noise_modes` docs) so it
-            // stays character-identical to the WGSL GPU port; `sim`/seed is not
-            // used (features decorrelate via `offset`, matching the GPU path).
-            NodeKind::Noise { mode, frequency, offset, param } => {
-                let px = x as f32 * frequency + offset[0];
-                let pz = z as f32 * frequency + offset[1];
-                crate::noise_modes::eval_mode(*mode, px, pz, *param) as f64
-            }
-            NodeKind::FractalNoise {
-                mode,
-                octaves,
-                base_frequency,
-                lacunarity,
-                persistence,
-                offset,
-                param,
-            } => {
-                let mut freq = *base_frequency;
-                let mut amp = 1.0f32;
-                let mut sum = 0.0f32;
-                for _ in 0..*octaves {
-                    let px = x as f32 * freq + offset[0];
-                    let pz = z as f32 * freq + offset[1];
-                    sum += amp * crate::noise_modes::eval_mode(*mode, px, pz, *param);
-                    freq *= lacunarity;
-                    amp *= persistence;
+                // Ported hash noise evaluates in f32 (see `noise_modes`):
+                // deterministic on one platform and ULP-close CPU vs GPU, but
+                // NOT bit-exact — [`Self::deterministic`] rejects these kinds
+                // for the game path; they are design-tool nodes for now.
+                NodeKind::Noise { mode, frequency, offset, param } => CKind::NoiseF32 {
+                    mode: *mode,
+                    freq: *frequency,
+                    off: *offset,
+                    param: *param,
+                },
+                NodeKind::FractalNoise {
+                    mode,
+                    octaves,
+                    base_frequency,
+                    lacunarity,
+                    persistence,
+                    offset,
+                    param,
+                } => CKind::FractalF32 {
+                    mode: *mode,
+                    octaves: *octaves,
+                    base: *base_frequency,
+                    lac: *lacunarity,
+                    per: *persistence,
+                    off: *offset,
+                    param: *param,
+                },
+                NodeKind::Abs { input } => CKind::Abs(cin(input)),
+                NodeKind::ScaleBias { input, scale, bias } => {
+                    CKind::ScaleBias(cin(input), fx::from_f32(*scale), fx::from_f32(*bias))
                 }
-                sum as f64
-            }
-            NodeKind::RadialFalloff { center, radius, exponent } => {
-                let dx = x - center[0] as f64;
-                let dz = z - center[1] as f64;
-                let d = (dx * dx + dz * dz).sqrt() / (*radius as f64).max(1e-6);
-                (1.0 - d.clamp(0.0, 1.0)).powf(*exponent as f64)
-            }
-            NodeKind::Abs { input } => ev(input, x, z).abs(),
-            NodeKind::ScaleBias { input, scale, bias } => {
-                ev(input, x, z) * *scale as f64 + *bias as f64
-            }
-            NodeKind::Clamp { input, min, max } => ev(input, x, z).clamp(*min as f64, *max as f64),
-            NodeKind::Power { input, exponent } => ev(input, x, z).powf(*exponent as f64),
-            NodeKind::Terrace { input, steps } => {
-                let s = (*steps as f64).max(1.0);
-                (ev(input, x, z) * s).round() / s
-            }
-            NodeKind::Add { a, b } => ev(a, x, z) + ev(b, x, z),
-            NodeKind::Sub { a, b } => ev(a, x, z) - ev(b, x, z),
-            NodeKind::Mul { a, b } => ev(a, x, z) * ev(b, x, z),
-            NodeKind::Min { a, b } => ev(a, x, z).min(ev(b, x, z)),
-            NodeKind::Max { a, b } => ev(a, x, z).max(ev(b, x, z)),
-            NodeKind::Lerp { a, b, t } => {
-                let (va, vb) = (ev(a, x, z), ev(b, x, z));
-                let tt = ev(t, x, z).clamp(0.0, 1.0);
-                va + (vb - va) * tt
-            }
-            NodeKind::DomainWarp { input, wx, wz, amount } => {
-                let amt = *amount as f64;
-                let nx = x + ev(wx, x, z) * amt;
-                let nz = z + ev(wz, x, z) * amt;
-                ev(input, nx, nz)
-            }
+                NodeKind::Clamp { input, min, max } => {
+                    CKind::Clamp(cin(input), fx::from_f32(*min), fx::from_f32(*max))
+                }
+                NodeKind::Terrace { input, steps } => {
+                    let s = steps.max(1.0);
+                    // 1/s in Q16.16, computed once in f64 (exact quantization).
+                    CKind::Terrace(cin(input), fx::from_f32(s), (65536.0 / s as f64).round() as Fx)
+                }
+                NodeKind::Add { a, b } => CKind::Add(cin(a), cin(b)),
+                NodeKind::Sub { a, b } => CKind::Sub(cin(a), cin(b)),
+                NodeKind::Mul { a, b } => CKind::Mul(cin(a), cin(b)),
+                NodeKind::Min { a, b } => CKind::Min(cin(a), cin(b)),
+                NodeKind::Max { a, b } => CKind::Max(cin(a), cin(b)),
+                NodeKind::Lerp { a, b, t } => CKind::Lerp(cin(a), cin(b), cin(t)),
+                NodeKind::DomainWarp { input, wx, wz, amount } => {
+                    CKind::DomainWarp(cin(input), cin(wx), cin(wz), fx::from_f32(*amount))
+                }
+                NodeKind::Power { .. } | NodeKind::RadialFalloff { .. } => {
+                    unreachable!("rejected by validate")
+                }
+            })
+            .collect();
+        Ok(CompiledGraph {
+            nodes,
+            height: cin(&self.outputs.height),
+            rock: self.outputs.rock.as_ref().map(cin),
+            structure: self.outputs.structure.as_ref().map(cin),
+            caves: self.caves.enabled.then(|| CompiledCaves {
+                freq: fx::from_f32(self.caves.frequency),
+                threshold: fx::from_f32(self.caves.threshold),
+            }),
+        })
+    }
+
+    /// Preview convenience: compile-and-evaluate one node's field at an f64
+    /// coordinate (0 for uncompilable graphs). Hot loops should
+    /// [`Self::compile`] once instead.
+    pub fn field_at(&self, seed: u32, node: NodeId, x: f64, z: f64) -> f64 {
+        match self.compile() {
+            Ok(c) => fx::to_f32(c.node_fx(seed, node, coord_fx(x), coord_fx(z))) as f64,
+            Err(_) => 0.0,
+        }
+    }
+
+    /// Preview convenience: compile-and-evaluate the surface channels (zeros
+    /// for uncompilable graphs).
+    pub fn eval_columns(&self, seed: u32, x: f64, z: f64) -> ColumnSample {
+        match self.compile() {
+            Ok(c) => c.eval_columns(seed, coord_fx(x), coord_fx(z)),
+            Err(_) => ColumnSample { height: 0.0, rock: 0.0, structure: 0.0 },
         }
     }
 
     /// The default graph, reconstructing the original `terrain.rs` height and
-    /// rock formulas node-for-node so the game is visually unchanged after the
-    /// refactor (floored height and carved voxels identical; frequencies are
-    /// stored `f32` so there is sub-1e-6 fractional drift, below any boundary).
+    /// rock formulas node-for-node (character-equivalent under the v2 noise;
+    /// same octave frequencies and amplitudes).
     ///
     /// Original height:
     /// `256 + floor( s(1/1000)*50 - s(1/500)*30 + s(1/250)*20 - s(1/75)*10 + s(1/25)*5 )`
@@ -465,6 +499,189 @@ impl TerrainGraph {
     }
 }
 
+/// Clamp an f64 preview coordinate into the Q16.16 envelope.
+fn coord_fx(v: f64) -> Fx {
+    (v * 65536.0).round().clamp(i32::MIN as f64, i32::MAX as f64) as Fx
+}
+
+/// A compiled input slot: wired node or quantized constant.
+#[derive(Debug, Clone, Copy)]
+pub enum CIn {
+    Node(NodeId),
+    Const(Fx),
+}
+
+/// A node with parameters quantized to Q16.16 and inverses precomputed.
+#[derive(Debug, Clone)]
+pub enum CKind {
+    Constant(Fx),
+    Coord(Axis),
+    Noise2 { freq: Fx, off: [Fx; 2] },
+    Fbm { octaves: u32, base: Fx, lac: Fx, per: Fx, off: [Fx; 2] },
+    /// Ported hash noise, evaluated in **f32** (params stay f32 and cross the
+    /// GPU boundary as raw bit patterns): design-tool only, ULP-close but not
+    /// bit-exact across devices — see [`TerrainGraph::deterministic`].
+    NoiseF32 { mode: NoiseMode, freq: f32, off: [f32; 2], param: f32 },
+    FractalF32 { mode: NoiseMode, octaves: u32, base: f32, lac: f32, per: f32, off: [f32; 2], param: f32 },
+    Abs(CIn),
+    ScaleBias(CIn, Fx, Fx),
+    Clamp(CIn, Fx, Fx),
+    /// (input, steps, 1/steps).
+    Terrace(CIn, Fx, Fx),
+    Add(CIn, CIn),
+    Sub(CIn, CIn),
+    Mul(CIn, CIn),
+    Min(CIn, CIn),
+    Max(CIn, CIn),
+    Lerp(CIn, CIn, CIn),
+    DomainWarp(CIn, CIn, CIn, Fx),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CompiledCaves {
+    pub freq: Fx,
+    pub threshold: Fx,
+}
+
+/// The deterministic evaluator: everything is Q16.16, every operation has a
+/// WGSL mirror, so CPU (client + server) and GPU produce identical bits.
+/// World coordinates enter as Fx (wrapping past ±32767 voxels — deterministic
+/// on all ends, see `fx` module docs).
+#[derive(Debug, Clone)]
+pub struct CompiledGraph {
+    nodes: Vec<CKind>,
+    height: CIn,
+    rock: Option<CIn>,
+    structure: Option<CIn>,
+    pub caves: Option<CompiledCaves>,
+}
+
+impl CompiledGraph {
+    /// Surface channels at a world column, exact Q16.16.
+    pub fn columns_fx(&self, seed: u32, x: Fx, z: Fx) -> (Fx, Fx, Fx) {
+        (
+            self.eval_in(seed, self.height, x, z),
+            self.rock.map_or(0, |s| self.eval_in(seed, s, x, z)),
+            self.structure.map_or(0, |s| self.eval_in(seed, s, x, z)),
+        )
+    }
+
+    /// [`Self::columns_fx`] converted for preview/display consumers.
+    pub fn eval_columns(&self, seed: u32, x: Fx, z: Fx) -> ColumnSample {
+        let (h, r, s) = self.columns_fx(seed, x, z);
+        ColumnSample {
+            height: fx::to_f32(h) as f64,
+            rock: fx::to_f32(r) as f64,
+            structure: fx::to_f32(s) as f64,
+        }
+    }
+
+    /// One node's field (design-tool previews of intermediate nodes).
+    pub fn node_fx(&self, seed: u32, node: NodeId, x: Fx, z: Fx) -> Fx {
+        self.eval_node(seed, node, x, z)
+    }
+
+    /// True if a cave carves air at integer world voxel (x, y, z).
+    pub fn cave_carves(&self, seed: u32, x: i32, y: i32, z: i32) -> bool {
+        match self.caves {
+            None => false,
+            Some(c) => fx::abs(self.cave_noise(seed, x, y, z)) > c.threshold,
+        }
+    }
+
+    /// The signed cave field at integer world voxel (x, y, z) — exposed so the
+    /// chunk generator can lattice-sample + interpolate it.
+    pub fn cave_noise(&self, seed: u32, x: i32, y: i32, z: i32) -> Fx {
+        let c = self.caves.expect("caller checks caves");
+        noise_det::noise3(
+            seed,
+            fx::int_mul(x, c.freq),
+            fx::int_mul(y, c.freq),
+            fx::int_mul(z, c.freq),
+        )
+    }
+
+    fn eval_in(&self, seed: u32, slot: CIn, x: Fx, z: Fx) -> Fx {
+        match slot {
+            CIn::Node(id) => self.eval_node(seed, id, x, z),
+            CIn::Const(v) => v,
+        }
+    }
+
+    fn eval_node(&self, seed: u32, id: NodeId, x: Fx, z: Fx) -> Fx {
+        let ev = |slot: CIn, x: Fx, z: Fx| self.eval_in(seed, slot, x, z);
+        match &self.nodes[id] {
+            CKind::Constant(v) => *v,
+            CKind::Coord(Axis::X) => x,
+            CKind::Coord(Axis::Z) => z,
+            CKind::Noise2 { freq, off } => noise_det::noise2(
+                seed,
+                fx::mul(x, *freq).wrapping_add(off[0]),
+                fx::mul(z, *freq).wrapping_add(off[1]),
+            ),
+            CKind::Fbm { octaves, base, lac, per, off } => {
+                let mut f = *base;
+                let mut amp = fx::ONE;
+                let mut sum: Fx = 0;
+                for _ in 0..*octaves {
+                    let n = noise_det::noise2(
+                        seed,
+                        fx::mul(x, f).wrapping_add(off[0]),
+                        fx::mul(z, f).wrapping_add(off[1]),
+                    );
+                    sum = sum.wrapping_add(fx::mul(amp, n));
+                    f = fx::mul(f, *lac);
+                    amp = fx::mul(amp, *per);
+                }
+                sum
+            }
+            // f32 boundary: convert the Q16.16 coordinate exactly (power-of-two
+            // divide), evaluate the ported mode, quantize the result back. The
+            // WGSL mirror does the same conversions — see `wgsl::HASH_NOISE`.
+            CKind::NoiseF32 { mode, freq, off, param } => {
+                let px = fx::to_f32(x) * freq + off[0];
+                let pz = fx::to_f32(z) * freq + off[1];
+                fx::from_f32(crate::noise_modes::eval_mode(*mode, px, pz, *param))
+            }
+            CKind::FractalF32 { mode, octaves, base, lac, per, off, param } => {
+                let (xf, zf) = (fx::to_f32(x), fx::to_f32(z));
+                let mut f = *base;
+                let mut amp = 1.0f32;
+                let mut sum = 0.0f32;
+                for _ in 0..*octaves {
+                    sum += amp
+                        * crate::noise_modes::eval_mode(*mode, xf * f + off[0], zf * f + off[1], *param);
+                    f *= lac;
+                    amp *= per;
+                }
+                fx::from_f32(sum)
+            }
+            CKind::Abs(i) => fx::abs(ev(*i, x, z)),
+            CKind::ScaleBias(i, s, b) => fx::mul(ev(*i, x, z), *s).wrapping_add(*b),
+            CKind::Clamp(i, lo, hi) => fx::clamp(ev(*i, x, z), *lo, *hi),
+            CKind::Terrace(i, s, inv_s) => {
+                let r = fx::round(fx::mul(ev(*i, x, z), *s));
+                fx::mul(r.wrapping_shl(16), *inv_s)
+            }
+            CKind::Add(a, b) => ev(*a, x, z).wrapping_add(ev(*b, x, z)),
+            CKind::Sub(a, b) => ev(*a, x, z).wrapping_sub(ev(*b, x, z)),
+            CKind::Mul(a, b) => fx::mul(ev(*a, x, z), ev(*b, x, z)),
+            CKind::Min(a, b) => ev(*a, x, z).min(ev(*b, x, z)),
+            CKind::Max(a, b) => ev(*a, x, z).max(ev(*b, x, z)),
+            CKind::Lerp(a, b, t) => {
+                let (va, vb) = (ev(*a, x, z), ev(*b, x, z));
+                let tt = fx::clamp(ev(*t, x, z), 0, fx::ONE);
+                fx::lerp(va, vb, tt)
+            }
+            CKind::DomainWarp(input, wx, wz, amount) => {
+                let nx = x.wrapping_add(fx::mul(ev(*wx, x, z), *amount));
+                let nz = z.wrapping_add(fx::mul(ev(*wz, x, z), *amount));
+                ev(*input, nx, nz)
+            }
+        }
+    }
+}
+
 impl NodeKind {
     /// The input slots this node reads, for validation / graph walks.
     pub fn inputs(&self) -> Vec<&In> {
@@ -496,68 +713,56 @@ impl NodeKind {
 mod tests {
     use super::*;
 
-    /// The default graph must reproduce the original hardcoded formula. The
-    /// schema stores frequencies as `f32` (so they can drive a GPU uniform), so
-    /// there is sub-1e-6 fractional drift versus the original's f64 divisions —
-    /// but the value the game actually consumes, `height.floor() as i32`, is
-    /// identical, and rock matches to well within any voxel boundary.
+    /// The default graph reproduces the original formula *shape*: five height
+    /// octaves summed with the original amplitudes, rock as the three-term
+    /// mix. With the v2 noise the values differ from the old f64 port, but the
+    /// structure must hold: height centered near 256, well inside the ±115
+    /// octave envelope; rock bounded by its ±30 envelope.
     #[test]
-    fn default_graph_matches_original_height_and_rock() {
-        let sim = Simplex::new(1234);
+    fn default_graph_height_and_rock_envelopes() {
         let graph = TerrainGraph::default_soils();
         graph.validate().unwrap();
-
-        let n2 = |x: f64, z: f64| sim.get([x, z]);
-        for &(gx, gz) in &[(0.0, 0.0), (37.0, -91.0), (1024.5, 2048.25), (-500.0, 700.0)] {
-            let want_h = 256.0
-                + (n2(gx / 1000.0, gz / 1000.0) * 50.0 - n2(gx / 500.0, gz / 500.0) * 30.0
-                    + n2(gx / 250.0, gz / 250.0) * 20.0
-                    - n2(gx / 75.0, gz / 75.0) * 10.0
-                    + n2(gx / 25.0, gz / 25.0) * 5.0);
-            let want_rock = n2(gx / 15.0, gz / 15.0) * 5.0
-                - n2(gx / 45.0, gz / 45.0).abs() * 10.0
-                - n2(gx / 25.0, gz / 25.0).abs() * 15.0;
-
-            let got = graph.eval_columns(&sim, gx, gz);
-            // The voxel-relevant value is the floored height; it must match.
-            assert_eq!(
-                got.height.floor() as i32,
-                want_h.floor() as i32,
-                "floored height mismatch at ({gx}, {gz})"
-            );
-            // Rock is compared against integer voxel heights, so a fractional
-            // drift that scales with coordinate magnitude (f32 frequency) is
-            // harmless; require it to stay well under a voxel.
-            assert!((got.rock - want_rock).abs() < 0.05, "rock mismatch at ({gx}, {gz})");
+        let c = graph.compile().unwrap();
+        let mut min_h = f64::MAX;
+        let mut max_h = f64::MIN;
+        for i in 0..2000u32 {
+            let x = (crate::noise_det::pcg(i) % 40000) as i32 - 20000;
+            let z = (crate::noise_det::pcg(i ^ 0xffff) % 40000) as i32 - 20000;
+            let s = c.eval_columns(7, x.wrapping_shl(16), z.wrapping_shl(16));
+            min_h = min_h.min(s.height);
+            max_h = max_h.max(s.height);
+            assert!(s.rock <= 5.0 && s.rock >= -30.0, "rock out of envelope: {}", s.rock);
         }
-    }
-
-    /// End-to-end guarantee that the refactor doesn't change generated voxels:
-    /// a full chunk from the default-graph generator is identical to one built
-    /// by the original inline formula.
-    #[test]
-    fn default_graph_generates_identical_chunk() {
-        use crate::blocks::BlockRegistry;
-        use crate::terrain::{TerrainGen, WorldType};
-
-        let yaml = "Air:\n  faces: [0,0,0]\nDirt:\n  faces: [1,1,1]\nGrass:\n  faces: [3,2,1]\nStone:\n  faces: [4,4,4]\nSlate:\n  faces: [13,13,13]\nTough Dirt:\n  faces: [14,14,14]\nRocky Dirt:\n  faces: [15,15,15]\n";
-        let reg = BlockRegistry::from_yaml(yaml).unwrap();
-        let tg = TerrainGen::new(1234, WorldType::Normal);
-        // A chunk straddling the surface (~y=256 → chunk y=8).
-        let chunk = tg.generate(glam::IVec3::new(2, 8, -3), &reg);
-        // Regenerating is deterministic; sanity check it has both solid and air.
-        assert!(chunk.as_bytes().iter().any(|&b| b == 0));
-        assert!(chunk.as_bytes().iter().any(|&b| b != 0));
+        assert!(min_h > 256.0 - 115.0 && max_h < 256.0 + 115.0, "height envelope: {min_h}..{max_h}");
+        // The terrain actually varies.
+        assert!(max_h - min_h > 20.0, "terrain suspiciously flat: {min_h}..{max_h}");
     }
 
     #[test]
-    fn cave_carve_matches_original() {
-        let sim = Simplex::new(7);
+    fn cave_carve_matches_noise3_directly() {
         let graph = TerrainGraph::default_soils();
-        for &(gx, gy, gz) in &[(10.0, 20.0, 30.0), (-5.0, 100.0, 42.0)] {
-            let want = sim.get([gx / 45.0, gy / 45.0, gz / 45.0]).abs() > 0.7;
-            assert_eq!(graph.cave_carves(&sim, gx, gy, gz), want);
+        let c = graph.compile().unwrap();
+        let caves = c.caves.expect("default graph has caves");
+        for &(gx, gy, gz) in &[(10, 20, 30), (-5, 100, 42)] {
+            let n = crate::noise_det::noise3(
+                7,
+                fx::int_mul(gx, caves.freq),
+                fx::int_mul(gy, caves.freq),
+                fx::int_mul(gz, caves.freq),
+            );
+            assert_eq!(c.cave_carves(7, gx, gy, gz), fx::abs(n) > caves.threshold);
         }
+    }
+
+    #[test]
+    fn power_and_radial_falloff_are_rejected() {
+        let mut graph = TerrainGraph::default_soils();
+        let id = graph.nodes.len();
+        graph.nodes.push(Node {
+            id,
+            kind: NodeKind::Power { input: In::constant(2.0), exponent: 2.0 },
+        });
+        assert!(graph.validate().is_err());
     }
 
     #[test]
@@ -566,9 +771,8 @@ mod tests {
         let text = ron::ser::to_string_pretty(&graph, ron::ser::PrettyConfig::default()).unwrap();
         let back: TerrainGraph = ron::from_str(&text).unwrap();
         back.validate().unwrap();
-        let sim = Simplex::new(99);
-        let a = graph.eval_columns(&sim, 12.0, 34.0);
-        let b = back.eval_columns(&sim, 12.0, 34.0);
+        let a = graph.eval_columns(99, 12.0, 34.0);
+        let b = back.eval_columns(99, 12.0, 34.0);
         assert_eq!(a.height, b.height);
         assert_eq!(a.rock, b.rock);
     }
@@ -578,11 +782,10 @@ mod tests {
     #[test]
     fn field_at_height_node_matches_eval_columns() {
         let graph = TerrainGraph::default_soils();
-        let sim = Simplex::new(2024);
         let height_node = graph.outputs.height.node.expect("default height is wired");
         for &(x, z) in &[(0.0, 0.0), (55.0, -120.0), (900.0, 410.0)] {
-            let via_field = graph.field_at(&sim, height_node, x, z);
-            let via_columns = graph.eval_columns(&sim, x, z).height;
+            let via_field = graph.field_at(2024, height_node, x, z);
+            let via_columns = graph.eval_columns(2024, x, z).height;
             assert_eq!(via_field, via_columns, "mismatch at ({x}, {z})");
         }
     }

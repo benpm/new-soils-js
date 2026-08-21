@@ -254,7 +254,7 @@ fn pin_y(rect: Rect, k: usize, count: usize) -> f32 {
 }
 
 fn pin(ui: &Ui, p: Pos2, color: Color32) {
-    ui.painter().circle(p, PIN_R, color, Stroke::new(1.0, Color32::from_gray(20)));
+    ui.painter().circle(p, PIN_R, color, Stroke::new(1.0_f32, Color32::from_gray(20)));
 }
 
 /// Faint alignment grid covering the visible scene rect, with brighter lines
@@ -267,7 +267,7 @@ fn grid_shape(view: Rect) -> Shape {
     }
     let line = |a: Pos2, b: Pos2, major: bool| {
         let color = if major { GRID_MAJOR } else { GRID_MINOR };
-        Shape::line_segment([a, b], Stroke::new(1.0, color))
+        Shape::line_segment([a, b], Stroke::new(1.0_f32, color))
     };
     let first = |lo: f32| (lo / GRID).ceil() as i32;
     let last = |hi: f32| (hi / GRID).floor() as i32;
@@ -295,7 +295,7 @@ fn wire_shape(from: Pos2, to: Pos2) -> Shape {
             cubic(from, c1, c2, to, t)
         })
         .collect();
-    Shape::Path(PathShape::line(pts, Stroke::new(2.0, WIRE_COLOR)))
+    Shape::Path(PathShape::line(pts, Stroke::new(2.0_f32, WIRE_COLOR)))
 }
 
 fn cubic(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, t: f32) -> Pos2 {

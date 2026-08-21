@@ -9,19 +9,25 @@
 mod actor;
 mod chunk;
 mod console;
+mod cull;
+mod demand;
 mod discovery;
 mod edit;
 mod gi;
 mod gi_demo;
+mod gpu_gen;
+mod gpu_light;
 mod gpu_mesh;
 mod hud;
-mod indirect_draw;
 mod light;
 mod login;
 mod material;
 mod net;
 mod pause;
+mod physics;
 mod player;
+mod pool;
+mod world_draw;
 mod server_msg;
 mod singleplayer;
 
@@ -36,7 +42,7 @@ use soils_protocol::ClientMsg;
 use soils_worldgen::default_registry;
 
 use actor::{Actor, ActorMap, LocalPlayer};
-use chunk::{Blocks, ChunkMap, VoxelChunk, WorldTime};
+use chunk::{Blocks, ChunkMap, WorldTime};
 use gpu_mesh::GpuMeshPlugin;
 use net::NetClient;
 use player::{Player, Streaming};
@@ -58,11 +64,24 @@ fn main() {
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "new-soils (Rust/Bevy)".into(),
+            // `SOILS_VSYNC=0` uncaps the frame clock. Perf runs need this: with
+            // vsync on, fps just reports the display refresh and says nothing
+            // about how much headroom the frame actually has.
+            present_mode: if std::env::var("SOILS_VSYNC").as_deref() == Ok("0") {
+                bevy::window::PresentMode::AutoNoVsync
+            } else {
+                bevy::window::PresentMode::AutoVsync
+            },
             ..default()
         }),
         ..default()
     }))
     .add_plugins(GpuMeshPlugin)
+    .add_plugins(pool::PoolPlugin)
+    .add_plugins(world_draw::WorldDrawPlugin)
+    .add_plugins(cull::CullPlugin)
+    .add_plugins(gpu_light::GpuLightPlugin)
+    .add_plugins(gpu_gen::GpuGenPlugin)
     .add_plugins(gi::GiPlugin)
     .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
     .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 1.0)))
@@ -88,7 +107,15 @@ fn main() {
     .insert_resource(net::connect())
     .insert_resource(discovery::spawn());
 
+    // `SOILS_RENDERDIAG=1` records per-render-pass CPU/GPU elapsed time into the
+    // DiagnosticsStore (dumped by the self-test at exit). Opt-in: it costs GPU
+    // timestamp queries every pass, so it stays off for normal play.
+    if std::env::var("SOILS_RENDERDIAG").as_deref() == Ok("1") {
+        app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
+    }
+
     server_msg::register(&mut app);
+    physics::register(&mut app);
 
     app.add_systems(
         Startup,
@@ -118,23 +145,29 @@ fn main() {
             )
                 .after(server_msg::route_server_messages),
             (
-                server_msg::apply_chunks,
+                demand::apply_directory,
                 server_msg::apply_edits,
-                server_msg::apply_time,
-                edit::apply_edit_acks,
-                server_msg::apply_entity_spawns,
+                demand::maintain_cpu_mirror,
+                demand::process_demands,
+                gpu_gen::flush_gen_batch,
             )
+                .chain()
                 .after(server_msg::apply_init)
                 .after(server_msg::apply_warp),
+            (server_msg::apply_time, edit::apply_edit_acks, server_msg::apply_entity_spawns)
+                .after(server_msg::apply_init)
+                .after(server_msg::apply_warp),
+            server_msg::flush_chunk_fetch.after(server_msg::route_server_messages),
             server_msg::apply_entity_updates.after(server_msg::apply_entity_spawns),
             server_msg::apply_entity_despawns.after(server_msg::apply_entity_updates),
             player::reconcile_self
                 .after(server_msg::apply_init)
                 .after(server_msg::apply_warp)
-                .after(server_msg::apply_chunks),
-            // Baked lighting runs once all voxel changes for the frame landed.
-            light::process_light
-                .after(server_msg::apply_chunks)
+                .after(demand::process_demands),
+            // Light job planning runs once all voxel changes for the frame
+            // landed (the flood itself is GPU compute — see gpu_light.rs).
+            gpu_light::plan_light_jobs
+                .after(demand::process_demands)
                 .after(server_msg::apply_edits)
                 .after(edit::edit_blocks),
             light::update_sky_term.after(server_msg::apply_time),
@@ -210,7 +243,7 @@ fn screenshot_once(
     mut taken: Local<bool>,
     mut camera: Query<(&mut Player, &mut Transform)>,
     mut hold: ResMut<player::CameraHold>,
-    meshed: Query<(&VoxelChunk, &Transform), (With<Mesh3d>, Without<Player>)>,
+    slots: Res<pool::ChunkSlots>,
     remote_actors: Query<&Transform, (With<Actor>, Without<Player>)>,
 ) {
     if *taken || std::env::var("SOILS_SELFTEST").is_err() {
@@ -248,13 +281,16 @@ fn screenshot_once(
             }
         }
         let mut sample = 0;
-        for (chunk, t) in &meshed {
+        for (cpos, slot) in slots.iter() {
+            if slot.mesh == pool::NO_MESH {
+                continue;
+            }
             if sample < 3 {
-                info!("SELFTEST: meshed chunk {:?} at world {:?}", chunk.pos, t.translation);
+                info!("SELFTEST: meshed chunk {cpos:?} in mesh slot {}", slot.mesh);
             }
             sample += 1;
         }
-        info!("SELFTEST: {sample} chunks currently have meshes");
+        info!("SELFTEST: {sample} chunks currently have mesh slots");
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk("/tmp/soils-selftest.png"));
@@ -278,19 +314,55 @@ fn self_test_daytime(mut world_time: ResMut<WorldTime>) {
 /// stream → mesh → render) be validated headlessly under xvfb + lavapipe.
 fn self_test(
     time: Res<Time>,
-    map: Res<ChunkMap>,
-    meshed: Query<&Mesh3d>,
+    slots: Res<pool::ChunkSlots>,
     remote_actors: Query<&Actor>,
+    diagnostics: Res<bevy::diagnostic::DiagnosticsStore>,
+    light_queue: Res<light::LightQueue>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if std::env::var("SOILS_SELFTEST").is_err() {
         return;
     }
     if time.elapsed_secs() > env_secs("SOILS_EXIT_SECS", 11.0) {
-        let chunks = map.map.len();
-        let meshes = meshed.iter().count();
+        let chunks = slots.len();
+        let meshes = slots.iter().filter(|(_, s)| s.mesh != pool::NO_MESH).count();
         let actors = remote_actors.iter().count();
-        info!("SELFTEST: {chunks} chunks loaded, {meshes} chunk meshes built, {actors} actors");
+        // Steady-state frame cost, sampled at exit (the camera parked at the
+        // screenshot deadline, so recent frames are the static viewpoint, not
+        // the join burst). Reported to stdout so perf runs are scriptable and
+        // diffable instead of being read off the F3 HUD in a screenshot.
+        let fps = diagnostics
+            .get(&bevy::diagnostic::FrameTimeDiagnosticsPlugin::FPS)
+            .and_then(|d| d.smoothed())
+            .unwrap_or(0.0);
+        let frame_ms = diagnostics
+            .get(&bevy::diagnostic::FrameTimeDiagnosticsPlugin::FRAME_TIME)
+            .and_then(|d| d.smoothed())
+            .unwrap_or(0.0);
+        info!("SELFTEST PERF: {fps:.1} fps, {frame_ms:.2} ms/frame");
+        // With SOILS_RENDERDIAG=1, break the frame down per render pass so the
+        // bottleneck is measured rather than guessed. Only the elapsed timers —
+        // the pipeline-statistics counters (shader invocations etc.) live in the
+        // same store but are counts, not milliseconds. Sorted slowest-first.
+        let mut passes: Vec<(String, f64)> = diagnostics
+            .iter()
+            .filter(|d| {
+                let p = d.path().as_str();
+                p.starts_with("render/") && (p.ends_with("elapsed_gpu") || p.ends_with("elapsed_cpu"))
+            })
+            .filter_map(|d| d.smoothed().map(|v| (d.path().to_string(), v)))
+            .filter(|(_, v)| *v > 0.001)
+            .collect();
+        passes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (path, ms) in passes.iter().take(24) {
+            info!("SELFTEST PASS: {ms:8.3} ms  {path}");
+        }
+        let (lq_chunks, lq_edits, lq_pads) = light_queue.backlog();
+        info!(
+            "SELFTEST LIGHT BACKLOG: {lq_chunks} chunks to flood, {lq_edits} edits, {lq_pads} pads \
+             pending (non-zero ⇒ still draining, fps above is not steady state)"
+        );
+        info!("SELFTEST: {chunks} chunks loaded, {meshes} chunk mesh slots, {actors} actors");
         // The login-screen shot (`SOILS_LOGINSHOT`) has no world by design, so
         // skip the world asserts there and just exit cleanly after the shot.
         if std::env::var("SOILS_LOGINSHOT").is_err() {
@@ -356,7 +428,12 @@ fn selftest_login(net: Res<NetClient>) {
     }
     if std::env::var("SOILS_SELFTEST").is_ok() && std::env::var("SOILS_LOGINSHOT").is_err() {
         net.connect(format!("{}://127.0.0.1:9001", net::default_scheme()));
-        net.send(ClientMsg::Login { name: "player".into(), password: String::new(), signup: true });
+        net.send(ClientMsg::Login {
+            name: "player".into(),
+            password: String::new(),
+            signup: true,
+            protocol: soils_protocol::PROTOCOL_VERSION,
+        });
     }
 }
 

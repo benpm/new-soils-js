@@ -102,6 +102,14 @@ struct Predictor {
     frames: Vec<InputFrame>,
     history: VecDeque<(u32, PlayerInput, PlayerState)>,
     chunks: HashMap<IVec3, ChunkVolume>,
+    /// Pristine manifest positions not yet materialized. Generated lazily in
+    /// [`tick`] for chunks near the player only — generating whole waves
+    /// inside the drain loop stalls the 64 Hz ticker and bursts inputs into
+    /// the server's token bucket, which reads as fake divergence.
+    pending: std::collections::HashSet<IVec3>,
+    /// Local generator mirror for pristine manifest entries (set after join
+    /// from the Init GenParams).
+    generator: Option<(soils_worldgen::TerrainGen, soils_worldgen::BlockRegistry)>,
     /// Scenario (b): pretend edit broadcasts haven't arrived, so the local
     /// world stays stale and the prediction runs into server-only terrain.
     ignore_edits: bool,
@@ -116,6 +124,15 @@ struct Predictor {
 }
 
 impl Predictor {
+    fn set_gen(&mut self, p: soils_protocol::GenParams) {
+        let wt = match p.world_type {
+            1 => soils_worldgen::WorldType::Flat,
+            _ => soils_worldgen::WorldType::Normal,
+        };
+        let terrain = soils_worldgen::TerrainGen::new(p.seed as u32, wt);
+        self.generator = Some((terrain, soils_worldgen::default_registry()));
+    }
+
     fn new(spawn: [f32; 3]) -> Self {
         Self {
             sim: PlayerState { pos: Vec3::from_array(spawn), ..Default::default() },
@@ -123,6 +140,8 @@ impl Predictor {
             frames: Vec::new(),
             history: VecDeque::new(),
             chunks: HashMap::new(),
+            pending: std::collections::HashSet::new(),
+            generator: None,
             ignore_edits: false,
             max_divergence: 0.0,
             reconciles: 0,
@@ -145,6 +164,21 @@ impl Predictor {
     /// One 64 Hz tick: predict locally, queue the frame bundle. Returns the
     /// `Inputs` message to send (the caller may drop it to simulate loss).
     fn tick(&mut self, input: PlayerInput, ack_tick: u32) -> ClientMsg {
+        // Materialize pending pristine chunks the step could touch (player's
+        // chunk ± 1); everything else stays pending (unloaded-reads-air).
+        if let Some((terrain, registry)) = &self.generator {
+            let pc = chunk_of(self.sim.pos.floor().as_ivec3());
+            let near: Vec<IVec3> = self
+                .pending
+                .iter()
+                .copied()
+                .filter(|p| (*p - pc).abs().max_element() <= 1)
+                .collect();
+            for p in near {
+                self.pending.remove(&p);
+                self.chunks.insert(p, terrain.generate(p, registry));
+            }
+        }
         let chunks = &self.chunks;
         let sampler = |v: IVec3| match chunks.get(&chunk_of(v)) {
             Some(c) => {
@@ -169,20 +203,26 @@ impl Predictor {
 
     fn handle(&mut self, msg: &ServerMsg, self_net: u32, tracker_states: &[(u32, [f32; 3], [f32; 3])]) {
         match msg {
-            ServerMsg::Bundle { chunks } => {
-                for c in chunks {
-                    if let Some(vol) = decode_chunk(&c.payload) {
-                        self.chunks.insert(IVec3::from_array(c.pos), vol);
+            ServerMsg::Manifest { chunks } => {
+                for info in chunks {
+                    let pos = IVec3::from_array(info.pos());
+                    match info {
+                        soils_protocol::ChunkInfo::Edited { payload, .. } => {
+                            self.pending.remove(&pos);
+                            if let Some(vol) = decode_chunk(payload) {
+                                self.chunks.insert(pos, vol);
+                            }
+                        }
+                        soils_protocol::ChunkInfo::Pristine { .. } => {
+                            self.pending.insert(pos);
+                        }
                     }
                 }
             }
-            ServerMsg::Chunk { pos, payload } => {
-                if let Some(vol) = decode_chunk(payload) {
-                    self.chunks.insert(IVec3::from_array(*pos), vol);
-                }
-            }
             ServerMsg::ChunkUnload { pos } => {
-                self.chunks.remove(&IVec3::from_array(*pos));
+                let pos = IVec3::from_array(*pos);
+                self.pending.remove(&pos);
+                self.chunks.remove(&pos);
             }
             ServerMsg::Edit { pos, value } | ServerMsg::EditAccepted { pos, value, .. } => {
                 if self.ignore_edits {
@@ -307,6 +347,7 @@ async fn prediction_holds_on_a_delayed_lossy_link() {
     let mut a = Client::join(proxy, "alice").await;
     let (self_net, spawn) = (a.self_entity, a.spawn);
     let mut pred = Predictor::new(spawn);
+    pred.set_gen(a.worldgen.expect("init captured"));
 
     // Straight-line flight north for ~2.5 s at 64 Hz, dropping every 50th
     // input send (2%); the bundled last-3 frames recover the gaps.
@@ -345,10 +386,7 @@ async fn forced_misprediction_reconciles_behind_the_wall() {
     let mut a = Client::join(proxy, "alice").await;
     let (self_net, spawn) = (a.self_entity, a.spawn);
     let mut pred = Predictor::new(spawn);
-    // The predictor never applies edit broadcasts — the deterministic form of
-    // "the world changed server-side inside my staleness window". (Fly mode
-    // is noclip by design, so this scenario must *walk* into the wall.)
-    pred.ignore_edits = true;
+    pred.set_gen(a.worldgen.expect("init captured"));
 
     let mut ticker = tokio::time::interval(Duration::from_micros(15_625));
 
@@ -369,22 +407,36 @@ async fn forced_misprediction_reconciles_behind_the_wall() {
         pred.max_divergence
     );
 
-    // A carves a walking tunnel north through the hillside (all within
-    // reach). The server applies the carve; the stale predictor still sees
-    // solid rock — so the *server* walks on while the prediction stays stuck.
+    // A builds a wall just north (both sides see it), goes stale, then carves
+    // a walking tunnel back through it (all within reach). Building the
+    // obstacle keeps the scenario independent of what the terrain generator
+    // put here. The server applies the carve; the stale predictor still sees
+    // the wall — so the *server* walks on while the prediction stays stuck.
+    // (Fly mode is noclip by design, so this scenario must *walk* into it.)
     let eye = pred.sim.pos;
     let (feet_y, x0) = ((eye.y - 1.6).floor() as i32, eye.x.floor() as i32);
-    let mut carved = 0u32;
-    for dz in 1..=6i32 {
-        for dx in -1..=1i32 {
-            for dy in 0..3i32 {
-                a.edit([x0 + dx, feet_y + dy, eye.z.floor() as i32 - dz], 0).await;
-                carved += 1;
-                if carved % 24 == 0 {
-                    // Respect the server's edit rate bucket.
-                    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mut edits = 0u32;
+    for value in [3u8, 0] {
+        for dz in 1..=3i32 {
+            for dx in -1..=1i32 {
+                for dy in 0..3i32 {
+                    a.edit([x0 + dx, feet_y + dy, eye.z.floor() as i32 - dz], value).await;
+                    edits += 1;
+                    if edits % 24 == 0 {
+                        // Respect the server's edit rate bucket.
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                    }
                 }
             }
+        }
+        drain(&mut a, &mut pred, self_net).await;
+        if value == 3 {
+            // Let the wall reach the predictor's map, then stop applying
+            // edits — the deterministic form of "the world changed
+            // server-side inside my staleness window".
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            drain(&mut a, &mut pred, self_net).await;
+            pred.ignore_edits = true;
         }
     }
 

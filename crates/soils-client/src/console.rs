@@ -1,7 +1,7 @@
 //! A small command console (open with `/`), mirroring the JS command box.
 //! Supported: `tp x y z`, `daytime t`, `loadradius n`, `fog on|off`,
-//! `ao on|off`, `gi on|off`. While open, gameplay input is suppressed (see
-//! `console_closed`).
+//! `ao on|off`, `gi on|off`, `spawn`/`cube` (drop a physics cube ahead of the
+//! camera). While open, gameplay input is suppressed (see `console_closed`).
 
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
@@ -11,7 +11,6 @@ use soils_protocol::ClientMsg;
 
 use crate::chunk::WorldTime;
 use crate::gi::GiSettings;
-use crate::material::{ChunkMeshMaterial, FOG_DENSITY};
 use crate::net::NetClient;
 use crate::pause::RenderToggles;
 use crate::player::{self, PendingInput, Player, Streaming};
@@ -62,7 +61,6 @@ pub fn console_input(
     mut streaming: ResMut<Streaming>,
     mut toggles: ResMut<RenderToggles>,
     mut gi: ResMut<GiSettings>,
-    mut materials: ResMut<Assets<ChunkMeshMaterial>>,
     net: Res<NetClient>,
 ) {
     for ev in events.read() {
@@ -85,7 +83,7 @@ pub fn console_input(
                 console.open = false;
                 run_command(
                     &cmd, &mut player, &mut world_time, &mut streaming, &mut toggles,
-                    &mut gi, &mut materials, &net,
+                    &mut gi, &net,
                 );
             }
             Key::Escape => {
@@ -125,7 +123,6 @@ fn run_command(
     streaming: &mut Streaming,
     toggles: &mut RenderToggles,
     gi: &mut GiSettings,
-    materials: &mut Assets<ChunkMeshMaterial>,
     net: &NetClient,
 ) {
     let mut parts = line.split_whitespace();
@@ -155,33 +152,25 @@ fn run_command(
                 streaming.last_chunk = None;
             }
         }
-        "fog" => {
-            toggles.fog = on_off(args.first());
-            let d = if toggles.fog { FOG_DENSITY } else { 0.0 };
-            for (_, m) in materials.iter_mut() {
-                m.params.fog_density = d;
-            }
-        }
-        "ao" | "occlusion" => {
-            toggles.ao = on_off(args.first());
-            let v = if toggles.ao { 1.0 } else { 0.0 };
-            for (_, m) in materials.iter_mut() {
-                m.params.ambient_occlusion = v;
-            }
-        }
-        "light" => {
-            toggles.light = on_off(args.first());
-            let v = if toggles.light { 1.0 } else { 0.0 };
-            for (_, m) in materials.iter_mut() {
-                m.params.light_enabled = v;
-            }
-        }
+        // The toggles flow into the terrain uniform every frame
+        // (world_draw::update_terrain_params); flipping them is enough.
+        "fog" => toggles.fog = on_off(args.first()),
+        "ao" | "occlusion" => toggles.ao = on_off(args.first()),
+        "light" => toggles.light = on_off(args.first()),
         "gi" => {
             gi.enabled = on_off(args.first());
         }
         "warp" if !args.is_empty() => {
             // Server creates the world on demand and replies with `Warp`.
             net.send(ClientMsg::Warp { world: args[0].to_string() });
+        }
+        "spawn" | "cube" => {
+            // Drop a physics cube a few metres ahead of the camera (server-gated
+            // on SOILS_PHYSICS, reach-checked, rate-limited).
+            if let Ok((_, t)) = player.single() {
+                let pos = t.translation + t.forward() * 3.0;
+                net.send(ClientMsg::SpawnCube { pos: pos.to_array() });
+            }
         }
         _ => {}
     }

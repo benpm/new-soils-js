@@ -5,7 +5,6 @@ use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::gi::GiSettings;
-use crate::material::{ChunkMeshMaterial, FOG_DENSITY};
 use crate::player::Streaming;
 use crate::singleplayer::Singleplayer;
 
@@ -224,7 +223,6 @@ pub fn pause_menu_buttons(
     buttons: Query<(&Interaction, &MenuButton), (Changed<Interaction>, With<Button>)>,
     mut streaming: ResMut<Streaming>,
     mut toggles: ResMut<RenderToggles>,
-    mut materials: ResMut<Assets<ChunkMeshMaterial>>,
     mut sp: ResMut<Singleplayer>,
     mut gi: ResMut<GiSettings>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
@@ -242,20 +240,10 @@ pub fn pause_menu_buttons(
                 streaming.load_radius = (streaming.load_radius + 1).min(RADIUS_MAX);
                 streaming.last_chunk = None;
             }
-            MenuButton::ToggleAo => {
-                toggles.ao = !toggles.ao;
-                let v = if toggles.ao { 1.0 } else { 0.0 };
-                for (_, m) in materials.iter_mut() {
-                    m.params.ambient_occlusion = v;
-                }
-            }
-            MenuButton::ToggleFog => {
-                toggles.fog = !toggles.fog;
-                let d = if toggles.fog { FOG_DENSITY } else { 0.0 };
-                for (_, m) in materials.iter_mut() {
-                    m.params.fog_density = d;
-                }
-            }
+            // Toggles flow into the terrain uniform every frame
+            // (world_draw::update_terrain_params).
+            MenuButton::ToggleAo => toggles.ao = !toggles.ao,
+            MenuButton::ToggleFog => toggles.fog = !toggles.fog,
             MenuButton::ToggleGi => {
                 gi.enabled = !gi.enabled;
             }
@@ -354,7 +342,6 @@ mod tests {
         app.insert_resource(Streaming::default());
         app.insert_resource(RenderToggles::default());
         app.insert_resource(GiSettings::default());
-        app.insert_resource(Assets::<ChunkMeshMaterial>::default());
         app.insert_resource(sp);
         app.add_systems(Update, pause_menu_buttons);
 

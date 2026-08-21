@@ -1,0 +1,15 @@
+{
+  "//": "AssemblyScript config for server scripts. The runtime invokes asc per-file with --runtime stub --optimize; these are the shared defaults for an explicit `asc` build.",
+  "targets": {
+    "release": {
+      "outFile": ".cache/example.wasm",
+      "optimize": true,
+      "runtime": "stub"
+    }
+  },
+  "options": {
+    "runtime": "stub",
+    "use": ["abort="],
+    "exportRuntime": false
+  }
+}

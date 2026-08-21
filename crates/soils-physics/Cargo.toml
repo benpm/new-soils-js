@@ -1,0 +1,18 @@
+[package]
+name = "soils-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+soils-protocol = { workspace = true }
+soils-sim = { workspace = true }
+avian3d = { workspace = true }
+# Headless-capable: ECS/math/transform/time only, no renderer (server uses it
+# too). Client enables render features on `bevy` elsewhere; features unify.
+bevy = { version = "0.18", default-features = false, features = ["std"] }
+glam = { workspace = true }
+
+[dev-dependencies]
+# Surfaces system/param names in ECS error messages during tests.
+bevy_ecs = { version = "0.18", features = ["debug"] }

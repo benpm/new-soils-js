@@ -14,8 +14,9 @@
 //! [`tick_lifecycle`](World::tick_lifecycle) evicts it (save-if-dirty) once it
 //! expires. Edits mark chunks dirty instead of persisting per edit; dirty
 //! chunks flush on an interval, on eviction, and on shutdown
-//! ([`flush_dirty`](World::flush_dirty)). Freshly *generated* chunks still
-//! persist immediately on adopt — they are written once and only rewritten if
+//! ([`flush_dirty`](World::flush_dirty)). Freshly *generated* chunks are NOT
+//! persisted — worldgen v2 is deterministic, so pristine chunks regenerate on
+//! demand and a chunk is only written once it has been
 //! edited.
 
 use std::collections::HashMap;
@@ -49,6 +50,9 @@ struct ChunkEntry {
     summary: LightSummary,
     version: u32,
     dirty: bool,
+    /// Ever edited (from the region header's EDITED_FLAG, set by `edit`).
+    /// Pristine chunks stream as manifest positions; edited ones as payloads.
+    edited: bool,
     zero_since: Option<Instant>,
 }
 
@@ -252,6 +256,58 @@ impl LightWorld for WorldLight<'_> {
     }
 }
 
+/// One-time (per generator identity) reclassification of persisted chunks:
+/// **pristine ⇔ persisted bytes == current gen(seed, graph, world_type, pos)**.
+/// Any worldgen change (algo bump, graph edit) invalidates the `gen_stamp`
+/// file and re-runs the sweep, demoting now-unreproducible chunks to edited —
+/// fail-safe in both directions: a wrong "pristine" is definitionally
+/// impossible (it requires byte equality with what the client will generate),
+/// a wrong "edited" only costs wire bytes. Crash mid-sweep → stamp absent →
+/// idempotent re-run.
+fn classify_regions(
+    data_dir: &Path,
+    name: &str,
+    regions_dir: &Path,
+    terrain: &TerrainGen,
+    registry: &BlockRegistry,
+    graph_hash: u64,
+) {
+    let stamp_path = data_dir.join("worlds").join(name).join("gen_stamp");
+    let stamp = format!("{graph_hash} {} 0", terrain.seed());
+    if std::fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str()) {
+        return;
+    }
+    let t0 = Instant::now();
+    let mut total = 0usize;
+    let mut edited = 0usize;
+    let result = region::classify_dir(regions_dir, |batch| {
+        let positions: Vec<IVec3> = batch.iter().map(|(p, _)| *p).collect();
+        let gens = terrain.generate_batch(&positions, registry);
+        total += batch.len();
+        batch
+            .iter()
+            .zip(&gens)
+            .map(|((_, vol), generated)| {
+                let is_edited = vol.as_bytes() != generated.as_bytes();
+                edited += is_edited as usize;
+                is_edited
+            })
+            .collect()
+    });
+    match result {
+        Ok(()) => {
+            let _ = std::fs::write(&stamp_path, &stamp);
+            if total > 0 {
+                println!(
+                    "world {name}: classified {total} persisted chunks ({edited} edited) in {:?}",
+                    t0.elapsed()
+                );
+            }
+        }
+        Err(e) => eprintln!("world {name}: region classification failed (will retry on open): {e}"),
+    }
+}
+
 pub struct World {
     pub registry: Arc<BlockRegistry>,
     terrain: Arc<TerrainGen>,
@@ -290,6 +346,8 @@ pub struct World {
     /// Spawn point in voxel space (matches the JS default world spawn).
     pub spawn: [f32; 3],
     pub seed: i64,
+    /// Cached `soils_worldgen::graph_hash` of the active generator.
+    graph_hash: u64,
 }
 
 impl World {
@@ -302,10 +360,13 @@ impl World {
         // bounded by the leak thresholds; runs before any header is memoised.
         region::compact_dir(&regions_dir);
         let registry = Arc::new(default_registry());
+        let terrain = Arc::new(TerrainGen::new(seed, WorldType::Normal));
+        let graph_hash = soils_worldgen::graph_hash(terrain.graph());
+        classify_regions(data_dir, name, &regions_dir, &terrain, &registry, graph_hash);
         Self {
             light_levels: registry.light_table(),
             registry,
-            terrain: Arc::new(TerrainGen::new(seed, WorldType::Normal)),
+            terrain,
             chunks: HashMap::new(),
             refs: HashMap::new(),
             light_queue: Vec::new(),
@@ -318,10 +379,11 @@ impl World {
             // the player starts in the open air rather than buried in rock.
             spawn: [282.0, 285.0, 268.0],
             seed: seed as i64,
+            graph_hash,
         }
     }
 
-    fn entry(&mut self, pos: IVec3, volume: ChunkVolume) -> ChunkEntry {
+    fn entry(&mut self, pos: IVec3, volume: ChunkVolume, edited: bool) -> ChunkEntry {
         let zero_since = if self.refs.get(&pos).copied().unwrap_or(0) > 0 {
             None
         } else {
@@ -334,6 +396,7 @@ impl World {
             summary: LightSummary::default(),
             version: 0,
             dirty: false,
+            edited,
             zero_since,
         }
     }
@@ -341,14 +404,16 @@ impl World {
     /// Read a persisted chunk via the memoised region-header cache, opening the
     /// region file at most once per region instead of once per chunk. Returns
     /// `None` for a chunk that has never been persisted (caller generates it).
-    fn probe(&mut self, pos: IVec3) -> Option<ChunkVolume> {
+    fn probe(&mut self, pos: IVec3) -> Option<(ChunkVolume, bool)> {
         let path = region::region_path(&self.regions_dir, pos);
         let header = self
             .header_cache
             .entry(path)
             .or_insert_with(|| region::read_header(&self.regions_dir, pos).unwrap_or(None));
         let hdr = header.as_ref()?;
-        region::read_chunk(&self.regions_dir, pos, hdr[region::header_index(pos)]).unwrap_or(None)
+        let entry = hdr[region::header_index(pos)];
+        let vol = region::read_chunk(&self.regions_dir, pos, entry).unwrap_or(None)?;
+        Some((vol, region::entry_edited(entry)))
     }
 
     /// Make `pos` resident from the in-memory cache or disk. `false` = never
@@ -359,8 +424,8 @@ impl World {
             return true;
         }
         match self.probe(pos) {
-            Some(volume) => {
-                let entry = self.entry(pos, volume);
+            Some((volume, edited)) => {
+                let entry = self.entry(pos, volume, edited);
                 self.chunks.insert(pos, entry);
                 true
             }
@@ -374,8 +439,10 @@ impl World {
     /// generated chunk is written once; later rewrites only happen via edits).
     pub fn adopt(&mut self, pos: IVec3, volume: ChunkVolume) {
         if !self.chunks.contains_key(&pos) {
-            self.persist.enqueue(self.regions_dir.clone(), pos, volume.clone());
-            let entry = self.entry(pos, volume);
+            // Pristine chunks are no longer persisted — they're reproducible
+            // from the world identity (worldgen v2 is deterministic), so they
+            // hit disk only once edited (the dirty flush).
+            let entry = self.entry(pos, volume, false);
             self.chunks.insert(pos, entry);
         }
     }
@@ -386,6 +453,21 @@ impl World {
         Some(soils_protocol::encode_chunk(&self.chunks.get(&pos)?.volume))
     }
 
+    /// Whether a resident chunk has ever been edited (manifest classification).
+    /// `None` if not resident.
+    pub fn chunk_edited(&self, pos: IVec3) -> Option<bool> {
+        self.chunks.get(&pos).map(|e| e.edited)
+    }
+
+    /// The world-generation identity clients need for local generation.
+    pub fn gen_params(&self) -> soils_protocol::GenParams {
+        soils_protocol::GenParams {
+            seed: self.seed,
+            world_type: 0, // the server currently always runs WorldType::Normal
+            graph_hash: self.graph_hash,
+        }
+    }
+
     /// Handles for generating chunks off-thread (generation is pure).
     pub fn gen_ctx(&self) -> (Arc<TerrainGen>, Arc<BlockRegistry>) {
         (self.terrain.clone(), self.registry.clone())
@@ -394,6 +476,12 @@ impl World {
     /// Whether a chunk is resident (used to freeze AI on unloaded terrain).
     pub fn has_chunk(&self, cpos: IVec3) -> bool {
         self.chunks.contains_key(&cpos)
+    }
+
+    /// A resident chunk's voxel volume and edit version, for building physics
+    /// colliders (`version` bumps on edit, so a stale collider is rebuilt).
+    pub fn chunk_volume(&self, cpos: IVec3) -> Option<(&ChunkVolume, u32)> {
+        self.chunks.get(&cpos).map(|e| (&e.volume, e.version))
     }
 
     /// Read one voxel at an absolute position. Unloaded space is Air (id 0) —
@@ -415,6 +503,7 @@ impl World {
         let Some(entry) = self.chunks.get_mut(&cpos) else { return false };
         entry.volume.set(x & CHUNK_CLIP, y & CHUNK_CLIP, z & CHUNK_CLIP, value);
         entry.dirty = true;
+        entry.edited = true;
         entry.version = entry.version.wrapping_add(1);
         let mut lw = WorldLight {
             chunks: &mut self.chunks,
@@ -650,7 +739,12 @@ impl World {
         for (pos, entry) in self.chunks.iter_mut() {
             if entry.dirty {
                 entry.dirty = false;
-                self.persist.enqueue(self.regions_dir.clone(), *pos, entry.volume.clone());
+                self.persist.enqueue(
+                    self.regions_dir.clone(),
+                    *pos,
+                    entry.volume.clone(),
+                    entry.edited,
+                );
             }
         }
     }
@@ -667,7 +761,7 @@ impl World {
         for pos in expired {
             let entry = self.chunks.remove(&pos).expect("collected above");
             if entry.dirty {
-                self.persist.enqueue(self.regions_dir.clone(), pos, entry.volume);
+                self.persist.enqueue(self.regions_dir.clone(), pos, entry.volume, entry.edited);
             }
             // The background writer will rewrite this chunk's region header;
             // the memoised copy is stale the moment the write lands.
@@ -719,14 +813,14 @@ mod tests {
     }
 
     #[test]
-    fn generated_chunks_persist_and_reload_from_disk() {
+    fn pristine_stays_off_disk_and_edits_persist() {
         let dir = std::env::temp_dir().join(format!("soils-world-persist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Generate a below-surface (non-empty) chunk; adopting caches it and
-        // enqueues background persistence.
+        // Adopting a generated chunk caches it but must NOT persist it:
+        // pristine chunks regenerate from the world identity on demand.
         let pos = IVec3::new(8, 7, 8);
-        let generated = {
+        {
             let persister = Persister::new();
             let mut world = World::new(&dir, "default", 0, persister.handle());
             assert!(!world.ensure_resident(pos), "fresh world: nothing on disk yet");
@@ -735,21 +829,31 @@ mod tests {
             let vol = soils_protocol::decode_chunk(&payload).expect("payload decodes");
             assert!(!vol.is_empty(), "below-surface chunk should be non-empty");
             persister.shutdown(); // flush the writer
-            (payload, vol)
-        };
-
-        // The region file now exists and holds exactly the generated voxels.
+        }
         let regions = dir.join("worlds").join("default").join("regions");
-        assert!(regions.is_dir(), "region dir should exist after flush");
-        let loaded = region::load(&regions, pos).unwrap().expect("chunk persisted");
-        assert_eq!(loaded.as_bytes(), generated.1.as_bytes());
+        assert!(
+            region::load(&regions, pos).ok().flatten().is_none(),
+            "pristine chunk must not persist on adopt"
+        );
 
-        // A fresh world loads the chunk from disk (identical bytes) rather than
-        // regenerating it.
+        // An edit dirties it; the flush persists it (edited flag set) and a
+        // fresh world then loads it from disk instead of regenerating.
+        let edited_payload = {
+            let persister = Persister::new();
+            let mut world = World::new(&dir, "default", 0, persister.handle());
+            world.adopt(pos, generate_one(&world, pos));
+            let v = pos * 32 + IVec3::new(1, 2, 3);
+            assert!(world.edit(v.x, v.y, v.z, 3));
+            world.flush_dirty();
+            let payload = world.serve(pos).expect("resident");
+            persister.shutdown();
+            payload
+        };
         let persister2 = Persister::new();
         let mut world2 = World::new(&dir, "default", 0, persister2.handle());
-        assert!(world2.ensure_resident(pos), "chunk should load from disk");
-        assert_eq!(world2.serve(pos).unwrap(), generated.0);
+        assert!(world2.ensure_resident(pos), "edited chunk should load from disk");
+        assert_eq!(world2.serve(pos).unwrap(), edited_payload);
+        assert_eq!(world2.chunk_edited(pos), Some(true));
         persister2.shutdown();
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -785,7 +889,16 @@ mod tests {
         let mut world = World::new(&dir, "default", 0, persister.handle());
 
         // A surface chunk plus its vertical neighbors (the grid samples them).
-        let cpos = IVec3::new(8, 8, 8);
+        // The surface height at this column depends on the worldgen tuning, so
+        // find the straddling chunk instead of hardcoding it.
+        let cy = {
+            let (terrain, registry) = world.gen_ctx();
+            (0..16)
+                .rev()
+                .find(|&cy| !terrain.generate(IVec3::new(8, cy, 8), &registry).is_empty())
+                .expect("some chunk in the column is solid")
+        };
+        let cpos = IVec3::new(8, cy, 8);
         for dy in -1..=1 {
             let p = cpos + IVec3::Y * dy;
             let vol = generate_one(&world, p);

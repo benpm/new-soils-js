@@ -265,18 +265,20 @@ fn gpu_blit_matches_cpu_fill() {
         return;
     };
 
-    // Deterministic chunk patterns: voxels (layout (y + z*32)*32 + x) and the
-    // padded 34³ light volume the material uses (interior voxel at +1/axis).
+    // Deterministic chunk patterns in mini pools (both layout
+    // (y + z*32)*32 + x): the scene chunk lives in mesh slot 1 / light slot 2,
+    // exercising slot addressing.
+    const MESH_SLOT: u32 = 1;
+    const LIGHT_SLOT: u32 = 2;
     let mut chunk = vec![0u8; 32 * 32 * 32];
     let mut s = 7u64;
     for b in chunk.iter_mut() {
         s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         *b = (s >> 33) as u8;
     }
-    const LPAD: usize = 34;
-    let mut pad = vec![0u8; LPAD * LPAD * LPAD];
+    let mut light = vec![0u8; 32 * 32 * 32];
     let mut s = 13u64;
-    for b in pad.iter_mut() {
+    for b in light.iter_mut() {
         s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         *b = (s >> 33) as u8;
     }
@@ -295,24 +297,25 @@ fn gpu_blit_matches_cpu_fill() {
                         (x + rel[0] as usize, y + rel[1] as usize, z + rel[2] as usize);
                     let dst = (vy * dim + vz) * dim + vx;
                     want[dst] = chunk[(y + z * 32) * 32 + x];
-                    want_light[dst] = pad[((y + 1) + (z + 1) * LPAD) * LPAD + (x + 1)];
+                    want_light[dst] = light[(y + z * 32) * 32 + x];
                 }
             }
         }
     }
 
+    // Mini pools: zeros everywhere except the scene slots.
+    let mut vox_pool = vec![0u8; 2 * 32768];
+    vox_pool[(MESH_SLOT as usize) * 32768..].copy_from_slice(&chunk);
     let chunk_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("chunk"),
-        contents: &chunk,
+        label: Some("voxel_pool"),
+        contents: &vox_pool,
         usage: wgpu::BufferUsages::STORAGE,
     });
-    // Padded to a word multiple (34³ = 39304 isn't); the shader never reads
-    // the tail. Bevy's ShaderStorageBuffer rounds the same way.
-    let mut pad_upload = pad.clone();
-    pad_upload.resize(pad_upload.len().div_ceil(4) * 4, 0);
+    let mut light_pool = vec![0u8; 3 * 32768];
+    light_pool[(LIGHT_SLOT as usize) * 32768..].copy_from_slice(&light);
     let light_pad_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("chunk_light"),
-        contents: &pad_upload,
+        label: Some("light_pool"),
+        contents: &light_pool,
         usage: wgpu::BufferUsages::STORAGE,
     });
     let vol_bytes = (dim * dim * dim) as u64;
@@ -396,7 +399,16 @@ fn gpu_blit_matches_cpu_fill() {
         for (i, rel) in rels.iter().enumerate() {
             let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("blit_params"),
-                contents: bytemuck::cast_slice(&[rel[0], rel[1], rel[2], 0]),
+                contents: bytemuck::cast_slice(&[
+                    rel[0],
+                    rel[1],
+                    rel[2],
+                    MESH_SLOT as i32,
+                    LIGHT_SLOT as i32,
+                    0,
+                    0,
+                    0,
+                ]),
                 usage: wgpu::BufferUsages::STORAGE,
             });
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {

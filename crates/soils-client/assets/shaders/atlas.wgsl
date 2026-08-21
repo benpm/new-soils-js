@@ -1,14 +1,16 @@
-// Chunk material: vertex-pulls greedy quads from a storage buffer the compute
-// mesher (voxel_mesh.wgsl) wrote, then shades with the original atlas.frag logic
-// (world-space per-face tiling, ambient occlusion, normal tint). No vertex
-// buffer / Bevy Mesh attributes are used.
+// Terrain draw over the POOLED chunk caches: one multi_draw_indirect renders
+// every resident chunk. The vertex stage pulls packed greedy quads from the
+// shared quad pool (slot = vertex_index / (QUADS_PER_SLOT * 6)); the fragment
+// stage shades with the original atlas logic (world-space per-face tiling,
+// ambient occlusion, normal tint), sampling L0 light across chunk borders
+// through the slot table — no per-chunk buffers, materials, or bind groups.
 
 #import bevy_pbr::{
     mesh_view_bindings::view,
     view_transformations::position_world_to_clip,
 }
 
-struct AtlasParams {
+struct WorldParams {
     ambient_occlusion: f32,
     // Effective illuminance applied to the (otherwise unlit) terrain so it sits
     // in the same exposure regime as the physically-bright atmosphere sky.
@@ -18,66 +20,63 @@ struct AtlasParams {
     fog_density: f32,
     fog_color: vec3<f32>,
     // Radiance-cascades GI (see gi.rs): world-voxel corner of the volume, and a
-    // >0.5 enable flag. Carried here (not in a shared buffer) so the material
-    // bind group never references a per-frame-recreated buffer.
+    // >0.5 enable flag.
     gi_origin: vec3<f32>,
     gi_enabled: f32,
     // Baked L0 light grid (see light.rs): day-scaled illuminance of a fully
-    // sky-lit surface, and a >0.5 enable flag (off = flat `brightness`, the
-    // pre-L0 look the GI demo uses).
+    // sky-lit surface, and a >0.5 enable flag (off = flat `brightness`).
     sky_term: f32,
     light_enabled: f32,
-    // World position of the chunk's (0,0,0) corner; replaces the per-instance
-    // mesh transform, which indirect draws can't index.
-    chunk_origin: vec3<f32>,
 };
 
-struct QuadGpu {
-    base: vec3<f32>, tile: u32,
-    du: vec3<f32>,   nx: f32,
-    dv: vec3<f32>,   ny: f32,
-    ao: vec4<f32>,
-    nz: f32, pad0: f32, pad1: f32, pad2: f32,
+struct ChunkSlot {
+    cpos: vec3<i32>,
+    mesh_slot: u32,
+    flags: u32,
+    flags_gpu: u32,
+    quad_count: u32,
+    pad: u32,
 };
 
-struct QuadBuffer {
-    count: u32,
-    p0: u32, p1: u32, p2: u32,
-    quads: array<QuadGpu>,
-};
+@group(2) @binding(0) var<storage, read> quads: array<u32>;          // packed, N_MESH × QPS × 2
+@group(2) @binding(1) var<storage, read> mesh_info: array<vec4<i32>>; // per mesh slot: cpos, light slot
+@group(2) @binding(2) var<storage, read> desc: array<ChunkSlot>;      // per unified slot
+@group(2) @binding(3) var<storage, read> light_pool: array<u32>;      // N_SLOTS × 8192 words
+@group(2) @binding(4) var<storage, read> slot_table: array<u32>;      // 32³ wrap-window map
+@group(2) @binding(5) var<storage, read> gi_probes: array<vec4<f32>>;
+@group(2) @binding(6) var atlas_tex: texture_2d<f32>;
+@group(2) @binding(7) var atlas_sampler: sampler;
+@group(2) @binding(8) var<uniform> params: WorldParams;
 
-// GI radiance-cascades output (see gi.rs / radiance.wgsl): the merged cascade-0
-// field, shared (read-only) across all chunk materials.
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<storage, read> qb: QuadBuffer;
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var atlas_tex: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(2) var atlas_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: AtlasParams;
-// Per-probe ambient-cube irradiance (6 vec4 faces per probe, +x -x +y -y +z
-// -z), projected from merged cascade 0 by gi_irradiance.wgsl.
-@group(#{MATERIAL_BIND_GROUP}) @binding(4) var<storage, read> gi_probes: array<vec4<f32>>;
-// Per-chunk padded L0 light volume: LPAD^3 packed bytes (sky nibble hi, block
-// nibble lo) — the chunk's 32^3 plus one voxel of neighbor light per side.
-@group(#{MATERIAL_BIND_GROUP}) @binding(5) var<storage, read> chunk_light: array<u32>;
-
-// Must match `gpu_mesh::MAX_QUADS` / voxel_mesh.wgsl. The mesher's atomic
-// count keeps incrementing past this when a chunk overflows (writes are
-// dropped), so readers must clamp or they index past the allocation.
-const MAX_QUADS: u32 = 8192u;
-// Must match `gpu_mesh::LIGHT_PAD`.
-const LPAD: i32 = 34;
+// Must match pool::QUADS_PER_SLOT / voxel_mesh.wgsl.
+const QUADS_PER_SLOT: u32 = 4096u;
+const TABLE_EMPTY: u32 = 0xffffffffu;
 // Illuminance of a level-15 blocklight surface (lux regime), warm-tinted.
 const BLOCK_LUX: f32 = 35000.0;
 const BLOCK_TINT: vec3<f32> = vec3<f32>(1.0, 0.82, 0.6);
 
+// Resolve a world chunk coordinate to its unified slot through the
+// wrap-window table, validating against the descriptor (stale cells are
+// expected; validation makes them read as "unloaded").
+fn slot_of(cpos: vec3<i32>) -> u32 {
+    let m = vec3<i32>(31);
+    let c = cpos & m;
+    let slot = slot_table[u32(c.x + c.y * 32 + c.z * 1024)];
+    if (slot == TABLE_EMPTY) { return TABLE_EMPTY; }
+    let d = desc[slot];
+    if (any(d.cpos != cpos)) { return TABLE_EMPTY; }
+    return slot;
+}
+
 // Packed L0 light byte for the air voxel just in front of a fragment's face.
-fn light_at(local_pos: vec3<f32>, n: vec3<f32>) -> u32 {
-    let c = clamp(
-        vec3<i32>(floor(local_pos + n * 0.5)) + vec3<i32>(1),
-        vec3<i32>(0),
-        vec3<i32>(LPAD - 1),
-    );
-    let idx = u32((c.y + c.z * LPAD) * LPAD + c.x);
-    let w = chunk_light[idx >> 2u];
+// Crosses chunk borders through the slot table; unloaded space reads dark.
+fn light_at(world_pos: vec3<f32>, n: vec3<f32>) -> u32 {
+    let v = vec3<i32>(floor(world_pos + n * 0.5));
+    let slot = slot_of(v >> vec3<u32>(5u));
+    if (slot == TABLE_EMPTY) { return 0u; }
+    let l = v & vec3<i32>(31);
+    let idx = u32((l.y + l.z * 32) * 32 + l.x);
+    let w = light_pool[slot * 8192u + (idx >> 2u)];
     return (w >> ((idx & 3u) * 8u)) & 0xffu;
 }
 
@@ -101,11 +100,7 @@ fn gi_cube(pidx: u32, n: vec3<f32>) -> vec3<f32> {
         + n2.z * gi_probes[base + fz].rgb;
 }
 
-// Trilinearly interpolated ambient-cube irradiance about normal `n`: one
-// interpolated fetch over the 8 surrounding probes, replacing the old
-// per-fragment 16-direction integration (that integral now runs once per
-// probe in gi_irradiance.wgsl). Returns linear RGB irradiance (0 outside the
-// probe volume, matching the old nearest-probe cutoff).
+// Trilinearly interpolated ambient-cube irradiance about normal `n`.
 fn gi_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     // Sample one probe-spacing off the surface along the normal: a probe sitting
     // exactly on the surface is embedded in the solid voxel and traces only that
@@ -145,31 +140,50 @@ const CORNERS = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
 @vertex
 fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     var out: VertexOutput;
-    let q = vertex_index / 6u;
-    let corner = CORNERS[vertex_index % 6u];
+    // For non-indexed indirect draws vertex_index includes first_vertex, so it
+    // carries the slot's global quad offset already.
+    let slot = vertex_index / (QUADS_PER_SLOT * 6u);
+    let rem = vertex_index % (QUADS_PER_SLOT * 6u);
+    let q = rem / 6u;
+    let corner = CORNERS[rem % 6u];
 
-    // Defense-in-depth: the indirect args already stop at count*6, and the
-    // finalize pass clamps count to MAX_QUADS.
-    if (q >= min(qb.count, MAX_QUADS)) {
-        out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-        return out;
-    }
+    // Unpack (see voxel_mesh.wgsl emit): w0 = x|y|z|w|h|axis, w1 = sign|tile|ao.
+    let at = (slot * QUADS_PER_SLOT + q) * 2u;
+    let w0 = quads[at];
+    let w1 = quads[at + 1u];
+    let base = vec3<f32>(
+        f32(w0 & 63u),
+        f32((w0 >> 6u) & 63u),
+        f32((w0 >> 12u) & 63u),
+    );
+    let qw = i32((w0 >> 18u) & 63u);
+    let qh = i32((w0 >> 24u) & 63u);
+    let d = (w0 >> 30u) & 3u;
+    let positive = (w1 & 1u) == 1u;
+    let u_axis = (d + 1u) % 3u;
+    let v_axis = (d + 2u) % 3u;
 
-    let quad = qb.quads[q];
-    var p = quad.base;
-    if (corner == 1u) { p = quad.base + quad.du; }
-    else if (corner == 2u) { p = quad.base + quad.du + quad.dv; }
-    else if (corner == 3u) { p = quad.base + quad.dv; }
+    var du = vec3<i32>(0);
+    var dv = vec3<i32>(0);
+    if (positive) { du[u_axis] = qw; dv[v_axis] = qh; }
+    else          { du[v_axis] = qh; dv[u_axis] = qw; }
+    var normal = vec3<f32>(0.0);
+    normal[d] = select(-1.0, 1.0, positive);
 
-    let normal = vec3<f32>(quad.nx, quad.ny, quad.nz);
+    var p = base;
+    if (corner == 1u) { p = base + vec3<f32>(du); }
+    else if (corner == 2u) { p = base + vec3<f32>(du) + vec3<f32>(dv); }
+    else if (corner == 3u) { p = base + vec3<f32>(dv); }
 
-    let world_position = params.chunk_origin + p;
+    let origin = vec3<f32>(mesh_info[slot].xyz * 32);
+    let world_position = origin + p;
     out.clip_position = position_world_to_clip(world_position);
     out.local_position = p;
     out.world_position = world_position;
     out.normal = normal;
-    out.tile = quad.tile;
-    out.ao = quad.ao[corner];
+    out.tile = (w1 >> 1u) & 0xffu;
+    let ao_lvl = (w1 >> (9u + corner * 2u)) & 3u;
+    out.ao = 0.1 + f32(ao_lvl) * 0.3;
     return out;
 }
 
@@ -220,7 +234,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // The radiance-cascades GI then adds coloured bounce on top.
     var lit = vec3<f32>(params.brightness);
     if (params.light_enabled > 0.5) {
-        let l = light_at(in.local_position, n);
+        let l = light_at(in.world_position, n);
         let skyf = f32(l >> 4u) / 15.0;
         let blockf = f32(l & 15u) / 15.0;
         let sky_l = params.sky_term * skyf * skyf;

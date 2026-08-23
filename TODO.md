@@ -1,5 +1,8 @@
 # Todo
 
+## UI and Inventory
+
+
 ## BigRefactor
 
 Focus on this refactor unles instructed otherwise. Commit for each, make sure to pull as well.

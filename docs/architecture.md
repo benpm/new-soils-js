@@ -7,15 +7,15 @@ complete. This is the "what is" companion to the "what should be" plans
 
 ## Workspace
 
-| Crate | Role |
-|-------|------|
-| `soils-protocol` | Wire types + codecs: `ClientMsg`/`ServerMsg` (bincode), the palette+LZ4 chunk codec (`chunk_codec.rs`), the quantized delta-snapshot codec + `SnapshotTracker` (`snapshot.rs`), chunk/voxel coordinates. No Bevy, no tokio. |
-| `soils-worldgen` | Block registry, terrain generation (lattice-interpolated cave noise, early-outs), and the *CPU oracles*: reference greedy mesher (`greedy.rs`) and radiance-cascades math (`radiance.rs`). Pure, unit-tested, criterion-benched. |
-| `soils-sim` | The shared simulation both sides run: player movement/collision (`step_player`), input packing, edit validation, the L0 light flood (`light.rs`), entity registry (`entities.yaml`), and pathfinding (`nav.rs`: walk grids, budgeted A*, HPA*, flow fields). Engine-free, everything over a `VoxelSampler` trait (unloaded space reads as air). |
-| `soils-script` | Server-side scripting host: a wasmtime (Cranelift JIT) runtime that loads AssemblyScript (`.ts`, compiled at runtime via `asc`) or precompiled `.wasm`/`.wat`, exposes a scalar host ABI (`host.rs`) for reading/mutating world state, and runs scripts under a per-call fuel + memory budget (`lib.rs`). No Bevy/tokio. |
-| `soils-physics` | Shared Avian rigid-body physics: config + body/collider builders, `Collider::voxels` terrain conversion (`collider.rs`), the kinematic player-proxy, and the `add_physics` app setup. Used by both server (authority) and client (local prediction), like `soils-sim`. Behind `SOILS_PHYSICS`. |
-| `soils-server` | Headless authoritative server: a Bevy ECS app (`app.rs`) at a 20 Hz fixed tick behind a tokio network edge (`lib.rs`), world/chunk lifecycle + persistence (`world.rs`, `region.rs`, `persist.rs`), accounts (`auth.rs`). |
-| `soils-client` | The Bevy game: net bridge (`net.rs`), chunk streaming + GPU meshing (`server_msg.rs`, `gpu_mesh.rs`, `indirect_draw.rs`), materials + L0 shading (`material.rs`, `light.rs`), radiance-cascades GI (`gi.rs`), prediction (`player.rs`), remote-entity interpolation (`actor.rs`), optimistic edits (`edit.rs`), UI. |
+| Crate            | Role                                                                                                                                                                                                                                                                                                                                            |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `soils-protocol` | Wire types + codecs: `ClientMsg`/`ServerMsg` (bincode), the palette+LZ4 chunk codec (`chunk_codec.rs`), the quantized delta-snapshot codec + `SnapshotTracker` (`snapshot.rs`), chunk/voxel coordinates. No Bevy, no tokio.                                                                                                                     |
+| `soils-worldgen` | Block registry, terrain generation (lattice-interpolated cave noise, early-outs), and the *CPU oracles*: reference greedy mesher (`greedy.rs`) and radiance-cascades math (`radiance.rs`). Pure, unit-tested, criterion-benched.                                                                                                                |
+| `soils-sim`      | The shared simulation both sides run: player movement/collision (`step_player`), input packing, edit validation, the L0 light flood (`light.rs`), entity registry (`entities.yaml`), and pathfinding (`nav.rs`: walk grids, budgeted A*, HPA*, flow fields). Engine-free, everything over a `VoxelSampler` trait (unloaded space reads as air). |
+| `soils-script`   | Server-side scripting host: a wasmtime (Cranelift JIT) runtime that loads AssemblyScript (`.ts`, compiled at runtime via `asc`) or precompiled `.wasm`/`.wat`, exposes a scalar host ABI (`host.rs`) for reading/mutating world state, and runs scripts under a per-call fuel + memory budget (`lib.rs`). No Bevy/tokio.                        |
+| `soils-physics`  | Shared Avian rigid-body physics: config + body/collider builders, `Collider::voxels` terrain conversion (`collider.rs`), the kinematic player-proxy, and the `add_physics` app setup. Used by both server (authority) and client (local prediction), like `soils-sim`. Behind `SOILS_PHYSICS`.                                                  |
+| `soils-server`   | Headless authoritative server: a Bevy ECS app (`app.rs`) at a 20 Hz fixed tick behind a tokio network edge (`lib.rs`), world/chunk lifecycle + persistence (`world.rs`, `region.rs`, `persist.rs`), accounts (`auth.rs`).                                                                                                                       |
+| `soils-client`   | The Bevy game: net bridge (`net.rs`), chunk streaming + GPU meshing (`server_msg.rs`, `gpu_mesh.rs`, `indirect_draw.rs`), materials + L0 shading (`material.rs`, `light.rs`), radiance-cascades GI (`gi.rs`), prediction (`player.rs`), remote-entity interpolation (`actor.rs`), optimistic edits (`edit.rs`), UI.                             |
 
 One rule holds everything together: **client and server share one simulation**
 (`soils-sim`) and one set of codecs (`soils-protocol`), so predicted movement,
@@ -24,29 +24,41 @@ the remaining risks are pinned by oracle tests.
 
 ## Data flow
 
-```
-             ┌────────────────────── soils-server ──────────────────────┐
- tokio edge  │  ECS app (20 Hz FixedUpdate)                             │
-┌─────────┐  │  accept → drain_inboxes → wander_critters →              │
-│ WS pump │──┼─▶ inbox   (auth, inputs, edits, view radius)             │
-│ WT pump │◀─┼── outbox  (reliable: chunks/edits/control)               │
-└─────────┘  │   snapshot lane (latest-wins watch channel)              │
-             │  pump_chunk_jobs ── rayon: worldgen waves, light jobs    │
-             │  replicate_entities ─ interest diff + delta snapshots    │
-             │  world_lifecycle ── refcounts, evict, flush, compaction  │
-             └───────────────────────────────────────────────────────────┘
-                     ▲ inputs (datagram/WS)        │ chunks, snapshots
-                     │                             ▼
-             ┌────────────────────── soils-client ──────────────────────┐
-             │ net thread (ws:// or wt://) → NetEvent channel           │
-             │ apply_chunks (ordered stream, time-boxed)                │
-             │   → GPU voxel buffers → compute mesher → indirect draws  │
-             │   → L0 light flood → padded light buffers → material     │
-             │   → GI volume blit → trace/merge round-robin → probes    │
-             │ snapshots → SnapshotTracker → reconcile self / buffer    │
-             │             remote actors (interp @ 2-tick delay)        │
-             │ FixedUpdate 64 Hz: predict_and_send (shared step_player) │
-             └───────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph SERVER["soils-server"]
+        subgraph EDGE["tokio edge"]
+            WSP["WS pump"]
+            WTP["WT pump"]
+        end
+        subgraph TICK["ECS app — 20 Hz FixedUpdate"]
+            direction TB
+            T1["accept → drain_inboxes → wander_critters"]
+            T2["pump_chunk_jobs<br/>rayon: worldgen waves, light jobs"]
+            T3["replicate_entities<br/>interest diff + delta snapshots"]
+            T4["world_lifecycle<br/>refcounts, evict, flush, compaction"]
+            T1 --> T2 --> T3 --> T4
+        end
+        EDGE -- "inbox: auth, inputs, edits, view radius" --> TICK
+        TICK -- "outbox, reliable: chunks / edits / control" --> EDGE
+        TICK -- "snapshot lane: latest-wins watch channel" --> EDGE
+    end
+
+    subgraph CLIENT["soils-client"]
+        NET["net thread (ws:// or wt://) → NetEvent channel"]
+        C1["apply_chunks — ordered stream, time-boxed"]
+        C2["GPU voxel buffers → compute mesher → indirect draws"]
+        C3["L0 light flood → padded light buffers → material"]
+        C4["GI volume blit → trace/merge round-robin → probes"]
+        S1["snapshots → SnapshotTracker"]
+        S2["reconcile self / buffer remote actors<br/>(interp @ 2-tick delay)"]
+        P1["FixedUpdate 64 Hz: predict_and_send<br/>(shared step_player)"]
+        NET --> C1 --> C2 --> C3 --> C4
+        NET --> S1 --> S2 --> P1
+    end
+
+    EDGE -- "chunks, snapshots" --> NET
+    P1 -- "inputs (datagram/WS)" --> EDGE
 ```
 
 ## Protocol

@@ -6,49 +6,49 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct SetVerifierArgs {
+pub(super) struct SetPasswordArgs {
     pub name: String,
-    pub verifier: String,
+    pub password: String,
 }
 
-impl From<SetVerifierArgs> for super::Reducer {
-    fn from(args: SetVerifierArgs) -> Self {
-        Self::SetVerifier {
+impl From<SetPasswordArgs> for super::Reducer {
+    fn from(args: SetPasswordArgs) -> Self {
+        Self::SetPassword {
             name: args.name,
-            verifier: args.verifier,
+            password: args.password,
         }
     }
 }
 
-impl __sdk::InModule for SetVerifierArgs {
+impl __sdk::InModule for SetPasswordArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `set_verifier`.
+/// Extension trait for access to the reducer `set_password`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait set_verifier {
-    /// Request that the remote module invoke the reducer `set_verifier` to run as soon as possible.
+pub trait set_password {
+    /// Request that the remote module invoke the reducer `set_password` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`set_verifier:set_verifier_then`] to run a callback after the reducer completes.
-    fn set_verifier(&self, name: String, verifier: String) -> __sdk::Result<()> {
-        self.set_verifier_then(name, verifier, |_, _| {})
+    /// /// Use [`set_password:set_password_then`] to run a callback after the reducer completes.
+    fn set_password(&self, name: String, password: String) -> __sdk::Result<()> {
+        self.set_password_then(name, password, |_, _| {})
     }
 
-    /// Request that the remote module invoke the reducer `set_verifier` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `set_password` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn set_verifier_then(
+    fn set_password_then(
         &self,
         name: String,
-        verifier: String,
+        password: String,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
@@ -56,17 +56,17 @@ pub trait set_verifier {
     ) -> __sdk::Result<()>;
 }
 
-impl set_verifier for super::RemoteReducers {
-    fn set_verifier_then(
+impl set_password for super::RemoteReducers {
+    fn set_password_then(
         &self,
         name: String,
-        verifier: String,
+        password: String,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
     ) -> __sdk::Result<()> {
         self.imp
-            .invoke_reducer_with_callback(SetVerifierArgs { name, verifier }, callback)
+            .invoke_reducer_with_callback(SetPasswordArgs { name, password }, callback)
     }
 }

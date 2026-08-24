@@ -14,6 +14,7 @@ pub struct ChunkBlob {
     pub cz: i32,
     pub payload: Vec<u8>,
     pub version: u32,
+    pub writer_epoch: u64,
     pub updated_at: __sdk::Timestamp,
 }
 
@@ -32,6 +33,7 @@ pub struct ChunkBlobCols {
     pub cz: __sdk::__query_builder::Col<ChunkBlob, i32>,
     pub payload: __sdk::__query_builder::Col<ChunkBlob, Vec<u8>>,
     pub version: __sdk::__query_builder::Col<ChunkBlob, u32>,
+    pub writer_epoch: __sdk::__query_builder::Col<ChunkBlob, u64>,
     pub updated_at: __sdk::__query_builder::Col<ChunkBlob, __sdk::Timestamp>,
 }
 
@@ -46,6 +48,7 @@ impl __sdk::__query_builder::HasCols for ChunkBlob {
             cz: __sdk::__query_builder::Col::new(table_name, "cz"),
             payload: __sdk::__query_builder::Col::new(table_name, "payload"),
             version: __sdk::__query_builder::Col::new(table_name, "version"),
+            writer_epoch: __sdk::__query_builder::Col::new(table_name, "writer_epoch"),
             updated_at: __sdk::__query_builder::Col::new(table_name, "updated_at"),
         }
     }

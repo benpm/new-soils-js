@@ -17,6 +17,8 @@ use spacetimedb::{
 };
 use std::time::Duration;
 
+mod password;
+
 /// Longest accepted chat message, in bytes.
 pub const MAX_CHAT_LEN: usize = 512;
 
@@ -29,6 +31,14 @@ pub const LIVENESS_TTL: Duration = Duration::from_secs(30);
 
 /// How often [`reap_stale`] runs.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Longest accepted password, in bytes. Argon2's cost is dominated by its
+/// memory parameter rather than the input length, but an unbounded input is
+/// still an unbounded copy, and no honest password needs more than this.
+pub const MAX_PASSWORD_LEN: usize = 128;
+
+/// Longest accepted account name. Mirrored by the game server's own check.
+pub const MAX_NAME_LEN: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Tables
@@ -44,7 +54,7 @@ pub const REAP_INTERVAL: Duration = Duration::from_secs(10);
 /// `verifier` is a PHC-format password hash produced and checked by the game
 /// server. The module never sees a plaintext password and never verifies one —
 /// it is a store, and the row is only writable by a registered game server.
-#[table(accessor = account, public)]
+#[table(accessor = account)]
 pub struct Account {
     #[primary_key]
     pub name: String,
@@ -94,8 +104,14 @@ pub struct ChunkBlob {
     pub cy: i32,
     pub cz: i32,
     pub payload: Vec<u8>,
-    /// Mirrors the server's per-chunk edit version.
+    /// Mirrors the server's per-chunk edit version. Only ordered *within* one
+    /// `writer_epoch` — see the stale-write guard in [`put_chunk_blob`].
     pub version: u32,
+    /// Identifies the writing server *process*. The server's chunk versions
+    /// are in-memory edit counters that restart at 0 whenever a chunk is
+    /// evicted and reloaded from its region file, so comparing versions across
+    /// two epochs is meaningless and rejects perfectly good writes forever.
+    pub writer_epoch: u64,
     pub updated_at: Timestamp,
 }
 
@@ -283,42 +299,35 @@ pub fn reap_stale(ctx: &ReducerContext, _timer: ReapTimer) -> Result<(), String>
 // Accounts (server-only)
 // ---------------------------------------------------------------------------
 
-/// Longest accepted account name, in bytes.
-pub const MAX_NAME_LEN: usize = 32;
-
-/// Create an account, or migrate one that already exists locally.
+/// Create an account.
 ///
-/// **Server-only.** The module stores a verifier and never sees or checks a
-/// password: the game server owns hashing and verification, because it is the
-/// only party a client actually proves anything to. Letting players call this
-/// would let anyone claim any unclaimed name with a verifier of their choosing.
+/// **Server-only.** The password is hashed here and the resulting verifier is
+/// never readable by anyone — `account` is a private table. Letting players
+/// call this would let anyone claim any unclaimed name.
 ///
-/// Idempotent for an account whose verifier already matches, so a server
+/// Idempotent for an account whose password already matches, so a server
 /// migrating its local account file can call this for every account without
-/// having to know which ones already crossed over.
+/// having to know which ones already crossed over. A name that exists with a
+/// *different* password is an error: changing a password is [`set_password`],
+/// which is a separate authorisation.
 #[reducer]
 pub fn register_account(
     ctx: &ReducerContext,
     name: String,
-    verifier: String,
+    password: String,
 ) -> Result<(), String> {
     require_server(ctx)?;
-    let name = name.trim().to_string();
-    if name.is_empty() || name.len() > MAX_NAME_LEN {
-        return Err(format!("name must be 1..={MAX_NAME_LEN} bytes"));
-    }
-    if verifier.is_empty() {
-        return Err("verifier must not be empty".to_string());
-    }
+    let name = check_name(name)?;
+    check_password(&password)?;
+
     if let Some(existing) = ctx.db.account().name().find(&name) {
-        return if existing.verifier == verifier {
+        return if password::verify(&password, &existing.verifier) {
             Ok(())
         } else {
-            // Changing an existing account's password is a separate operation
-            // that has to prove knowledge of the old one; this reducer cannot.
             Err(format!("account '{name}' already exists"))
         };
     }
+    let verifier = password::hash(ctx, &password)?;
     ctx.db
         .account()
         .try_insert(Account {
@@ -333,26 +342,93 @@ pub fn register_account(
     Ok(())
 }
 
-/// Replace an account's verifier, for a password change the game server has
-/// already authorised, or a rehash onto stronger parameters.
+/// Check a login. `Ok` means the password matched.
+///
+/// **Server-only**, and deliberately so even though it mutates nothing: an
+/// open version would be a password oracle anyone could grind against. The
+/// game server rate-limits logins; the module trusts it to.
+///
+/// The answer travels back as this reducer's own success or failure, which
+/// SpacetimeDB delivers only to the connection that made the call — reducer
+/// outcomes have been connection-scoped since 2.0.
+///
+/// Answers [`NO_SUCH_ACCOUNT`] and [`WRONG_PASSWORD`] separately; see those for
+/// why that is safe here and must not be passed on to a player verbatim.
 #[reducer]
-pub fn set_verifier(
+pub fn verify_login(
     ctx: &ReducerContext,
     name: String,
-    verifier: String,
+    password: String,
 ) -> Result<(), String> {
     require_server(ctx)?;
-    if verifier.is_empty() {
-        return Err("verifier must not be empty".to_string());
+    let name = check_name(name)?;
+    check_password(&password)?;
+    let account = ctx
+        .db
+        .account()
+        .name()
+        .find(&name)
+        .ok_or_else(|| NO_SUCH_ACCOUNT.to_string())?;
+    if password::verify(&password, &account.verifier) {
+        Ok(())
+    } else {
+        Err(WRONG_PASSWORD.to_string())
     }
+}
+
+/// Replace an account's password, for a change the game server has already
+/// authorised, or a rehash onto stronger parameters.
+#[reducer]
+pub fn set_password(
+    ctx: &ReducerContext,
+    name: String,
+    password: String,
+) -> Result<(), String> {
+    require_server(ctx)?;
+    let name = check_name(name)?;
+    check_password(&password)?;
     let mut account = ctx
         .db
         .account()
         .name()
         .find(&name)
         .ok_or_else(|| format!("no such account '{name}'"))?;
-    account.verifier = verifier;
+    account.verifier = password::hash(ctx, &password)?;
     ctx.db.account().name().update(account);
+    Ok(())
+}
+
+/// A login for a name with no account.
+///
+/// Told apart from [`WRONG_PASSWORD`] on purpose. Distinguishing them to an
+/// *untrusted* caller would enumerate which names exist, but the only callers
+/// here are registered game servers: [`verify_login`] is server-only, and the
+/// server needs to know which case it is — an absent account is what a signup
+/// or a migration from its local account file turns into, and a wrong password
+/// is a flat rejection. Conflating the two for the player is the game server's
+/// job, and it is the layer that can do it without also breaking migration.
+pub const NO_SUCH_ACCOUNT: &str = "no such account";
+
+/// A login for an account that exists, with the wrong password.
+pub const WRONG_PASSWORD: &str = "wrong password";
+
+fn check_name(name: String) -> Result<String, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() || name.len() > MAX_NAME_LEN {
+        return Err(format!("name must be 1..={MAX_NAME_LEN} bytes"));
+    }
+    Ok(name)
+}
+
+/// Only an upper bound. An empty password is allowed deliberately: guest
+/// logins have always used one, and rejecting it here would refuse an account
+/// the local file happily keeps — a difference in behaviour depending on
+/// whether a database is configured, which is exactly what this integration is
+/// supposed to avoid. It is still salted and hashed like any other.
+fn check_password(password: &str) -> Result<(), String> {
+    if password.len() > MAX_PASSWORD_LEN {
+        return Err(format!("password must be at most {MAX_PASSWORD_LEN} bytes"));
+    }
     Ok(())
 }
 
@@ -459,6 +535,7 @@ pub fn put_chunk_blob(
     key: u64,
     payload: Vec<u8>,
     version: u32,
+    writer_epoch: u64,
 ) -> Result<(), String> {
     require_server(ctx)?;
     let (world_id, cx, cy, cz) = chunk_key::unpack_chunk_key(key);
@@ -470,15 +547,25 @@ pub fn put_chunk_blob(
     }
 
     if let Some(mut blob) = ctx.db.chunk_blob().chunk_key().find(key) {
-        // Late or duplicated flushes must not roll the chunk backwards.
-        if version < blob.version {
+        // Late or duplicated flushes must not roll the chunk backwards — but
+        // only a flush from the *same* server process is comparable. The
+        // version is an in-memory edit counter that resets to 0 every time the
+        // chunk is evicted and reloaded from disk, so a version check spanning
+        // epochs would reject every edit made after a reload until the counter
+        // climbed past its own previous high-water mark: silently, permanently,
+        // and in the ordinary case of a long-lived world.
+        //
+        // Across epochs the later caller is by definition the current owner of
+        // the world, so its write wins.
+        if writer_epoch == blob.writer_epoch && version < blob.version {
             return Err(format!(
-                "stale write: incoming version {version} < stored {}",
+                "stale write: incoming version {version} < stored {} (epoch {writer_epoch})",
                 blob.version
             ));
         }
         blob.payload = payload;
         blob.version = version;
+        blob.writer_epoch = writer_epoch;
         blob.updated_at = ctx.timestamp;
         ctx.db.chunk_blob().chunk_key().update(blob);
         return Ok(());
@@ -493,20 +580,13 @@ pub fn put_chunk_blob(
             cz,
             payload,
             version,
+            writer_epoch,
             updated_at: ctx.timestamp,
         })
         .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Drop journal rows already folded into a chunk's blob. Bounds commit-log
-/// Refresh a server's registry row so it stays visible in a server browser and
-/// the reaper doesn't drop it.
-///
-/// Takes a player *count* rather than a list of identities: game players
-/// authenticate to the game server with a name/password and have no
-/// SpacetimeDB identity until the client connects here directly. Per-identity
-/// presence is maintained separately by [`mark_present`] once that exists.
 /// Record where a player was when they logged out, so they resume there.
 #[reducer]
 pub fn save_profile(
@@ -543,6 +623,13 @@ pub fn save_profile(
     Ok(())
 }
 
+/// Refresh a server's registry row so it stays visible in a server browser and
+/// the reaper doesn't drop it.
+///
+/// Takes a player *count* rather than a list of identities: game players
+/// authenticate to the game server with a name/password and have no
+/// SpacetimeDB identity until the client connects here directly. Per-identity
+/// presence is maintained separately by [`mark_present`].
 #[reducer]
 pub fn heartbeat(
     ctx: &ReducerContext,

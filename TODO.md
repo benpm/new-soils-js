@@ -193,12 +193,32 @@ as it was, region files only. Setup and schema notes in
 - [x] Read path: `player_profile` subscription + synchronous cache lookup;
       startup waits (bounded) for the first snapshot so a login cannot race it.
 - [x] A returning player resumes where they logged out.
-- [x] `chunk_blob.version` is the chunk's edit counter, not a wall clock.
+- [x] `chunk_blob.version` is the chunk's edit counter, not a wall clock, and
+      the stale-write guard compares versions only within one `writer_epoch`.
+      The counter lives in memory and restarts at 0 when a chunk is evicted and
+      reloaded, so comparing across server processes silently rejected every
+      edit to a reloaded chunk — permanently, since the region file is
+      authoritative and nothing retries.
 - [x] Edit journal removed: built on both sides, unreachable, and its
       `edits_through` column was hardcoded to 0 in every row it wrote.
 - [x] Accounts live in SpacetimeDB, hashed with Argon2id and per-account salts,
       replacing the `DefaultHasher`-and-fixed-salt scheme. Offline play keeps
       the local file; existing accounts migrate on their next login.
+- [x] `account` is a **private** table and verification happens inside the
+      module (`verify_login`/`register_account`/`set_password`). It was public,
+      which in SpacetimeDB means every connected client could subscribe and
+      read every Argon2 verifier; limiting our own client's subscription list
+      was politeness, not a boundary. Row-level security would be the natural
+      tool and is not usable in 2.7.1 — `client_visibility_filter` is behind
+      the `unstable` feature and documented in its own source as not enforced.
+- [x] Logins run on a worker thread. Argon2id inline on the 64 Hz tick froze
+      every player for 1.95 s under a 40-login flood — measured, and now
+      guarded by `logins_do_not_stall_the_tick`, which watches the longest gap
+      between ticks rather than total elapsed time.
+- [x] The one-off `chunk_blob` restore subscription is released when it is
+      done. Dropping the handle does not unsubscribe, so it stayed live for the
+      process lifetime and held the whole stored world in memory — exactly what
+      taking a one-off subscription was meant to avoid.
 - [x] Client-side layer: `soils-client` depends on `soils-stdb`, with an
       optional non-blocking connection, a server browser merging the registry
       with LAN discovery, chat (`/say` + HUD), and identity linking through a
@@ -206,16 +226,35 @@ as it was, region files only. Setup and schema notes in
 - [x] `World.daytime` refreshed on the heartbeat instead of sitting at 0.0.
 - [x] The link reconnects with capped backoff after a database restart.
 
+- [x] A server with an empty region directory rehydrates from the database
+      (`World::restore_from_stdb`), which is what makes the mirror worth its
+      cost for a fresh deployment rather than a write-only backup.
+- [x] Chat reads `<ben>`, not `<a1b2c3>`: the speaker's account name is
+      denormalised into `chat_message.sender_name` at write time, because
+      clients cannot resolve an identity to a name themselves.
+
 ### Remaining
 
-- [ ] Nothing reads `chunk_blob`. Decide whether a server with an empty region
-      directory should rehydrate from the database — the case that would make
-      the mirror worth its cost for a fresh deployment, and the last piece that
-      would make SpacetimeDB a real second home for world data rather than a
-      write-only backup.
-- [ ] Chat shows a truncated identity as the speaker. Once `link_identity` has
-      run, the account name is derivable — wire it through so lines read
-      `<ben>` rather than `<a1b2c3>`.
+- [ ] **`player_profile` is world-readable**, and it holds every player's last
+      known position. It has to be public: the game server reads it from the
+      SDK cache on login, and a private table has no client accessor at all.
+      Row-level security is the fix and is unimplemented in 2.7.1 — revisit
+      when upstream lands it, rather than declaring a filter that does nothing.
+      The same applies to `chunk_blob`, where the exposure is the stored world
+      rather than player locations.
+- [ ] **`send_chat` trusts the caller's `world_id`.** A client can post into
+      any world's channel. The check wants a presence row for the sender's
+      account in that world, which needs the client to know its real
+      `world_id_for(name)` first — today `Social::chat_world` defaults to 0.
+      Worth doing together with per-world chat channels rather than alone.
+- [ ] **Opening a *new* world on login blocks the tick** for up to 5 s while
+      the restore runs. Correct as written — pristine terrain must not be
+      generated over chunks being recovered — but it is a stall a joining
+      player imposes on everyone. Wants world creation to become asynchronous
+      with joins held until it completes, not a shorter timeout.
+- [ ] **`grant_server` is trust-on-first-use.** Whoever claims an empty
+      allowlist first becomes a server. Fine for a local database, a race on a
+      public one; seed the first identity from a trusted console instead.
 - [ ] Decision gate: re-evaluate whether the hybrid split still earns its keep,
       or whether more should move across.
 

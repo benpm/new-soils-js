@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
@@ -90,6 +90,14 @@ pub(crate) struct Client {
     /// are just never acked. Everything else stays on the reliable `outbox`.
     snapshot: watch::Sender<Option<ServerMsg>>,
     authenticated: bool,
+    /// A login is being checked on a worker thread. Bounds each connection to
+    /// one outstanding check, so a client cannot queue unlimited Argon2 work.
+    auth_inflight: bool,
+    /// Set by [`AuthQueue`] when a check came back good, and taken by the
+    /// replayed `Login` message. Carrying the verdict on the connection is
+    /// what lets the success path stay exactly where it was, in the message
+    /// loop, rather than being duplicated for the deferred case.
+    auth_verified: Option<()>,
     /// Account name this connection authenticated as; keys the SpacetimeDB
     /// profile/presence rows.
     account: String,
@@ -238,6 +246,26 @@ struct NetRx(UnboundedReceiver<NewConn>);
 struct ShutdownRx(watch::Receiver<bool>);
 #[derive(Resource)]
 struct AccountsRes(Arc<Accounts>);
+
+/// A login checked off the tick thread, on its way back.
+struct AuthDone {
+    id: u16,
+    name: String,
+    signup: bool,
+    protocol: u32,
+    verdict: Result<(), String>,
+}
+
+/// Where worker threads leave finished logins for the next tick to collect.
+///
+/// Password checking cannot happen inline. Argon2id is memory-hard *by design*
+/// — that is what makes a stolen verifier expensive to crack — and it costs
+/// tens of milliseconds against a 50 ms tick. Run inside `drain_inboxes` it
+/// stalls every player on the server for the duration, and a client sending
+/// logins in a loop is a denial of service that needs no bandwidth to mount.
+/// With SpacetimeDB configured the check is a network round trip on top.
+#[derive(Resource, Clone, Default)]
+struct AuthQueue(Arc<Mutex<Vec<AuthDone>>>);
 /// Shared with the LAN discovery responder on the tokio side.
 #[derive(Resource)]
 struct PlayerCount(Arc<AtomicU16>);
@@ -435,6 +463,7 @@ pub(crate) fn run_app(
     .insert_resource(NetRx(conns))
     .insert_resource(ShutdownRx(shutdown))
     .insert_resource(AccountsRes(accounts))
+    .insert_resource(AuthQueue::default())
     .insert_resource(PlayerCount(player_count))
     .insert_resource(Clients(HashMap::new()))
     .insert_resource(worlds)
@@ -774,6 +803,8 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 outbox: conn.outbox,
                 snapshot: conn.snapshot,
                 authenticated: false,
+                auth_inflight: false,
+                auth_verified: None,
                 account: String::new(),
                 world: DEFAULT_WORLD.to_string(),
                 entity: None,
@@ -827,6 +858,7 @@ fn drain_inboxes(
     mut worlds: ResMut<Worlds>,
     clock: Res<Clock>,
     accounts: Res<AccountsRes>,
+    auth_queue: Res<AuthQueue>,
     player_count: Res<PlayerCount>,
     mut next_net: ResMut<NextNetId>,
     critter_count: Res<CritterCount>,
@@ -836,9 +868,38 @@ fn drain_inboxes(
     mut sims: Query<(&mut SimState, &mut Yaw, &mut InWorld, Entity, Has<PlayerControlled>)>,
     stdb: Option<Res<StdbMirror>>,
 ) {
+    // Phase 0: collect logins that finished on a worker thread. A rejection is
+    // answered here; a success is replayed as the `Login` message it came from,
+    // so the join path stays in one place.
+    let mut msgs: Vec<(u16, ClientMsg)> = Vec::new();
+    for done in auth_queue.0.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default() {
+        // The connection may have gone while the hash was running.
+        let Some(c) = clients.0.get_mut(&done.id) else { continue };
+        c.auth_inflight = false;
+        match done.verdict {
+            Err(reason) => {
+                println!("login denied: {} (id {}): {reason}", done.name, done.id);
+                let _ = c.outbox.send(ServerMsg::LoginError { message: reason });
+            }
+            Ok(()) => {
+                c.auth_verified = Some(());
+                msgs.push((
+                    done.id,
+                    ClientMsg::Login {
+                        name: done.name,
+                        // Already checked; never read again on this path, and
+                        // not worth keeping a plaintext alive for.
+                        password: String::new(),
+                        signup: done.signup,
+                        protocol: done.protocol,
+                    },
+                ));
+            }
+        }
+    }
+
     // Phase 1: refill rate buckets and pull everything out of the inboxes.
     let dt = time.delta_secs();
-    let mut msgs: Vec<(u16, ClientMsg)> = Vec::new();
     let mut gone: Vec<u16> = Vec::new();
     for (&id, c) in clients.0.iter_mut() {
         c.input_tokens = (c.input_tokens + dt * soils_sim::TICK_HZ as f32).min(INPUT_BURST);
@@ -892,7 +953,33 @@ fn drain_inboxes(
                     });
                     continue;
                 }
-                match accounts.0.authenticate(&name, &password, signup) {
+                // Off-thread: see [`AuthQueue`]. The first Login only starts
+                // the check and returns; the answer comes back through the
+                // queue, which replays this message with `auth_verified` set
+                // so the success path below runs unchanged.
+                let verdict: Result<(), String> = match c.auth_verified.take() {
+                    Some(()) => Ok(()),
+                    None => {
+                        if !c.auth_inflight {
+                            c.auth_inflight = true;
+                            let queue = auth_queue.0.clone();
+                            let accounts = accounts.0.clone();
+                            std::thread::Builder::new()
+                                .name(format!("auth-{id}"))
+                                .spawn(move || {
+                                    let verdict =
+                                        accounts.authenticate(&name, &password, signup);
+                                    if let Ok(mut q) = queue.lock() {
+                                        q.push(AuthDone { id, name, signup, protocol, verdict });
+                                    }
+                                })
+                                .map_err(|e| eprintln!("auth: could not spawn worker: {e}"))
+                                .ok();
+                        }
+                        continue;
+                    }
+                };
+                match verdict {
                     Err(reason) => {
                         println!("login denied: {name} (id {id}): {reason}");
                         let _ = c.outbox.send(ServerMsg::LoginError { message: reason });

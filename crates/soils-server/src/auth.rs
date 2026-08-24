@@ -31,6 +31,16 @@ const LEGACY_SALT: u64 = 0x5015_0115_2024_0601;
 /// name accepted locally cannot be rejected on the way to the database.
 const MAX_NAME_LEN: usize = 32;
 
+/// What the module answers for a name it has no account for. Matched exactly,
+/// so anything unrecognised is understood as the database being unavailable
+/// rather than as the player being wrong — a database that cannot be reached
+/// must not read as a failed password.
+const NO_SUCH_ACCOUNT: &str = "no such account";
+
+/// What the module answers for an account that exists with a different
+/// password. A flat rejection: there is nothing to migrate or create.
+const WRONG_PASSWORD: &str = "wrong password";
+
 fn legacy_hash(name: &str, password: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -133,6 +143,21 @@ impl Accounts {
         }
     }
 
+    /// How long a login waits on the database before giving up.
+    ///
+    /// Generous: the module runs Argon2id, which is meant to be slow, and a
+    /// login that fails because the hash took 300 ms is worse than one that
+    /// takes 300 ms.
+    const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Authenticate against SpacetimeDB.
+    ///
+    /// The verifier is never read here — it cannot be. `account` is a private
+    /// table with no client-side accessor, so the comparison happens inside the
+    /// module and only its verdict comes back. That is the whole point: a
+    /// verifier the game server can read is a verifier every *other* client of
+    /// that database could read too, since SpacetimeDB's only alternative to
+    /// private is world-readable.
     fn stdb_auth(
         &self,
         link: &soils_stdb::StdbLink,
@@ -140,45 +165,60 @@ impl Accounts {
         password: &str,
         signup: bool,
     ) -> Result<(), String> {
-        if let Some(account) = link.account(name) {
-            if !verify_password(password, &account.verifier) {
-                return Err(if signup {
-                    "username already taken".into()
-                } else {
-                    "wrong password".into()
-                });
+        match link.verify_login(name, password, Self::AUTH_TIMEOUT) {
+            Ok(()) => {
+                if signup {
+                    // Signing up into an existing account with the right
+                    // password is not an error worth failing a login over.
+                    println!("auth: '{name}' already existed; treated as a login");
+                }
+                Ok(())
             }
-            return Ok(());
+            Err(reason) => self.stdb_register_or_reject(link, name, password, signup, reason),
+        }
+    }
+
+    /// Reached when `verify_login` said no. That covers three different
+    /// situations, and only the database knows which — so the account file
+    /// decides what to do about it.
+    fn stdb_register_or_reject(
+        &self,
+        link: &soils_stdb::StdbLink,
+        name: &str,
+        password: &str,
+        signup: bool,
+        reason: String,
+    ) -> Result<(), String> {
+        match reason.as_str() {
+            // The account exists and the password is wrong. Nothing local can
+            // change that, and a local account of the same name is a different
+            // account with a colliding name, not a fallback.
+            WRONG_PASSWORD => return Err(WRONG_PASSWORD.to_string()),
+            NO_SUCH_ACCOUNT => {}
+            // Unreachable, timed out, not authorised: not the player's fault,
+            // and it must not be reported as a bad password.
+            _ => return Err(reason),
         }
 
-        // Not in the database yet. An account that exists locally migrates on
-        // this login — the only moment a plaintext is available to rehash from.
+        // An account that exists locally migrates on this login: it is the only
+        // moment a plaintext is in hand to re-register with. `register_account`
+        // is idempotent for a matching password, so a repeat is harmless.
         let local = self.map.lock().unwrap().get(name).cloned();
         match (local, signup) {
-            (Some(stored), _) => {
-                if !Self::check_local(name, password, &stored) {
-                    return Err("wrong password".into());
-                }
-                let verifier = hash_password(password)?;
-                link.send(soils_stdb::StdbCmd::RegisterAccount {
-                    name: name.to_string(),
-                    verifier: verifier.clone(),
-                })
-                .map_err(|e| format!("account store unavailable: {e}"))?;
-                self.put_local(name, Stored::Phc(verifier));
+            (Some(stored), _) if Self::check_local(name, password, &stored) => {
+                link.register_account(name, password, Self::AUTH_TIMEOUT)?;
+                // Kept locally too, so the server still works if the database
+                // goes away later.
+                self.put_local(name, Stored::Phc(hash_password(password)?));
                 println!("auth: migrated account '{name}' to SpacetimeDB");
                 Ok(())
             }
+            // Present locally with a different password: a genuine rejection,
+            // whichever store answered.
+            (Some(_), _) => Err(WRONG_PASSWORD.to_string()),
             (None, true) => {
-                let verifier = hash_password(password)?;
-                link.send(soils_stdb::StdbCmd::RegisterAccount {
-                    name: name.to_string(),
-                    verifier: verifier.clone(),
-                })
-                .map_err(|e| format!("account store unavailable: {e}"))?;
-                // Kept locally too, so the server still works if the database
-                // goes away later.
-                self.put_local(name, Stored::Phc(verifier));
+                link.register_account(name, password, Self::AUTH_TIMEOUT)?;
+                self.put_local(name, Stored::Phc(hash_password(password)?));
                 Ok(())
             }
             (None, false) => Err("no such account — sign up first".into()),

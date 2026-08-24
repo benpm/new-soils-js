@@ -6,7 +6,6 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
-pub mod account_table;
 pub mod account_type;
 pub mod chat_message_table;
 pub mod chat_message_type;
@@ -30,12 +29,12 @@ pub mod register_account_reducer;
 pub mod save_profile_reducer;
 pub mod send_chat_reducer;
 pub mod server_identity_type;
-pub mod set_verifier_reducer;
+pub mod set_password_reducer;
 pub mod upsert_world_reducer;
+pub mod verify_login_reducer;
 pub mod world_table;
 pub mod world_type;
 
-pub use account_table::*;
 pub use account_type::Account;
 pub use chat_message_table::*;
 pub use chat_message_type::ChatMessage;
@@ -59,8 +58,9 @@ pub use register_account_reducer::register_account;
 pub use save_profile_reducer::save_profile;
 pub use send_chat_reducer::send_chat;
 pub use server_identity_type::ServerIdentity;
-pub use set_verifier_reducer::set_verifier;
+pub use set_password_reducer::set_password;
 pub use upsert_world_reducer::upsert_world;
+pub use verify_login_reducer::verify_login;
 pub use world_table::*;
 pub use world_type::World;
 
@@ -102,10 +102,11 @@ pub enum Reducer {
         key: u64,
         payload: Vec<u8>,
         version: u32,
+        writer_epoch: u64,
     },
     RegisterAccount {
         name: String,
-        verifier: String,
+        password: String,
     },
     SaveProfile {
         account: String,
@@ -120,9 +121,9 @@ pub enum Reducer {
         world_id: u16,
         text: String,
     },
-    SetVerifier {
+    SetPassword {
         name: String,
-        verifier: String,
+        password: String,
     },
     UpsertWorld {
         world_id: u16,
@@ -131,6 +132,10 @@ pub enum Reducer {
         world_type: u8,
         graph_hash: u64,
         daytime: f32,
+    },
+    VerifyLogin {
+        name: String,
+        password: String,
     },
 }
 
@@ -151,8 +156,9 @@ impl __sdk::Reducer for Reducer {
             Reducer::RegisterAccount { .. } => "register_account",
             Reducer::SaveProfile { .. } => "save_profile",
             Reducer::SendChat { .. } => "send_chat",
-            Reducer::SetVerifier { .. } => "set_verifier",
+            Reducer::SetPassword { .. } => "set_password",
             Reducer::UpsertWorld { .. } => "upsert_world",
+            Reducer::VerifyLogin { .. } => "verify_login",
             _ => unreachable!(),
         }
     }
@@ -208,15 +214,17 @@ impl __sdk::Reducer for Reducer {
                 key,
                 payload,
                 version,
+                writer_epoch,
             } => __sats::bsatn::to_vec(&put_chunk_blob_reducer::PutChunkBlobArgs {
                 key: key.clone(),
                 payload: payload.clone(),
                 version: version.clone(),
+                writer_epoch: writer_epoch.clone(),
             }),
-            Reducer::RegisterAccount { name, verifier } => {
+            Reducer::RegisterAccount { name, password } => {
                 __sats::bsatn::to_vec(&register_account_reducer::RegisterAccountArgs {
                     name: name.clone(),
-                    verifier: verifier.clone(),
+                    password: password.clone(),
                 })
             }
             Reducer::SaveProfile {
@@ -242,10 +250,10 @@ impl __sdk::Reducer for Reducer {
                     text: text.clone(),
                 })
             }
-            Reducer::SetVerifier { name, verifier } => {
-                __sats::bsatn::to_vec(&set_verifier_reducer::SetVerifierArgs {
+            Reducer::SetPassword { name, password } => {
+                __sats::bsatn::to_vec(&set_password_reducer::SetPasswordArgs {
                     name: name.clone(),
-                    verifier: verifier.clone(),
+                    password: password.clone(),
                 })
             }
             Reducer::UpsertWorld {
@@ -263,6 +271,12 @@ impl __sdk::Reducer for Reducer {
                 graph_hash: graph_hash.clone(),
                 daytime: daytime.clone(),
             }),
+            Reducer::VerifyLogin { name, password } => {
+                __sats::bsatn::to_vec(&verify_login_reducer::VerifyLoginArgs {
+                    name: name.clone(),
+                    password: password.clone(),
+                })
+            }
             _ => unreachable!(),
         }
     }
@@ -272,7 +286,6 @@ impl __sdk::Reducer for Reducer {
 #[allow(non_snake_case)]
 #[doc(hidden)]
 pub struct DbUpdate {
-    account: __sdk::TableUpdate<Account>,
     chat_message: __sdk::TableUpdate<ChatMessage>,
     chunk_blob: __sdk::TableUpdate<ChunkBlob>,
     game_server: __sdk::TableUpdate<GameServer>,
@@ -287,9 +300,6 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
         let mut db_update = DbUpdate::default();
         for table_update in __sdk::transaction_update_iter_table_updates(raw) {
             match &table_update.table_name[..] {
-                "account" => db_update
-                    .account
-                    .append(account_table::parse_table_update(table_update)?),
                 "chat_message" => db_update
                     .chat_message
                     .append(chat_message_table::parse_table_update(table_update)?),
@@ -334,9 +344,6 @@ impl __sdk::DbUpdate for DbUpdate {
     ) -> AppliedDiff<'_> {
         let mut diff = AppliedDiff::default();
 
-        diff.account = cache
-            .apply_diff_to_table::<Account>("account", &self.account)
-            .with_updates_by_pk(|row| &row.name);
         diff.chat_message = cache
             .apply_diff_to_table::<ChatMessage>("chat_message", &self.chat_message)
             .with_updates_by_pk(|row| &row.id);
@@ -362,9 +369,6 @@ impl __sdk::DbUpdate for DbUpdate {
         let mut db_update = DbUpdate::default();
         for table_rows in raw.tables {
             match &table_rows.table[..] {
-                "account" => db_update
-                    .account
-                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "chat_message" => db_update
                     .chat_message
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
@@ -396,9 +400,6 @@ impl __sdk::DbUpdate for DbUpdate {
         let mut db_update = DbUpdate::default();
         for table_rows in raw.tables {
             match &table_rows.table[..] {
-                "account" => db_update
-                    .account
-                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "chat_message" => db_update
                     .chat_message
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
@@ -432,7 +433,6 @@ impl __sdk::DbUpdate for DbUpdate {
 #[allow(non_snake_case)]
 #[doc(hidden)]
 pub struct AppliedDiff<'r> {
-    account: __sdk::TableAppliedDiff<'r, Account>,
     chat_message: __sdk::TableAppliedDiff<'r, ChatMessage>,
     chunk_blob: __sdk::TableAppliedDiff<'r, ChunkBlob>,
     game_server: __sdk::TableAppliedDiff<'r, GameServer>,
@@ -452,7 +452,6 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
         event: &EventContext,
         callbacks: &mut __sdk::DbCallbacks<RemoteModule>,
     ) {
-        callbacks.invoke_table_row_callbacks::<Account>("account", &self.account, event);
         callbacks.invoke_table_row_callbacks::<ChatMessage>(
             "chat_message",
             &self.chat_message,
@@ -1127,7 +1126,6 @@ impl __sdk::SpacetimeModule for RemoteModule {
     type QueryBuilder = __sdk::QueryBuilder;
 
     fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {
-        account_table::register_table(client_cache);
         chat_message_table::register_table(client_cache);
         chunk_blob_table::register_table(client_cache);
         game_server_table::register_table(client_cache);
@@ -1136,7 +1134,6 @@ impl __sdk::SpacetimeModule for RemoteModule {
         world_table::register_table(client_cache);
     }
     const ALL_TABLE_NAMES: &'static [&'static str] = &[
-        "account",
         "chat_message",
         "chunk_blob",
         "game_server",

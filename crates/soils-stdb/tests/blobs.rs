@@ -84,6 +84,14 @@ fn bulky_chunk(salt: u8) -> ChunkVolume {
     v
 }
 
+/// Stands in for one server process. The module only compares chunk versions
+/// within a single epoch, so a test that means "a later flush from the same
+/// server" has to say so.
+const EPOCH: u64 = 0x5011_5000_0000_0001;
+
+/// A different server process — or the same one after a restart.
+const OTHER_EPOCH: u64 = 0x5011_5000_0000_0002;
+
 #[test]
 fn large_chunk_payload_round_trips() {
     let Some(conn) = connect() else {
@@ -114,7 +122,7 @@ fn large_chunk_payload_round_trips() {
     eprintln!("payload: {} B", payload.len());
 
     let key = pack_chunk_key(world_id, 3, -2, 5).expect("in range");
-    conn.reducers.put_chunk_blob(key, payload.clone(), 1).expect("put queued");
+    conn.reducers.put_chunk_blob(key, payload.clone(), 1, EPOCH).expect("put queued");
 
     assert!(
         wait_for(&conn, Duration::from_secs(15), |c| {
@@ -155,8 +163,8 @@ fn identical_payloads_are_accepted_under_distinct_keys() {
     let payload = encode_chunk(&bulky_chunk(9));
     let a = pack_chunk_key(world_id, 10, 0, 0).unwrap();
     let b = pack_chunk_key(world_id, 11, 0, 0).unwrap();
-    conn.reducers.put_chunk_blob(a, payload.clone(), 1).unwrap();
-    conn.reducers.put_chunk_blob(b, payload.clone(), 1).unwrap();
+    conn.reducers.put_chunk_blob(a, payload.clone(), 1, EPOCH).unwrap();
+    conn.reducers.put_chunk_blob(b, payload.clone(), 1, EPOCH).unwrap();
 
     assert!(
         wait_for(&conn, Duration::from_secs(15), |c| {
@@ -189,16 +197,66 @@ fn stale_version_write_is_rejected() {
 
     let key = pack_chunk_key(world_id, 20, 0, 0).unwrap();
     let v5 = encode_chunk(&bulky_chunk(5));
-    conn.reducers.put_chunk_blob(key, v5.clone(), 5).unwrap();
+    conn.reducers.put_chunk_blob(key, v5.clone(), 5, EPOCH).unwrap();
     assert!(wait_for(&conn, Duration::from_secs(15), |c| {
         c.db().chunk_blob().iter().any(|r| r.chunk_key == key && r.version == 5)
     }));
 
     // A late flush carrying an older version must not roll the chunk back.
     let v2 = encode_chunk(&bulky_chunk(2));
-    conn.reducers.put_chunk_blob(key, v2, 2).unwrap();
+    conn.reducers.put_chunk_blob(key, v2, 2, EPOCH).unwrap();
     std::thread::sleep(Duration::from_secs(2));
     let row = conn.db().chunk_blob().iter().find(|r| r.chunk_key == key).unwrap();
     assert_eq!(row.version, 5, "stale write must be refused");
     assert_eq!(row.payload, v5, "stale write must not alter the payload");
+}
+
+/// The bug this guards: chunk versions are in-memory edit counters that reset
+/// to 0 when a chunk is evicted and reloaded from its region file. Comparing
+/// them across server processes made every edit to a reloaded chunk look stale,
+/// so the mirror silently stopped tracking the world — permanently, since the
+/// region file is authoritative and the chunk is no longer dirty to retry.
+#[test]
+fn a_write_from_a_new_epoch_is_not_stale() {
+    let Some(conn) = connect() else {
+        eprintln!("skipping: set SOILS_STDB_URI to run against a live SpacetimeDB");
+        return;
+    };
+    subscribe_all(&conn);
+
+    conn.reducers.upsert_world(world_id_for(WORLD), WORLD.into(), 4242, 0, 7, 0.25).unwrap();
+    assert!(wait_for(&conn, Duration::from_secs(10), |c| {
+        c.db().world().iter().any(|w| w.name == WORLD)
+    }));
+    let world_id = conn.db().world().iter().find(|w| w.name == WORLD).unwrap().world_id;
+
+    let key = pack_chunk_key(world_id, 21, 0, 0).unwrap();
+    let high = encode_chunk(&bulky_chunk(9));
+    conn.reducers.put_chunk_blob(key, high.clone(), 9, EPOCH).unwrap();
+    assert!(wait_for(&conn, Duration::from_secs(15), |c| {
+        c.db().chunk_blob().iter().any(|r| r.chunk_key == key && r.version == 9)
+    }));
+
+    // Same chunk, restarted counter, different process: this is the ordinary
+    // case of a chunk being unloaded and edited again, and it must land.
+    let fresh = encode_chunk(&bulky_chunk(1));
+    conn.reducers.put_chunk_blob(key, fresh.clone(), 1, OTHER_EPOCH).unwrap();
+    assert!(
+        wait_for(&conn, Duration::from_secs(15), |c| {
+            c.db()
+                .chunk_blob()
+                .iter()
+                .any(|r| r.chunk_key == key && r.version == 1 && r.writer_epoch == OTHER_EPOCH)
+        }),
+        "a write from a new epoch must be accepted even though its version is lower"
+    );
+    let row = conn.db().chunk_blob().iter().find(|r| r.chunk_key == key).unwrap();
+    assert_eq!(row.payload, fresh, "the new epoch's payload must win");
+
+    // Within the new epoch the guard still applies.
+    conn.reducers.put_chunk_blob(key, encode_chunk(&bulky_chunk(0)), 0, OTHER_EPOCH).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    let row = conn.db().chunk_blob().iter().find(|r| r.chunk_key == key).unwrap();
+    assert_eq!(row.version, 1, "a stale write inside one epoch must still be refused");
+    assert_eq!(row.payload, fresh);
 }

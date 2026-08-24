@@ -98,22 +98,50 @@ cargo test -p soils-server --test stdb_mirror     # a real edit reaches the data
 
 ## What is stored
 
-| Table | Keyed by | Written by |
-|---|---|---|
-| `world` | server-chosen `world_id` (`world_id_for(name)`) | server, on world open |
-| `chunk_blob` | packed `chunk_key` | server, after a successful region write |
-| `chunk_edit` | auto id | server (journal, pruned once folded into a blob) |
-| `player_profile` | **account name** | server, on logout |
-| `presence` | **account name** | server, on login, every 5 s, and on logout |
-| `game_server` | `server_id` (hash of name+bind) | server, every 5 s |
-| `account`, `chat_message` | Identity / auto id | players — **no caller yet** |
+| Table | Keyed by | Written by | Readable by |
+|---|---|---|---|
+| `world` | server-chosen `world_id` (`world_id_for(name)`) | server, on world open | everyone |
+| `chunk_blob` | packed `chunk_key` | server, after a successful region write | everyone |
+| `player_profile` | **account name** | server, on logout | everyone |
+| `presence` | **account name** | server, on login, every 5 s, and on logout | everyone |
+| `game_server` | `server_id` (hash of name+bind) | server, every 5 s | everyone |
+| `chat_message` | auto id | players | everyone |
+| `account` | account name | server, via reducers | **nobody** — private |
+| `server_identity` | `Identity` | `grant_server` | **nobody** — private |
+
+### `public` is a permission, not a label
+
+SpacetimeDB has exactly two visibilities. `public` means *any* connected
+identity may subscribe to that table and read every row — restricting what our
+own client subscribes to (`CLIENT_SUBSCRIPTIONS`) is politeness, and a hostile
+client is under no obligation to be polite.
+
+So `account` is **private**, and password verifiers never leave the database.
+That has a consequence worth stating plainly: a private table generates no
+client-side accessor at all, so the *game server* cannot read it either.
+Verification therefore happens where the row lives — the `verify_login`,
+`register_account` and `set_password` reducers do the Argon2id work inside the
+module, and only a yes/no comes back.
+
+Sending a password to a reducer is safe here specifically because SpacetimeDB
+2.0 stopped broadcasting reducer arguments: an outcome is delivered only to the
+connection that called it. Under 1.0 semantics this design would have published
+every password to every client.
+
+Row-level security would be the natural tool for the tables that must stay
+readable by servers but not players (`player_profile` carries every player's
+last known position). As of 2.7.1 it is not available: `client_visibility_filter`
+is gated behind the `unstable` feature and the bindings' own source says the
+filters are "currently unimplemented, and are not enforced". Declaring one would
+look like a boundary while being decoration, so this is left as a known
+limitation rather than a fake mitigation.
 
 `player_profile` and `presence` are keyed by *account*, not `Identity`: players
 authenticate to the game server with a name/password, so the account is what
 durably identifies them. `player_profile.identity` is filled in by the
-`link_identity` reducer, which is **server-only**: nothing in the module can
-verify account ownership, since the name and password live in the game server's
-`auth.rs`. An earlier version let the claiming client call it and checked only
+`link_identity` reducer, which is **server-only**: the module has no way to
+tell whether a caller owns an account, because ownership is proved by a
+password to the *game server*, which is the party that then vouches for it. An earlier version let the claiming client call it and checked only
 that any *existing* link matched the sender — vacuous for an unlinked account,
 which is every account's normal state, so any client could claim any account by
 name.

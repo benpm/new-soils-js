@@ -182,7 +182,12 @@ fn flush_batch(batch: Vec<SaveJob>, stdb: Option<&StdbLink>) {
                 // the module's stale-write guard — and since the region file is
                 // authoritative and the chunk is no longer dirty, those edits
                 // would never be retried, wedging the mirror silently.
+                //
+                // The counter is only meaningful within one server process,
+                // hence the epoch: it lives in memory and restarts at 0 every
+                // time a chunk is evicted and read back from its region file.
                 version: *version,
+                writer_epoch: writer_epoch(),
             }) {
                 eprintln!("chunk writer: spacetimedb mirror unavailable: {e}");
             }
@@ -191,3 +196,30 @@ fn flush_batch(batch: Vec<SaveJob>, stdb: Option<&StdbLink>) {
 }
 
 
+
+/// Identifies this server process to the module's stale-write guard.
+///
+/// Chunk versions are in-memory edit counters: they restart at 0 whenever a
+/// chunk is evicted and reloaded from disk, so "incoming version < stored
+/// version" only means *stale* when both came from the same process. Compared
+/// across processes it means nothing, and rejecting on it would silently
+/// discard every edit made to a reloaded chunk until its counter climbed back
+/// past its own previous high-water mark.
+///
+/// Only distinctness matters, never order — a later epoch is simply the current
+/// owner of the world, and its write wins. So this is deliberately not a clock:
+/// it has no ordering to get wrong.
+pub fn writer_epoch() -> u64 {
+    static EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.write_u64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64),
+        );
+        h.finish()
+    })
+}

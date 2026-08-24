@@ -16,10 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 pub use spacetimedb_sdk::Identity;
+// Brings `unsubscribe` into scope for the generated `SubscriptionHandle`.
+use spacetimedb_sdk::SubscriptionHandle as _;
 use spacetimedb_sdk::{DbContext, Table};
 
 use module_bindings::{
-    DbConnection, RemoteReducers, account_table::AccountTableAccess,
+    DbConnection, RemoteReducers,
     chat_message_table::ChatMessageTableAccess, chunk_blob_table::ChunkBlobTableAccess,
     game_server_table::GameServerTableAccess, player_profile_table::PlayerProfileTableAccess,
     world_table::WorldTableAccess,
@@ -28,21 +30,32 @@ use module_bindings::{
 // in scope for `reducers.<name>(..)` to resolve.
 use module_bindings::{
     heartbeat, heartbeat_presence, link_identity, mark_absent, mark_present, put_chunk_blob,
-    register_account, save_profile, send_chat, set_verifier, upsert_world,
+    register_account, save_profile, send_chat, set_password, upsert_world, verify_login,
 };
 
-pub use module_bindings::{Account, ChatMessage, ChunkBlob, GameServer, PlayerProfile, World};
+pub use module_bindings::{ChatMessage, ChunkBlob, GameServer, PlayerProfile, World};
 
-/// What a game server reads back: accounts to authenticate against, and
-/// profiles to restore a returning player's position.
-pub const SERVER_SUBSCRIPTIONS: &[&str] =
-    &["SELECT * FROM account", "SELECT * FROM player_profile"];
+/// What a game server reads back: profiles, to restore a returning player's
+/// position.
+///
+/// `account` is absent because it is a *private* table and has no client-side
+/// accessor at all — passwords are checked by the `verify_login` reducer,
+/// inside the database, so the verifier never crosses the wire.
+pub const SERVER_SUBSCRIPTIONS: &[&str] = &["SELECT * FROM player_profile"];
 
-/// What a game *client* reads: the lobby. Deliberately excludes `account` —
-/// verifiers are none of a client's business — and `chunk_blob`, which would
-/// stream the stored world into a player's memory.
+/// What a game *client* reads: the lobby. Excludes `chunk_blob`, which would
+/// stream the stored world into a player's memory. (`account` is private, so
+/// it is not excluded here so much as unreachable.)
 pub const CLIENT_SUBSCRIPTIONS: &[&str] =
     &["SELECT * FROM game_server", "SELECT * FROM world", "SELECT * FROM chat_message"];
+
+/// Where a reducer's verdict is sent once the module has run it.
+///
+/// Most commands are fire-and-forget, but authentication is a question: the
+/// answer only exists after the module has done the hashing. SpacetimeDB
+/// delivers a reducer's outcome to the connection that called it and to no
+/// one else, so this is a private round-trip, not a broadcast.
+pub type Reply = Sender<Result<(), String>>;
 
 /// Work handed to the SpacetimeDB thread.
 #[derive(Debug, Clone)]
@@ -59,11 +72,19 @@ pub enum StdbCmd {
         daytime: f32,
     },
     /// Write a coalesced chunk payload (`soils_protocol::chunk_codec` bytes).
-    PutChunkBlob { key: u64, payload: Vec<u8>, version: u32 },
-    /// Create an account, or migrate one that already exists locally.
-    RegisterAccount { name: String, verifier: String },
-    /// Replace an account's password verifier.
-    SetVerifier { name: String, verifier: String },
+    ///
+    /// `writer_epoch` identifies the writing server *process*: chunk versions
+    /// are in-memory counters that restart when a chunk is evicted and
+    /// reloaded, so the module's stale-write guard only compares them within
+    /// one epoch.
+    PutChunkBlob { key: u64, payload: Vec<u8>, version: u32, writer_epoch: u64 },
+    /// Create an account, or migrate one that already exists locally. The
+    /// module hashes; `reply` carries its verdict back to the caller.
+    RegisterAccount { name: String, password: String, reply: Reply },
+    /// Check a password. The comparison happens inside the module.
+    VerifyLogin { name: String, password: String, reply: Reply },
+    /// Replace an account's password.
+    SetPassword { name: String, password: String, reply: Reply },
     /// Bind a SpacetimeDB identity to an account the server has authenticated.
     LinkIdentity { account: String, identity: Identity },
     /// Post a chat message as this connection's own identity.
@@ -200,21 +221,84 @@ impl StdbLink {
         true
     }
 
-    /// Whether the account cache is warm enough to authenticate against.
+    /// Whether the first subscription snapshot has arrived.
     ///
-    /// Distinguished from "no such account" on purpose: treating an unwarm
-    /// cache as an empty one would reject every existing player's password.
+    /// Authentication no longer depends on this — passwords are checked by a
+    /// reducer, not against a cache — but restoring a player's saved position
+    /// does, and a login that beats the snapshot would silently drop them at
+    /// the world spawn instead.
     pub fn accounts_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
 
-    /// A stored account, by login name.
-    pub fn account(&self, name: &str) -> Option<Account> {
-        if !self.ready.load(Ordering::Relaxed) {
-            return None;
+    /// Check a password against the stored account, inside the database.
+    ///
+    /// Blocks for the round-trip, so it must not be called from a thread that
+    /// owes anyone latency — Argon2 is deliberately expensive, and the point of
+    /// running it in the module is that it costs the *database* that time
+    /// rather than the simulation tick.
+    ///
+    /// A timeout is reported as an error rather than a rejection, and the
+    /// caller decides what to do about it; treating "the database did not
+    /// answer" as "wrong password" would lock every player out of a healthy
+    /// server the moment the network hiccuped.
+    pub fn verify_login(
+        &self,
+        name: &str,
+        password: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        self.ask(timeout, |reply| StdbCmd::VerifyLogin {
+            name: name.to_string(),
+            password: password.to_string(),
+            reply,
+        })
+    }
+
+    /// Create an account. Idempotent when the password already matches, which
+    /// is what makes migrating a local account file safe to repeat.
+    pub fn register_account(
+        &self,
+        name: &str,
+        password: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        self.ask(timeout, |reply| StdbCmd::RegisterAccount {
+            name: name.to_string(),
+            password: password.to_string(),
+            reply,
+        })
+    }
+
+    /// Replace an account's password. The caller is responsible for having
+    /// authorised the change.
+    pub fn set_password(
+        &self,
+        name: &str,
+        password: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        self.ask(timeout, |reply| StdbCmd::SetPassword {
+            name: name.to_string(),
+            password: password.to_string(),
+            reply,
+        })
+    }
+
+    /// Send a command that expects an answer, and wait for it.
+    fn ask(
+        &self,
+        timeout: std::time::Duration,
+        build: impl FnOnce(Reply) -> StdbCmd,
+    ) -> Result<(), String> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.send(build(tx)).map_err(|e| format!("account store unavailable: {e}"))?;
+        match rx.recv_timeout(timeout) {
+            Ok(verdict) => verdict,
+            // Disconnected means the worker dropped the command without
+            // answering — a session that ended mid-flight.
+            Err(_) => Err("account store did not answer".to_string()),
         }
-        let guard = self.conn.read().ok()?;
-        guard.as_ref()?.db().account().name().find(&name.to_string())
     }
 
     /// Every stored chunk for one world, for restoring a server whose region
@@ -241,7 +325,7 @@ impl StdbLink {
 
         let applied = Arc::new(AtomicBool::new(false));
         let flag = applied.clone();
-        let _handle = conn
+        let handle = conn
             .subscription_builder()
             .on_applied(move |_| flag.store(true, Ordering::Relaxed))
             .subscribe([format!("SELECT * FROM chunk_blob WHERE world_id = {world_id}")]);
@@ -250,7 +334,18 @@ impl StdbLink {
         while !applied.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        conn.db().chunk_blob().iter().filter(|b| b.world_id == world_id).collect()
+        let rows: Vec<ChunkBlob> =
+            conn.db().chunk_blob().iter().filter(|b| b.world_id == world_id).collect();
+
+        // Read the rows out *first*, then drop the query: unsubscribing clears
+        // them from the cache. Dropping the handle would not have been enough —
+        // it does not unsubscribe, so the query stayed live for the rest of the
+        // process and held the whole stored world in memory, which is precisely
+        // what taking a one-off subscription was meant to avoid.
+        if let Err(e) = handle.unsubscribe() {
+            eprintln!("stdb: could not release the chunk restore subscription: {e}");
+        }
+        rows
     }
 
     /// Live game servers, most populated first.
@@ -502,6 +597,32 @@ fn report<E: std::fmt::Display>(
     }
 }
 
+/// Forward a reducer's own verdict to whoever is waiting on it.
+///
+/// The outer `Result` is the SDK failing to deliver the call at all; the inner
+/// one is the module's answer. Both mean "not authenticated", but only the
+/// inner one is the module speaking, so its message is the one worth showing.
+fn answer(
+    reply: Reply,
+) -> impl FnOnce(&module_bindings::ReducerEventContext, Result<Result<(), String>, spacetimedb_sdk::__codegen::InternalError>)
++ Send
++ 'static {
+    move |_ctx, outcome| {
+        let _ = reply.send(match outcome {
+            Ok(inner) => inner,
+            Err(e) => Err(format!("account store error: {e}")),
+        });
+    }
+}
+
+/// Answer the waiter ourselves when the call could not even be sent, so a
+/// login blocks for the round-trip and not for the whole timeout.
+fn fail_reply<E: std::fmt::Display>(reply: &Reply, r: Result<(), E>) {
+    if let Err(e) = r {
+        let _ = reply.send(Err(format!("account store unavailable: {e}")));
+    }
+}
+
 fn apply(reducers: &RemoteReducers, cmd: StdbCmd, event_tx: &Sender<StdbEvent>) {
     let report = |reducer, r| report(event_tx, reducer, r);
 
@@ -510,14 +631,21 @@ fn apply(reducers: &RemoteReducers, cmd: StdbCmd, event_tx: &Sender<StdbEvent>) 
             "upsert_world",
             reducers.upsert_world(world_id, name, seed, world_type, graph_hash, daytime),
         ),
-        StdbCmd::PutChunkBlob { key, payload, version } => {
-            report("put_chunk_blob", reducers.put_chunk_blob(key, payload, version))
+        StdbCmd::PutChunkBlob { key, payload, version, writer_epoch } => report(
+            "put_chunk_blob",
+            reducers.put_chunk_blob(key, payload, version, writer_epoch),
+        ),
+        StdbCmd::RegisterAccount { name, password, reply } => {
+            let r = reducers.register_account_then(name, password, answer(reply.clone()));
+            fail_reply(&reply, r);
         }
-        StdbCmd::RegisterAccount { name, verifier } => {
-            report("register_account", reducers.register_account(name, verifier))
+        StdbCmd::VerifyLogin { name, password, reply } => {
+            let r = reducers.verify_login_then(name, password, answer(reply.clone()));
+            fail_reply(&reply, r);
         }
-        StdbCmd::SetVerifier { name, verifier } => {
-            report("set_verifier", reducers.set_verifier(name, verifier))
+        StdbCmd::SetPassword { name, password, reply } => {
+            let r = reducers.set_password_then(name, password, answer(reply.clone()));
+            fail_reply(&reply, r);
         }
         StdbCmd::LinkIdentity { account, identity } => {
             report("link_identity", reducers.link_identity(account, identity))

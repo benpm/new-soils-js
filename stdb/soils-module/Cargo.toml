@@ -25,3 +25,4 @@ spacetimedb = "2.7.1"
 # reimplementing them; soils-protocol is deliberately Bevy/tokio-free and
 # builds clean for wasm32-unknown-unknown (verified 2026-08-02).
 soils-protocol = { path = "../../crates/soils-protocol" }
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }

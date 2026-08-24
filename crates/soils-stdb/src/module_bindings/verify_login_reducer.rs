@@ -6,46 +6,46 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct RegisterAccountArgs {
+pub(super) struct VerifyLoginArgs {
     pub name: String,
     pub password: String,
 }
 
-impl From<RegisterAccountArgs> for super::Reducer {
-    fn from(args: RegisterAccountArgs) -> Self {
-        Self::RegisterAccount {
+impl From<VerifyLoginArgs> for super::Reducer {
+    fn from(args: VerifyLoginArgs) -> Self {
+        Self::VerifyLogin {
             name: args.name,
             password: args.password,
         }
     }
 }
 
-impl __sdk::InModule for RegisterAccountArgs {
+impl __sdk::InModule for VerifyLoginArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `register_account`.
+/// Extension trait for access to the reducer `verify_login`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait register_account {
-    /// Request that the remote module invoke the reducer `register_account` to run as soon as possible.
+pub trait verify_login {
+    /// Request that the remote module invoke the reducer `verify_login` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`register_account:register_account_then`] to run a callback after the reducer completes.
-    fn register_account(&self, name: String, password: String) -> __sdk::Result<()> {
-        self.register_account_then(name, password, |_, _| {})
+    /// /// Use [`verify_login:verify_login_then`] to run a callback after the reducer completes.
+    fn verify_login(&self, name: String, password: String) -> __sdk::Result<()> {
+        self.verify_login_then(name, password, |_, _| {})
     }
 
-    /// Request that the remote module invoke the reducer `register_account` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `verify_login` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn register_account_then(
+    fn verify_login_then(
         &self,
         name: String,
         password: String,
@@ -56,8 +56,8 @@ pub trait register_account {
     ) -> __sdk::Result<()>;
 }
 
-impl register_account for super::RemoteReducers {
-    fn register_account_then(
+impl verify_login for super::RemoteReducers {
+    fn verify_login_then(
         &self,
         name: String,
         password: String,
@@ -67,6 +67,6 @@ impl register_account for super::RemoteReducers {
             + 'static,
     ) -> __sdk::Result<()> {
         self.imp
-            .invoke_reducer_with_callback(RegisterAccountArgs { name, password }, callback)
+            .invoke_reducer_with_callback(VerifyLoginArgs { name, password }, callback)
     }
 }

@@ -253,11 +253,17 @@ row-granular deltas.
   roster on one 5 s clock, comfortably inside the module's 30 s TTL, and the
   module reaps anything staler. Presence writes are batched into a single
   transaction per world rather than one reducer call per player.
-- **Chunk versions** are the chunk's own edit counter, not a clock. A wall
-  clock looked monotonic but a backwards step would fail the module's
-  stale-write guard for every write until it caught up — and since the region
-  file is authoritative and the chunk is no longer dirty, those edits would
-  never be retried.
+- **Chunk versions** are the chunk's own edit counter, not a clock, and are
+  compared only *within one writer epoch*. A wall clock looked monotonic but a
+  backwards step would fail the module's stale-write guard for every write
+  until it caught up. The edit counter that replaced it has its own catch: it
+  lives in memory and restarts at 0 whenever a chunk is evicted and reloaded
+  from its region file, so comparing versions across server processes rejected
+  every edit to a reloaded chunk until the counter climbed past its previous
+  high-water mark. Both failures are silent and permanent in the same way —
+  the region file is authoritative and the chunk is no longer dirty, so nothing
+  retries. Hence `writer_epoch`: a value identifying the server *process*, with
+  no ordering to get wrong. Across epochs the later writer simply wins.
 
 - **Reads** go through the SDK's client-side cache, which the worker keeps
   current from a `player_profile` subscription. That makes a lookup synchronous,
@@ -267,16 +273,30 @@ row-granular deltas.
   profile for that account in that world restores their position; a miss just
   spawns them normally.
 
-- **Accounts** live in the `account` table when a database is configured.
-  Passwords are Argon2id with a per-account salt; the module stores the verifier
-  and never checks one, because the game server is the only party a client
-  proves anything to. `register_account` and `link_identity` are both
-  server-only for the same reason: nothing in the module can establish who owns
-  a name. Without a database the local file is authoritative exactly as before,
-  and existing accounts migrate on their next successful login.
+- **Accounts** live in the `account` table when a database is configured, and
+  that table is **private**: verifiers are never readable by any client. Since a
+  private table generates no client-side accessor, the game server cannot read
+  it either — so hashing and verification happen *inside the module*, in the
+  server-only `verify_login`, `register_account` and `set_password` reducers,
+  and only a verdict comes back. Passing a password to a reducer is safe
+  because SpacetimeDB 2.0 delivers a reducer's outcome only to the connection
+  that called it; under 1.0 it would have broadcast every password to every
+  client. Without a database the local file is authoritative exactly as before,
+  and existing accounts migrate on their next successful login — the one moment
+  a plaintext is in hand to re-register with.
+
+- **Logins run off the tick thread.** Argon2id is memory-hard by design and
+  costs tens of milliseconds, against a 15.6 ms tick; with a database it is a
+  network round trip on top. Checked inline, a flood of logins froze the whole
+  server for close to two seconds — a denial of service needing no bandwidth to
+  mount, and measured as exactly that before the fix. A `Login` now dispatches
+  to a worker and returns; the verdict comes back through `AuthQueue`, which
+  replays the message so the join path stays in one place. One check per
+  connection at a time.
 - **The client** (`soils-client/src/social.rs`) subscribes to the *lobby* half —
-  `game_server`, `world`, `chat_message` — and never to `account` or
-  `chunk_blob`. It is optional and non-blocking throughout: every accessor
+  `game_server`, `world`, `chat_message` — and not to `chunk_blob`, which would
+  stream the stored world into a player's memory. (`account` is private, so it
+  is not so much excluded as unreachable.) It is optional and non-blocking throughout: every accessor
   returns an empty list rather than an error, so a database that is down or
   absent costs the lobby and chat, never the game. The server browser merges
   the registry with UDP LAN discovery, which still works with no database at

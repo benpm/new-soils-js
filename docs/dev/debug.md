@@ -182,6 +182,23 @@ holds stale data.
 
 Use a real counter. `chunk_blob.version` is the chunk's own edit counter.
 
+### ...and then rejected forever after an eviction
+
+The counter that fixes the clock bug has the same shape of bug hiding in it.
+It lives in memory and is reset to 0 by `World::entry`, which runs every time a
+chunk is evicted and read back from its region file. Comparing versions across
+two server processes therefore rejects every edit made to a reloaded chunk
+until its counter climbs past its own previous high-water mark — silently,
+permanently, and in the ordinary case of a long-lived world.
+
+The guard is now scoped by `writer_epoch`, a per-process value with no ordering
+to get wrong; across epochs the later writer wins, since only one server owns a
+world at a time. `a_write_from_a_new_epoch_is_not_stale` covers it.
+
+The general lesson: **a monotonic counter is only monotonic within the lifetime
+of whatever holds it.** Before comparing two versions, ask what happens when
+they come from different processes, and what resets the counter.
+
 Consequence to remember: an edit counter is **deterministic across runs**, so a
 test that detects "a fresh write happened" by comparing versions will see an
 identical value on a repeat run. Compare `updated_at` instead.
@@ -225,6 +242,34 @@ Popping a non-matching message off a holding buffer and pushing it straight
 back spins forever. Drain from the *source* only; the holding buffer is
 append-only during a drain.
 
+### Something slow is on the tick thread
+
+Symptom: everyone on the server freezes together, for a fraction of a second to
+a couple of seconds, correlated with someone logging in.
+
+`drain_inboxes` runs on the tick thread. Anything it calls synchronously —
+Argon2, a database round trip, a file write — stops the world. Argon2id is
+*deliberately* expensive (that is what makes a stolen verifier costly to
+crack), so it is the worst possible thing to run there, and a client sending
+logins in a loop turns it into a denial of service needing no bandwidth.
+
+The pattern used here: dispatch to a worker, return immediately, and let the
+result re-enter through a queue that replays the original message. The success
+path then stays in exactly one place instead of being duplicated for the
+deferred case. Bound each connection to one outstanding check so the queue
+cannot be flooded.
+
+**How to test it, and how not to.** Total elapsed time is not discriminating:
+the first version of `logins_do_not_stall_the_tick` measured how long 20 ticks
+took under a flood, and passed happily with the hashing back on the tick thread
+— connection setup spread the cost outside the window. Measure the **longest
+gap between consecutive ticks** instead, and establish all the connections
+before firing the logins so the cost lands at once. That version reports a
+1.95 s stall inline and passes off-thread.
+
+Always check a timing test by reintroducing the bug. If it still passes, it is
+measuring the wrong thing.
+
 ### Tests that pass without testing anything
 
 Four real examples, all of which looked fine:
@@ -245,6 +290,37 @@ Ask of every assertion: *what value would make this fail?* If the answer is
 
 Setup, schema and gotchas live in [`stdb/README.md`](../../stdb/README.md).
 Debug-specific notes:
+
+### A table is readable by people who should not read it
+
+`public` on a `#[table]` is a **client read permission**, not documentation.
+Any connected identity may subscribe to a public table and read every row of
+it. Limiting what our own SDK subscribes to (`CLIENT_SUBSCRIPTIONS`) is our
+code being polite; a hostile client is under no obligation to be. `account`
+held Argon2 verifiers in a public table for exactly this reason — the
+subscription list looked like a boundary.
+
+Row-level security is the natural tool and is **not usable in 2.7.1**:
+`client_visibility_filter` is behind the `unstable` feature and the bindings'
+own source says the filters are "currently unimplemented, and are not
+enforced". A declared filter would compile, read as a security control, and do
+nothing.
+
+The available answer is `private`, with a consequence that is easy to miss:
+
+> A private table generates **no client-side accessor at all**. Regenerate the
+> bindings and `<table>_table.rs` is deleted. The database *owner* can still
+> query it with `spacetime sql`, but no SDK connection — the game server's
+> included — can read it.
+
+So making a table private means moving every read of it into a reducer. For
+`account` that meant hashing and verification move into the module.
+
+Related: passing a password to a reducer is safe **only** because SpacetimeDB
+2.0 stopped broadcasting reducer arguments (a reducer's outcome goes to the
+calling connection alone). Under 1.0 semantics the same code would publish
+every password to every client. If you ever see 1.0-era advice about reducer
+callbacks, check this before trusting it.
 
 ### Reads return nothing, or every password is rejected
 
@@ -282,12 +358,38 @@ Anything with a liveness TTL needs refreshing, not just writing once.
 `LIVENESS_TTL` is 30 s and `REAP_INTERVAL` 10 s, against a 5 s server
 heartbeat. A row written at login and never refreshed disappears mid-session.
 
+### Known exposures, so you do not rediscover them as bugs
+
+Two tables are readable by any client and should not be:
+
+- `player_profile` — every player's last known position.
+- `chunk_blob` — the stored (edited) world.
+
+Both must be public because the *game server* reads them through the SDK cache,
+and a private table has no client accessor at all. Row-level security is the
+right tool and is unimplemented in 2.7.1. This is recorded in `TODO.md`; it is
+a known limitation, not an oversight to re-report.
+
+Likewise `send_chat` trusts the caller's `world_id`, and `grant_server` is
+trust-on-first-use.
+
 ### Regenerating bindings deletes files
 
 `spacetimedb-cli generate` prompts to remove files it considers stale and
 `--yes` accepts. Check `git status` afterwards. Removing a table or reducer
 from the module *and* regenerating is two separate deletions — verify the
 reducer you still need is still there.
+
+### A reducer needs to answer a question
+
+Reducers are fire-and-forget by default, but the generated bindings also emit a
+`<reducer>_then` variant taking a callback that receives the module's own
+`Result<(), String>`. That is a private request/response channel — correlation
+is per call, so there is no need to match on arguments. `StdbLink::ask` wraps
+it into a blocking call.
+
+Blocking on it from the ECS tick thread is the trap; see the Argon2 entry under
+*Concurrency*.
 
 Other SDK facts that produce confusing failures:
 

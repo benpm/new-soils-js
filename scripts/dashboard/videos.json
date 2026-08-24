@@ -4,6 +4,21 @@
   "ref": "spacetimedb-integration",
   "videos": [
     {
+      "id": "2026-08-24_private-accounts-and-chat",
+      "date": "2026-08-24",
+      "title": "Private accounts, module-side auth",
+      "source": "recordings/obs/stdb_auth_web.mp4",
+      "test": "crates/soils-server/tests/stdb_demo.rs",
+      "test_name": "record_spacetimedb_lobby_and_chat",
+      "tags": [
+        "spacetimedb",
+        "auth",
+        "two-client",
+        "obs"
+      ],
+      "blurb": "The same two-client lobby after passwords moved <em>into</em> the database. <code>account</code> is now a private table, so no client can read a verifier &mdash; not even the game server, which is why <code>verify_login</code> does the Argon2id work inside the module and returns only a verdict. Hashing also moved off the 64&nbsp;Hz tick: inline, a 40-login flood froze every player for 1.95&nbsp;s. Each client still holds its own anonymous identity, visible here as chat attributed correctly to <code>ana</code> and <code>bo</code>."
+    },
+    {
       "id": "2026-08-24_spacetimedb-lobby-and-chat",
       "date": "2026-08-24",
       "title": "SpacetimeDB lobby and chat",

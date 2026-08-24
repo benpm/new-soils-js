@@ -554,7 +554,7 @@ fn session(
     // the `running` flag would discard commands already queued — and the flush
     // that matters most is the one at shutdown, where the server pushes its
     // dirty chunks out on the way down.
-    let mut shutdown;
+    let shutdown;
     loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(cmd) => apply(conn.reducers(), cmd, event_tx),

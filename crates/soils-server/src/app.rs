@@ -300,6 +300,10 @@ impl Worlds {
                     eprintln!("spacetimedb: could not register world '{name}': {e}");
                 } else {
                     world.enable_stdb(world_id);
+                    // An empty region directory means a fresh host: pull back
+                    // whatever edits the database still holds before anyone
+                    // joins and starts generating pristine terrain over them.
+                    world.restore_from_stdb(stdb);
                 }
             }
             self.map.insert(name.to_string(), world);

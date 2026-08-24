@@ -359,6 +359,58 @@ impl World {
         self.stdb_world_id = Some(world_id);
     }
 
+    /// Seed the region files from SpacetimeDB when there are none.
+    ///
+    /// This is the case that makes the mirror worth its cost: a fresh
+    /// deployment, or a host whose disk was lost, gets its edited chunks back
+    /// instead of a world reset to pristine terrain. Only edited chunks were
+    /// ever stored — everything else is bit-exact reproducible from
+    /// `GenParams`, so a full restore is exactly the edits and nothing more.
+    ///
+    /// Deliberately only when the directory is empty. Region files stay
+    /// authoritative, and a restore that ran over a populated directory could
+    /// roll live edits backwards to whatever the mirror last received.
+    pub fn restore_from_stdb(&mut self, link: &soils_stdb::StdbLink) -> usize {
+        let Some(world_id) = self.stdb_world_id else { return 0 };
+        let populated = std::fs::read_dir(&self.regions_dir)
+            .map(|d| d.filter_map(Result::ok).any(|e| e.path().is_file()))
+            .unwrap_or(false);
+        if populated {
+            return 0;
+        }
+
+        // Short, because this runs on the tick thread: the restore has to
+        // finish before anyone can join and generate pristine terrain over the
+        // chunks it is recovering, so it cannot be moved off the critical path
+        // — but it must not stall the first heartbeat either.
+        let blobs = link.fetch_world_chunks(world_id, std::time::Duration::from_secs(5));
+        if blobs.is_empty() {
+            return 0;
+        }
+        let mut restored = Vec::new();
+        for blob in &blobs {
+            let Some(volume) = soils_protocol::decode_chunk(&blob.payload) else {
+                eprintln!(
+                    "stdb restore: chunk ({}, {}, {}) has an undecodable payload; skipping",
+                    blob.cx, blob.cy, blob.cz
+                );
+                continue;
+            };
+            restored.push((IVec3::new(blob.cx, blob.cy, blob.cz), volume));
+        }
+        // Written straight to disk rather than into the resident map: the
+        // normal load path picks them up from there, and a restore should look
+        // to the rest of the server exactly like a world that was always there.
+        let refs: Vec<(IVec3, &ChunkVolume, bool)> =
+            restored.iter().map(|(p, v)| (*p, v, true)).collect();
+        if let Err(e) = region::save_many(&self.regions_dir, &refs) {
+            eprintln!("stdb restore: could not write region files: {e}");
+            return 0;
+        }
+        println!("stdb restore: recovered {} edited chunks from SpacetimeDB", refs.len());
+        refs.len()
+    }
+
     /// The chunk key this position mirrors under, if mirroring is on and the
     /// position is representable.
     fn stdb_key(&self, pos: IVec3) -> Option<u64> {

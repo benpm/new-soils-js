@@ -10,6 +10,7 @@ pub struct ChatMessage {
     pub id: u64,
     pub world_id: u16,
     pub sender: __sdk::Identity,
+    pub sender_name: String,
     pub text: String,
     pub at: __sdk::Timestamp,
 }
@@ -25,6 +26,7 @@ pub struct ChatMessageCols {
     pub id: __sdk::__query_builder::Col<ChatMessage, u64>,
     pub world_id: __sdk::__query_builder::Col<ChatMessage, u16>,
     pub sender: __sdk::__query_builder::Col<ChatMessage, __sdk::Identity>,
+    pub sender_name: __sdk::__query_builder::Col<ChatMessage, String>,
     pub text: __sdk::__query_builder::Col<ChatMessage, String>,
     pub at: __sdk::__query_builder::Col<ChatMessage, __sdk::Timestamp>,
 }
@@ -36,6 +38,7 @@ impl __sdk::__query_builder::HasCols for ChatMessage {
             id: __sdk::__query_builder::Col::new(table_name, "id"),
             world_id: __sdk::__query_builder::Col::new(table_name, "world_id"),
             sender: __sdk::__query_builder::Col::new(table_name, "sender"),
+            sender_name: __sdk::__query_builder::Col::new(table_name, "sender_name"),
             text: __sdk::__query_builder::Col::new(table_name, "text"),
             at: __sdk::__query_builder::Col::new(table_name, "at"),
         }

@@ -153,6 +153,12 @@ pub struct ChatMessage {
     #[index(btree)]
     pub world_id: u16,
     pub sender: Identity,
+    /// The speaker's account name, denormalised at write time.
+    ///
+    /// Clients do not subscribe to `account` — it holds password verifiers —
+    /// so they have no way to turn an identity into a name. Copying it here is
+    /// what lets chat read `<ben>` instead of a truncated identity.
+    pub sender_name: String,
     pub text: String,
     pub at: Timestamp,
 }
@@ -370,6 +376,7 @@ pub fn send_chat(ctx: &ReducerContext, world_id: u16, text: String) -> Result<()
     if ctx.timestamp < account.last_chat_at + CHAT_COOLDOWN {
         return Err("slow down".to_string());
     }
+    let sender_name = account.name.clone();
     account.last_chat_at = ctx.timestamp;
     ctx.db.account().name().update(account);
 
@@ -379,6 +386,7 @@ pub fn send_chat(ctx: &ReducerContext, world_id: u16, text: String) -> Result<()
             id: 0,
             world_id,
             sender: ctx.sender(),
+            sender_name,
             text,
             at: ctx.timestamp,
         })

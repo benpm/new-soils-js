@@ -217,6 +217,42 @@ impl StdbLink {
         guard.as_ref()?.db().account().name().find(&name.to_string())
     }
 
+    /// Every stored chunk for one world, for restoring a server whose region
+    /// files are gone.
+    ///
+    /// Takes out a one-off subscription rather than keeping `chunk_blob` in the
+    /// standing set: a running server serves chunks from region files, which
+    /// stay authoritative, so subscribing permanently would hold the whole
+    /// stored world in memory to answer a question asked once at startup.
+    ///
+    /// Returns what arrived before `timeout`. A partial restore is still better
+    /// than none — the missing chunks regenerate as pristine terrain, which is
+    /// exactly what they would have done with no database at all.
+    pub fn fetch_world_chunks(
+        &self,
+        world_id: u16,
+        timeout: std::time::Duration,
+    ) -> Vec<ChunkBlob> {
+        let guard = match self.conn.read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let Some(conn) = guard.as_ref() else { return Vec::new() };
+
+        let applied = Arc::new(AtomicBool::new(false));
+        let flag = applied.clone();
+        let _handle = conn
+            .subscription_builder()
+            .on_applied(move |_| flag.store(true, Ordering::Relaxed))
+            .subscribe([format!("SELECT * FROM chunk_blob WHERE world_id = {world_id}")]);
+
+        let deadline = std::time::Instant::now() + timeout;
+        while !applied.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        conn.db().chunk_blob().iter().filter(|b| b.world_id == world_id).collect()
+    }
+
     /// Live game servers, most populated first.
     ///
     /// Complements the UDP LAN discovery rather than replacing it: discovery

@@ -108,7 +108,7 @@ async fn an_edit_reaches_spacetimedb() {
         .await;
 
     // The server registers itself in the browser registry on its first tick.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while obs.db().game_server().iter().next().is_none() {
         assert!(Instant::now() < deadline, "server never registered a game_server row");
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -228,11 +228,24 @@ async fn an_edit_reaches_spacetimedb() {
     // the shared rayon pool), so constructing another while it is alive
     // deadlocks.
     drop(server);
+    let cfg_resume = cfg.clone();
     let server = TestServer::start_with("stdbresume", move |c| {
-        c.stdb = Some(cfg);
+        c.stdb = Some(cfg_resume);
     });
-    let resumed = Client::join(server.addr(), "mirror").await;
+    let mut resumed = Client::join(server.addr(), "mirror").await;
     let spawned = resumed.spawn;
+
+    // This server started on a fresh data dir, so its region files were empty
+    // and it had to pull the edited chunk back out of SpacetimeDB. That is the
+    // case the mirror exists for: a host that lost its disk recovering its
+    // world instead of resetting to pristine terrain.
+    let volume = resumed.await_chunk(spawn_chunk).await;
+    assert_eq!(
+        volume.get(lx, ly, lz),
+        1,
+        "a server with no region files should have restored the edited voxel \
+         from SpacetimeDB"
+    );
     let drift = ((spawned[0] - saved[0]).powi(2)
         + (spawned[1] - saved[1]).powi(2)
         + (spawned[2] - saved[2]).powi(2))

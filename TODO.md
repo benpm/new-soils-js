@@ -182,11 +182,11 @@ as it was, region files only. Setup and schema notes in
 
 Remaining, roughly in priority order:
 
-- [ ] **The server never reads from SpacetimeDB.** There is no subscription
-      anywhere outside tests, so the integration is a one-way write mirror.
-      Everything below depends on adding a read path.
-- [ ] `player_profile` is written but never read: login always spawns at
-      `world.spawn`, so "resume where you left off" does not happen.
+- [x] Read path: the link keeps a `player_profile` subscription and exposes a
+      synchronous cache lookup, and startup waits (bounded) for the first
+      snapshot so a login cannot race it.
+- [x] `player_profile` is read back — a returning player resumes where they
+      logged out instead of at `world.spawn`.
 - [ ] **Client-side layer is entirely absent** — `soils-client` does not depend
       on `soils-stdb`. Login/`register_account`, `link_identity`, world list,
       server browser (`game_server` is populated with nobody reading it) and

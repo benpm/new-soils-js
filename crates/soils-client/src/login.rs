@@ -88,7 +88,10 @@ const BTN_BG: Color = Color::srgba(0.20, 0.34, 0.46, 1.0);
 pub fn setup_login(mut commands: Commands) {
     // Self-test auto-logs in, so the screen is skipped — unless SOILS_LOGINSHOT
     // forces it up for a screenshot.
-    if std::env::var("SOILS_SELFTEST").is_ok() && std::env::var("SOILS_LOGINSHOT").is_err() {
+    let auto = std::env::var("SOILS_AUTOLOGIN").is_ok_and(|v| !v.is_empty());
+    if (auto || std::env::var("SOILS_SELFTEST").is_ok())
+        && std::env::var("SOILS_LOGINSHOT").is_err()
+    {
         return;
     }
     commands

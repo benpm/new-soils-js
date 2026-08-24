@@ -95,6 +95,14 @@ pub struct ServerConfig {
     /// Enable Avian rigid-body physics (authoritative world + demo props).
     /// `SOILS_PHYSICS=1` on the dedicated binary.
     pub physics: bool,
+    /// How many rigid-body props to drop near spawn on first login, instead of
+    /// the 3-cube demo stack (0 = the stack). Requires `physics`.
+    ///
+    /// A few hundred replicated bodies is a load test rather than a scene:
+    /// every one of them moves every tick while the pile settles, so this is
+    /// the case that shows what entity replication actually costs.
+    /// `SOILS_PROPS` on the dedicated binary.
+    pub props: u16,
     /// SpacetimeDB mirroring. `None` (the default) keeps persistence entirely
     /// on region files, so single-player and offline play need no database.
     /// Set via `SOILS_STDB_URI` / `SOILS_STDB_DB` / `SOILS_STDB_TOKEN`.
@@ -182,6 +190,7 @@ impl Default for ServerConfig {
             critters: 0,
             scripts_dir: None,
             physics: false,
+            props: 0,
             stdb: None,
         }
     }
@@ -370,13 +379,14 @@ async fn serve(
         let critters = config.critters;
         let scripts_dir = config.scripts_dir.clone();
         let physics = config.physics;
+        let props = config.props;
         let stdb = stdb.clone();
         let server_name = config.name.clone();
         let bind_addr = config.bind.clone();
         std::thread::Builder::new().name("soils-ecs".into()).spawn(move || {
             app::run_app(
                 conns_rx, shutdown, data_dir, persist, accounts, player_count, critters,
-                scripts_dir, physics, stdb, server_name, bind_addr,
+                scripts_dir, physics, props, stdb, server_name, bind_addr,
             );
         })?
     };

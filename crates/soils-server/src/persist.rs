@@ -29,6 +29,9 @@ pub struct SaveJob {
     /// `soils_protocol::chunk_key` of this chunk, when SpacetimeDB mirroring is
     /// on. `None` leaves the job disk-only.
     pub stdb_key: Option<u64>,
+    /// The chunk's edit version, which the mirror sends as `ChunkBlob.version`
+    /// for the module's stale-write guard.
+    pub version: u32,
 }
 
 enum Msg {
@@ -48,7 +51,7 @@ impl PersistHandle {
     /// cost is cloning the volume (done by the caller) and a channel send. If
     /// the writer has gone away the job is silently dropped.
     pub fn enqueue(&self, dir: PathBuf, pos: IVec3, volume: ChunkVolume, edited: bool) {
-        self.enqueue_with_key(dir, pos, volume, edited, None);
+        self.enqueue_with_key(dir, pos, volume, edited, None, 0);
     }
 
     /// As [`enqueue`](Self::enqueue), but also mirrors the chunk into
@@ -60,8 +63,9 @@ impl PersistHandle {
         volume: ChunkVolume,
         edited: bool,
         stdb_key: Option<u64>,
+        version: u32,
     ) {
-        let _ = self.tx.send(Msg::Save(SaveJob { dir, pos, volume, edited, stdb_key }));
+        let _ = self.tx.send(Msg::Save(SaveJob { dir, pos, volume, edited, stdb_key, version }));
     }
 }
 
@@ -144,20 +148,27 @@ fn writer_loop(rx: Receiver<Msg>, stdb: Option<Arc<StdbLink>>) {
 /// kill the writer.
 fn flush_batch(batch: Vec<SaveJob>, stdb: Option<&StdbLink>) {
     use std::collections::HashMap;
-    let mut by_dir: HashMap<PathBuf, Vec<(IVec3, ChunkVolume, bool, Option<u64>)>> = HashMap::new();
+    let mut by_dir: HashMap<PathBuf, Vec<(IVec3, ChunkVolume, bool, Option<u64>, u32)>> =
+        HashMap::new();
     for job in batch {
-        by_dir.entry(job.dir).or_default().push((job.pos, job.volume, job.edited, job.stdb_key));
+        by_dir.entry(job.dir).or_default().push((
+            job.pos,
+            job.volume,
+            job.edited,
+            job.stdb_key,
+            job.version,
+        ));
     }
     for (dir, chunks) in by_dir {
         let refs: Vec<(IVec3, &ChunkVolume, bool)> =
-            chunks.iter().map(|(p, v, e, _)| (*p, v, *e)).collect();
+            chunks.iter().map(|(p, v, e, ..)| (*p, v, *e)).collect();
         if let Err(e) = region::save_many(&dir, &refs) {
             eprintln!("chunk writer: failed to persist {} chunks in {dir:?}: {e}", refs.len());
             // Disk is authoritative; don't mirror what we failed to store.
             continue;
         }
         let Some(stdb) = stdb else { continue };
-        for (_, volume, edited, key) in &chunks {
+        for (_, volume, edited, key, version) in &chunks {
             // Pristine chunks are reproducible from GenParams and are already
             // skipped on disk — mirroring them would waste the database too.
             let (Some(key), true) = (key, *edited) else { continue };
@@ -165,10 +176,13 @@ fn flush_batch(batch: Vec<SaveJob>, stdb: Option<&StdbLink>) {
             if let Err(e) = stdb.send(StdbCmd::PutChunkBlob {
                 key: *key,
                 payload,
-                // The region file carries no version counter, so the mirror
-                // uses a monotonic clock stamp: later writes always win the
-                // module's stale-write check.
-                version: stamp(),
+                // The chunk's own edit counter, not a clock. A wall-clock
+                // stamp looked monotonic but a backwards step (NTP correction,
+                // VM resume) would make every write for the next N seconds fail
+                // the module's stale-write guard — and since the region file is
+                // authoritative and the chunk is no longer dirty, those edits
+                // would never be retried, wedging the mirror silently.
+                version: *version,
                 edits_through: 0,
             }) {
                 eprintln!("chunk writer: spacetimedb mirror unavailable: {e}");
@@ -177,11 +191,4 @@ fn flush_batch(batch: Vec<SaveJob>, stdb: Option<&StdbLink>) {
     }
 }
 
-/// Seconds since the unix epoch, saturating into `u32`. Monotonic enough to
-/// order chunk writes for the module's stale-version guard.
-fn stamp() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0)
-}
+

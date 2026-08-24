@@ -767,6 +767,7 @@ impl World {
                     entry.volume.clone(),
                     entry.edited,
                     key,
+                    entry.version,
                 );
             }
         }
@@ -791,6 +792,7 @@ impl World {
                     entry.volume,
                     entry.edited,
                     key,
+                    entry.version,
                 );
             }
             // The background writer will rewrite this chunk's region header;

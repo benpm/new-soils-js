@@ -26,15 +26,16 @@ oracles.*
 
 ## Networked physics, from both sides
 
-<video src="docs/media/two-views.webm" poster="docs/media/two-views.png"
-       width="960" controls muted loop playsinline></video>
+[![Two first-person views of the same 300-body rigid-body pile — click to play](docs/media/two-views.png)](docs/media/two-views.webm)
 
 *Both players' first-person views composited into one frame — `alice` left,
 `bob` right — walking through 300 server-simulated rigid bodies and into each
 other. Two independent connections, two independent reconstructions from delta
 snapshots; [the tests](crates/soils-server/tests/props.rs) put the worst
 cross-client disagreement at **0.000 units**. Try it with
-`SOILS_PROPS=300 cargo run -p soils-server`.*
+`SOILS_PROPS=300 cargo run -p soils-server`. Click through for the
+[10 s clip](docs/media/two-views.webm) — GitHub strips `<video>` from
+markdown, so the still links to it instead.*
 
 ## What works today
 

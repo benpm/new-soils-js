@@ -103,6 +103,18 @@ apart.
   lifecycle. Player movement integrates client inputs through the shared
   `step_player` at the client dt, so speed-hacking is structurally impossible
   (scenario-verified).
+- **Player-vs-player collision**: `step_player_peers` sweeps the player AABB
+  against other players' bodies as well as voxels, per axis. Being blocked on
+  the vertical axis while falling sets `grounded`, so players stand — and jump
+  — on one another. Two rules keep it stable: peers are read from a
+  *tick-boundary snapshot* (so the result does not depend on ECS iteration
+  order, and the client can predict the same thing), and a peer already
+  interpenetrating at the start of a tick is ignored, so players sharing a
+  spawn point can walk apart instead of locking each other in place forever.
+  Fly mode stays noclip. The client feeds the same peer set into both
+  prediction and rollback replay, taking each peer's *newest* snapshot rather
+  than its render-delayed interpolated position — the newest is what the server
+  resolved against, so contact does not spray reconciliations.
 - **Chunk lifecycle**: subscriptions are server-owned boxes around each
   client (radius + hysteresis); wanted chunks are probed cache→disk on the
   tick and generated on rayon in nearest-first waves (≤8 in flight per
@@ -203,6 +215,10 @@ share-one-simulation rule as movement, but through the `soils-physics` crate.
   `soils-sim` (`player_proxy`), so props are shoved by the player without
   changing the tuned movement. Full two-way (riding on props) would require
   moving the player onto an Avian character controller — deferred.
+  Note this proxy is *not* how players collide with each other: it is one-way
+  and its position is overwritten from `SimState` every tick. Player-vs-player
+  collision lives in `step_player_peers` (below), independent of Avian, so it
+  works with `SOILS_PHYSICS` off.
 - **Spawning**: the `spawn`/`cube` console command (→ `ClientMsg::SpawnCube`,
   reach-checked + rate-limited) drops a cube ahead of the camera; a demo stack
   also falls near the first player on join.
@@ -220,6 +236,23 @@ share-one-simulation rule as movement, but through the `soils-physics` crate.
   gate — parallel embedded servers starve the shared rayon pool.
 - **Prediction**: a TCP delay proxy (75 ms each way, 2% input loss) drives a
   headless client twin through convergence and forced-misprediction cases.
+- **Concurrency** (`soils-server/tests/concurrent.rs`): every client runs on its
+  own OS thread with its own runtime, so connection handling, input integration
+  and replication are exercised in real parallel rather than interleaved on one
+  executor. Covers mutual observation, player-vs-player blocking, standing and
+  jumping on another player's head, the same under a degraded link, and 100
+  simultaneous clients (both clean and adverse links). Barrier waits carry
+  deadlines: a peer thread that panics would otherwise hang the binary and bury
+  the real failure.
+- **Network conditions** (`soils-protocol/src/netsim.rs`): latency, gaussian
+  jitter (Box-Muller) and loss, seeded so a failure reproduces. Delivery is
+  monotonic — the modelled transports are ordered streams, so reordering them
+  would test a network that cannot occur — and loss applies only to lanes built
+  for it (`Inputs`, which re-sends the last 3 frames; `Snapshot`, delta-coded
+  against acked baselines). Dropping a manifest would strand a chunk and prove
+  nothing. Unit tests assert the distribution really is gaussian (mean, sigma,
+  1-sigma/2-sigma coverage), not merely random. Available to the real client as
+  `SOILS_NETSIM=<latency_ms>,<jitter_ms>,<loss>[,<seed>]`.
 - **Physics** (`soils-server/tests/physics.rs`): a dropped cube falls and its
   orientation replicates as a unit quaternion, two clients converge on the same
   rest state, and the `SpawnCube` command creates a replicated cube.
@@ -232,6 +265,14 @@ share-one-simulation rule as movement, but through the `soils-physics` crate.
 - **Visual**: `SOILS_SELFTEST=1` renders, screenshots, and asserts terrain
   presence headlessly; the GI demo scene isolates the bounce for eyeballing;
   CI renders release screenshots under Mesa lavapipe.
+- **Recording** (`soils-server/tests/demo.rs`, ignored by default): hosts a
+  server, scripts two participants, and points a third client at them as a
+  fixed camera (`SOILS_SPECTATE`) recording frames (`SOILS_RECORD`). A
+  spectator is necessary rather than convenient — a first-person camera cannot
+  show two bodies meeting. `scripts/mux_recording.py` muxes the result using
+  each frame's *recorded* timestamp: PNG encoding perturbs the frame clock, so
+  assuming a constant rate would stamp fabricated judder onto the video and
+  make good interpolation look broken.
 
 ## Known deferrals
 

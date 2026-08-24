@@ -375,6 +375,11 @@ async fn serve(
     discovery_port_tx: watch::Sender<Option<u16>>,
 ) -> std::io::Result<()> {
     let accounts = Arc::new(Accounts::load(&config.data_dir));
+    // With a database configured, it becomes the account store; the local file
+    // stays as a fallback and as the migration source for existing accounts.
+    if let Some(link) = &stdb {
+        accounts.use_stdb(link.clone());
+    }
     let player_count = Arc::new(AtomicU16::new(0));
     let (conns_tx, conns_rx) = mpsc::unbounded_channel::<NewConn>();
 

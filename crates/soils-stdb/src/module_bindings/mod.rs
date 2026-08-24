@@ -12,8 +12,6 @@ pub mod chat_message_table;
 pub mod chat_message_type;
 pub mod chunk_blob_table;
 pub mod chunk_blob_type;
-pub mod chunk_edit_table;
-pub mod chunk_edit_type;
 pub mod game_server_table;
 pub mod game_server_type;
 pub mod grant_server_reducer;
@@ -22,19 +20,17 @@ pub mod heartbeat_reducer;
 pub mod link_identity_reducer;
 pub mod mark_absent_reducer;
 pub mod mark_present_reducer;
-pub mod packed_edit_type;
 pub mod player_profile_table;
 pub mod player_profile_type;
 pub mod presence_table;
 pub mod presence_type;
-pub mod prune_edits_reducer;
 pub mod put_chunk_blob_reducer;
 pub mod reap_timer_type;
 pub mod register_account_reducer;
 pub mod save_profile_reducer;
 pub mod send_chat_reducer;
 pub mod server_identity_type;
-pub mod submit_edits_reducer;
+pub mod set_verifier_reducer;
 pub mod upsert_world_reducer;
 pub mod world_table;
 pub mod world_type;
@@ -45,8 +41,6 @@ pub use chat_message_table::*;
 pub use chat_message_type::ChatMessage;
 pub use chunk_blob_table::*;
 pub use chunk_blob_type::ChunkBlob;
-pub use chunk_edit_table::*;
-pub use chunk_edit_type::ChunkEdit;
 pub use game_server_table::*;
 pub use game_server_type::GameServer;
 pub use grant_server_reducer::grant_server;
@@ -55,19 +49,17 @@ pub use heartbeat_reducer::heartbeat;
 pub use link_identity_reducer::link_identity;
 pub use mark_absent_reducer::mark_absent;
 pub use mark_present_reducer::mark_present;
-pub use packed_edit_type::PackedEdit;
 pub use player_profile_table::*;
 pub use player_profile_type::PlayerProfile;
 pub use presence_table::*;
 pub use presence_type::Presence;
-pub use prune_edits_reducer::prune_edits;
 pub use put_chunk_blob_reducer::put_chunk_blob;
 pub use reap_timer_type::ReapTimer;
 pub use register_account_reducer::register_account;
 pub use save_profile_reducer::save_profile;
 pub use send_chat_reducer::send_chat;
 pub use server_identity_type::ServerIdentity;
-pub use submit_edits_reducer::submit_edits;
+pub use set_verifier_reducer::set_verifier;
 pub use upsert_world_reducer::upsert_world;
 pub use world_table::*;
 pub use world_type::World;
@@ -96,6 +88,7 @@ pub enum Reducer {
     },
     LinkIdentity {
         account: String,
+        identity: __sdk::Identity,
     },
     MarkAbsent {
         account: String,
@@ -105,18 +98,14 @@ pub enum Reducer {
         server_id: u32,
         world_id: u16,
     },
-    PruneEdits {
-        key: u64,
-        up_to_id: u64,
-    },
     PutChunkBlob {
         key: u64,
         payload: Vec<u8>,
         version: u32,
-        edits_through: u64,
     },
     RegisterAccount {
         name: String,
+        verifier: String,
     },
     SaveProfile {
         account: String,
@@ -131,9 +120,9 @@ pub enum Reducer {
         world_id: u16,
         text: String,
     },
-    SubmitEdits {
-        tick: u64,
-        edits: Vec<PackedEdit>,
+    SetVerifier {
+        name: String,
+        verifier: String,
     },
     UpsertWorld {
         world_id: u16,
@@ -158,12 +147,11 @@ impl __sdk::Reducer for Reducer {
             Reducer::LinkIdentity { .. } => "link_identity",
             Reducer::MarkAbsent { .. } => "mark_absent",
             Reducer::MarkPresent { .. } => "mark_present",
-            Reducer::PruneEdits { .. } => "prune_edits",
             Reducer::PutChunkBlob { .. } => "put_chunk_blob",
             Reducer::RegisterAccount { .. } => "register_account",
             Reducer::SaveProfile { .. } => "save_profile",
             Reducer::SendChat { .. } => "send_chat",
-            Reducer::SubmitEdits { .. } => "submit_edits",
+            Reducer::SetVerifier { .. } => "set_verifier",
             Reducer::UpsertWorld { .. } => "upsert_world",
             _ => unreachable!(),
         }
@@ -196,9 +184,10 @@ impl __sdk::Reducer for Reducer {
                 world_id: world_id.clone(),
                 accounts: accounts.clone(),
             }),
-            Reducer::LinkIdentity { account } => {
+            Reducer::LinkIdentity { account, identity } => {
                 __sats::bsatn::to_vec(&link_identity_reducer::LinkIdentityArgs {
                     account: account.clone(),
+                    identity: identity.clone(),
                 })
             }
             Reducer::MarkAbsent { account } => {
@@ -215,26 +204,19 @@ impl __sdk::Reducer for Reducer {
                 server_id: server_id.clone(),
                 world_id: world_id.clone(),
             }),
-            Reducer::PruneEdits { key, up_to_id } => {
-                __sats::bsatn::to_vec(&prune_edits_reducer::PruneEditsArgs {
-                    key: key.clone(),
-                    up_to_id: up_to_id.clone(),
-                })
-            }
             Reducer::PutChunkBlob {
                 key,
                 payload,
                 version,
-                edits_through,
             } => __sats::bsatn::to_vec(&put_chunk_blob_reducer::PutChunkBlobArgs {
                 key: key.clone(),
                 payload: payload.clone(),
                 version: version.clone(),
-                edits_through: edits_through.clone(),
             }),
-            Reducer::RegisterAccount { name } => {
+            Reducer::RegisterAccount { name, verifier } => {
                 __sats::bsatn::to_vec(&register_account_reducer::RegisterAccountArgs {
                     name: name.clone(),
+                    verifier: verifier.clone(),
                 })
             }
             Reducer::SaveProfile {
@@ -260,10 +242,10 @@ impl __sdk::Reducer for Reducer {
                     text: text.clone(),
                 })
             }
-            Reducer::SubmitEdits { tick, edits } => {
-                __sats::bsatn::to_vec(&submit_edits_reducer::SubmitEditsArgs {
-                    tick: tick.clone(),
-                    edits: edits.clone(),
+            Reducer::SetVerifier { name, verifier } => {
+                __sats::bsatn::to_vec(&set_verifier_reducer::SetVerifierArgs {
+                    name: name.clone(),
+                    verifier: verifier.clone(),
                 })
             }
             Reducer::UpsertWorld {
@@ -293,7 +275,6 @@ pub struct DbUpdate {
     account: __sdk::TableUpdate<Account>,
     chat_message: __sdk::TableUpdate<ChatMessage>,
     chunk_blob: __sdk::TableUpdate<ChunkBlob>,
-    chunk_edit: __sdk::TableUpdate<ChunkEdit>,
     game_server: __sdk::TableUpdate<GameServer>,
     player_profile: __sdk::TableUpdate<PlayerProfile>,
     presence: __sdk::TableUpdate<Presence>,
@@ -315,9 +296,6 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                 "chunk_blob" => db_update
                     .chunk_blob
                     .append(chunk_blob_table::parse_table_update(table_update)?),
-                "chunk_edit" => db_update
-                    .chunk_edit
-                    .append(chunk_edit_table::parse_table_update(table_update)?),
                 "game_server" => db_update
                     .game_server
                     .append(game_server_table::parse_table_update(table_update)?),
@@ -358,16 +336,13 @@ impl __sdk::DbUpdate for DbUpdate {
 
         diff.account = cache
             .apply_diff_to_table::<Account>("account", &self.account)
-            .with_updates_by_pk(|row| &row.identity);
+            .with_updates_by_pk(|row| &row.name);
         diff.chat_message = cache
             .apply_diff_to_table::<ChatMessage>("chat_message", &self.chat_message)
             .with_updates_by_pk(|row| &row.id);
         diff.chunk_blob = cache
             .apply_diff_to_table::<ChunkBlob>("chunk_blob", &self.chunk_blob)
             .with_updates_by_pk(|row| &row.chunk_key);
-        diff.chunk_edit = cache
-            .apply_diff_to_table::<ChunkEdit>("chunk_edit", &self.chunk_edit)
-            .with_updates_by_pk(|row| &row.id);
         diff.game_server = cache
             .apply_diff_to_table::<GameServer>("game_server", &self.game_server)
             .with_updates_by_pk(|row| &row.server_id);
@@ -395,9 +370,6 @@ impl __sdk::DbUpdate for DbUpdate {
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "chunk_blob" => db_update
                     .chunk_blob
-                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "chunk_edit" => db_update
-                    .chunk_edit
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "game_server" => db_update
                     .game_server
@@ -433,9 +405,6 @@ impl __sdk::DbUpdate for DbUpdate {
                 "chunk_blob" => db_update
                     .chunk_blob
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "chunk_edit" => db_update
-                    .chunk_edit
-                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "game_server" => db_update
                     .game_server
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
@@ -466,7 +435,6 @@ pub struct AppliedDiff<'r> {
     account: __sdk::TableAppliedDiff<'r, Account>,
     chat_message: __sdk::TableAppliedDiff<'r, ChatMessage>,
     chunk_blob: __sdk::TableAppliedDiff<'r, ChunkBlob>,
-    chunk_edit: __sdk::TableAppliedDiff<'r, ChunkEdit>,
     game_server: __sdk::TableAppliedDiff<'r, GameServer>,
     player_profile: __sdk::TableAppliedDiff<'r, PlayerProfile>,
     presence: __sdk::TableAppliedDiff<'r, Presence>,
@@ -491,7 +459,6 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
             event,
         );
         callbacks.invoke_table_row_callbacks::<ChunkBlob>("chunk_blob", &self.chunk_blob, event);
-        callbacks.invoke_table_row_callbacks::<ChunkEdit>("chunk_edit", &self.chunk_edit, event);
         callbacks.invoke_table_row_callbacks::<GameServer>("game_server", &self.game_server, event);
         callbacks.invoke_table_row_callbacks::<PlayerProfile>(
             "player_profile",
@@ -1163,7 +1130,6 @@ impl __sdk::SpacetimeModule for RemoteModule {
         account_table::register_table(client_cache);
         chat_message_table::register_table(client_cache);
         chunk_blob_table::register_table(client_cache);
-        chunk_edit_table::register_table(client_cache);
         game_server_table::register_table(client_cache);
         player_profile_table::register_table(client_cache);
         presence_table::register_table(client_cache);
@@ -1173,7 +1139,6 @@ impl __sdk::SpacetimeModule for RemoteModule {
         "account",
         "chat_message",
         "chunk_blob",
-        "chunk_edit",
         "game_server",
         "player_profile",
         "presence",

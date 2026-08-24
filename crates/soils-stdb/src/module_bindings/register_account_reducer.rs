@@ -8,11 +8,15 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[sats(crate = __lib)]
 pub(super) struct RegisterAccountArgs {
     pub name: String,
+    pub verifier: String,
 }
 
 impl From<RegisterAccountArgs> for super::Reducer {
     fn from(args: RegisterAccountArgs) -> Self {
-        Self::RegisterAccount { name: args.name }
+        Self::RegisterAccount {
+            name: args.name,
+            verifier: args.verifier,
+        }
     }
 }
 
@@ -31,8 +35,8 @@ pub trait register_account {
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
     /// /// Use [`register_account:register_account_then`] to run a callback after the reducer completes.
-    fn register_account(&self, name: String) -> __sdk::Result<()> {
-        self.register_account_then(name, |_, _| {})
+    fn register_account(&self, name: String, verifier: String) -> __sdk::Result<()> {
+        self.register_account_then(name, verifier, |_, _| {})
     }
 
     /// Request that the remote module invoke the reducer `register_account` to run as soon as possible,
@@ -44,6 +48,7 @@ pub trait register_account {
     fn register_account_then(
         &self,
         name: String,
+        verifier: String,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
@@ -55,12 +60,13 @@ impl register_account for super::RemoteReducers {
     fn register_account_then(
         &self,
         name: String,
+        verifier: String,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
     ) -> __sdk::Result<()> {
         self.imp
-            .invoke_reducer_with_callback(RegisterAccountArgs { name }, callback)
+            .invoke_reducer_with_callback(RegisterAccountArgs { name, verifier }, callback)
     }
 }

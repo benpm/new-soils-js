@@ -77,7 +77,9 @@ impl TestServer {
         Self::start_at_with(data_dir, tag, |_| {})
     }
 
-    fn start_at_with(
+    /// Reuse a data dir *and* tweak config — for restart scenarios where the
+    /// second run differs, e.g. gaining a database.
+    pub fn start_at_with(
         data_dir: PathBuf,
         tag: &str,
         tweak: impl FnOnce(&mut ServerConfig),

@@ -183,7 +183,6 @@ fn flush_batch(batch: Vec<SaveJob>, stdb: Option<&StdbLink>) {
                 // authoritative and the chunk is no longer dirty, those edits
                 // would never be retried, wedging the mirror silently.
                 version: *version,
-                edits_through: 0,
             }) {
                 eprintln!("chunk writer: spacetimedb mirror unavailable: {e}");
             }

@@ -8,12 +8,14 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[sats(crate = __lib)]
 pub(super) struct LinkIdentityArgs {
     pub account: String,
+    pub identity: __sdk::Identity,
 }
 
 impl From<LinkIdentityArgs> for super::Reducer {
     fn from(args: LinkIdentityArgs) -> Self {
         Self::LinkIdentity {
             account: args.account,
+            identity: args.identity,
         }
     }
 }
@@ -33,8 +35,8 @@ pub trait link_identity {
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
     /// /// Use [`link_identity:link_identity_then`] to run a callback after the reducer completes.
-    fn link_identity(&self, account: String) -> __sdk::Result<()> {
-        self.link_identity_then(account, |_, _| {})
+    fn link_identity(&self, account: String, identity: __sdk::Identity) -> __sdk::Result<()> {
+        self.link_identity_then(account, identity, |_, _| {})
     }
 
     /// Request that the remote module invoke the reducer `link_identity` to run as soon as possible,
@@ -46,6 +48,7 @@ pub trait link_identity {
     fn link_identity_then(
         &self,
         account: String,
+        identity: __sdk::Identity,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
@@ -57,12 +60,13 @@ impl link_identity for super::RemoteReducers {
     fn link_identity_then(
         &self,
         account: String,
+        identity: __sdk::Identity,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
     ) -> __sdk::Result<()> {
         self.imp
-            .invoke_reducer_with_callback(LinkIdentityArgs { account }, callback)
+            .invoke_reducer_with_callback(LinkIdentityArgs { account, identity }, callback)
     }
 }

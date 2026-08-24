@@ -10,7 +10,6 @@ pub(super) struct PutChunkBlobArgs {
     pub key: u64,
     pub payload: Vec<u8>,
     pub version: u32,
-    pub edits_through: u64,
 }
 
 impl From<PutChunkBlobArgs> for super::Reducer {
@@ -19,7 +18,6 @@ impl From<PutChunkBlobArgs> for super::Reducer {
             key: args.key,
             payload: args.payload,
             version: args.version,
-            edits_through: args.edits_through,
         }
     }
 }
@@ -39,14 +37,8 @@ pub trait put_chunk_blob {
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
     /// /// Use [`put_chunk_blob:put_chunk_blob_then`] to run a callback after the reducer completes.
-    fn put_chunk_blob(
-        &self,
-        key: u64,
-        payload: Vec<u8>,
-        version: u32,
-        edits_through: u64,
-    ) -> __sdk::Result<()> {
-        self.put_chunk_blob_then(key, payload, version, edits_through, |_, _| {})
+    fn put_chunk_blob(&self, key: u64, payload: Vec<u8>, version: u32) -> __sdk::Result<()> {
+        self.put_chunk_blob_then(key, payload, version, |_, _| {})
     }
 
     /// Request that the remote module invoke the reducer `put_chunk_blob` to run as soon as possible,
@@ -60,7 +52,6 @@ pub trait put_chunk_blob {
         key: u64,
         payload: Vec<u8>,
         version: u32,
-        edits_through: u64,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
@@ -74,7 +65,6 @@ impl put_chunk_blob for super::RemoteReducers {
         key: u64,
         payload: Vec<u8>,
         version: u32,
-        edits_through: u64,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
@@ -85,7 +75,6 @@ impl put_chunk_blob for super::RemoteReducers {
                 key,
                 payload,
                 version,
-                edits_through,
             },
             callback,
         )

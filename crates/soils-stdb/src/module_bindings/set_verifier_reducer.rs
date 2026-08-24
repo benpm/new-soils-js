@@ -4,53 +4,51 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
-use super::packed_edit_type::PackedEdit;
-
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct SubmitEditsArgs {
-    pub tick: u64,
-    pub edits: Vec<PackedEdit>,
+pub(super) struct SetVerifierArgs {
+    pub name: String,
+    pub verifier: String,
 }
 
-impl From<SubmitEditsArgs> for super::Reducer {
-    fn from(args: SubmitEditsArgs) -> Self {
-        Self::SubmitEdits {
-            tick: args.tick,
-            edits: args.edits,
+impl From<SetVerifierArgs> for super::Reducer {
+    fn from(args: SetVerifierArgs) -> Self {
+        Self::SetVerifier {
+            name: args.name,
+            verifier: args.verifier,
         }
     }
 }
 
-impl __sdk::InModule for SubmitEditsArgs {
+impl __sdk::InModule for SetVerifierArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `submit_edits`.
+/// Extension trait for access to the reducer `set_verifier`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait submit_edits {
-    /// Request that the remote module invoke the reducer `submit_edits` to run as soon as possible.
+pub trait set_verifier {
+    /// Request that the remote module invoke the reducer `set_verifier` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`submit_edits:submit_edits_then`] to run a callback after the reducer completes.
-    fn submit_edits(&self, tick: u64, edits: Vec<PackedEdit>) -> __sdk::Result<()> {
-        self.submit_edits_then(tick, edits, |_, _| {})
+    /// /// Use [`set_verifier:set_verifier_then`] to run a callback after the reducer completes.
+    fn set_verifier(&self, name: String, verifier: String) -> __sdk::Result<()> {
+        self.set_verifier_then(name, verifier, |_, _| {})
     }
 
-    /// Request that the remote module invoke the reducer `submit_edits` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `set_verifier` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn submit_edits_then(
+    fn set_verifier_then(
         &self,
-        tick: u64,
-        edits: Vec<PackedEdit>,
+        name: String,
+        verifier: String,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
@@ -58,17 +56,17 @@ pub trait submit_edits {
     ) -> __sdk::Result<()>;
 }
 
-impl submit_edits for super::RemoteReducers {
-    fn submit_edits_then(
+impl set_verifier for super::RemoteReducers {
+    fn set_verifier_then(
         &self,
-        tick: u64,
-        edits: Vec<PackedEdit>,
+        name: String,
+        verifier: String,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
     ) -> __sdk::Result<()> {
         self.imp
-            .invoke_reducer_with_callback(SubmitEditsArgs { tick, edits }, callback)
+            .invoke_reducer_with_callback(SetVerifierArgs { name, verifier }, callback)
     }
 }

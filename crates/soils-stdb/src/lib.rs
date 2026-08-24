@@ -18,23 +18,17 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use spacetimedb_sdk::{DbContext, Identity, Table};
 
 use module_bindings::{
-    DbConnection, RemoteReducers, chunk_blob_table::ChunkBlobTableAccess,
-    player_profile_table::PlayerProfileTableAccess,
+    DbConnection, RemoteReducers, account_table::AccountTableAccess,
+    chunk_blob_table::ChunkBlobTableAccess, player_profile_table::PlayerProfileTableAccess,
 };
 // Each reducer is generated as its own snake_case extension trait; they must be
 // in scope for `reducers.<name>(..)` to resolve.
 use module_bindings::{
-    heartbeat, heartbeat_presence, mark_absent, mark_present, prune_edits, put_chunk_blob,
-    save_profile, submit_edits, upsert_world,
+    heartbeat, heartbeat_presence, link_identity, mark_absent, mark_present, put_chunk_blob,
+    register_account, save_profile, set_verifier, upsert_world,
 };
 
-pub use module_bindings::{ChunkBlob, ChunkEdit, PackedEdit, PlayerProfile, World};
-
-/// Batch cap for [`StdbCmd::SubmitEdits`], mirroring the module's
-/// `MAX_EDITS_PER_CALL`. Larger batches risk exhausting the reducer's fuel
-/// budget, which rolls back the *entire* transaction — so the caller must
-/// chunk rather than gamble.
-pub const MAX_EDITS_PER_CALL: usize = 4096;
+pub use module_bindings::{Account, ChunkBlob, PlayerProfile, World};
 
 /// Work handed to the SpacetimeDB thread.
 #[derive(Debug, Clone)]
@@ -50,12 +44,14 @@ pub enum StdbCmd {
         graph_hash: u64,
         daytime: f32,
     },
-    /// Append voxel edits to the journal.
-    SubmitEdits { tick: u64, edits: Vec<PackedEdit> },
     /// Write a coalesced chunk payload (`soils_protocol::chunk_codec` bytes).
-    PutChunkBlob { key: u64, payload: Vec<u8>, version: u32, edits_through: u64 },
-    /// Drop journal rows already folded into a blob.
-    PruneEdits { key: u64, up_to_id: u64 },
+    PutChunkBlob { key: u64, payload: Vec<u8>, version: u32 },
+    /// Create an account, or migrate one that already exists locally.
+    RegisterAccount { name: String, verifier: String },
+    /// Replace an account's password verifier.
+    SetVerifier { name: String, verifier: String },
+    /// Bind a SpacetimeDB identity to an account the server has authenticated.
+    LinkIdentity { account: String, identity: Identity },
     /// Persist a player's last known position, keyed by account name.
     SaveProfile {
         account: String,
@@ -97,8 +93,8 @@ pub struct StdbLink {
     event_rx: Receiver<StdbEvent>,
     running: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
-    /// Set once the profile subscription has delivered its first snapshot, so
-    /// a read can tell "no such player" from "cache not warm yet".
+    /// Set once the subscription has delivered its first snapshot, so a read
+    /// can tell "no such row" from "cache not warm yet".
     ready: Arc<AtomicBool>,
     /// The live connection, published by the worker once it is up.
     ///
@@ -172,6 +168,22 @@ impl StdbLink {
         true
     }
 
+    /// Whether the account cache is warm enough to authenticate against.
+    ///
+    /// Distinguished from "no such account" on purpose: treating an unwarm
+    /// cache as an empty one would reject every existing player's password.
+    pub fn accounts_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+
+    /// A stored account, by login name.
+    pub fn account(&self, name: &str) -> Option<Account> {
+        if !self.ready.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.conn.get()?.db().account().name().find(&name.to_string())
+    }
+
     /// A player's saved profile, or `None` if the cache is not warm yet or the
     /// account has never logged out.
     ///
@@ -236,13 +248,16 @@ fn worker(
     // Drives the connection's I/O on its own thread; `conn` stays usable here.
     let handle = conn.run_threaded();
 
-    // Subscribe to the rows the server reads back. Profiles only: chunks are
-    // served from region files, which stay authoritative, so subscribing to
-    // `chunk_blob` would stream the whole stored world into memory for nothing.
+    // Subscribe to the rows the server reads back. Not `chunk_blob`: chunks are
+    // served from region files, which stay authoritative, so subscribing would
+    // stream the whole stored world into memory for nothing.
     let applied = ready.clone();
     conn.subscription_builder()
         .on_applied(move |_| applied.store(true, Ordering::Relaxed))
-        .subscribe(["SELECT * FROM player_profile".to_string()]);
+        .subscribe([
+            "SELECT * FROM player_profile".to_string(),
+            "SELECT * FROM account".to_string(),
+        ]);
     // Shared so the ECS thread can read the cache; the worker keeps using it
     // through the Arc.
     let conn = Arc::new(conn);
@@ -316,19 +331,17 @@ fn apply(reducers: &RemoteReducers, cmd: StdbCmd, event_tx: &Sender<StdbEvent>) 
             "upsert_world",
             reducers.upsert_world(world_id, name, seed, world_type, graph_hash, daytime),
         ),
-        StdbCmd::SubmitEdits { tick, edits } => {
-            // Split oversized batches rather than letting the module reject
-            // them wholesale.
-            for chunk in edits.chunks(MAX_EDITS_PER_CALL) {
-                report("submit_edits", reducers.submit_edits(tick, chunk.to_vec()));
-            }
+        StdbCmd::PutChunkBlob { key, payload, version } => {
+            report("put_chunk_blob", reducers.put_chunk_blob(key, payload, version))
         }
-        StdbCmd::PutChunkBlob { key, payload, version, edits_through } => report(
-            "put_chunk_blob",
-            reducers.put_chunk_blob(key, payload, version, edits_through),
-        ),
-        StdbCmd::PruneEdits { key, up_to_id } => {
-            report("prune_edits", reducers.prune_edits(key, up_to_id))
+        StdbCmd::RegisterAccount { name, verifier } => {
+            report("register_account", reducers.register_account(name, verifier))
+        }
+        StdbCmd::SetVerifier { name, verifier } => {
+            report("set_verifier", reducers.set_verifier(name, verifier))
+        }
+        StdbCmd::LinkIdentity { account, identity } => {
+            report("link_identity", reducers.link_identity(account, identity))
         }
         StdbCmd::SaveProfile { account, world_id, x, y, z, yaw, view_radius } => report(
             "save_profile",

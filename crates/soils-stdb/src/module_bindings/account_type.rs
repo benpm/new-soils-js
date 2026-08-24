@@ -7,8 +7,9 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub struct Account {
-    pub identity: __sdk::Identity,
     pub name: String,
+    pub verifier: String,
+    pub identity: Option<__sdk::Identity>,
     pub created_at: __sdk::Timestamp,
     pub last_chat_at: __sdk::Timestamp,
 }
@@ -21,8 +22,9 @@ impl __sdk::InModule for Account {
 ///
 /// Provides typed access to columns for query building.
 pub struct AccountCols {
-    pub identity: __sdk::__query_builder::Col<Account, __sdk::Identity>,
     pub name: __sdk::__query_builder::Col<Account, String>,
+    pub verifier: __sdk::__query_builder::Col<Account, String>,
+    pub identity: __sdk::__query_builder::Col<Account, Option<__sdk::Identity>>,
     pub created_at: __sdk::__query_builder::Col<Account, __sdk::Timestamp>,
     pub last_chat_at: __sdk::__query_builder::Col<Account, __sdk::Timestamp>,
 }
@@ -31,8 +33,9 @@ impl __sdk::__query_builder::HasCols for Account {
     type Cols = AccountCols;
     fn cols(table_name: &'static str) -> Self::Cols {
         AccountCols {
-            identity: __sdk::__query_builder::Col::new(table_name, "identity"),
             name: __sdk::__query_builder::Col::new(table_name, "name"),
+            verifier: __sdk::__query_builder::Col::new(table_name, "verifier"),
+            identity: __sdk::__query_builder::Col::new(table_name, "identity"),
             created_at: __sdk::__query_builder::Col::new(table_name, "created_at"),
             last_chat_at: __sdk::__query_builder::Col::new(table_name, "last_chat_at"),
         }
@@ -43,7 +46,6 @@ impl __sdk::__query_builder::HasCols for Account {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct AccountIxCols {
-    pub identity: __sdk::__query_builder::IxCol<Account, __sdk::Identity>,
     pub name: __sdk::__query_builder::IxCol<Account, String>,
 }
 
@@ -51,7 +53,6 @@ impl __sdk::__query_builder::HasIxCols for Account {
     type IxCols = AccountIxCols;
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         AccountIxCols {
-            identity: __sdk::__query_builder::IxCol::new(table_name, "identity"),
             name: __sdk::__query_builder::IxCol::new(table_name, "name"),
         }
     }

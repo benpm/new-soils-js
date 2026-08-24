@@ -7,23 +7,15 @@
 //! queryable store plus a lobby/social layer, not a game simulation.
 //!
 //! Terrain is bit-exact reproducible on the client from `GenParams`, so only
-//! *edited* chunks are ever stored. Edits arrive as a fine-grained journal
-//! (`chunk_edit`) and are periodically coalesced into a `chunk_blob` holding
-//! the shipping `soils_protocol::chunk_codec` payload — the same
-//! journal-then-compact shape the region files already use.
+//! *edited* chunks are ever stored, as a `chunk_blob` holding the shipping
+//! `soils_protocol::chunk_codec` payload. Region files remain authoritative;
+//! this is a mirror written after a successful disk write.
 
 use soils_protocol::chunk_key;
 use spacetimedb::{
-    Identity, ReducerContext, SpacetimeType, ScheduleAt, Table, Timestamp, reducer, table,
+    Identity, ReducerContext, ScheduleAt, Table, Timestamp, reducer, table,
 };
 use std::time::Duration;
-
-/// Upper bound on edits applied in one [`submit_edits`] call. A reducer that
-/// exhausts its fuel budget has its **entire transaction rolled back**, so the
-/// server must chunk large flushes rather than risk losing all of them.
-///
-/// Provisional: the A0 spike measures the real ceiling and re-pins this.
-pub const MAX_EDITS_PER_CALL: usize = 4096;
 
 /// Longest accepted chat message, in bytes.
 pub const MAX_CHAT_LEN: usize = 512;
@@ -42,15 +34,22 @@ pub const REAP_INTERVAL: Duration = Duration::from_secs(10);
 // Tables
 // ---------------------------------------------------------------------------
 
-/// A player account, keyed by SpacetimeDB Identity. This replaces the
-/// `DefaultHasher`-and-fixed-salt scheme in `soils-server/src/auth.rs`, which
-/// is self-documented as not production-grade.
+/// A player account, keyed by the name players log in with.
+///
+/// Keyed by name rather than `Identity` because the credential *is* the name
+/// and password: a player logging in from a new machine has a new identity but
+/// the same account. `identity` is the link to a client that has authenticated
+/// to SpacetimeDB directly, filled in by [`link_identity`].
+///
+/// `verifier` is a PHC-format password hash produced and checked by the game
+/// server. The module never sees a plaintext password and never verifies one —
+/// it is a store, and the row is only writable by a registered game server.
 #[table(accessor = account, public)]
 pub struct Account {
     #[primary_key]
-    pub identity: Identity,
-    #[unique]
     pub name: String,
+    pub verifier: String,
+    pub identity: Option<Identity>,
     pub created_at: Timestamp,
     /// Drives the [`send_chat`] cooldown.
     pub last_chat_at: Timestamp,
@@ -77,24 +76,6 @@ pub struct World {
     pub created_at: Timestamp,
 }
 
-/// One voxel edit. Append-only; rows are pruned once subsumed by a
-/// `chunk_blob` (see [`prune_edits`]). Deliberately small so a burst of edits
-/// is cheap to commit and cheap to push.
-#[table(accessor = chunk_edit, public)]
-pub struct ChunkEdit {
-    #[primary_key]
-    #[auto_inc]
-    pub id: u64,
-    /// [`chunk_key::pack_chunk_key`] of `(world_id, cx, cy, cz)`.
-    #[index(btree)]
-    pub chunk_key: u64,
-    /// `soils_protocol::voxel_index` of the cell within its 32³ chunk.
-    pub voxel: u16,
-    pub value: u8,
-    pub tick: u64,
-    pub by: Identity,
-}
-
 /// Coalesced chunk contents. `payload` is exactly what
 /// `soils_protocol::chunk_codec::encode_chunk` produces, so the server can
 /// serve it without transcoding.
@@ -115,9 +96,6 @@ pub struct ChunkBlob {
     pub payload: Vec<u8>,
     /// Mirrors the server's per-chunk edit version.
     pub version: u32,
-    /// Highest `chunk_edit.id` folded into `payload`; the reconcile path
-    /// replays only journal rows above this.
-    pub edits_through: u64,
     pub updated_at: Timestamp,
 }
 
@@ -194,14 +172,6 @@ pub struct ReapTimer {
     #[auto_inc]
     pub scheduled_id: u64,
     pub scheduled_at: ScheduleAt,
-}
-
-/// One entry of a [`submit_edits`] batch.
-#[derive(SpacetimeType, Clone, Copy)]
-pub struct PackedEdit {
-    pub chunk_key: u64,
-    pub voxel: u16,
-    pub value: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -304,39 +274,79 @@ pub fn reap_stale(ctx: &ReducerContext, _timer: ReapTimer) -> Result<(), String>
 }
 
 // ---------------------------------------------------------------------------
-// Accounts (player-callable)
+// Accounts (server-only)
 // ---------------------------------------------------------------------------
 
-/// Claim a display name for the calling identity. Idempotent for the owner;
-/// fails if another identity already holds the name.
+/// Longest accepted account name, in bytes.
+pub const MAX_NAME_LEN: usize = 32;
+
+/// Create an account, or migrate one that already exists locally.
+///
+/// **Server-only.** The module stores a verifier and never sees or checks a
+/// password: the game server owns hashing and verification, because it is the
+/// only party a client actually proves anything to. Letting players call this
+/// would let anyone claim any unclaimed name with a verifier of their choosing.
+///
+/// Idempotent for an account whose verifier already matches, so a server
+/// migrating its local account file can call this for every account without
+/// having to know which ones already crossed over.
 #[reducer]
-pub fn register_account(ctx: &ReducerContext, name: String) -> Result<(), String> {
+pub fn register_account(
+    ctx: &ReducerContext,
+    name: String,
+    verifier: String,
+) -> Result<(), String> {
+    require_server(ctx)?;
     let name = name.trim().to_string();
-    if name.is_empty() || name.len() > 32 {
-        return Err("name must be 1..=32 bytes".to_string());
+    if name.is_empty() || name.len() > MAX_NAME_LEN {
+        return Err(format!("name must be 1..={MAX_NAME_LEN} bytes"));
+    }
+    if verifier.is_empty() {
+        return Err("verifier must not be empty".to_string());
     }
     if let Some(existing) = ctx.db.account().name().find(&name) {
-        return if existing.identity == ctx.sender() {
+        return if existing.verifier == verifier {
             Ok(())
         } else {
-            Err("name already taken".to_string())
+            // Changing an existing account's password is a separate operation
+            // that has to prove knowledge of the old one; this reducer cannot.
+            Err(format!("account '{name}' already exists"))
         };
-    }
-    if let Some(mut account) = ctx.db.account().identity().find(ctx.sender()) {
-        account.name = name;
-        ctx.db.account().identity().update(account);
-        return Ok(());
     }
     ctx.db
         .account()
         .try_insert(Account {
-            identity: ctx.sender(),
             name,
+            verifier,
+            identity: None,
             created_at: ctx.timestamp,
-            // Epoch-ish: no cooldown owed on a fresh account.
+            // Epoch: no cooldown owed on a fresh account.
             last_chat_at: Timestamp::UNIX_EPOCH,
         })
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Replace an account's verifier, for a password change the game server has
+/// already authorised, or a rehash onto stronger parameters.
+#[reducer]
+pub fn set_verifier(
+    ctx: &ReducerContext,
+    name: String,
+    verifier: String,
+) -> Result<(), String> {
+    require_server(ctx)?;
+    if verifier.is_empty() {
+        return Err("verifier must not be empty".to_string());
+    }
+    let mut account = ctx
+        .db
+        .account()
+        .name()
+        .find(&name)
+        .ok_or_else(|| format!("no such account '{name}'"))?;
+    account.verifier = verifier;
+    ctx.db.account().name().update(account);
     Ok(())
 }
 
@@ -346,18 +356,22 @@ pub fn send_chat(ctx: &ReducerContext, world_id: u16, text: String) -> Result<()
     if text.is_empty() || text.len() > MAX_CHAT_LEN {
         return Err(format!("message must be 1..={MAX_CHAT_LEN} bytes"));
     }
+    // Scanned rather than indexed: `identity` is optional (an account exists
+    // before any client links one), and a unique index would make every
+    // unlinked account collide on `None`. Chat is low-frequency, so a scan is
+    // the cheaper trade than carrying a second table to invert the mapping.
     let mut account = ctx
         .db
         .account()
-        .identity()
-        .find(ctx.sender())
-        .ok_or_else(|| "no account: call register_account first".to_string())?;
+        .iter()
+        .find(|a| a.identity == Some(ctx.sender()))
+        .ok_or_else(|| "no account linked to this identity".to_string())?;
 
     if ctx.timestamp < account.last_chat_at + CHAT_COOLDOWN {
         return Err("slow down".to_string());
     }
     account.last_chat_at = ctx.timestamp;
-    ctx.db.account().identity().update(account);
+    ctx.db.account().name().update(account);
 
     ctx.db
         .chat_message()
@@ -427,38 +441,6 @@ pub fn upsert_world(
     Ok(())
 }
 
-/// Append a batch of voxel edits to the journal.
-#[reducer]
-pub fn submit_edits(ctx: &ReducerContext, tick: u64, edits: Vec<PackedEdit>) -> Result<(), String> {
-    require_server(ctx)?;
-    if edits.len() > MAX_EDITS_PER_CALL {
-        return Err(format!(
-            "batch of {} exceeds MAX_EDITS_PER_CALL ({MAX_EDITS_PER_CALL})",
-            edits.len()
-        ));
-    }
-    for edit in &edits {
-        if edit.voxel as usize >= soils_protocol::CHUNK_CUBED {
-            return Err(format!("voxel index {} out of range", edit.voxel));
-        }
-    }
-    let sender = ctx.sender();
-    for edit in edits {
-        ctx.db
-            .chunk_edit()
-            .try_insert(ChunkEdit {
-                id: 0,
-                chunk_key: edit.chunk_key,
-                voxel: edit.voxel,
-                value: edit.value,
-                tick,
-                by: sender,
-            })
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
 /// Write the coalesced contents of one chunk.
 ///
 /// `payload` must be a `soils_protocol::chunk_codec` payload; it is decoded
@@ -469,7 +451,6 @@ pub fn put_chunk_blob(
     key: u64,
     payload: Vec<u8>,
     version: u32,
-    edits_through: u64,
 ) -> Result<(), String> {
     require_server(ctx)?;
     let (world_id, cx, cy, cz) = chunk_key::unpack_chunk_key(key);
@@ -490,7 +471,6 @@ pub fn put_chunk_blob(
         }
         blob.payload = payload;
         blob.version = version;
-        blob.edits_through = edits_through;
         blob.updated_at = ctx.timestamp;
         ctx.db.chunk_blob().chunk_key().update(blob);
         return Ok(());
@@ -505,7 +485,6 @@ pub fn put_chunk_blob(
             cz,
             payload,
             version,
-            edits_through,
             updated_at: ctx.timestamp,
         })
         .map_err(|e| e.to_string())?;
@@ -513,24 +492,14 @@ pub fn put_chunk_blob(
 }
 
 /// Drop journal rows already folded into a chunk's blob. Bounds commit-log
-/// growth; the mirror of region-file compaction.
-#[reducer]
-pub fn prune_edits(ctx: &ReducerContext, key: u64, up_to_id: u64) -> Result<(), String> {
-    require_server(ctx)?;
-    let doomed: Vec<u64> = ctx
-        .db
-        .chunk_edit()
-        .chunk_key()
-        .filter(key)
-        .filter(|e| e.id <= up_to_id)
-        .map(|e| e.id)
-        .collect();
-    for id in doomed {
-        ctx.db.chunk_edit().id().delete(id);
-    }
-    Ok(())
-}
-
+/// Refresh a server's registry row so it stays visible in a server browser and
+/// the reaper doesn't drop it.
+///
+/// Takes a player *count* rather than a list of identities: game players
+/// authenticate to the game server with a name/password and have no
+/// SpacetimeDB identity until the client connects here directly. Per-identity
+/// presence is maintained separately by [`mark_present`] once that exists.
+/// Record where a player was when they logged out, so they resume there.
 #[reducer]
 pub fn save_profile(
     ctx: &ReducerContext,
@@ -544,9 +513,9 @@ pub fn save_profile(
 ) -> Result<(), String> {
     require_server(ctx)?;
     // Preserve any linked identity across position updates.
-    let identity = ctx.db.player_profile().account().find(&account).and_then(|p| p.identity);
-    let existed = identity.is_some()
-        || ctx.db.player_profile().account().find(&account).is_some();
+    let existing = ctx.db.player_profile().account().find(&account);
+    let identity = existing.as_ref().and_then(|p| p.identity);
+    let existed = existing.is_some();
     let profile = PlayerProfile {
         account,
         identity,
@@ -566,13 +535,6 @@ pub fn save_profile(
     Ok(())
 }
 
-/// Refresh a server's registry row so it stays visible in a server browser and
-/// the reaper doesn't drop it.
-///
-/// Takes a player *count* rather than a list of identities: game players
-/// authenticate to the game server with a name/password and have no
-/// SpacetimeDB identity until the client connects here directly. Per-identity
-/// presence is maintained separately by [`mark_present`] once that exists.
 #[reducer]
 pub fn heartbeat(
     ctx: &ReducerContext,
@@ -710,18 +672,24 @@ pub fn link_identity(
     identity: Identity,
 ) -> Result<(), String> {
     require_server(ctx)?;
-    let mut profile = ctx
+    let mut row = ctx
         .db
-        .player_profile()
         .account()
+        .name()
         .find(&account)
-        .ok_or_else(|| format!("no profile for account '{account}'"))?;
-    if let Some(existing) = profile.identity
+        .ok_or_else(|| format!("no such account '{account}'"))?;
+    if let Some(existing) = row.identity
         && existing != identity
     {
         return Err(format!("account '{account}' is already linked to another identity"));
     }
-    profile.identity = Some(identity);
-    ctx.db.player_profile().account().update(profile);
+    row.identity = Some(identity);
+    ctx.db.account().name().update(row);
+    // Mirror onto the profile when there is one, so a profile row alone is
+    // enough to answer "whose is this?".
+    if let Some(mut profile) = ctx.db.player_profile().account().find(&account) {
+        profile.identity = Some(identity);
+        ctx.db.player_profile().account().update(profile);
+    }
     Ok(())
 }

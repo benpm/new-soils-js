@@ -22,6 +22,9 @@ bevy_app = "0.19"
 bevy_ecs = "0.19"
 bevy_time = "0.19"
 rayon = "1"
+# Password hashing for accounts (auth.rs). Pure Rust, no C toolchain.
+argon2 = "0.5"
+serde = { version = "1", features = ["derive"] }
 # dangerous-configuration: `with_no_cert_validation` for the LAN/test client
 # path (the server side uses a per-boot self-signed identity).
 wtransport = { version = "0.7.1", features = ["dangerous-configuration"] }

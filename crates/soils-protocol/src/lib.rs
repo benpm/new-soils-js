@@ -7,6 +7,7 @@ pub mod chunk_key;
 pub mod coords;
 pub mod discovery;
 pub mod messages;
+pub mod netsim;
 pub mod snapshot;
 pub mod voxel;
 

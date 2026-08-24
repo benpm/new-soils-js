@@ -37,6 +37,10 @@ cross-client disagreement at **0.000 units**. Try it with
 [10 s clip](docs/media/two-views.webm) — GitHub strips `<video>` from
 markdown, so the still links to it instead.*
 
+**More clips: [the public test-recording dashboard](http://34.41.84.40/)** —
+every recording the test suite produces, newest first, each naming the test
+that made it. Rebuilt with `python scripts/deploy_dashboard.py`.
+
 ## What works today
 
 - **Server authority + prediction** — clients send *inputs*, not positions;
@@ -190,6 +194,10 @@ CI renders release screenshots headlessly under Mesa lavapipe
 - [`docs/perf-report.md`](docs/perf-report.md) — the optimization arc with
   measurements (23 MB → 498 KB joins, 849 → 187 ms bursts, the GI rework),
   methodology, and the ranked list of what to optimize next.
+- [`docs/dev/debug.md`](docs/dev/debug.md) — a symptom-first debugging field
+  guide: the traps this codebase actually produced (the asset-path void, delta
+  snapshots that omit unchanged entities, barrier deadlocks that hide the real
+  failure), and how to tell them apart quickly.
 - [`TODO.md`](TODO.md) — the 14-phase implementation log; each checkoff
   records what shipped, what was measured, and what was deferred and why.
 - [`docs/plan-rendering.md`](docs/plan-rendering.md) /

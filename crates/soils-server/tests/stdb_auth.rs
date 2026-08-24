@@ -300,3 +300,41 @@ async fn logins_do_not_stall_the_tick() {
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A configured database that cannot be reached must cost the lobby, not the
+/// game. This is the one test here that needs no live host — an unreachable one
+/// is the point.
+///
+/// It guards a promise that verification moving into the module could easily
+/// have broken: the check is now a round trip, and a round trip that times out
+/// must fall back to the local account file rather than read as a wrong
+/// password. Fail-closed here would lock every player out of a server that can
+/// still serve them.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_database_does_not_block_logins() {
+    let dir = fresh_dir("auth-offline");
+    let dead = soils_server::StdbConfig {
+        // Port 1: reserved, and nothing will ever answer on it.
+        uri: "http://127.0.0.1:1".into(),
+        database: "soils".into(),
+        token: None,
+    };
+    let server = TestServer::start_at_with(dir.clone(), "stdbdead", move |c| {
+        c.stdb = Some(dead);
+    });
+
+    let name = unique_name("offline");
+    login(server.addr(), &name, "hunter2", true)
+        .await
+        .expect("an unreachable database must not stop a signup");
+    login(server.addr(), &name, "hunter2", false)
+        .await
+        .expect("nor a login afterwards");
+    let refused = login(server.addr(), &name, "not-it", false)
+        .await
+        .expect_err("and the local file must still check the password");
+    assert!(refused.to_lowercase().contains("password"), "unexpected refusal: {refused}");
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}

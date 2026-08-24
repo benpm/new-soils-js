@@ -964,7 +964,7 @@ fn drain_inboxes(
                             c.auth_inflight = true;
                             let queue = auth_queue.0.clone();
                             let accounts = accounts.0.clone();
-                            std::thread::Builder::new()
+                            let spawned = std::thread::Builder::new()
                                 .name(format!("auth-{id}"))
                                 .spawn(move || {
                                     let verdict =
@@ -972,9 +972,16 @@ fn drain_inboxes(
                                     if let Ok(mut q) = queue.lock() {
                                         q.push(AuthDone { id, name, signup, protocol, verdict });
                                     }
-                                })
-                                .map_err(|e| eprintln!("auth: could not spawn worker: {e}"))
-                                .ok();
+                                });
+                            if let Err(e) = spawned {
+                                // Nothing will ever clear the flag otherwise,
+                                // and this connection could never log in again.
+                                c.auth_inflight = false;
+                                eprintln!("auth: could not spawn worker: {e}");
+                                let _ = c.outbox.send(ServerMsg::LoginError {
+                                    message: "server busy; try again".into(),
+                                });
+                            }
                         }
                         continue;
                     }

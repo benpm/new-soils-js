@@ -165,7 +165,21 @@ impl Accounts {
         password: &str,
         signup: bool,
     ) -> Result<(), String> {
-        match link.verify_login(name, password, Self::AUTH_TIMEOUT) {
+        let verdict = link.verify_login(name, password, Self::AUTH_TIMEOUT);
+        // A database that did not answer must not lock players out of a server
+        // that can still serve them: the local file is maintained in both modes
+        // precisely so it can answer here. Only a *credential* verdict is
+        // authoritative; anything else means the store was unavailable, and the
+        // original design's promise — that a slow database costs the lobby, not
+        // the game — has to survive verification moving into the module.
+        if let Err(reason) = &verdict
+            && reason != NO_SUCH_ACCOUNT
+            && reason != WRONG_PASSWORD
+        {
+            eprintln!("auth: falling back to the local account file ({reason})");
+            return self.local_auth(name, password, signup);
+        }
+        match verdict {
             Ok(()) => {
                 if signup {
                     // Signing up into an existing account with the right
@@ -195,8 +209,8 @@ impl Accounts {
             // account with a colliding name, not a fallback.
             WRONG_PASSWORD => return Err(WRONG_PASSWORD.to_string()),
             NO_SUCH_ACCOUNT => {}
-            // Unreachable, timed out, not authorised: not the player's fault,
-            // and it must not be reported as a bad password.
+            // Anything else was handled by the local fallback in `stdb_auth`
+            // before it got here.
             _ => return Err(reason),
         }
 

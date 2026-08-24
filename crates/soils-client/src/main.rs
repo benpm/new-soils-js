@@ -232,6 +232,7 @@ fn main() {
             social::refresh,
             hud::update_chat.after(social::refresh),
             social::link_identity.run_if(login::logged_in),
+            bot::chatter.run_if(bot::active),
         ),
     )
     // Gameplay: only once authenticated.

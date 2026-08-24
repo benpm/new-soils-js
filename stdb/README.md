@@ -159,13 +159,31 @@ world into memory for no benefit.
   since the region file is authoritative and the chunk is no longer dirty by
   then, those edits would never be retried.
 
+## Client credentials
+
+A client connects with its **own** identity, not the server's. `soils-client`
+reads `SOILS_STDB_CLIENT_TOKEN` — deliberately a different variable from the
+server's `SOILS_STDB_TOKEN`, which is a credential in the module's allowlist:
+handing it to a client would let that client call every server-only reducer.
+
+Unset means an anonymous identity, which is the right default — a player is
+identified by their game account, and `link_identity` binds the two after the
+server has checked the password.
+
+Two clients sharing one identity is a real failure mode and looks confusing
+rather than broken: both accounts link to the same identity, `send_chat`
+attributes every line to whichever linked last, and the per-account chat
+cooldown starts throttling both. Child processes inherit the environment, so a
+launcher that exports `SOILS_STDB_TOKEN` has to clear it explicitly.
+
+Note also that `link_identity` refuses to rebind an account already linked to a
+*different* identity. That is deliberate, but it means a database carrying links
+from an earlier run will reject new ones — republish with `--delete-data` when
+starting over.
+
 ## Not wired yet
 
 Tracked in `TODO.md`. Built on both sides and currently unreachable:
 
-- `chunk_edit` + `submit_edits` + `prune_edits` — the journal-then-compact path.
-  Only whole blobs are written today.
-- `account` + `register_account`, and `chat_message` + `send_chat` — the social
-  layer has no consumer, because `soils-client` does not depend on `soils-stdb`.
-- `game_server` is populated on a heartbeat with nothing reading it: there is no
-  server browser yet.
+Nothing, as of the client layer landing. `account`, `chat_message` and
+`game_server` all have consumers now; see `TODO.md` for what is left.

@@ -76,6 +76,19 @@ impl Role {
     }
 }
 
+/// Seconds between scripted chat lines.
+const CHAT_EVERY: f32 = 4.0;
+
+/// What each role says, in order, cycling.
+const LINES_A: &[&str] = &[
+    "hey, you there?",
+    "server list came from the database",
+    "watch this jump",
+    "nice cubes",
+];
+const LINES_B: &[&str] =
+    &["reading you", "same registry here", "go on then", "they barely moved"];
+
 #[derive(Resource)]
 pub struct Bot {
     role: Role,
@@ -83,6 +96,7 @@ pub struct Bot {
     started: Option<f32>,
     toggled_fly: bool,
     jumps: u32,
+    lines_said: u32,
 }
 
 /// The configured bot, if `SOILS_BOT` names a role.
@@ -101,6 +115,7 @@ pub fn configured() -> Option<Bot> {
         started: None,
         toggled_fly: false,
         jumps: 0,
+        lines_said: 0,
     })
 }
 
@@ -192,6 +207,36 @@ fn hold(pending: &mut PendingInput, axes: Vec2, yaw: f32) {
     pending.input.sprint = false;
     pending.input.up = false;
     pending.input.down = false;
+}
+
+/// Say a scripted line every few seconds once the routine is running.
+///
+/// Chat goes straight to SpacetimeDB as this client's own identity, so this is
+/// also what proves the client half of the integration is live: nothing here
+/// travels through the game server.
+pub fn chatter(
+    time: Res<Time>,
+    mut bot: ResMut<Bot>,
+    social: Res<crate::social::Social>,
+) {
+    let Some(started) = bot.started else { return };
+    if !social.enabled() {
+        return;
+    }
+    let due = ((time.elapsed_secs() - started) / CHAT_EVERY) as u32;
+    if due < bot.lines_said {
+        return;
+    }
+    bot.lines_said = due + 1;
+    let lines = match bot.role {
+        Role::A => LINES_A,
+        Role::B => LINES_B,
+    };
+    // Role B answers half a beat later, so the two do not collide on the
+    // module's per-account chat cooldown and the exchange reads as a
+    // conversation rather than two monologues.
+    let idx = (due as usize) % lines.len();
+    social.say(social.chat_world, lines[idx]);
 }
 
 fn aim(player: &mut Player, transform: &mut Transform, yaw: f32) {

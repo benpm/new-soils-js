@@ -94,7 +94,16 @@ pub fn configured() -> Social {
         return Social::default();
     }
     let database = std::env::var("SOILS_STDB_DB").unwrap_or_else(|_| "soils".into());
-    let token = std::env::var("SOILS_STDB_TOKEN").ok().filter(|t| !t.is_empty());
+    // Deliberately *not* `SOILS_STDB_TOKEN`, which on a host that also runs a
+    // game server is a server-identity credential sitting in the module's
+    // allowlist — handing it to a client would let that client call every
+    // server-only reducer. It also collapses every client sharing the machine
+    // onto one identity, so chat would attribute everyone's lines to whichever
+    // account linked last.
+    //
+    // Unset means an anonymous identity, which is the right default: a player
+    // is identified by their game account, and `link_identity` binds the two.
+    let token = std::env::var("SOILS_STDB_CLIENT_TOKEN").ok().filter(|t| !t.is_empty());
     info!("social: connecting to {uri} / {database}");
     Social {
         link: Some(std::sync::Arc::new(soils_stdb::StdbLink::connect_with(
@@ -143,11 +152,14 @@ pub fn refresh(time: Res<Time>, mut social: ResMut<Social>) {
         .chat(world, CHAT_BACKLOG)
         .into_iter()
         .map(|m| ChatLine {
-            // Identities are long; the tail is enough to tell speakers apart
-            // until the name lookup lands.
-            sender: {
+            // The account name is denormalised into the message: clients do
+            // not subscribe to `account` (it holds password verifiers), so a
+            // truncated identity is the only fallback if it is somehow blank.
+            sender: if m.sender_name.is_empty() {
                 let s = m.sender.to_string();
                 s.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect()
+            } else {
+                m.sender_name
             },
             text: m.text,
         })

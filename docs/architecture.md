@@ -259,12 +259,19 @@ row-granular deltas.
   file is authoritative and the chunk is no longer dirty, those edits would
   never be retried.
 
-Known limits, tracked in `TODO.md`: **the server never reads from
-SpacetimeDB** — there is no subscription outside tests, so this is a one-way
-write mirror. `player_profile` is therefore written but never restored, and the
-whole social layer (accounts, chat, world list, server browser) has no
-consumer, because `soils-client` does not depend on `soils-stdb` at all. The
-`chunk_edit` journal and its reducers are built on both sides and unreachable.
+- **Reads** go through the SDK's client-side cache, which the worker keeps
+  current from a `player_profile` subscription. That makes a lookup synchronous,
+  which the login path needs — it cannot wait on a round trip mid-tick. Startup
+  blocks (bounded) on the first snapshot: a login racing it would fall back to
+  the world spawn and quietly lose the player's saved position. On login, a
+  profile for that account in that world restores their position; a miss just
+  spawns them normally.
+
+Known limits, tracked in `TODO.md`: reads are confined to profiles, so the rest
+is still a one-way write mirror. The whole social layer (accounts, chat, world
+list, server browser) has no consumer, because `soils-client` does not depend on
+`soils-stdb` at all. The `chunk_edit` journal and its reducers are built on both
+sides and unreachable.
 
 ## Testing
 

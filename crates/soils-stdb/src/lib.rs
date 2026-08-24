@@ -17,7 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use spacetimedb_sdk::{DbContext, Identity, Table};
 
-use module_bindings::{DbConnection, RemoteReducers, chunk_blob_table::ChunkBlobTableAccess};
+use module_bindings::{
+    DbConnection, RemoteReducers, chunk_blob_table::ChunkBlobTableAccess,
+    player_profile_table::PlayerProfileTableAccess,
+};
 // Each reducer is generated as its own snake_case extension trait; they must be
 // in scope for `reducers.<name>(..)` to resolve.
 use module_bindings::{
@@ -25,7 +28,7 @@ use module_bindings::{
     save_profile, submit_edits, upsert_world,
 };
 
-pub use module_bindings::{ChunkBlob, ChunkEdit, PackedEdit, World};
+pub use module_bindings::{ChunkBlob, ChunkEdit, PackedEdit, PlayerProfile, World};
 
 /// Batch cap for [`StdbCmd::SubmitEdits`], mirroring the module's
 /// `MAX_EDITS_PER_CALL`. Larger batches risk exhausting the reducer's fuel
@@ -94,6 +97,16 @@ pub struct StdbLink {
     event_rx: Receiver<StdbEvent>,
     running: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Set once the profile subscription has delivered its first snapshot, so
+    /// a read can tell "no such player" from "cache not warm yet".
+    ready: Arc<AtomicBool>,
+    /// The live connection, published by the worker once it is up.
+    ///
+    /// Reads go straight to the SDK's client-side cache, which the worker keeps
+    /// current from its subscriptions. That is safe from the ECS thread and,
+    /// more importantly, synchronous: the login path needs a player's saved
+    /// position *now*, and cannot wait on a round trip mid-tick.
+    conn: Arc<std::sync::OnceLock<Arc<DbConnection>>>,
 }
 
 impl StdbLink {
@@ -107,12 +120,18 @@ impl StdbLink {
         let uri = uri.to_string();
         let database = database.to_string();
         let flag = running.clone();
+        let conn = Arc::new(std::sync::OnceLock::new());
+        let published = conn.clone();
+        let ready = Arc::new(AtomicBool::new(false));
+        let signal = ready.clone();
         let worker = std::thread::Builder::new()
             .name("soils-stdb".into())
-            .spawn(move || worker(uri, database, token, cmd_rx, event_tx, flag))
+            .spawn(move || {
+                worker(uri, database, token, cmd_rx, event_tx, flag, published, signal)
+            })
             .expect("spawn soils-stdb thread");
 
-        Self { cmd_tx, event_rx, running, worker: Some(worker) }
+        Self { cmd_tx, event_rx, running, worker: Some(worker), conn, ready }
     }
 
     /// Queue a command. Fails only once the worker has stopped.
@@ -134,6 +153,38 @@ impl StdbLink {
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
+    }
+
+    /// Block until the profile cache has its first snapshot, or `timeout`
+    /// elapses. Returns whether it is ready.
+    ///
+    /// Worth waiting for at startup: reads come from the local cache, so a
+    /// login arriving before the first snapshot would silently fall back to the
+    /// world spawn point and quietly lose the player's saved position.
+    pub fn wait_ready(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.ready.load(Ordering::Relaxed) {
+            if std::time::Instant::now() >= deadline || !self.is_running() {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        true
+    }
+
+    /// A player's saved profile, or `None` if the cache is not warm yet or the
+    /// account has never logged out.
+    ///
+    /// All three are indistinguishable here and all mean the same thing to the
+    /// caller: spawn them at the world spawn point. A returning player losing
+    /// their position is a small regression; blocking the tick to find out is
+    /// not an acceptable alternative.
+    pub fn profile(&self, account: &str) -> Option<PlayerProfile> {
+        if !self.ready.load(Ordering::Relaxed) {
+            return None;
+        }
+        let conn = self.conn.get()?;
+        conn.db().player_profile().iter().find(|p| p.account == account)
     }
 }
 
@@ -165,6 +216,8 @@ fn worker(
     cmd_rx: Receiver<StdbCmd>,
     event_tx: Sender<StdbEvent>,
     running: Arc<AtomicBool>,
+    publish: Arc<std::sync::OnceLock<Arc<DbConnection>>>,
+    ready: Arc<AtomicBool>,
 ) {
     let mut builder = DbConnection::builder().with_uri(&uri).with_database_name(&database);
     if let Some(token) = token {
@@ -182,6 +235,18 @@ fn worker(
 
     // Drives the connection's I/O on its own thread; `conn` stays usable here.
     let handle = conn.run_threaded();
+
+    // Subscribe to the rows the server reads back. Profiles only: chunks are
+    // served from region files, which stay authoritative, so subscribing to
+    // `chunk_blob` would stream the whole stored world into memory for nothing.
+    let applied = ready.clone();
+    conn.subscription_builder()
+        .on_applied(move |_| applied.store(true, Ordering::Relaxed))
+        .subscribe(["SELECT * FROM player_profile".to_string()]);
+    // Shared so the ECS thread can read the cache; the worker keeps using it
+    // through the Arc.
+    let conn = Arc::new(conn);
+    let _ = publish.set(conn.clone());
 
     // The identity lands once the handshake completes, which is *after*
     // `build()` returns — so poll briefly rather than declaring failure on the

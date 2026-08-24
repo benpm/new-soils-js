@@ -144,6 +144,15 @@ pub(crate) fn connect_stdb(cfg: Option<&StdbConfig>) -> Option<Arc<soils_stdb::S
     let cfg = cfg?;
     let link = Arc::new(soils_stdb::StdbLink::connect(&cfg.uri, &cfg.database, cfg.token.clone()));
     println!("spacetimedb mirror: connecting to {} / {}", cfg.uri, cfg.database);
+    // Wait for the profile cache before accepting logins. Reads come from the
+    // local cache, so a login racing the first snapshot would fall back to the
+    // world spawn and quietly lose that player's saved position. Bounded: a
+    // slow or absent database must not stop the server from starting.
+    if !link.wait_ready(std::time::Duration::from_secs(10)) {
+        eprintln!(
+            "spacetimedb mirror: profile cache not ready; returning players will              spawn at the world spawn point until it arrives"
+        );
+    }
 
     // Nothing else drains the event channel, and a silently-swallowed reducer
     // rejection (a stale write, or an identity missing from `server_identity`)

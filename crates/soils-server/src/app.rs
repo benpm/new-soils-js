@@ -904,7 +904,20 @@ fn drain_inboxes(
                         }
                         let world_name = c.world.clone();
                         let world = worlds.get_or_create(&world_name);
-                        let (spawn, worldgen) = (world.spawn, world.gen_params());
+                        let (mut spawn, worldgen) = (world.spawn, world.gen_params());
+                        // Resume where they logged out, when SpacetimeDB has a
+                        // profile for them in this world. Read from the SDK's
+                        // local cache, so this costs no round trip; a miss —
+                        // no mirror, cache not warm yet, or a first-time player
+                        // — just leaves them at the world spawn.
+                        if let Some(stdb) = &stdb
+                            && let Some(p) = stdb.link.profile(&name)
+                            && p.world_id == soils_protocol::chunk_key::world_id_for(&world_name)
+                            && [p.x, p.y, p.z].iter().all(|v| v.is_finite())
+                        {
+                            spawn = [p.x, p.y, p.z];
+                            println!("login: {name} resumed at {spawn:?}");
+                        }
                         let c = clients.0.get_mut(&id).unwrap();
                         // (Re)spawn this connection's player entity.
                         if let Some(old) = c.entity.take() {

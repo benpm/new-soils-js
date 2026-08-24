@@ -32,6 +32,7 @@ mod record;
 mod world_draw;
 mod server_msg;
 mod singleplayer;
+mod social;
 
 use bevy::app::{RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::camera::{Exposure, Hdr};
@@ -224,6 +225,15 @@ fn main() {
             record::cue.run_if(resource_exists::<record::CaptureCue>),
         ),
     )
+    // A second block: Bevy's system tuples cap at 20 elements.
+    .add_systems(
+        Update,
+        (
+            social::refresh,
+            hud::update_chat.after(social::refresh),
+            social::link_identity.run_if(login::logged_in),
+        ),
+    )
     // Gameplay: only once authenticated.
     .add_systems(
         Update,
@@ -270,6 +280,7 @@ fn main() {
     if let Some(cue) = record::configured() {
         app.insert_resource(cue);
     }
+    app.insert_resource(social::configured());
     // Only present when SOILS_BOT names a role.
     if let Some(b) = bot::configured() {
         app.insert_resource(b);

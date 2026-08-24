@@ -311,6 +311,11 @@ impl Worlds {
     fn world(&self, name: &str) -> Option<&World> {
         self.map.get(name)
     }
+
+    /// Names of the worlds currently open.
+    fn names(&self) -> Vec<String> {
+        self.map.keys().cloned().collect()
+    }
 }
 
 /// Server-side script runtime (AssemblyScript/WASM), or `None` when scripting
@@ -986,6 +991,21 @@ fn drain_inboxes(
             // Everything below requires authentication; silently drop otherwise
             // (same as the old pre-auth gate).
             _ if !clients.0[&id].authenticated => {}
+            ClientMsg::LinkIdentity { identity } => {
+                // Only meaningful once authenticated: the whole point is that
+                // the *server* vouches for the account, having checked the
+                // password. An unauthenticated caller has nothing to bind.
+                let c = clients.0.get_mut(&id).unwrap();
+                if !c.authenticated {
+                    continue;
+                }
+                if let Some(stdb) = &stdb {
+                    let _ = stdb.link.send(soils_stdb::StdbCmd::LinkIdentity {
+                        account: c.account.clone(),
+                        identity: soils_stdb::Identity::from_byte_array(identity),
+                    });
+                }
+            }
             ClientMsg::ViewRadius { radius, full_streams } => {
                 let c = clients.0.get_mut(&id).unwrap();
                 c.radius = (radius as i32).clamp(1, MAX_RADIUS);
@@ -1802,6 +1822,8 @@ fn stdb_heartbeat(
     mut acc: Local<Option<f32>>,
     stdb: Option<Res<StdbMirror>>,
     clients: Res<Clients>,
+    worlds: Res<Worlds>,
+    clock: Res<Clock>,
 ) {
     let Some(stdb) = stdb else { return };
     // Seeded at the interval so the very first tick registers the server: a
@@ -1834,6 +1856,22 @@ fn stdb_heartbeat(
             server_id: stdb.server_id,
             world_id: soils_protocol::chunk_key::world_id_for(world),
             accounts,
+        });
+    }
+
+    // Refresh each live world's clock. Written once at world creation, the
+    // column sat at 0.0 forever while the day/night cycle ran, which made it
+    // worse than absent — a reader would have believed it.
+    for name in worlds.names() {
+        let Some(world) = worlds.world(&name) else { continue };
+        let params = world.gen_params();
+        let _ = stdb.link.send(soils_stdb::StdbCmd::UpsertWorld {
+            world_id: soils_protocol::chunk_key::world_id_for(&name),
+            name: name.clone(),
+            seed: params.seed,
+            world_type: params.world_type,
+            graph_hash: params.graph_hash,
+            daytime: clock.daytime,
         });
     }
 }

@@ -62,6 +62,7 @@ pub fn console_input(
     mut toggles: ResMut<RenderToggles>,
     mut gi: ResMut<GiSettings>,
     net: Res<NetClient>,
+    social: Res<crate::social::Social>,
 ) {
     for ev in events.read() {
         if ev.state != ButtonState::Pressed {
@@ -83,7 +84,7 @@ pub fn console_input(
                 console.open = false;
                 run_command(
                     &cmd, &mut player, &mut world_time, &mut streaming, &mut toggles,
-                    &mut gi, &net,
+                    &mut gi, &net, &social,
                 );
             }
             Key::Escape => {
@@ -124,6 +125,7 @@ fn run_command(
     toggles: &mut RenderToggles,
     gi: &mut GiSettings,
     net: &NetClient,
+    social: &crate::social::Social,
 ) {
     let mut parts = line.split_whitespace();
     let Some(cmd) = parts.next() else { return };
@@ -171,6 +173,14 @@ fn run_command(
                 let pos = t.translation + t.forward() * 3.0;
                 net.send(ClientMsg::SpawnCube { pos: pos.to_array() });
             }
+        }
+        "say" | "chat" if !args.is_empty() => {
+            // Chat goes to SpacetimeDB directly, not through the game server:
+            // the message is attributed to this client's own identity, which
+            // the game server has no way to speak for. With no database
+            // configured this is a no-op rather than an error — the game is
+            // playable without a lobby.
+            social.say(social.chat_world, &args.join(" "));
         }
         _ => {}
     }

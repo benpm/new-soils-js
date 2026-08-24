@@ -15,20 +15,34 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
-use spacetimedb_sdk::{DbContext, Identity, Table};
+pub use spacetimedb_sdk::Identity;
+use spacetimedb_sdk::{DbContext, Table};
 
 use module_bindings::{
     DbConnection, RemoteReducers, account_table::AccountTableAccess,
-    chunk_blob_table::ChunkBlobTableAccess, player_profile_table::PlayerProfileTableAccess,
+    chat_message_table::ChatMessageTableAccess, chunk_blob_table::ChunkBlobTableAccess,
+    game_server_table::GameServerTableAccess, player_profile_table::PlayerProfileTableAccess,
+    world_table::WorldTableAccess,
 };
 // Each reducer is generated as its own snake_case extension trait; they must be
 // in scope for `reducers.<name>(..)` to resolve.
 use module_bindings::{
     heartbeat, heartbeat_presence, link_identity, mark_absent, mark_present, put_chunk_blob,
-    register_account, save_profile, set_verifier, upsert_world,
+    register_account, save_profile, send_chat, set_verifier, upsert_world,
 };
 
-pub use module_bindings::{Account, ChunkBlob, PlayerProfile, World};
+pub use module_bindings::{Account, ChatMessage, ChunkBlob, GameServer, PlayerProfile, World};
+
+/// What a game server reads back: accounts to authenticate against, and
+/// profiles to restore a returning player's position.
+pub const SERVER_SUBSCRIPTIONS: &[&str] =
+    &["SELECT * FROM account", "SELECT * FROM player_profile"];
+
+/// What a game *client* reads: the lobby. Deliberately excludes `account` —
+/// verifiers are none of a client's business — and `chunk_blob`, which would
+/// stream the stored world into a player's memory.
+pub const CLIENT_SUBSCRIPTIONS: &[&str] =
+    &["SELECT * FROM game_server", "SELECT * FROM world", "SELECT * FROM chat_message"];
 
 /// Work handed to the SpacetimeDB thread.
 #[derive(Debug, Clone)]
@@ -52,6 +66,8 @@ pub enum StdbCmd {
     SetVerifier { name: String, verifier: String },
     /// Bind a SpacetimeDB identity to an account the server has authenticated.
     LinkIdentity { account: String, identity: Identity },
+    /// Post a chat message as this connection's own identity.
+    SendChat { world_id: u16, text: String },
     /// Persist a player's last known position, keyed by account name.
     SaveProfile {
         account: String,
@@ -102,28 +118,44 @@ pub struct StdbLink {
     /// current from its subscriptions. That is safe from the ECS thread and,
     /// more importantly, synchronous: the login path needs a player's saved
     /// position *now*, and cannot wait on a round trip mid-tick.
-    conn: Arc<std::sync::OnceLock<Arc<DbConnection>>>,
+    conn: Arc<std::sync::RwLock<Option<Arc<DbConnection>>>>,
 }
 
 impl StdbLink {
-    /// Spawn the worker and begin connecting. Non-blocking: the caller learns
-    /// the outcome through [`StdbEvent::Connected`] / `ConnectError`.
+    /// Spawn the worker and begin connecting, subscribing to what a game
+    /// server needs. Non-blocking: the caller learns the outcome through
+    /// [`StdbEvent::Connected`] / `ConnectError`.
     pub fn connect(uri: &str, database: &str, token: Option<String>) -> Self {
+        Self::connect_with(uri, database, token, SERVER_SUBSCRIPTIONS)
+    }
+
+    /// As [`connect`](Self::connect), with an explicit subscription set.
+    ///
+    /// Servers and clients read different halves of the schema, and a
+    /// subscription is what fills the local cache — so the caller has to say
+    /// which half it wants rather than paying for both.
+    pub fn connect_with(
+        uri: &str,
+        database: &str,
+        token: Option<String>,
+        subscriptions: &[&str],
+    ) -> Self {
         let (cmd_tx, cmd_rx) = unbounded::<StdbCmd>();
         let (event_tx, event_rx) = unbounded::<StdbEvent>();
         let running = Arc::new(AtomicBool::new(true));
 
         let uri = uri.to_string();
         let database = database.to_string();
+        let subs: Vec<String> = subscriptions.iter().map(|s| s.to_string()).collect();
         let flag = running.clone();
-        let conn = Arc::new(std::sync::OnceLock::new());
+        let conn = Arc::new(std::sync::RwLock::new(None));
         let published = conn.clone();
         let ready = Arc::new(AtomicBool::new(false));
         let signal = ready.clone();
         let worker = std::thread::Builder::new()
             .name("soils-stdb".into())
             .spawn(move || {
-                worker(uri, database, token, cmd_rx, event_tx, flag, published, signal)
+                worker(uri, database, token, subs, cmd_rx, event_tx, flag, published, signal)
             })
             .expect("spawn soils-stdb thread");
 
@@ -181,7 +213,48 @@ impl StdbLink {
         if !self.ready.load(Ordering::Relaxed) {
             return None;
         }
-        self.conn.get()?.db().account().name().find(&name.to_string())
+        let guard = self.conn.read().ok()?;
+        guard.as_ref()?.db().account().name().find(&name.to_string())
+    }
+
+    /// Live game servers, most populated first.
+    ///
+    /// Complements the UDP LAN discovery rather than replacing it: discovery
+    /// still finds servers on a local network with no database in the picture.
+    pub fn servers(&self) -> Vec<GameServer> {
+        let guard = self.conn.read().ok();
+        let Some(conn) = guard.as_ref().and_then(|g| g.as_ref()) else { return Vec::new() };
+        let mut rows: Vec<GameServer> = conn.db().game_server().iter().collect();
+        rows.sort_by(|a, b| b.players.cmp(&a.players).then_with(|| a.name.cmp(&b.name)));
+        rows
+    }
+
+    /// Known worlds, by name.
+    pub fn worlds(&self) -> Vec<World> {
+        let guard = self.conn.read().ok();
+        let Some(conn) = guard.as_ref().and_then(|g| g.as_ref()) else { return Vec::new() };
+        let mut rows: Vec<World> = conn.db().world().iter().collect();
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        rows
+    }
+
+    /// The most recent chat for a world, oldest first, capped at `limit`.
+    pub fn chat(&self, world_id: u16, limit: usize) -> Vec<ChatMessage> {
+        let guard = self.conn.read().ok();
+        let Some(conn) = guard.as_ref().and_then(|g| g.as_ref()) else { return Vec::new() };
+        let mut rows: Vec<ChatMessage> =
+            conn.db().chat_message().iter().filter(|m| m.world_id == world_id).collect();
+        rows.sort_by_key(|m| m.at);
+        if rows.len() > limit {
+            rows.drain(..rows.len() - limit);
+        }
+        rows
+    }
+
+    /// This connection's own identity, once the handshake has completed.
+    pub fn identity(&self) -> Option<Identity> {
+        let guard = self.conn.read().ok()?;
+        guard.as_ref()?.try_identity()
     }
 
     /// A player's saved profile, or `None` if the cache is not warm yet or the
@@ -195,7 +268,8 @@ impl StdbLink {
         if !self.ready.load(Ordering::Relaxed) {
             return None;
         }
-        let conn = self.conn.get()?;
+        let guard = self.conn.read().ok()?;
+        let conn = guard.as_ref()?;
         conn.db().player_profile().iter().find(|p| p.account == account)
     }
 }
@@ -225,13 +299,76 @@ fn worker(
     uri: String,
     database: String,
     token: Option<String>,
+    subscriptions: Vec<String>,
     cmd_rx: Receiver<StdbCmd>,
     event_tx: Sender<StdbEvent>,
     running: Arc<AtomicBool>,
-    publish: Arc<std::sync::OnceLock<Arc<DbConnection>>>,
+    publish: Arc<std::sync::RwLock<Option<Arc<DbConnection>>>>,
     ready: Arc<AtomicBool>,
 ) {
-    let mut builder = DbConnection::builder().with_uri(&uri).with_database_name(&database);
+    // Reconnect loop. A database restart used to end the link for the lifetime
+    // of the process, which for a long-running server meant losing the mirror
+    // permanently over a momentary outage.
+    let mut backoff = std::time::Duration::from_secs(1);
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        match session(
+            &uri,
+            &database,
+            token.clone(),
+            &subscriptions,
+            &cmd_rx,
+            &event_tx,
+            &running,
+            &publish,
+            &ready,
+        ) {
+            SessionEnd::Shutdown => break,
+            SessionEnd::Lost => {
+                ready.store(false, Ordering::Relaxed);
+                if let Ok(mut slot) = publish.write() {
+                    *slot = None;
+                }
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = event_tx.send(StdbEvent::Disconnected(Some(format!(
+                    "retrying in {:.0}s",
+                    backoff.as_secs_f32()
+                ))));
+                std::thread::sleep(backoff);
+                // Capped so a long outage does not turn into a long silence.
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+            }
+        }
+    }
+    running.store(false, Ordering::Relaxed);
+}
+
+/// Why a session ended.
+enum SessionEnd {
+    /// The link is shutting down; do not reconnect.
+    Shutdown,
+    /// The connection failed or dropped.
+    Lost,
+}
+
+/// One connection's lifetime: connect, subscribe, pump commands.
+#[allow(clippy::too_many_arguments)]
+fn session(
+    uri: &str,
+    database: &str,
+    token: Option<String>,
+    subscriptions: &[String],
+    cmd_rx: &Receiver<StdbCmd>,
+    event_tx: &Sender<StdbEvent>,
+    running: &Arc<AtomicBool>,
+    publish: &Arc<std::sync::RwLock<Option<Arc<DbConnection>>>>,
+    ready: &Arc<AtomicBool>,
+) -> SessionEnd {
+    let mut builder = DbConnection::builder().with_uri(uri).with_database_name(database);
     if let Some(token) = token {
         builder = builder.with_token(Some(token));
     }
@@ -240,28 +377,23 @@ fn worker(
         Ok(c) => c,
         Err(e) => {
             let _ = event_tx.send(StdbEvent::ConnectError(e.to_string()));
-            running.store(false, Ordering::Relaxed);
-            return;
+            return SessionEnd::Lost;
         }
     };
 
     // Drives the connection's I/O on its own thread; `conn` stays usable here.
     let handle = conn.run_threaded();
 
-    // Subscribe to the rows the server reads back. Not `chunk_blob`: chunks are
-    // served from region files, which stay authoritative, so subscribing would
-    // stream the whole stored world into memory for nothing.
     let applied = ready.clone();
     conn.subscription_builder()
         .on_applied(move |_| applied.store(true, Ordering::Relaxed))
-        .subscribe([
-            "SELECT * FROM player_profile".to_string(),
-            "SELECT * FROM account".to_string(),
-        ]);
+        .subscribe(subscriptions.to_vec());
     // Shared so the ECS thread can read the cache; the worker keeps using it
     // through the Arc.
     let conn = Arc::new(conn);
-    let _ = publish.set(conn.clone());
+    if let Ok(mut slot) = publish.write() {
+        *slot = Some(conn.clone());
+    }
 
     // The identity lands once the handshake completes, which is *after*
     // `build()` returns — so poll briefly rather than declaring failure on the
@@ -283,6 +415,7 @@ fn worker(
         None => {
             let _ = event_tx
                 .send(StdbEvent::ConnectError("handshake did not yield an identity".into()));
+            return SessionEnd::Lost;
         }
     }
 
@@ -290,19 +423,29 @@ fn worker(
     // the `running` flag would discard commands already queued — and the flush
     // that matters most is the one at shutdown, where the server pushes its
     // dirty chunks out on the way down.
+    let mut shutdown;
     loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(cmd) => apply(conn.reducers(), cmd, &event_tx),
+            Ok(cmd) => apply(conn.reducers(), cmd, event_tx),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if !running.load(Ordering::Relaxed) {
+                    shutdown = true;
                     break;
                 }
+                if !conn.is_active() {
+                    // The host went away. Anything still queued is kept for the
+                    // next session rather than applied to a dead connection.
+                    return SessionEnd::Lost;
+                }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                shutdown = true;
+                break;
+            }
         }
     }
     while let Ok(cmd) = cmd_rx.try_recv() {
-        apply(conn.reducers(), cmd, &event_tx);
+        apply(conn.reducers(), cmd, event_tx);
     }
 
     // Reducer calls are queued on the connection, so let them reach the host
@@ -310,7 +453,7 @@ fn worker(
     std::thread::sleep(std::time::Duration::from_millis(250));
     let _ = conn.disconnect();
     let _ = handle.join();
-    running.store(false, Ordering::Relaxed);
+    if shutdown { SessionEnd::Shutdown } else { SessionEnd::Lost }
 }
 
 fn report<E: std::fmt::Display>(
@@ -342,6 +485,9 @@ fn apply(reducers: &RemoteReducers, cmd: StdbCmd, event_tx: &Sender<StdbEvent>) 
         }
         StdbCmd::LinkIdentity { account, identity } => {
             report("link_identity", reducers.link_identity(account, identity))
+        }
+        StdbCmd::SendChat { world_id, text } => {
+            report("send_chat", reducers.send_chat(world_id, text))
         }
         StdbCmd::SaveProfile { account, world_id, x, y, z, yaw, view_radius } => report(
             "save_profile",

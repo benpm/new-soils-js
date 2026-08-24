@@ -114,7 +114,7 @@ fn large_chunk_payload_round_trips() {
     eprintln!("payload: {} B", payload.len());
 
     let key = pack_chunk_key(world_id, 3, -2, 5).expect("in range");
-    conn.reducers.put_chunk_blob(key, payload.clone(), 1, 0).expect("put queued");
+    conn.reducers.put_chunk_blob(key, payload.clone(), 1).expect("put queued");
 
     assert!(
         wait_for(&conn, Duration::from_secs(15), |c| {
@@ -155,8 +155,8 @@ fn identical_payloads_are_accepted_under_distinct_keys() {
     let payload = encode_chunk(&bulky_chunk(9));
     let a = pack_chunk_key(world_id, 10, 0, 0).unwrap();
     let b = pack_chunk_key(world_id, 11, 0, 0).unwrap();
-    conn.reducers.put_chunk_blob(a, payload.clone(), 1, 0).unwrap();
-    conn.reducers.put_chunk_blob(b, payload.clone(), 1, 0).unwrap();
+    conn.reducers.put_chunk_blob(a, payload.clone(), 1).unwrap();
+    conn.reducers.put_chunk_blob(b, payload.clone(), 1).unwrap();
 
     assert!(
         wait_for(&conn, Duration::from_secs(15), |c| {
@@ -189,14 +189,14 @@ fn stale_version_write_is_rejected() {
 
     let key = pack_chunk_key(world_id, 20, 0, 0).unwrap();
     let v5 = encode_chunk(&bulky_chunk(5));
-    conn.reducers.put_chunk_blob(key, v5.clone(), 5, 0).unwrap();
+    conn.reducers.put_chunk_blob(key, v5.clone(), 5).unwrap();
     assert!(wait_for(&conn, Duration::from_secs(15), |c| {
         c.db().chunk_blob().iter().any(|r| r.chunk_key == key && r.version == 5)
     }));
 
     // A late flush carrying an older version must not roll the chunk back.
     let v2 = encode_chunk(&bulky_chunk(2));
-    conn.reducers.put_chunk_blob(key, v2, 2, 0).unwrap();
+    conn.reducers.put_chunk_blob(key, v2, 2).unwrap();
     std::thread::sleep(Duration::from_secs(2));
     let row = conn.db().chunk_blob().iter().find(|r| r.chunk_key == key).unwrap();
     assert_eq!(row.version, 5, "stale write must be refused");

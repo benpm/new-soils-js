@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// [`GenParams`] (worldgen v2 is bit-exact CPU==GPU); only edited chunks ship
 /// payloads. `Chunk`/`Bundle` replaced by `Manifest`; `Edit` broadcasts are
 /// interest-filtered.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Bincode configuration used on both ends. Standard little-endian, variable
 /// int encoding.
@@ -62,6 +62,14 @@ pub enum ClientMsg {
     /// `full_streams` opts out of client-side generation: every chunk ships
     /// as an `Edited` payload (graph-hash mismatch, gen failure fallback).
     ViewRadius { radius: u8, full_streams: bool },
+    /// This client's SpacetimeDB identity, sent after login so the server —
+    /// which has already checked the password — can bind it to the account.
+    ///
+    /// The client cannot bind it itself: nothing in the database can establish
+    /// who owns an account name, so a self-served link would let anyone claim
+    /// any account. 32 raw bytes rather than a hex string, since that is what
+    /// `Identity` is.
+    LinkIdentity { identity: [u8; 32] },
     /// Fetch full payloads for specific subscribed positions regardless of
     /// class — the escape hatch for hash-mismatch repair, local gen failure,
     /// and divergence self-tests. Rate-limited server-side; unsubscribed or

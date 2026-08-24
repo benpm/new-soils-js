@@ -267,11 +267,29 @@ row-granular deltas.
   profile for that account in that world restores their position; a miss just
   spawns them normally.
 
-Known limits, tracked in `TODO.md`: reads are confined to profiles, so the rest
-is still a one-way write mirror. The whole social layer (accounts, chat, world
-list, server browser) has no consumer, because `soils-client` does not depend on
-`soils-stdb` at all. The `chunk_edit` journal and its reducers are built on both
-sides and unreachable.
+- **Accounts** live in the `account` table when a database is configured.
+  Passwords are Argon2id with a per-account salt; the module stores the verifier
+  and never checks one, because the game server is the only party a client
+  proves anything to. `register_account` and `link_identity` are both
+  server-only for the same reason: nothing in the module can establish who owns
+  a name. Without a database the local file is authoritative exactly as before,
+  and existing accounts migrate on their next successful login.
+- **The client** (`soils-client/src/social.rs`) subscribes to the *lobby* half —
+  `game_server`, `world`, `chat_message` — and never to `account` or
+  `chunk_blob`. It is optional and non-blocking throughout: every accessor
+  returns an empty list rather than an error, so a database that is down or
+  absent costs the lobby and chat, never the game. The server browser merges
+  the registry with UDP LAN discovery, which still works with no database at
+  all.
+- **Identity** is bound by the server, not claimed by the client: the client
+  sends its SpacetimeDB identity over the game protocol
+  (`ClientMsg::LinkIdentity`) after logging in, and the server — which has
+  already checked the password — calls `link_identity`.
+- **Reconnection**: the link retries with capped exponential backoff. A
+  database restart used to end the mirror for the lifetime of the process.
+
+Known limits, tracked in `TODO.md`: nothing reads `chunk_blob`, so a server with
+an empty region directory does not rehydrate from the database.
 
 ## Testing
 

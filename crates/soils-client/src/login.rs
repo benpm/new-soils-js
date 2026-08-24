@@ -358,10 +358,11 @@ pub fn finish_login(
 /// per server, or a placeholder while none are found.
 pub fn update_server_list(
     servers: Res<DiscoveredServers>,
+    social: Res<crate::social::Social>,
     container: Query<(Entity, Option<&Children>), With<ServerListContainer>>,
     mut commands: Commands,
 ) {
-    if !servers.is_changed() {
+    if !servers.is_changed() && !social.is_changed() {
         return;
     }
     let Ok((container, children)) = container.single() else {
@@ -372,17 +373,38 @@ pub fn update_server_list(
             commands.entity(child).despawn();
         }
     }
+    // Two sources, one list. LAN discovery finds servers on this network with
+    // no database involved; the SpacetimeDB registry finds servers anywhere.
+    // A server that answers both is shown once — discovery wins, because its
+    // address is the one that definitely routes from here.
+    let mut rows: Vec<(String, String, u32, bool)> = servers
+        .list
+        .iter()
+        .map(|s| (s.name.clone(), s.addr.to_string(), s.players as u32, true))
+        .collect();
+    for s in &social.servers {
+        if rows.iter().any(|(_, addr, ..)| addr == &s.addr) {
+            continue;
+        }
+        rows.push((s.name.clone(), s.addr.clone(), s.players, false));
+    }
+
     commands.entity(container).with_children(|list| {
-        if servers.list.is_empty() {
+        if rows.is_empty() {
+            let msg = if social.enabled() {
+                "searching for servers…"
+            } else {
+                "searching for LAN servers…"
+            };
             list.spawn((
-                Text::new("searching for LAN servers…"),
+                Text::new(msg),
                 TextFont { font_size: 14.0.into(), ..default() },
                 TextColor(Color::srgb(0.55, 0.55, 0.55)),
             ));
             return;
         }
-        for s in &servers.list {
-            let addr = s.addr.to_string();
+        for (name, addr, players, lan) in &rows {
+            let tag = if *lan { "LAN" } else { "net" };
             list.spawn((
                 Button,
                 ServerButton { addr: addr.clone() },
@@ -391,7 +413,7 @@ pub fn update_server_list(
             ))
             .with_children(|b| {
                 b.spawn((
-                    Text::new(format!("{} ({}) — {}", s.name, s.players, addr)),
+                    Text::new(format!("[{tag}] {name} ({players}) — {addr}")),
                     TextFont { font_size: 14.0.into(), ..default() },
                     TextColor(Color::WHITE),
                 ));

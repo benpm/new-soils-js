@@ -223,6 +223,49 @@ share-one-simulation rule as movement, but through the `soils-physics` crate.
   reach-checked + rate-limited) drops a cube ahead of the camera; a demo stack
   also falls near the first player on join.
 
+## SpacetimeDB mirror (behind `SOILS_STDB_URI`)
+
+A hybrid split, not a port. SpacetimeDB owns cold, relational, persistent and
+social state; `soils-server` stays authoritative for movement, chunks, entities
+and physics. The hot path never touches it. A full port was rejected on
+concrete grounds: no threads for rayon worldgen, no nested WASM for the
+scripting engine, nowhere to host Avian, no unreliable lane, and no
+row-granular deltas.
+
+- **Module** (`stdb/soils-module`): 10 tables. Every world-mutating reducer is
+  gated on `require_server`, an allowlist bootstrapped trust-on-first-use, so
+  players cannot write world state even though the tables are `public` for
+  future client reads. Excluded from the workspace, so no `wasm32` toolchain is
+  needed for a normal build; generated bindings are checked in, so no CLI is
+  either.
+- **Link** (`soils-stdb`): a worker thread plus channels, deliberately the same
+  shape as the `NewConn` transport seam. The ECS sends `StdbCmd`s and drains
+  `StdbEvent`s, unaware of the database. No Bevy dependency, so a client could
+  use it too.
+- **What is mirrored**: world registration on first open, edited-chunk blobs
+  (only after a successful region write — disk stays authoritative), the server
+  registry heartbeat, the logout profile save, and login/logout presence.
+  Pristine chunks are reproducible from `GenParams` and are never stored.
+- **Failure is non-fatal by design.** A database that is down or misconfigured
+  logs and is otherwise ignored; losing it must never take the game down.
+  Unset `SOILS_STDB_URI` and the server behaves exactly as it did before.
+- **Liveness**: the server refreshes its registry row and its whole presence
+  roster on one 5 s clock, comfortably inside the module's 30 s TTL, and the
+  module reaps anything staler. Presence writes are batched into a single
+  transaction per world rather than one reducer call per player.
+- **Chunk versions** are the chunk's own edit counter, not a clock. A wall
+  clock looked monotonic but a backwards step would fail the module's
+  stale-write guard for every write until it caught up — and since the region
+  file is authoritative and the chunk is no longer dirty, those edits would
+  never be retried.
+
+Known limits, tracked in `TODO.md`: **the server never reads from
+SpacetimeDB** — there is no subscription outside tests, so this is a one-way
+write mirror. `player_profile` is therefore written but never restored, and the
+whole social layer (accounts, chat, world list, server browser) has no
+consumer, because `soils-client` does not depend on `soils-stdb` at all. The
+`chunk_edit` journal and its reducers are built on both sides and unreachable.
+
 ## Testing
 
 - **Oracles**: GPU mesher vs CPU greedy mesher (sorted multiset equality);

@@ -146,6 +146,7 @@ pub fn predict_and_send(
     tracker: Res<crate::server_msg::SnapTracker>,
     map: Res<ChunkMap>,
     chunks: Query<&VoxelChunk>,
+    actors: Query<&crate::actor::Actor>,
     mut query: Query<&mut Player>,
 ) {
     let Ok(mut player) = query.single_mut() else { return };
@@ -156,7 +157,14 @@ pub fn predict_and_send(
     let player = &mut *player;
     player.prev_pos = player.sim.pos;
     let sampler = |v: IVec3| voxel_at(&map, &chunks, v);
-    soils_sim::step_player(&mut player.sim, &input, 1.0 / soils_sim::TICK_HZ as f32, &sampler);
+    let peers = peer_positions(&actors);
+    soils_sim::step_player_peers(
+        &mut player.sim,
+        &input,
+        1.0 / soils_sim::TICK_HZ as f32,
+        &sampler,
+        &peers,
+    );
 
     ring.seq += 1;
     let seq = ring.seq;
@@ -175,6 +183,17 @@ pub fn predict_and_send(
     });
 }
 
+/// Eye positions of the other players we know about. The local player has no
+/// `Actor` body (`spawn_actors` skips `self_entity`), so this is exactly the
+/// peer set the server steps us against.
+fn peer_positions(actors: &Query<&crate::actor::Actor>) -> Vec<Vec3> {
+    actors
+        .iter()
+        .filter(|a| a.kind == soils_sim::KIND_PLAYER)
+        .filter_map(|a| a.latest_pos())
+        .collect()
+}
+
 /// Predicted-vs-authoritative tolerance (world units) before a rewind+replay.
 const RECONCILE_EPSILON: f32 = 0.05;
 
@@ -187,6 +206,7 @@ pub fn reconcile_self(
     mut ring: ResMut<InputRing>,
     map: Res<ChunkMap>,
     chunks: Query<&VoxelChunk>,
+    actors: Query<&crate::actor::Actor>,
     mut query: Query<&mut Player>,
 ) {
     for msg in reader.read() {
@@ -237,8 +257,16 @@ pub fn reconcile_self(
         }
         let mut sim = base;
         let sampler = |v: IVec3| voxel_at(&map, &chunks, v);
+        // Replaying without peers would re-diverge on every corrected tick.
+        let peers = peer_positions(&actors);
         for (_, input, recorded) in ring.history.iter_mut().skip(1) {
-            soils_sim::step_player(&mut sim, input, 1.0 / soils_sim::TICK_HZ as f32, &sampler);
+            soils_sim::step_player_peers(
+                &mut sim,
+                input,
+                1.0 / soils_sim::TICK_HZ as f32,
+                &sampler,
+                &peers,
+            );
             *recorded = sim;
         }
         player.sim = sim;

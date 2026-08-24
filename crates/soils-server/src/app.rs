@@ -25,7 +25,7 @@ use avian3d::prelude::{AngularVelocity, LinearVelocity, Position, Rotation};
 use bevy_app::{App, AppExit, FixedUpdate, ScheduleRunnerPlugin, Update};
 use bevy_ecs::message::MessageWriter;
 use bevy_ecs::prelude::{
-    Commands, Component, Entity, IntoScheduleConfigs, Local, NonSendMut, Query, Res, ResMut,
+    Commands, Component, Entity, Has, IntoScheduleConfigs, Local, NonSendMut, Query, Res, ResMut,
     Resource, With, Without,
 };
 use bevy_time::{Fixed, Time, TimePlugin};
@@ -206,6 +206,10 @@ impl Wander {
 
 #[derive(Resource)]
 struct NextNetId(u32);
+/// Rigid-body props dropped near spawn (from `ServerConfig::props`).
+#[derive(Resource)]
+struct PropCount(u16);
+
 /// Ambient test critters per world (from `ServerConfig::critters`).
 #[derive(Resource)]
 struct CritterCount(u16);
@@ -365,6 +369,7 @@ pub(crate) fn run_app(
     critters: u16,
     scripts_dir: Option<PathBuf>,
     physics_enabled: bool,
+    props: u16,
     stdb: Option<Arc<soils_stdb::StdbLink>>,
     server_name: String,
     bind_addr: String,
@@ -426,6 +431,7 @@ pub(crate) fn run_app(
     .insert_resource(worlds)
     .insert_resource(NextNetId(1))
     .insert_resource(CritterCount(critters))
+    .insert_resource(PropCount(props))
     .insert_resource(physics)
     .init_resource::<CrittersSpawned>()
     .init_resource::<TickCount>()
@@ -599,6 +605,7 @@ fn spawn_physics_demo(
     mut done: Local<bool>,
     players: Query<(&SimState, &InWorld), With<PlayerControlled>>,
     worlds: Res<Worlds>,
+    props: Res<PropCount>,
     mut commands: Commands,
     mut next_net: ResMut<NextNetId>,
 ) {
@@ -624,12 +631,63 @@ fn spawn_physics_demo(
     *done = true;
 
     let base = Vec3::new(feet.x, surface_y as f32 + 6.0, feet.z);
-    // A 3-cube stack, each given a spin so the replicated orientation is
-    // non-trivial as they fall and settle.
-    for i in 0..3u32 {
-        let pos = base + Vec3::Y * (i as f32 * 1.2);
-        spawn_physics_cube(&mut commands, &mut next_net, &in_world.0, pos, Vec3::new(1.5, 2.0, 0.5));
+    if props.0 == 0 {
+        // A 3-cube stack, each given a spin so the replicated orientation is
+        // non-trivial as they fall and settle.
+        for i in 0..3u32 {
+            let pos = base + Vec3::Y * (i as f32 * 1.2);
+            spawn_physics_cube(
+                &mut commands,
+                &mut next_net,
+                &in_world.0,
+                pos,
+                Vec3::new(1.5, 2.0, 0.5),
+            );
+        }
+        return;
     }
+
+    // A loose cube pile. Laid out on a square lattice with a small
+    // deterministic jitter: a perfectly aligned grid drops into a stable
+    // lattice and barely interacts, which would make a load test of settling
+    // bodies measure almost nothing.
+    // Wide and shallow, not cubic. A cubic lattice of a few hundred bodies is
+    // taller than a player, so anyone walking in is simply buried and the pile
+    // reads as a wall — spread it out and keep it waist-high.
+    let n = props.0 as u32;
+    let layers = 3u32;
+    let side = ((n as f32 / layers as f32).sqrt().ceil()).max(1.0) as u32;
+    let spacing = 1.35; // > the 1.0 cube, so nothing starts interpenetrating
+    let mut spawned = 0u32;
+    'pile: for y in 0..layers {
+        for x in 0..side {
+            for z in 0..side {
+                if spawned >= n {
+                    break 'pile;
+                }
+                // Cheap hash → jitter, so the pile is identical every run.
+                let h = (spawned as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let jx = ((h >> 8) & 0xFF) as f32 / 255.0 - 0.5;
+                let jz = ((h >> 24) & 0xFF) as f32 / 255.0 - 0.5;
+                let spin = ((h >> 40) & 0xFF) as f32 / 255.0 * 2.0 - 1.0;
+                let pos = base
+                    + Vec3::new(
+                        (x as f32 - side as f32 / 2.0) * spacing + jx * 0.3,
+                        y as f32 * spacing,
+                        (z as f32 - side as f32 / 2.0) * spacing + jz * 0.3,
+                    );
+                spawn_physics_cube(
+                    &mut commands,
+                    &mut next_net,
+                    &in_world.0,
+                    pos,
+                    Vec3::new(spin, spin * 1.5, -spin),
+                );
+                spawned += 1;
+            }
+        }
+    }
+    println!("physics: dropped {spawned} props near spawn");
 }
 
 /// Spawn one replicated rigid-body cube at `pos` with initial angular velocity
@@ -766,7 +824,7 @@ fn drain_inboxes(
     mut critters_spawned: ResMut<CrittersSpawned>,
     mut script_events: ResMut<ScriptEvents>,
     physics: Res<PhysicsCfg>,
-    mut sims: Query<(&mut SimState, &mut Yaw, &mut InWorld)>,
+    mut sims: Query<(&mut SimState, &mut Yaw, &mut InWorld, Entity, Has<PlayerControlled>)>,
     stdb: Option<Res<StdbMirror>>,
 ) {
     // Phase 1: refill rate buckets and pull everything out of the inboxes.
@@ -787,6 +845,18 @@ fn drain_inboxes(
             }
         }
     }
+
+    // Player positions as of the tick boundary, the obstacle set for
+    // player-vs-player collision. Snapshotting (rather than querying live
+    // mid-loop) keeps the result independent of ECS iteration order; the entry
+    // for a player who moves is refreshed below, so within a tick everyone
+    // collides against the freshest position their arrival order can justify.
+    let mut peer_snapshot: Vec<(Entity, String, Vec3)> = sims
+        .iter()
+        .filter(|(.., is_player)| *is_player)
+        .map(|(sim, _, w, e, _)| (e, w.0.clone(), sim.0.pos))
+        .collect();
+    let mut peers: Vec<Vec3> = Vec::new();
 
     // Phase 2: apply, in per-client arrival order (all the old per-connection
     // loop guaranteed across clients was per-client FIFO too).
@@ -983,8 +1053,20 @@ fn drain_inboxes(
                 let c = clients.0.get_mut(&id).unwrap();
                 c.ack_tick = c.ack_tick.max(ack_tick);
                 let Some(entity) = c.entity else { continue };
-                let Ok((mut sim, mut yaw, _)) = sims.get_mut(entity) else { continue };
-                let world = worlds.get_or_create(&c.world.clone());
+                let world_name = c.world.clone();
+                // Everyone else in this world is a solid body to walk into and
+                // stand on. Peers are read from the tick-boundary snapshot, not
+                // the live query, so this stays a plain `&[Vec3]` and cannot
+                // alias the `&mut SimState` being stepped.
+                peers.clear();
+                peers.extend(
+                    peer_snapshot
+                        .iter()
+                        .filter(|(e, w, _)| *e != entity && *w == world_name)
+                        .map(|(.., p)| *p),
+                );
+                let Ok((mut sim, mut yaw, ..)) = sims.get_mut(entity) else { continue };
+                let world = worlds.get_or_create(&world_name);
                 let sim_dt = 1.0 / soils_sim::TICK_HZ as f32;
                 for f in frames {
                     if f.seq <= c.last_seq || c.input_tokens < 1.0 {
@@ -994,7 +1076,16 @@ fn drain_inboxes(
                     c.last_seq = f.seq;
                     let input = soils_sim::unpack_input(f.buttons, f.flags, f.yaw);
                     yaw.0 = input.yaw;
-                    soils_sim::step_player(&mut sim.0, &input, sim_dt, &|v| world.voxel(v));
+                    soils_sim::step_player_peers(
+                        &mut sim.0,
+                        &input,
+                        sim_dt,
+                        &|v| world.voxel(v),
+                        &peers,
+                    );
+                }
+                if let Some(slot) = peer_snapshot.iter_mut().find(|(e, ..)| *e == entity) {
+                    slot.2 = sim.0.pos;
                 }
                 // Crossing a chunk boundary moves the subscription window.
                 let pc = chunk_at(sim.0.pos.to_array());
@@ -1047,11 +1138,15 @@ fn drain_inboxes(
                 let spawn = world.spawn;
                 let c = clients.0.get_mut(&id).unwrap();
                 if let Some(entity) = c.entity
-                    && let Ok((mut sim, _, mut in_world)) = sims.get_mut(entity)
+                    && let Ok((mut sim, _, mut in_world, ..)) = sims.get_mut(entity)
                 {
                     sim.0.pos = Vec3::from_array(spawn);
                     sim.0.vel = Vec3::ZERO;
                     in_world.0 = name.clone();
+                    if let Some(slot) = peer_snapshot.iter_mut().find(|(e, ..)| *e == entity) {
+                        slot.1 = name.clone();
+                        slot.2 = sim.0.pos;
+                    }
                 }
                 let _ = c.outbox.send(ServerMsg::Warp {
                     spawn,
@@ -1075,7 +1170,7 @@ fn drain_inboxes(
                 if let Some(stdb) = &stdb {
                     // Last known position, so a returning player resumes where
                     // they left off rather than at spawn.
-                    if let Some((sim, yaw, _)) = c.entity.and_then(|e| sims.get(e).ok()) {
+                    if let Some((sim, yaw, ..)) = c.entity.and_then(|e| sims.get(e).ok()) {
                         let _ = stdb.link.send(soils_stdb::StdbCmd::SaveProfile {
                             account: c.account.clone(),
                             world_id: soils_protocol::chunk_key::world_id_for(&c.world),

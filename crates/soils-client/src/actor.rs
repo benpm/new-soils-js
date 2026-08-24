@@ -60,6 +60,15 @@ impl Actor {
         Self { kind, buffer }
     }
 
+    /// Newest buffered eye position. Prediction collides against this rather
+    /// than the render-delayed interpolated one: the server resolves
+    /// player-vs-player collision against its tick-boundary positions, and the
+    /// newest snapshot is the closest a client has to those, so the two agree
+    /// and contact does not spray reconciliations.
+    pub fn latest_pos(&self) -> Option<Vec3> {
+        self.buffer.back().map(|&(_, pos, ..)| pos)
+    }
+
     pub fn push_snapshot(&mut self, tick: u32, pos: Vec3, vel: Vec3, rot: Quat) {
         if self.buffer.back().is_some_and(|(t, ..)| *t >= tick) {
             return; // stale or duplicate
@@ -165,5 +174,154 @@ pub fn interpolate_actors(
         let drop = assets.kinds.get(actor.kind as usize).map_or(0.9, |k| k.body_drop);
         transform.translation = eye - Vec3::Y * drop;
         transform.rotation = rot;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Server ticks per rendered frame at 60 fps: the render clock advances in
+    /// server ticks, so this is `SERVER_TICK_HZ / fps`.
+    const TICKS_PER_FRAME: f32 = soils_sim::SERVER_TICK_HZ as f32 / 60.0;
+    /// A body walking at a constant 8 u/s along +X.
+    const SPEED: f32 = 8.0;
+
+    /// Replicate a constant-velocity body at 20 Hz. `drop_every` simulates
+    /// packet loss by omitting every Nth snapshot (0 = lossless).
+    fn linear_actor(ticks: u32, drop_every: u32) -> Actor {
+        let vel = Vec3::new(SPEED, 0.0, 0.0);
+        let per_tick = vel / soils_sim::SERVER_TICK_HZ as f32;
+        let mut a = Actor::new(soils_sim::KIND_PLAYER, 0, Vec3::ZERO);
+        for t in 1..=ticks {
+            if drop_every != 0 && t % drop_every == 0 {
+                continue; // dropped in flight
+            }
+            a.push_snapshot(t, per_tick * t as f32, vel, Quat::IDENTITY);
+        }
+        a
+    }
+
+    /// Walk the render clock across everything the buffer holds, one 60 fps
+    /// frame at a time, returning the per-frame displacement along +X.
+    ///
+    /// The span is taken from the buffer rather than assumed: the buffer keeps
+    /// only the newest 32 ticks, so a render clock older than that sits behind
+    /// the oldest segment and `sample` correctly clamps to a constant. Real
+    /// rendering never gets there — `INTERP_DELAY_TICKS` keeps the clock two
+    /// ticks behind the newest — but a test that started at tick 0 would.
+    fn frame_steps(actor: &mut Actor) -> Vec<f32> {
+        let first = actor.buffer.front().expect("a buffered snapshot").0 as f32;
+        let last = actor.buffer.back().expect("a buffered snapshot").0 as f32;
+        let mut t = first;
+        let mut prev = actor.sample(t).expect("a buffered sample").0;
+        let mut steps = Vec::new();
+        while t + TICKS_PER_FRAME <= last {
+            t += TICKS_PER_FRAME;
+            let now = actor.sample(t).expect("a buffered sample").0;
+            steps.push(now.x - prev.x);
+            prev = now;
+        }
+        assert!(!steps.is_empty(), "nothing sampled");
+        steps
+    }
+
+    /// What one 60 fps frame of 8 u/s motion should cover.
+    fn expected_step() -> f32 {
+        SPEED / 60.0
+    }
+
+    #[test]
+    fn interpolation_is_smooth_at_60hz() {
+        let mut a = linear_actor(40, 0);
+        let steps = frame_steps(&mut a);
+        let want = expected_step();
+        for (i, s) in steps.iter().enumerate() {
+            assert!(
+                (s - want).abs() < 1e-3,
+                "frame {i} moved {s}, expected {want} — interpolation is not uniform"
+            );
+        }
+    }
+
+    #[test]
+    fn lost_snapshots_do_not_produce_a_jump() {
+        // Every third snapshot never arrives. The segments either side simply
+        // span two ticks instead of one, so constant-velocity motion must stay
+        // exactly as smooth — this is the property that makes delta snapshot
+        // loss survivable rather than visible.
+        let mut a = linear_actor(40, 3);
+        let steps = frame_steps(&mut a);
+        let want = expected_step();
+        let worst = steps.iter().map(|s| (s - want).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-3, "worst frame deviated by {worst} under 33% snapshot loss");
+    }
+
+    #[test]
+    fn heavy_loss_still_never_moves_backwards() {
+        // Half the stream gone. Positions may be coarser, but motion must stay
+        // monotonic: a backwards step is the visible stutter players notice.
+        let mut a = linear_actor(60, 2);
+        for (i, s) in frame_steps(&mut a).iter().enumerate() {
+            assert!(*s >= -1e-4, "frame {i} moved backwards by {s}");
+        }
+    }
+
+    #[test]
+    fn the_interp_delay_keeps_sampling_off_the_extrapolator() {
+        // Rendering INTERP_DELAY_TICKS behind the newest snapshot should mean
+        // the next segment has always arrived, so `sample` interpolates rather
+        // than extrapolating. Extrapolation is the fallback that snaps when the
+        // body changes direction, so staying off it is what buys smoothness.
+        let mut a = linear_actor(40, 0);
+        let newest = 40.0;
+        let mut t = a.buffer.front().expect("a buffered snapshot").0 as f32;
+        while t < newest - INTERP_DELAY_TICKS {
+            a.sample(t);
+            assert!(
+                a.buffer.len() >= 2,
+                "at render tick {t} the buffer held only {} entries — sampling fell \
+                 through to extrapolation",
+                a.buffer.len()
+            );
+            t += TICKS_PER_FRAME;
+        }
+    }
+
+    #[test]
+    fn extrapolation_is_capped_when_the_stream_dies() {
+        // The link drops entirely after tick 10. The body must coast, not fly
+        // off: the cap bounds how far a dead stream can carry it.
+        let mut a = linear_actor(10, 0);
+        let far = a.sample(10.0 + 100.0 * soils_sim::SERVER_TICK_HZ as f32).expect("sample").0;
+        let last = SPEED / soils_sim::SERVER_TICK_HZ as f32 * 10.0;
+        assert!(
+            far.x - last <= SPEED * EXTRAPOLATE_CAP + 1e-3,
+            "extrapolated {} past the last snapshot, cap allows {}",
+            far.x - last,
+            SPEED * EXTRAPOLATE_CAP
+        );
+    }
+
+    #[test]
+    fn stale_and_duplicate_snapshots_are_ignored() {
+        // Jitter can deliver an older snapshot after a newer one; accepting it
+        // would drag the body backwards.
+        let mut a = Actor::new(soils_sim::KIND_PLAYER, 5, Vec3::ZERO);
+        a.push_snapshot(6, Vec3::X, Vec3::ZERO, Quat::IDENTITY);
+        a.push_snapshot(5, Vec3::new(-99.0, 0.0, 0.0), Vec3::ZERO, Quat::IDENTITY);
+        a.push_snapshot(6, Vec3::new(-99.0, 0.0, 0.0), Vec3::ZERO, Quat::IDENTITY);
+        assert_eq!(a.buffer.len(), 2, "stale and duplicate ticks must be dropped");
+        assert_eq!(a.buffer[1].1, Vec3::X);
+    }
+
+    #[test]
+    fn latest_pos_tracks_the_newest_snapshot() {
+        // Prediction collides against this, so it must be the newest known
+        // state and not the render-delayed one.
+        let mut a = linear_actor(20, 0);
+        a.sample(4.0); // advancing the render clock must not change it
+        let per_tick = SPEED / soils_sim::SERVER_TICK_HZ as f32;
+        assert!((a.latest_pos().unwrap().x - per_tick * 20.0).abs() < 1e-4);
     }
 }

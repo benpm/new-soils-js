@@ -433,6 +433,23 @@ A force-killed OBS leaves a modal "OBS Studio Crash Detected" dialog that
 blocks websocket startup, and `--disable-shutdown-check` does **not** suppress
 it on OBS 32. `obs_record.py` dismisses it via UI Automation.
 
+### The raw file is enormous
+
+OBS writes at the canvas resolution and a quality bitrate: a 30 s two-pane
+2560x720 take is ~173 MB. That is the right thing for a master. Everything
+downstream — the share folder, the dashboard, a PR — wants a second pass:
+
+```sh
+ffmpeg -ss 3 -i take.mp4 -t 27 -vf scale=1400:-2   -c:v libx264 -preset slow -crf 36 -pix_fmt yuv420p -an   -movflags +faststart out.mp4      # 173 MB -> 1.7 MB
+```
+
+`-ss 3` drops the settling seconds at the head, `-an` drops a silent audio
+track, and `+faststart` moves the moov atom to the front so the file plays
+before it has fully downloaded. Check the result is actually smaller: a source
+already encoded harder than your settings will *grow*, and you will have paid a
+second generation of loss for the privilege (`deploy_dashboard.py` keeps
+whichever is smaller for this reason).
+
 ### The recording opens on an empty world
 
 Do not guess a warm-up delay. The client signals `SOILS_READY_FILE` once

@@ -102,6 +102,37 @@ async fn an_edit_reaches_spacetimedb() {
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
+    // Presence must survive being online, not merely appear at login. The
+    // module reaps rows older than its 30 s liveness TTL, so a row written once
+    // at login and never refreshed vanishes while the player is still
+    // connected — and a test that only checks presence is *gone* after logout
+    // passes either way.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !obs.db().presence().iter().any(|p| p.account == "mirror") {
+        assert!(Instant::now() < deadline, "no presence row for 'mirror' while online");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let first = obs
+        .db()
+        .presence()
+        .iter()
+        .find(|p| p.account == "mirror")
+        .expect("present")
+        .heartbeat;
+    // Long enough to cover more than one server heartbeat period.
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let refreshed = obs
+        .db()
+        .presence()
+        .iter()
+        .find(|p| p.account == "mirror")
+        .expect("presence row was reaped while the player was still online")
+        .heartbeat;
+    assert!(
+        refreshed > first,
+        "presence heartbeat never advanced ({first:?} -> {refreshed:?}); the row          will be reaped out from under an online player"
+    );
+
     // Disconnect first so the server observes the logout and runs the profile /
     // presence path; shutting down with the client still attached would skip it.
     drop(client);

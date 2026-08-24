@@ -17,6 +17,7 @@ pub mod chunk_edit_type;
 pub mod game_server_table;
 pub mod game_server_type;
 pub mod grant_server_reducer;
+pub mod heartbeat_presence_reducer;
 pub mod heartbeat_reducer;
 pub mod link_identity_reducer;
 pub mod mark_absent_reducer;
@@ -49,6 +50,7 @@ pub use chunk_edit_type::ChunkEdit;
 pub use game_server_table::*;
 pub use game_server_type::GameServer;
 pub use grant_server_reducer::grant_server;
+pub use heartbeat_presence_reducer::heartbeat_presence;
 pub use heartbeat_reducer::heartbeat;
 pub use link_identity_reducer::link_identity;
 pub use mark_absent_reducer::mark_absent;
@@ -86,6 +88,11 @@ pub enum Reducer {
         name: String,
         addr: String,
         player_count: u32,
+    },
+    HeartbeatPresence {
+        server_id: u32,
+        world_id: u16,
+        accounts: Vec<String>,
     },
     LinkIdentity {
         account: String,
@@ -147,6 +154,7 @@ impl __sdk::Reducer for Reducer {
         match self {
             Reducer::GrantServer { .. } => "grant_server",
             Reducer::Heartbeat { .. } => "heartbeat",
+            Reducer::HeartbeatPresence { .. } => "heartbeat_presence",
             Reducer::LinkIdentity { .. } => "link_identity",
             Reducer::MarkAbsent { .. } => "mark_absent",
             Reducer::MarkPresent { .. } => "mark_present",
@@ -178,6 +186,15 @@ impl __sdk::Reducer for Reducer {
                 name: name.clone(),
                 addr: addr.clone(),
                 player_count: player_count.clone(),
+            }),
+            Reducer::HeartbeatPresence {
+                server_id,
+                world_id,
+                accounts,
+            } => __sats::bsatn::to_vec(&heartbeat_presence_reducer::HeartbeatPresenceArgs {
+                server_id: server_id.clone(),
+                world_id: world_id.clone(),
+                accounts: accounts.clone(),
             }),
             Reducer::LinkIdentity { account } => {
                 __sats::bsatn::to_vec(&link_identity_reducer::LinkIdentityArgs {

@@ -21,8 +21,8 @@ use module_bindings::{DbConnection, RemoteReducers, chunk_blob_table::ChunkBlobT
 // Each reducer is generated as its own snake_case extension trait; they must be
 // in scope for `reducers.<name>(..)` to resolve.
 use module_bindings::{
-    mark_absent, mark_present,
-    heartbeat, prune_edits, put_chunk_blob, save_profile, submit_edits, upsert_world,
+    heartbeat, heartbeat_presence, mark_absent, mark_present, prune_edits, put_chunk_blob,
+    save_profile, submit_edits, upsert_world,
 };
 
 pub use module_bindings::{ChunkBlob, ChunkEdit, PackedEdit, World};
@@ -67,6 +67,13 @@ pub enum StdbCmd {
     Heartbeat { server_id: u32, name: String, addr: String, player_count: u32 },
     /// Record an account as online on this server.
     MarkPresent { account: String, server_id: u32, world_id: u16 },
+    /// Refresh presence for this server's whole roster in one transaction, and
+    /// drop rows for anyone no longer on it.
+    ///
+    /// `MarkPresent` alone is not enough to stay online: the module reaps any
+    /// presence row older than its liveness TTL, so a row written at login and
+    /// never refreshed disappears while the player is still connected.
+    HeartbeatPresence { server_id: u32, world_id: u16, accounts: Vec<String> },
     /// Drop an account's presence row on a clean disconnect.
     MarkAbsent { account: String },
 }
@@ -86,6 +93,7 @@ pub struct StdbLink {
     cmd_tx: Sender<StdbCmd>,
     event_rx: Receiver<StdbEvent>,
     running: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl StdbLink {
@@ -99,12 +107,12 @@ impl StdbLink {
         let uri = uri.to_string();
         let database = database.to_string();
         let flag = running.clone();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("soils-stdb".into())
             .spawn(move || worker(uri, database, token, cmd_rx, event_tx, flag))
             .expect("spawn soils-stdb thread");
 
-        Self { cmd_tx, event_rx, running }
+        Self { cmd_tx, event_rx, running, worker: Some(worker) }
     }
 
     /// Queue a command. Fails only once the worker has stopped.
@@ -130,8 +138,23 @@ impl StdbLink {
 }
 
 impl Drop for StdbLink {
+    /// Wait for the worker to finish draining before returning.
+    ///
+    /// The flush that matters most is the one at shutdown, where the server
+    /// pushes its dirty chunks out on the way down. Previously this only set a
+    /// flag, so the process could exit while the worker was still delivering —
+    /// losing exactly that flush.
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        // Closing the command channel is what tells the worker to drain and
+        // exit; it cannot see that while this handle still holds a sender.
+        let (dead, _) = unbounded();
+        let _ = std::mem::replace(&mut self.cmd_tx, dead);
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            eprintln!("spacetimedb worker panicked during shutdown");
+        }
     }
 }
 
@@ -255,6 +278,10 @@ fn apply(reducers: &RemoteReducers, cmd: StdbCmd, event_tx: &Sender<StdbEvent>) 
         StdbCmd::MarkAbsent { account } => {
             report("mark_absent", reducers.mark_absent(account))
         }
+        StdbCmd::HeartbeatPresence { server_id, world_id, accounts } => report(
+            "heartbeat_presence",
+            reducers.heartbeat_presence(server_id, world_id, accounts),
+        ),
     }
 }
 

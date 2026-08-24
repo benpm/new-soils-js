@@ -594,6 +594,10 @@ pub fn heartbeat(
 
 /// Record that `account` is online on `server_id` in `world_id`, refreshing its
 /// heartbeat. Separate from [`heartbeat`], which covers the server itself.
+///
+/// Used at login; [`heartbeat_presence`] keeps the row alive after that. A row
+/// inserted here and never refreshed is deleted by the reaper once it passes
+/// `LIVENESS_TTL`, even though the player is still connected.
 #[reducer]
 pub fn mark_present(
     ctx: &ReducerContext,
@@ -622,6 +626,59 @@ pub fn mark_present(
     Ok(())
 }
 
+/// Refresh the heartbeat of every account currently online on `server_id`, and
+/// drop any presence row this server owns that is no longer among them.
+///
+/// One transaction for the whole roster rather than a `mark_present` per
+/// player: the server calls this every few seconds, so per-player reducers
+/// would put a transaction per player per interval on the database for no gain.
+///
+/// The removal half matters as much as the refresh. A player who leaves without
+/// a clean logout would otherwise sit in `presence` until the reaper's
+/// `LIVENESS_TTL` expires; here the next roster that omits them takes them out.
+#[reducer]
+pub fn heartbeat_presence(
+    ctx: &ReducerContext,
+    server_id: u32,
+    world_id: u16,
+    accounts: Vec<String>,
+) -> Result<(), String> {
+    require_server(ctx)?;
+    for account in &accounts {
+        if let Some(mut presence) = ctx.db.presence().account().find(account) {
+            presence.world_id = world_id;
+            presence.server_id = server_id;
+            presence.heartbeat = ctx.timestamp;
+            ctx.db.presence().account().update(presence);
+        } else {
+            ctx.db
+                .presence()
+                .try_insert(Presence {
+                    account: account.clone(),
+                    world_id,
+                    server_id,
+                    connected_at: ctx.timestamp,
+                    heartbeat: ctx.timestamp,
+                })
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    // Only ever prunes rows belonging to *this* server, so two servers sharing
+    // the database cannot evict each other's players.
+    let departed: Vec<String> = ctx
+        .db
+        .presence()
+        .server_id()
+        .filter(server_id)
+        .filter(|p| !accounts.contains(&p.account))
+        .map(|p| p.account)
+        .collect();
+    for account in departed {
+        ctx.db.presence().account().delete(&account);
+    }
+    Ok(())
+}
+
 /// Drop `account`'s presence row on a clean disconnect. The reaper covers
 /// unclean ones, but only after `LIVENESS_TTL`.
 #[reducer]
@@ -633,22 +690,38 @@ pub fn mark_absent(ctx: &ReducerContext, account: String) -> Result<(), String> 
 
 /// Link a SpacetimeDB identity to an account, for when a player's own client
 /// authenticates to SpacetimeDB directly (chat, social reads).
+///
+/// **Server-only, deliberately.** An earlier version let the claiming client
+/// call this itself and checked only that any *existing* link matched the
+/// sender — which is vacuous for an unlinked account, and unlinked is the
+/// normal state for every account the game server creates. Any anonymous
+/// client could therefore claim any account by name and inherit its profile
+/// link. Nothing in this module can verify account ownership: the name and
+/// password live in the game server's `auth.rs`, so only the game server is in
+/// a position to assert that a given identity really is a given account.
+///
+/// The intended flow is that a client tells the game server its SpacetimeDB
+/// identity over the game protocol, and the server — which has already
+/// authenticated that connection — calls this.
 #[reducer]
-pub fn link_identity(ctx: &ReducerContext, account: String) -> Result<(), String> {
-    let sender = ctx.sender();
+pub fn link_identity(
+    ctx: &ReducerContext,
+    account: String,
+    identity: Identity,
+) -> Result<(), String> {
+    require_server(ctx)?;
     let mut profile = ctx
         .db
         .player_profile()
         .account()
         .find(&account)
         .ok_or_else(|| format!("no profile for account '{account}'"))?;
-    // Only the account's own identity may claim it, and only once.
     if let Some(existing) = profile.identity
-        && existing != sender
+        && existing != identity
     {
         return Err(format!("account '{account}' is already linked to another identity"));
     }
-    profile.identity = Some(sender);
+    profile.identity = Some(identity);
     ctx.db.player_profile().account().update(profile);
     Ok(())
 }

@@ -845,13 +845,23 @@ fn drain_inboxes(
             }
         }
     }
+    // `Clients` is a HashMap, so the order clients came out of that loop is
+    // randomized per process. Sort by client id — stably, so each client's own
+    // messages keep their arrival order — or two servers replaying identical
+    // input reach different states.
+    msgs.sort_by_key(|(id, _)| *id);
 
-    // Player positions as of the tick boundary, the obstacle set for
-    // player-vs-player collision. Snapshotting (rather than querying live
-    // mid-loop) keeps the result independent of ECS iteration order; the entry
-    // for a player who moves is refreshed below, so within a tick everyone
-    // collides against the freshest position their arrival order can justify.
-    let mut peer_snapshot: Vec<(Entity, String, Vec3)> = sims
+    // Player positions as of the tick boundary: the obstacle set for
+    // player-vs-player collision, frozen for the whole tick.
+    //
+    // Frozen, not refreshed as players move through the loop. Refreshing looks
+    // more accurate, but it makes the outcome depend on the order the
+    // messages happen to be processed in: of two players walking head-on, the
+    // one stepped second would collide against the other's already-updated
+    // position and stop further back. Freezing also gives the client something
+    // it can reproduce — it knows every peer's tick-boundary position, and
+    // nothing about the server's intra-tick ordering.
+    let peer_snapshot: Vec<(Entity, String, Vec3)> = sims
         .iter()
         .filter(|(.., is_player)| *is_player)
         .map(|(sim, _, w, e, _)| (e, w.0.clone(), sim.0.pos))
@@ -1084,9 +1094,6 @@ fn drain_inboxes(
                         &peers,
                     );
                 }
-                if let Some(slot) = peer_snapshot.iter_mut().find(|(e, ..)| *e == entity) {
-                    slot.2 = sim.0.pos;
-                }
                 // Crossing a chunk boundary moves the subscription window.
                 let pc = chunk_at(sim.0.pos.to_array());
                 if c.center != Some(pc) {
@@ -1143,10 +1150,6 @@ fn drain_inboxes(
                     sim.0.pos = Vec3::from_array(spawn);
                     sim.0.vel = Vec3::ZERO;
                     in_world.0 = name.clone();
-                    if let Some(slot) = peer_snapshot.iter_mut().find(|(e, ..)| *e == entity) {
-                        slot.1 = name.clone();
-                        slot.2 = sim.0.pos;
-                    }
                 }
                 let _ = c.outbox.send(ServerMsg::Warp {
                     spawn,
@@ -1796,12 +1799,30 @@ fn stdb_heartbeat(
         return;
     }
     *elapsed = 0.0;
+    let online: Vec<&Client> = clients.0.values().filter(|c| c.authenticated).collect();
     let _ = stdb.link.send(soils_stdb::StdbCmd::Heartbeat {
         server_id: stdb.server_id,
         name: stdb.name.clone(),
         addr: stdb.addr.clone(),
-        player_count: clients.0.values().filter(|c| c.authenticated).count() as u32,
+        player_count: online.len() as u32,
     });
+
+    // Presence has to be refreshed on the same clock, not just written at
+    // login: the module reaps any presence row older than its liveness TTL, so
+    // a login-only row vanishes out from under a player who is still connected.
+    // Rosters are per world, since a presence row records which world its
+    // player is in.
+    let mut by_world: HashMap<&str, Vec<String>> = HashMap::new();
+    for c in &online {
+        by_world.entry(c.world.as_str()).or_default().push(c.account.clone());
+    }
+    for (world, accounts) in by_world {
+        let _ = stdb.link.send(soils_stdb::StdbCmd::HeartbeatPresence {
+            server_id: stdb.server_id,
+            world_id: soils_protocol::chunk_key::world_id_for(world),
+            accounts,
+        });
+    }
 }
 
 fn tick_clock(time: Res<Time>, mut clock: ResMut<Clock>, clients: Res<Clients>) {

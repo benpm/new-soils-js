@@ -121,11 +121,18 @@ impl NetSim {
         if !(3..=4).contains(&f.len()) {
             return None;
         }
-        let ms = |s: &str| s.parse::<f64>().ok().filter(|v| *v >= 0.0);
+        // `Duration::from_secs_f64` panics on non-finite or overflowing input,
+        // and `>= 0.0` admits both `inf` and absurd magnitudes — so bound them
+        // here rather than turning a typo in an env var into a crash.
+        const MAX_MS: f64 = 60_000.0;
+        let ms = |s: &str| {
+            s.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0 && *v <= MAX_MS)
+        };
+        let loss = f[2].parse::<f64>().ok().filter(|v| v.is_finite())?;
         Some(Self::new(
             Duration::from_secs_f64(ms(f[0])? / 1000.0),
             Duration::from_secs_f64(ms(f[1])? / 1000.0),
-            f[2].parse::<f64>().ok()?,
+            loss,
             f.get(3).map_or(Some(1), |s| s.parse::<u64>().ok())?,
         ))
     }
@@ -196,6 +203,12 @@ mod tests {
         assert!(NetSim::parse("80,25,0.02,7,9").is_none(), "too many fields");
         assert!(NetSim::parse("abc,25,0.02").is_none(), "non-numeric");
         assert!(NetSim::parse("-5,25,0.02").is_none(), "negative latency");
+        // `Duration::from_secs_f64` panics on these rather than erroring, so a
+        // typo in an env var must be rejected here, not passed through.
+        assert!(NetSim::parse("inf,0,0").is_none(), "infinite latency");
+        assert!(NetSim::parse("0,inf,0").is_none(), "infinite jitter");
+        assert!(NetSim::parse("1e300,0,0").is_none(), "absurd latency");
+        assert!(NetSim::parse("0,0,NaN").is_none(), "NaN loss");
     }
 
     #[test]

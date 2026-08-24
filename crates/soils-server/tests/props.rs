@@ -86,7 +86,10 @@ async fn await_settled(c: &mut Client) -> HashMap<u32, [f32; 3]> {
             return last;
         }
     }
-    last
+    // Returning the last reading here would hand back a mid-settle snapshot,
+    // and a caller comparing before/after would then measure the pile's own
+    // residual motion — letting a shove assertion pass without any shove.
+    panic!("{PROPS} props never settled");
 }
 
 // ---------------------------------------------------------------------------
@@ -258,8 +261,12 @@ fn settling_pile_snapshot_cost_is_recorded() {
          {:.1} KB/s at 20 Hz",
         mean * 20.0 / 1024.0
     );
+    // Well above the ordinary 410 B/tick budget, which a settling pile of this
+    // size is deliberately outside — but close enough to the ~620 B actually
+    // measured that a codec regression cannot slip past. The previous ceiling
+    // was 32 kB, which nothing could ever have tripped.
     assert!(
-        mean < 32_000.0,
+        mean < 3_000.0,
         "mean snapshot payload {mean:.0} B for {PROPS} props looks like a codec \
          regression"
     );

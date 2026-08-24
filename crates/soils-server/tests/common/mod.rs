@@ -9,12 +9,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use soils_protocol::netsim::{Lane, NetSim};
 use soils_protocol::{ChunkInfo, 
     ChunkVolume, ClientMsg, EntityState, InputFrame, ServerMsg, SnapshotTracker, decode,
     decode_chunk, encode,
 };
 use soils_server::{ServerConfig, ServerHandle};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 /// An embedded server on an ephemeral loopback port. Dropping it shuts the
@@ -33,6 +35,24 @@ pub struct TestServer {
 }
 
 static SERVER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Configure the process-global rayon pool once, before any server uses it.
+///
+/// Worldgen and light jobs run there. Debug builds give async/generator frames
+/// no layout optimisation, and the default worker stack is not enough once a
+/// test binary has already run a hundred-client test in the same process — the
+/// symptom is `thread '<unknown>' has overflowed its stack`, unnamed because
+/// rayon does not name its workers by default. Naming them keeps any future
+/// overflow attributable instead of anonymous.
+fn init_rayon() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("soils-rayon-{i}"))
+            .stack_size(16 * 1024 * 1024)
+            .build_global();
+    });
+}
 
 impl TestServer {
     /// Fresh scratch data dir. `tag` keeps parallel tests in the same binary
@@ -62,6 +82,7 @@ impl TestServer {
         tag: &str,
         tweak: impl FnOnce(&mut ServerConfig),
     ) -> Self {
+        init_rayon();
         let gate = SERVER_GATE.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = ServerConfig {
             bind: "127.0.0.1:0".into(),
@@ -93,8 +114,32 @@ impl Drop for TestServer {
 
 /// A scripted client. Dropping it closes the connection (the server then
 /// broadcasts `ActorRemove` to same-world clients).
+///
+/// Messages travel through [`spawn_link`], so an optional [`NetSim`] can add
+/// latency, gaussian jitter, and loss without any test needing to know.
 pub struct Client {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    out: UnboundedSender<ClientMsg>,
+    inbox: UnboundedReceiver<ServerMsg>,
+    /// Non-snapshot messages set aside by [`Client::drain_self_pos`], so
+    /// skipping ahead to the freshest position never loses a manifest or an
+    /// edit ack that a later `recv_until` is waiting for.
+    held: std::collections::VecDeque<ServerMsg>,
+    /// Every chunk the server has pushed, and every entity it has announced.
+    ///
+    /// `recv_until` *discards* messages that do not match its predicate, so
+    /// waiting for an entity spawn silently throws away any chunk manifest
+    /// that arrives first — and the server sends each chunk once, so the later
+    /// `await_chunk` would wait forever. A real client keeps state from every
+    /// message it sees; so does this one.
+    seen_chunks: std::collections::HashMap<[i32; 3], ChunkInfo>,
+    seen_spawns: std::collections::HashMap<u32, u16>,
+    /// Last position seen for each entity.
+    ///
+    /// Snapshots are deltas: an entity that has not moved is simply absent, so
+    /// there is no message to wait for. Without this, asking a standing
+    /// player where it is would block until it moved again — which, for a
+    /// player deliberately holding still, is never.
+    known: std::collections::HashMap<u32, [f32; 3]>,
     /// Player id from `Init` (0 until logged in).
     pub id: u16,
     /// NetId of our own player entity, from `Init`.
@@ -114,10 +159,21 @@ pub struct Client {
 impl Client {
     /// Connect without logging in (for pre-auth behavior tests).
     pub async fn connect(addr: SocketAddr) -> Self {
+        Self::connect_with(addr, None).await
+    }
+
+    /// Connect over a simulated link. `None` is a direct connection.
+    pub async fn connect_with(addr: SocketAddr, sim: Option<NetSim>) -> Self {
         let (ws, _) =
             tokio_tungstenite::connect_async(format!("ws://{addr}")).await.expect("connect");
+        let (out, inbox) = spawn_link(ws, sim);
         Self {
-            ws,
+            out,
+            inbox,
+            held: std::collections::VecDeque::new(),
+            seen_chunks: std::collections::HashMap::new(),
+            seen_spawns: std::collections::HashMap::new(),
+            known: std::collections::HashMap::new(),
             id: 0,
             self_entity: 0,
             spawn: [0.0; 3],
@@ -132,6 +188,13 @@ impl Client {
     /// Connect and log in as a guest, returning once `Init` arrives.
     pub async fn join(addr: SocketAddr, name: &str) -> Self {
         let mut c = Self::connect(addr).await;
+        c.login(name).await;
+        c
+    }
+
+    /// [`join`](Self::join) over a simulated link.
+    pub async fn join_with(addr: SocketAddr, name: &str, sim: Option<NetSim>) -> Self {
+        let mut c = Self::connect_with(addr, sim).await;
         c.login(name).await;
         c
     }
@@ -158,26 +221,190 @@ impl Client {
         self.self_entity = self_entity;
         self.spawn = spawn;
         self.worldgen = Some(worldgen);
+        self.known.insert(self_entity, spawn);
     }
 
     pub async fn send(&mut self, msg: &ClientMsg) {
-        self.ws.send(Message::Binary(encode(msg))).await.expect("send");
+        self.out.send(msg.clone()).expect("link closed");
     }
 
-    /// Next decodable `ServerMsg`, with a 10 s deadline.
+    /// Next `ServerMsg`, with a 10 s deadline. Every message is recorded on
+    /// the way past, so nothing a later wait depends on can be thrown away.
     pub async fn next_msg(&mut self) -> ServerMsg {
+        if let Some(msg) = self.held.pop_front() {
+            return msg;
+        }
+        let msg = tokio::time::timeout(Duration::from_secs(10), self.inbox.recv())
+            .await
+            .expect("timed out waiting for server message")
+            .expect("connection closed");
+        self.record(&msg);
+        msg
+    }
+
+    /// Note the durable facts carried by a message: which chunks exist, which
+    /// entities exist. Idempotent; safe to call for a message twice.
+    fn record(&mut self, msg: &ServerMsg) {
+        match msg {
+            ServerMsg::Manifest { chunks } => {
+                for info in chunks {
+                    self.seen_chunks.insert(info.pos(), info.clone());
+                }
+            }
+            ServerMsg::EntitySpawn { id, kind, pos } => {
+                self.seen_spawns.insert(*id, *kind);
+                // Seed the position table from the spawn message. A body that
+                // settles never appears in a delta snapshot again, so without
+                // this its position would only ever be knowable if it happened
+                // to move after we started listening.
+                self.known.entry(*id).or_insert(*pos);
+            }
+            ServerMsg::EntityDespawn { id } => {
+                self.seen_spawns.remove(id);
+                self.known.remove(id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Last known position of an entity, without waiting for it to move.
+    pub fn known_pos(&self, net: u32) -> Option<[f32; 3]> {
+        self.known.get(&net).copied()
+    }
+
+    /// NetIds of every physics prop the server has announced.
+    pub fn props_seen(&self) -> Vec<u32> {
+        self.seen_spawns
+            .iter()
+            .filter(|(_, kind)| **kind == soils_sim::KIND_PHYSICS_CUBE)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// NetIds of other players the server has announced.
+    pub fn peer_players(&self) -> Vec<u32> {
+        self.seen_spawns
+            .iter()
+            .filter(|(id, kind)| **kind == soils_sim::KIND_PLAYER && **id != self.self_entity)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Wait until the server has announced another player, and return its
+    /// NetId. Checks what has already been seen before waiting.
+    pub async fn await_peer_player(&mut self) -> u32 {
         loop {
-            let frame = tokio::time::timeout(Duration::from_secs(10), self.ws.next())
-                .await
-                .expect("timed out waiting for server message")
-                .expect("connection closed")
-                .expect("websocket error");
-            if let Message::Binary(b) = frame
-                && let Some(msg) = decode::<ServerMsg>(b.as_ref())
-            {
-                return msg;
+            if let Some(id) = self.peer_players().into_iter().min() {
+                return id;
+            }
+            let msg = self.next_msg().await;
+            self.record(&msg);
+        }
+    }
+
+    /// Freshest server-reported position of our own entity, taken from
+    /// everything already queued without blocking. `None` means no snapshot
+    /// mentioned us — which, in a delta stream, means we did not move.
+    ///
+    /// Tests that pause (building a structure, waiting on a barrier) build up
+    /// a backlog; reading one message off the front of it reports where the
+    /// player *was*, not where they are.
+    pub fn drain_self_pos(&mut self) -> Option<[f32; 3]> {
+        self.drain_entity_pos(self.self_entity)
+    }
+
+    /// As [`drain_self_pos`](Self::drain_self_pos), for any entity.
+    ///
+    /// Pulls only from the socket. `held` is append-only here: draining it too
+    /// would re-queue each non-snapshot message it just popped, and spin.
+    pub fn drain_entity_pos(&mut self, net: u32) -> Option<[f32; 3]> {
+        let mut latest = None;
+        while let Ok(msg) = self.inbox.try_recv() {
+            match msg {
+                ServerMsg::Snapshot { tick, baseline_tick, ref payload, .. } => {
+                    if let Some(states) = self.tracker.apply(tick, baseline_tick, payload) {
+                        for st in &states {
+                            self.known.insert(st.id, st.pos);
+                            if st.id == net {
+                                latest = Some(st.pos);
+                            }
+                        }
+                    }
+                }
+                other => {
+                    self.record(&other);
+                    self.held.push_back(other);
+                }
             }
         }
+        latest
+    }
+
+    /// Our current position: the freshest queued snapshot, else the last one
+    /// seen, else the next to arrive.
+    pub async fn current_self_pos(&mut self) -> [f32; 3] {
+        self.current_entity_pos(self.self_entity).await
+    }
+
+    /// Drain until the snapshot stream has advanced `n` server ticks.
+    ///
+    /// This is what makes "no update for us" mean "we did not move". Waiting a
+    /// fixed wall-clock interval instead would be wrong on a slow link: with a
+    /// 240 ms round trip the reply to an input has not arrived after 150 ms,
+    /// and silence would be misread as stillness — reporting a falling player
+    /// as landed.
+    pub async fn await_server_ticks(&mut self, n: u32) {
+        let target = self.tracker.latest_tick + n;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while self.tracker.latest_tick < target {
+            // Drains snapshots, which advances the tracker and refreshes the
+            // last-known position table.
+            self.drain_self_pos();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "snapshot stream stalled below tick {target} (at {})",
+                self.tracker.latest_tick
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Poll our own server-reported position until `pred` holds.
+    ///
+    /// Polling, rather than waiting on the next snapshot mentioning us, is
+    /// what makes this safe in both directions: a player who has stopped
+    /// never appears in a delta snapshot again, and a player under load may
+    /// not appear for many ticks. Sampling the freshest known position on a
+    /// timer covers both.
+    pub async fn await_self_where(
+        &mut self,
+        mut pred: impl FnMut([f32; 3]) -> bool,
+        what: &str,
+    ) -> [f32; 3] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let p = self.current_self_pos().await;
+            if pred(p) {
+                return p;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}; last position {p:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Any entity's current position, same freshness rule. Never blocks on an
+    /// entity that has simply stopped moving.
+    pub async fn current_entity_pos(&mut self, net: u32) -> [f32; 3] {
+        if let Some(p) = self.drain_entity_pos(net) {
+            return p;
+        }
+        if let Some(p) = self.known.get(&net).copied() {
+            return p;
+        }
+        self.await_entity(net, |_| true).await.pos
     }
 
     /// Drain messages until `f` yields a value; interleaved broadcasts
@@ -191,22 +418,32 @@ impl Client {
     }
 
     /// Fly for `ticks` fixed ticks with forward held, facing `yaw` (0 = -Z,
-    /// -π/2 = +X). Paced in bursts matched to the server's input token refill
-    /// (64/s) so no frame is dropped; players spawn in fly mode, so this moves
-    /// at 8 u/s (32 u/s with `sprint`).
+    /// -π/2 = +X). Players spawn in fly mode, so this moves at 8 u/s (32 u/s
+    /// with `sprint`).
     pub async fn fly(&mut self, ticks: u32, yaw: f32, sprint: bool) {
+        let input = soils_sim::PlayerInput {
+            move_axes: glam::Vec2::new(0.0, 1.0),
+            yaw,
+            sprint,
+            ..Default::default()
+        };
+        self.drive(ticks, |_| input).await;
+    }
+
+    /// Send `ticks` input frames, each built by `make`. Paced in bursts matched
+    /// to the server's input token refill (64/s) so no frame is dropped.
+    pub async fn drive(
+        &mut self,
+        ticks: u32,
+        mut make: impl FnMut(u32) -> soils_sim::PlayerInput,
+    ) {
         let mut sent = 0;
         while sent < ticks {
             let batch = (ticks - sent).min(16);
             let frames: Vec<InputFrame> = (0..batch)
-                .map(|_| {
+                .map(|i| {
                     self.input_seq += 1;
-                    let input = soils_sim::PlayerInput {
-                        move_axes: glam::Vec2::new(0.0, 1.0),
-                        yaw,
-                        sprint,
-                        ..Default::default()
-                    };
+                    let input = make(sent + i);
                     let (buttons, flags, yaw_q) = soils_sim::pack_input(&input);
                     InputFrame { seq: self.input_seq, buttons, flags, yaw: yaw_q }
                 })
@@ -217,6 +454,76 @@ impl Client {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
+    }
+
+    /// Hold `input` for `ticks` ticks.
+    pub async fn hold(&mut self, ticks: u32, input: soils_sim::PlayerInput) {
+        self.drive(ticks, |_| input).await;
+    }
+
+    /// Walk with forward held, facing `yaw`. Only meaningful out of fly mode
+    /// (see [`land`](Self::land)) — fly mode is noclip, so a flying player
+    /// passes through everything a walking one collides with.
+    pub async fn walk(&mut self, ticks: u32, yaw: f32) {
+        self.hold(ticks, soils_sim::PlayerInput {
+            move_axes: glam::Vec2::new(0.0, 1.0),
+            yaw,
+            ..Default::default()
+        })
+        .await;
+    }
+
+    /// Send idle input for `dur` of wall-clock time.
+    ///
+    /// [`hold`](Self::hold) with a small tick count returns *immediately* — it
+    /// paces only between batches — so holding a position for a real interval
+    /// needs this. A client that simply stops sending is frozen, not standing.
+    pub async fn idle_for(&mut self, dur: Duration) {
+        let end = tokio::time::Instant::now() + dur;
+        while tokio::time::Instant::now() < end {
+            self.hold(16, soils_sim::PlayerInput::default()).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Toggle fly mode with a single edge-flagged frame.
+    pub async fn toggle_fly(&mut self) {
+        self.drive(1, |_| soils_sim::PlayerInput { toggle_fly: true, ..Default::default() })
+            .await;
+    }
+
+    /// Leave fly mode and fall until the server reports us at rest. Returns the
+    /// resting eye position.
+    ///
+    /// "At rest" is judged from the server's own echo rather than a fixed tick
+    /// count, because how far there is to fall depends on the terrain (and, in
+    /// the stacking tests, on whoever is already standing below).
+    pub async fn land(&mut self) -> [f32; 3] {
+        self.toggle_fly().await;
+        self.settle().await
+    }
+
+    /// Idle until the server reports us at rest vertically, *without* touching
+    /// fly mode. Use after a jump; [`land`](Self::land) is this plus the
+    /// toggle.
+    pub async fn settle(&mut self) -> [f32; 3] {
+        let mut last = self.current_self_pos().await;
+        let mut still = 0;
+        for _ in 0..120 {
+            // Idle frames: gravity only integrates on ticks the server is
+            // given input for.
+            self.hold(8, soils_sim::PlayerInput::default()).await;
+            // Wait for the server to actually report back before judging
+            // stillness — see `await_server_ticks`.
+            self.await_server_ticks(4).await;
+            let now = self.current_self_pos().await;
+            still = if (now[1] - last[1]).abs() < 1e-3 { still + 1 } else { 0 };
+            last = now;
+            if still >= 3 {
+                return now;
+            }
+        }
+        panic!("never came to rest while landing (last y {})", last[1]);
     }
 
     /// Send one edit with the next sequence number; returns that `seq`.
@@ -234,6 +541,9 @@ impl Client {
                 self.next_msg().await
                 && let Some(updated) = self.tracker.apply(tick, baseline_tick, &payload)
             {
+                for st in &updated {
+                    self.known.insert(st.id, st.pos);
+                }
                 return updated;
             }
         }
@@ -302,13 +612,13 @@ impl Client {
     /// subscription — chunks stream in after login/moves without a request).
     /// Returns it materialized.
     pub async fn await_chunk(&mut self, pos: [i32; 3]) -> ChunkVolume {
-        let info = self
-            .recv_until(|msg| match msg {
-                ServerMsg::Manifest { chunks } => chunks.into_iter().find(|c| c.pos() == pos),
-                _ => None,
-            })
-            .await;
-        self.materialize(&info)
+        loop {
+            if let Some(info) = self.seen_chunks.get(&pos).cloned() {
+                return self.materialize(&info);
+            }
+            let msg = self.next_msg().await;
+            self.record(&msg);
+        }
     }
 
     /// Drain pushed chunks until every position in `positions` has arrived.
@@ -347,6 +657,130 @@ pub struct CollectedChunks {
     pub payloads: std::collections::HashMap<[i32; 3], Vec<u8>>,
     pub wire_bytes: usize,
     pub edited: usize,
+}
+
+/// Pump a websocket through an optional simulated link.
+///
+/// Each direction gets its own [`NetSim`]. Delay is applied by stamping an
+/// absolute deadline the moment a message is read and sleeping until it in a
+/// separate task, rather than sleeping inline: sleeping in the read loop would
+/// stall the *next* read too, so a 100 ms link fed at 10 ms intervals would
+/// accumulate delay without bound instead of holding steady at 100 ms.
+/// Deadlines from `NetSim::delay` are non-decreasing, so FIFO + `sleep_until`
+/// preserves order exactly.
+fn spawn_link(
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    sim: Option<NetSim>,
+) -> (UnboundedSender<ClientMsg>, UnboundedReceiver<ServerMsg>) {
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (out_tx, mut out_rx) = unbounded_channel::<ClientMsg>();
+    let (in_tx, in_rx) = unbounded_channel::<ServerMsg>();
+    let (mut up, mut down) = sim.map(|s| s.split_direction()).unzip();
+
+    // Uplink: test -> (delay/loss) -> server.
+    let (uq_tx, mut uq_rx) = unbounded_channel::<(tokio::time::Instant, ClientMsg)>();
+    tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            let at = match &mut up {
+                None => tokio::time::Instant::now(),
+                Some(sim) => {
+                    // Inputs re-send the last 3 frames precisely so the link
+                    // may drop them; everything else must arrive.
+                    let lane = match msg {
+                        ClientMsg::Inputs { .. } => Lane::Unreliable,
+                        _ => Lane::Reliable,
+                    };
+                    if sim.should_drop(lane) {
+                        continue;
+                    }
+                    tokio::time::Instant::now() + sim.delay(std::time::Instant::now())
+                }
+            };
+            if uq_tx.send((at, msg)).is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some((at, msg)) = uq_rx.recv().await {
+            tokio::time::sleep_until(at).await;
+            if ws_tx.send(Message::Binary(encode(&msg))).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Downlink: server -> (delay/loss) -> test.
+    let (dq_tx, mut dq_rx) = unbounded_channel::<(tokio::time::Instant, ServerMsg)>();
+    tokio::spawn(async move {
+        while let Some(Ok(frame)) = ws_rx.next().await {
+            let Message::Binary(b) = frame else { continue };
+            let Some(msg) = decode::<ServerMsg>(b.as_ref()) else { continue };
+            let at = match &mut down {
+                None => tokio::time::Instant::now(),
+                Some(sim) => {
+                    // Snapshots are delta-coded against acked baselines, so a
+                    // lost one costs precision, not correctness.
+                    let lane = match msg {
+                        ServerMsg::Snapshot { .. } => Lane::Unreliable,
+                        _ => Lane::Reliable,
+                    };
+                    if sim.should_drop(lane) {
+                        continue;
+                    }
+                    tokio::time::Instant::now() + sim.delay(std::time::Instant::now())
+                }
+            };
+            if dq_tx.send((at, msg)).is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some((at, msg)) = dq_rx.recv().await {
+            tokio::time::sleep_until(at).await;
+            if in_tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    (out_tx, in_rx)
+}
+
+/// Run `body` on its own OS thread with its own current-thread runtime, after
+/// joining as `name`. Real threads (not just tasks) are the point: the server
+/// must hold up when its connections are driven by genuinely parallel clients,
+/// not merely interleaved ones on a single executor.
+pub fn spawn_peer<F, Fut, T>(
+    addr: SocketAddr,
+    name: impl Into<String>,
+    sim: Option<NetSim>,
+    body: F,
+) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce(Client) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+    T: Send + 'static,
+{
+    let name = name.into();
+    std::thread::Builder::new()
+        .name(format!("peer-{name}"))
+        // Debug builds do not shrink async state machines, and a `Client`
+        // future nested through login/stream/settle overflows the 1 MB Windows
+        // default once a hundred of them run at once.
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("peer runtime");
+            rt.block_on(async move {
+                let client = Client::join_with(addr, &name, sim).await;
+                body(client).await
+            })
+        })
+        .expect("spawn peer thread")
 }
 
 /// Poll `cond` until it holds or `timeout` elapses. Used for asynchronous

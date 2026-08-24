@@ -104,15 +104,38 @@ cargo test -p soils-server --test stdb_mirror     # a real edit reaches the data
 | `chunk_blob` | packed `chunk_key` | server, after a successful region write |
 | `chunk_edit` | auto id | server (journal, pruned once folded into a blob) |
 | `player_profile` | **account name** | server, on logout |
-| `presence` | **account name** | server, on login / logout |
+| `presence` | **account name** | server, on login, every 5 s, and on logout |
 | `game_server` | `server_id` (hash of name+bind) | server, every 5 s |
-| `account`, `chat_message` | Identity / auto id | players |
+| `account`, `chat_message` | Identity / auto id | players — **no caller yet** |
 
 `player_profile` and `presence` are keyed by *account*, not `Identity`: players
 authenticate to the game server with a name/password, so the account is what
 durably identifies them. `player_profile.identity` is filled in by the
-`link_identity` reducer once a player's own client authenticates to SpacetimeDB
-directly — only that account's own identity may claim it, and only once.
+`link_identity` reducer, which is **server-only**: nothing in the module can
+verify account ownership, since the name and password live in the game server's
+`auth.rs`. An earlier version let the claiming client call it and checked only
+that any *existing* link matched the sender — vacuous for an unlinked account,
+which is every account's normal state, so any client could claim any account by
+name.
+
+Presence is refreshed on the server's 5 s heartbeat, not just written at login.
+The reaper deletes any presence row older than `LIVENESS_TTL` (30 s), so a
+login-only row would vanish while the player was still connected.
+`heartbeat_presence` refreshes the whole roster in one transaction per world and
+prunes rows for anyone no longer on that server, which also covers unclean
+disconnects sooner than the reaper would.
+
+## What is read back
+
+The server subscribes to `player_profile` and reads it from the SDK's local
+cache, which makes a lookup synchronous — the login path runs inside the tick
+and cannot wait on a round trip. Startup blocks (bounded, non-fatal) for the
+first snapshot: a login racing it would fall back to the world spawn point and
+quietly lose that player's saved position.
+
+Nothing else is subscribed. Chunks are served from region files, which stay
+authoritative, so subscribing to `chunk_blob` would stream the whole stored
+world into memory for no benefit.
 
 ## Gotchas
 
@@ -130,3 +153,19 @@ directly — only that account's own identity may claim it, and only once.
   failure.
 - **`wasm-opt` is optional** but the CLI will nag; installing binaryen shrinks
   and speeds up the published module.
+- **`chunk_blob.version` is the chunk's edit counter, not a clock.** The module
+  rejects a write whose version is below the stored one, so a wall-clock stamp
+  would fail every write after a backwards clock step (NTP, VM resume) — and
+  since the region file is authoritative and the chunk is no longer dirty by
+  then, those edits would never be retried.
+
+## Not wired yet
+
+Tracked in `TODO.md`. Built on both sides and currently unreachable:
+
+- `chunk_edit` + `submit_edits` + `prune_edits` — the journal-then-compact path.
+  Only whole blobs are written today.
+- `account` + `register_account`, and `chat_message` + `send_chat` — the social
+  layer has no consumer, because `soils-client` does not depend on `soils-stdb`.
+- `game_server` is populated on a heartbeat with nothing reading it: there is no
+  server browser yet.

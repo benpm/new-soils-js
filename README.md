@@ -89,6 +89,11 @@ markdown, so the still links to it instead.*
 - **Simulated bad links** — latency, gaussian jitter and loss
   (`SOILS_NETSIM=120,40,0.05`), with loss confined to the lanes built to absorb
   it and delivery kept in order, since the real transports are ordered streams.
+- **SpacetimeDB mirror** (opt-in, `SOILS_STDB_URI`) — the cold, relational half:
+  worlds, edited-chunk blobs, a server registry, player profiles and presence.
+  Region files stay authoritative and the hot path never touches it, so with the
+  variable unset the server behaves exactly as before. A returning player
+  resumes where they logged out. See [`stdb/README.md`](stdb/README.md).
 - **The rest** — login/signup accounts, multiple named worlds (`/warp`),
   LAN discovery, day/night cycle, HUD/console/pause menu.
 
@@ -100,6 +105,8 @@ markdown, so the still links to it instead.*
 | `soils-worldgen` | Block registry, terrain generation, and the CPU oracles (reference mesher, GI math). Pure, benched, unit-tested. |
 | `soils-sim` | The shared simulation: movement/collision, edit rules, L0 light flood, entity registry, pathfinding. Both sides run this — prediction and authority can't drift. |
 | `soils-server` | Headless Bevy ECS app at a 20 Hz tick behind a tokio edge; worldgen waves, lighting jobs, replication, persistence, WS + WebTransport. |
+| `soils-physics` | Shared Avian rigid-body setup: body/collider builders, voxel→collider conversion, the kinematic player proxy. Server and client both run it. |
+| `soils-stdb` | Native SpacetimeDB client: a worker thread plus channels shaped like the transport seam, with checked-in bindings so a normal build needs no CLI. |
 | `soils-client` | The Bevy game: streaming, GPU meshing + indirect draws, L0/GI shading, prediction, interpolation, editing, UI. |
 
 ## Running

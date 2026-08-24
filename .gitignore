@@ -16,3 +16,5 @@ recordings/
 # Generated artifact pages — the videos are inlined as data URIs, so these are
 # tens of megabytes of build output (see scripts/build_*_artifact.py).
 artifact/
+# Obsidian settings are not to be included
+.obsidian/

@@ -164,6 +164,8 @@ Mirroring is strictly opt-in — unset `SOILS_STDB_URI` and the server is exactl
 as it was, region files only. Setup and schema notes in
 [`stdb/README.md`](stdb/README.md).
 
+### Done
+
 - [x] Module: 10 tables + reducers, every world-mutating one gated on a
       registered server identity (TOFU `grant_server` bootstrap).
 - [x] `chunk_key` shared with the server so the two cannot drift.
@@ -172,38 +174,91 @@ as it was, region files only. Setup and schema notes in
 - [x] Mirrored end-to-end and live-verified: world registration, edited-chunk
       blobs (only after a successful disk write), server registry heartbeat,
       logout profile save, login/logout presence.
-- [x] Presence stays alive while a player is online. `mark_present` at login
-      alone was reaped after the module's 30 s TTL, so an online player silently
-      vanished from `presence`; `heartbeat_presence` now refreshes the whole
-      roster in one transaction and prunes anyone who left.
-- [x] `link_identity` is server-only. It was player-callable with a check that
-      was vacuous for an unlinked account, so any client could claim any
-      account by name.
+- [x] Presence stays alive while a player is online (`heartbeat_presence`
+      refreshes the roster in one transaction per world and prunes leavers).
+- [x] `link_identity` is server-only — it was player-callable with a check that
+      was vacuous for an unlinked account.
+- [x] Read path: `player_profile` subscription + synchronous cache lookup;
+      startup waits (bounded) for the first snapshot so a login cannot race it.
+- [x] A returning player resumes where they logged out.
+- [x] `chunk_blob.version` is the chunk's edit counter, not a wall clock.
 
-Remaining, roughly in priority order:
+### Remaining
 
-- [x] Read path: the link keeps a `player_profile` subscription and exposes a
-      synchronous cache lookup, and startup waits (bounded) for the first
-      snapshot so a login cannot race it.
-- [x] `player_profile` is read back — a returning player resumes where they
-      logged out instead of at `world.spawn`.
-- [ ] **Client-side layer is entirely absent** — `soils-client` does not depend
-      on `soils-stdb`. Login/`register_account`, `link_identity`, world list,
-      server browser (`game_server` is populated with nobody reading it) and
-      chat (`send_chat`/`chat_message`) are all dead ends. Largest missing piece.
-- [ ] Decide the fate of the edit journal. `chunk_edit` + `submit_edits` +
-      `prune_edits` are built on both sides and completely unreachable; wiring
-      them depends on the deferred per-chunk edit aggregation above. Either
-      wire them or delete them and the `edits_through` column, which is
-      currently hardcoded to 0.
-- [ ] `Account` was meant to replace `soils-server/src/auth.rs`, which is
-      self-documented as not production-grade. Not started.
+**1. Client-side layer** — the largest gap. `soils-client` does not depend on
+`soils-stdb` at all, so everything the module built for players has no consumer.
+
+- [ ] Add the dependency and a connection that is *optional and non-blocking*:
+      single-player and offline LAN play must not require a database, and a
+      failed connect must never block reaching the game.
+- [ ] Identity: the client authenticates to SpacetimeDB as itself, tells the
+      game server its identity over the game protocol, and the server (which has
+      already checked the password) calls `link_identity`. Needs a new
+      `ClientMsg` variant and a `StdbCmd::LinkIdentity`.
+- [ ] Server browser from `game_server`. The rows are already being written on a
+      5 s heartbeat with nobody reading them. Must coexist with — not replace —
+      the UDP LAN discovery, which still serves local play with no database.
+- [ ] World list from `world`, so the login screen can offer worlds by name
+      rather than requiring `/warp` after joining.
+- [ ] Chat via `send_chat` / `chat_message`, subscribed per world. Decide
+      whether chat is SpacetimeDB-only (players write directly, and a server
+      with no database has no chat) or mirrored through the game server.
+
+**2. Decide the fate of the edit journal.** `chunk_edit` + `submit_edits` +
+`prune_edits` + the matching `StdbCmd`s are built on both sides and completely
+unreachable; only whole blobs are written.
+
+- [ ] Either wire it — which needs the per-chunk edit aggregation deferred in
+      phase 7 above, so a tick's edits batch into one `submit_edits` — or delete
+      it along with `chunk_blob.edits_through`, which is hardcoded to 0.
+- [ ] If wired: re-pin `MAX_EDITS_PER_CALL` (still the provisional 4096) against
+      what the A0 spike in `soils-stdb/tests/blobs.rs` measured. A reducer that
+      exhausts its fuel budget rolls back its *entire* transaction, so the batch
+      size is a correctness bound, not a tuning knob.
+
+**3. Accounts.** `Account` was meant to replace the `DefaultHasher`-and-fixed-salt
+scheme in `soils-server/src/auth.rs`, which is self-documented as not
+production-grade.
+
+- [ ] Move authentication to the module, keeping the game protocol's
+      name/password login working for clients with no database.
+- [ ] Decide what happens to existing `accounts.bin` accounts — migrate, or
+      support both paths.
+
+**4. Smaller fidelity items.**
+
 - [ ] `World.daytime` is written once at world open and never refreshed, so the
-      column is permanently 0.
-- [ ] Re-pin `MAX_EDITS_PER_CALL` (still the provisional 4096) against what the
-      A0 spike in `soils-stdb/tests/blobs.rs` actually measured.
-- [ ] Decide whether the hybrid split still earns its keep, or whether more
-      should move across.
+      column is permanently 0. Either fold it into a periodic upsert or drop it.
+- [ ] Nothing reads `chunk_blob`. Decide whether a server with an empty region
+      directory should rehydrate from the database, which is the case that would
+      make the mirror worth its cost for a fresh deployment.
+- [ ] Reconnection: `StdbLink` connects once. A database restart currently ends
+      the link for the process lifetime.
+
+**5. Decision gate.** Re-evaluate whether the hybrid split still earns its keep
+once the above lands, or whether more should move across.
+
+### Considerations for other work on this list
+
+These are not SpacetimeDB tasks, but they interact with it and will be cheaper
+to get right if the interaction is settled first.
+
+- **Biomes / structures** (Content Expansion below): structure "seeds" placed by
+  blue noise across chunk boundaries are exactly the kind of sparse relational
+  state SpacetimeDB is good at, and a structure spanning chunks needs a claim
+  that survives a server restart. Worth deciding before the generator is written
+  whether seed ownership lives in region files or the database.
+- **Inventory / UI** (above): item stacks are cold relational state and a natural
+  fit for a table, but inventory is also latency-sensitive during play. The
+  likely split is authoritative in `soils-server` during a session, persisted to
+  SpacetimeDB on logout — the same shape as `player_profile`.
+- **Blocks with data-parity to Minecraft**: a larger block registry changes the
+  chunk payload size, and `chunk_blob` payloads above 992 bytes land in
+  SpacetimeDB's content-addressed blob store. Worth re-measuring dedupe rates
+  once palettes get wider.
+- **Networked physics follow-ups**: prop state is hot and per-tick; it should
+  stay out of the database entirely. Anything persisted should be the *resting*
+  state at unload, if at all.
 
 ## The First Content Expansion
 - [ ] Robust, neural texture gen techniques for tile gen with constraints to create complex 3d structures based on inferred structural relationships and probabilies from example. Ingest minecraft builds from the internet, parsing them, converting them to a compressed structure format. These should be editable in a new mode in game: structure design. Structure design should allow the instant output of applying the structure generation algorithm to your structure as input. You should be aple to tweak the ruleset that gets generated from your source map. Use techniques from the internet

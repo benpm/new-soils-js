@@ -68,3 +68,17 @@ See [`example.ts`](./example.ts) for a working script.
   discarded) until you edit and reload it. Memory is capped per instance.
 - `on_init` runs with no live world view — do world setup in `on_tick`.
 - Script-originated edits do **not** re-trigger `on_edit` (no recursion).
+
+## Python tooling in this directory
+
+Unrelated to the AssemblyScript scripts above — these drive recordings and
+artifact pages, and are never loaded by the server.
+
+| Script | Role |
+|---|---|
+| `obs_scene.py` | Writes a dedicated OBS scene collection that captures the game window (one pane per client, for side-by-side comparisons). Leaves existing collections alone. |
+| `obs_record.py` | `ensure` / `start` / `stop` / `status` against OBS over obs-websocket **v5**. Not `muesli/obs-cli`, which is pinned to protocol 4 and cannot talk to OBS 28+. |
+| `build_artifact.py`, `build_props_artifact.py` | Build the demo pages with their videos inlined as data URIs. |
+
+The recordings themselves are produced by the `#[ignore]`d tests
+`soils-server/tests/demo.rs` and `soils-server/tests/props_demo.rs`.

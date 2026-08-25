@@ -173,7 +173,10 @@ pub fn setup_inventory_ui(mut commands: Commands) {
                     TextColor(Color::srgba(0.75, 0.75, 0.78, 0.9)),
                 ));
                 panel.spawn((
-                    Text::new("1-9 choose what to build with  ·  Q throws one while playing"),
+                    // ASCII only: Bevy's default font is a FiraMono subset with
+                    // no U+00B7, so a middot here renders as a tofu box. Caught
+                    // in the demo recording, in the UI the recording was of.
+                    Text::new("1-9 choose what to build with   -   Q throws one while playing"),
                     TextFont { font_size: 12.0.into(), ..default() },
                     TextColor(Color::srgba(0.65, 0.65, 0.68, 0.85)),
                 ));

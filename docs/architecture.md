@@ -368,7 +368,7 @@ row-granular deltas.
   that the table is an ever-growing broadcast — unbounded memory in every
   client's cache and an initial sync that never stops getting slower.
 
-Known limits are tracked in `TODO.md`.
+Known limits are tracked in [`Tasks.md`](../Tasks.md).
 
 ## Testing
 
@@ -433,7 +433,8 @@ Known limits are tracked in `TODO.md`.
 
 ## Known deferrals
 
-Each `TODO.md` checkoff records its own; the ones that shape future work:
+Each `TODO.md` checkoff records its own, and open work is listed in
+[`Tasks.md`](../Tasks.md); the ones that shape future work:
 pooled quad memory / merged draws (the current frame bound), GI 3D-texture +
 DDA marching and default-on, async pathfinding + a flow-field consumer (the
 mob spawner), snapshot MTU packing, wasm client with cert-hash pinning, and

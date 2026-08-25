@@ -5,8 +5,8 @@
 > the drop collects it, placing spends it. What is left is persistence across
 > logout and the radial *shape* of the ring — see [§9](#9-what-is-left).
 > Companion to `plan-game-systems.md` (authority, protocol) and
-> `architecture.md` (current state). Task checkoffs live in `TODO.md` under
-> `## UI`.
+> `architecture.md` (current state). The remaining work is tracked in
+> [`../Tasks.md`](../Tasks.md).
 
 Goal: replace the placeholder nine-slot block hotbar with an actual inventory —
 an item model, a radial selector for tools/weapons/consumables, and a full
@@ -214,6 +214,8 @@ Phase 0 was a refactor of code that already worked, and shipped on its own
 before anything was built on it.
 
 ## 9. What is left
+
+Tracked as tasks in [`../Tasks.md`](../Tasks.md); the reasoning is here.
 
 * **The ring is a strip, not a ring.** It shows exactly what the design asks
   for — every carried tool, weapon and consumable, and no blocks — but laid out

@@ -1,11 +1,11 @@
-# Todo
+# Todo — implementation log
+
+> **Open work lives in [`Tasks.md`](Tasks.md).** This file is the historical
+> record: what shipped in each phase, what was measured, and what was deferred
+> with the reasoning. Checkoffs here are not re-litigated; they are evidence.
 
 <!-- As you complete tasks, add descriptions of your implementation to CHANGELOG.md, and then reference them here, removing their descriptions from here. -->
 <!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. -->
-
-## Design
-- [ ] Organize the information in [concepts.md](concepts.md). Some of it refers to Minecraft, so you should research Minecraft and take extensive notes on its mechanics before interpreting and rewriting concepts.md
-- [ ] Clean up this file, moving the finished tasks into [[CHANGELOG]]
 
 ## UI
 
@@ -46,28 +46,16 @@ radial *shape* of the ring, and a TTL for uncollected drops.
       `BlockDef.faces[1]` is the top face, so block icons need no new art.
       Placeholder tiles for tools/weapons/consumables. Gate: every block in
       `blocks.yaml` resolves to an in-range tile.
-- [~] **Phase 3 — the ring.** Radial selector over the carried
-      tools/weapons/consumables, replacing the 1-9 `Hotbar`; `edit.rs` reads
-      the ring's selection. Retire `Hotbar` and the HUD's `block [n]` line only
-      once the screen lands. Gate: angle-to-index at sector boundaries and the
-      wrap seam; empty ring does not panic.
-      *Partly done:* `Hotbar` is retired and the strip shows exactly the right
-      items, but the layout is horizontal rather than radial and it is not a
-      selector yet — nothing in the game is a tool, so there is nothing to
-      select between. Worth finishing when tools exist and it can be felt.
+- [x] **Phase 3 — the ring** (partial). `Hotbar` retired; the strip shows the
+      carried tools/weapons/consumables. Radial layout and hold-to-open
+      selection deferred until tools exist — tracked in `Tasks.md`.
 - [x] **Phase 4 — inventory screen.** E/I/Tab into `UiMode::Inventory`, slot
       grid, click-to-pick/click-to-place, and the backpack affordance with the
       circled "E". Gate: open/close per binding; moving a stack conserves it;
       closing with a stack in hand returns it rather than voiding it.
-- [~] **Phase 5 — authority and persistence.** Out of scope for the UI work and
-      listed so the phases above do not foreclose it: inventory messages,
-      `PROTOCOL_VERSION` to 4, server-owned during a session, mirrored to
-      SpacetimeDB on logout (same shape as `player_profile` — see the Inventory
-      / UI note under SpacetimeDB → Considerations).
-      *Partly done:* authority shipped — the server owns the inventory and the
-      client only mirrors it, so this is safe in multiplayer. Persistence did
-      not: inventory is session state, and a reconnecting player is re-stocked
-      with the starter kit.
+- [x] **Phase 5 — authority** (persistence deferred). Protocol v4, server-owned
+      inventory, client mirrors only. Persistence across logout is tracked in
+      `Tasks.md`.
 
 ## BigRefactor
 
@@ -220,7 +208,10 @@ what was measured, and what was deferred with rationale. Current-state documenta
 - [x] Client local Avian world: predicts props, rebases to server snapshots past an epsilon; client terrain colliders from `ChunkMap`. Rendered from the predicted transform. (In-game validated.)
 - [x] Kinematic player proxy (server + client) so props are shoved by the player, movement feel unchanged.
 - [x] `spawn`/`cube` console command → `ClientMsg::SpawnCube` (reach-checked, rate-limited); test.
-- [ ] Optional follow-ups: replicate angular velocity (smoother predicted spin); full two-way player via an Avian character controller (ride on / be pushed by props); interpolation plugin for sub-tick smoothing.
+- [x] Angular velocity replicated (`MASK_ANGVEL` / `BodyAngVel`), so the client
+      predicts a prop's spin between snapshots. Remaining follow-ups (two-way
+      player via an Avian character controller, sub-tick interpolation) are in
+      `Tasks.md`.
 
 ## SpacetimeDB (`stdb/soils-module`, `soils-stdb`) — behind `SOILS_STDB_URI`
 
@@ -289,62 +280,12 @@ as it was, region files only. Setup and schema notes in
 
 ### Remaining
 
-- [ ] **`player_profile` is world-readable**, and it holds every player's last
-      known position. It has to be public: the game server reads it from the
-      SDK cache on login, and a private table has no client accessor at all.
-      Row-level security is the fix and is unimplemented in 2.7.1 — revisit
-      when upstream lands it, rather than declaring a filter that does nothing.
-      The same applies to `chunk_blob`, where the exposure is the stored world
-      rather than player locations.
-- [ ] **`send_chat` trusts the caller's `world_id`.** A client can post into
-      any world's channel. The check wants a presence row for the sender's
-      account in that world, which needs the client to know its real
-      `world_id_for(name)` first — today `Social::chat_world` defaults to 0.
-      Worth doing together with per-world chat channels rather than alone.
-- [ ] **Opening a *new* world on login blocks the tick** for up to 5 s while
-      the restore runs. Correct as written — pristine terrain must not be
-      generated over chunks being recovered — but it is a stall a joining
-      player imposes on everyone. Wants world creation to become asynchronous
-      with joins held until it completes, not a shorter timeout.
-- [ ] **A database-only account cannot log in while the database is down.**
-      The local account file is a cache written when *this* server registers or
-      migrates an account, so a player who signed up against another server has
-      no local record here and `local_auth` answers "no such account". Keeping
-      a local verifier for every successful database login would fix it, at the
-      cost of scattering verifiers across every server a player touches —
-      a deliberate trade, not an oversight.
-- [ ] **`grant_server` is trust-on-first-use.** Whoever claims an empty
-      allowlist first becomes a server. Fine for a local database, a race on a
-      public one; seed the first identity from a trusted console instead.
-- [ ] Decision gate: re-evaluate whether the hybrid split still earns its keep,
-      or whether more should move across.
-
-### Considerations for other work on this list
-
-These are not SpacetimeDB tasks, but they interact with it and will be cheaper
-to get right if the interaction is settled first.
-
-- **Biomes / structures** (Content Expansion below): structure "seeds" placed by
-  blue noise across chunk boundaries are exactly the kind of sparse relational
-  state SpacetimeDB is good at, and a structure spanning chunks needs a claim
-  that survives a server restart. Worth deciding before the generator is written
-  whether seed ownership lives in region files or the database.
-- **Inventory / UI** (above): item stacks are cold relational state and a natural
-  fit for a table, but inventory is also latency-sensitive during play. The
-  likely split is authoritative in `soils-server` during a session, persisted to
-  SpacetimeDB on logout — the same shape as `player_profile`.
-- **Blocks with data-parity to Minecraft**: a larger block registry changes the
-  chunk payload size, and `chunk_blob` payloads above 992 bytes land in
-  SpacetimeDB's content-addressed blob store. Worth re-measuring dedupe rates
-  once palettes get wider.
-- **Networked physics follow-ups**: prop state is hot and per-tick; it should
-  stay out of the database entirely. Anything persisted should be the *resting*
-  state at unload, if at all.
+Moved to [`Tasks.md`](Tasks.md) — the known limits of the hybrid split
+(world-readable `player_profile`/`chunk_blob`, `send_chat` world trust, the
+new-world join stall, database-down logins, `grant_server` trust-on-first-use)
+and the cross-cutting notes that shape work elsewhere on the list.
 
 ## The First Content Expansion
-- [ ] Robust, neural texture gen techniques for tile gen with constraints to create complex 3d structures based on inferred structural relationships and probabilies from example. Ingest minecraft builds from the internet, parsing them, converting them to a compressed structure format. These should be editable in a new mode in game: structure design. Structure design should allow the instant output of applying the structure generation algorithm to your structure as input. You should be aple to tweak the ruleset that gets generated from your source map. Use techniques from the internet
-- [ ] Create block types (even with no real properties yet) to match all blocks in this Minecraft texture pack: (https://github.com/Unity-Resource-Pack/Unity-Modded). Use data files from the texture pack to help understand which tiles are what. Also, start creating some amount of data parity with minecraft files. Replace existing textures with these.
-- [ ] Biomes. Biomes should blend into each other oranically. The color of grass should able to shift in a subtle gradient stored a individual block data. Some biomes have tall trees, some short, some none. Some have rain, clouds, storms. Others, a barren moon-like landscape. Biome transitions might be able to have unique structures, such as small, sparse ponds between wetlands and a desert, or a desert and a tundra. Some biomes are more unique and have more extreme boundaries, such as the Crater Forest, where the boundary is a sheer cliff straight into the dense cannopy of massive trees. Make sure structures can be generated at great quantity along chunk boundaries use blue noise to place structure "seeds", which can fully generate as structures and thus "completing" the chunks it resides, only if all chunks it intersects are otherwise fully generated. Generate chunks in 2x2 blocks of chunks to mitigate large structures being incomplete.
-- [x] Upgrade to Bevy 0.19 — headless crates in `bcb1acd`, `soils-client` in
-      `d701362` (2026-08-02, `master`). Workspace is on 0.19.1; Avian 0.7.0
-      tracks it.
+
+Moved to [`Tasks.md`](Tasks.md): Minecraft-parity block types, biomes, and
+neural tile/structure generation.

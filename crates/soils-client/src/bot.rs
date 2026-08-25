@@ -276,34 +276,39 @@ const INV_LAND_BY: f32 = 2.0;
 /// placed and the item that drops from it are both in frame.
 const INV_PITCH: f32 = -0.62;
 
-/// Where the routine steps back to before walking onto the drop. Far enough
-/// that the pickup is a visible walk rather than an instant collection.
-const INV_BACK_OFF: f32 = 1.1;
+/// How long the collecting walk runs. The drop sits about two blocks ahead of
+/// where the camera was aimed, so this only has to cover that.
+const INV_WALK_SECS: f32 = 1.3;
 
 /// The script, as (time, action) beats. Times are seconds since landing.
 ///
 /// Written as data rather than an if-ladder because the *timing* is the whole
 /// design here: each beat has to leave the previous result on screen long
 /// enough to read before the next one changes it.
+///
+/// There is deliberately no step-back beat. The first version retreated before
+/// walking in, on the theory that a longer approach reads better — but walking
+/// backwards is unobstructed while walking forwards runs into the one-block
+/// ledge by the spawn, so the player returned 3 units instead of the 8 it had
+/// given up and stalled short of its own drop. The item is already ahead; the
+/// walk only has to close two blocks.
 const INV_BEATS: &[(f32, InvAction)] = &[
-    (0.5, InvAction::Place),        // a block appears at the crosshair
-    (2.0, InvAction::Break),        // and drops as an item where it stood
-    (3.0, InvAction::StepBack),     // clear of it, so the pickup is legible
-    (5.0, InvAction::WalkOn),       // walk back over it -> collected
-    (8.0, InvAction::OpenScreen),   // the inventory itself, icons and counts
-    (12.0, InvAction::CloseScreen),
-    (13.0, InvAction::Place),       // place what was just collected
-    (15.0, InvAction::Break),
-    (16.5, InvAction::WalkOn),
-    (20.0, InvAction::OpenScreen),
-    (24.0, InvAction::CloseScreen),
+    (0.5, InvAction::Place),      // a block appears at the crosshair
+    (2.5, InvAction::Break),      // and drops as an item where it stood
+    (4.0, InvAction::WalkOn),     // walk onto it -> collected
+    (7.0, InvAction::OpenScreen), // the inventory itself, icons and counts
+    (11.0, InvAction::CloseScreen),
+    (12.0, InvAction::Place),     // place what was just collected
+    (14.0, InvAction::Break),
+    (15.5, InvAction::WalkOn),
+    (18.5, InvAction::OpenScreen),
+    (22.5, InvAction::CloseScreen),
 ];
 
 #[derive(Clone, Copy, PartialEq)]
 enum InvAction {
     Place,
     Break,
-    StepBack,
     WalkOn,
     OpenScreen,
     CloseScreen,
@@ -347,10 +352,17 @@ fn drive_inventory(
     // Movement is a function of where we are in the script, not a one-shot.
     if let Some((at, action)) = current_beat(script_t) {
         let since = script_t - at;
-        match action {
-            InvAction::StepBack if since < INV_BACK_OFF => axes = Vec2::new(0.0, -1.0),
-            InvAction::WalkOn if since < INV_BACK_OFF + 0.35 => axes = Vec2::new(0.0, 1.0),
-            _ => {}
+        if action == InvAction::WalkOn && since < INV_WALK_SECS {
+            axes = Vec2::new(0.0, 1.0);
+            // Hop while closing. The terrain by the spawn is stepped and a
+            // walking player cannot climb a one-block ledge; without this the
+            // approach stalls against the nearest ridge short of the drop,
+            // which is exactly how the third take failed to collect anything.
+            let due = (since / 0.45) as u32 + 1;
+            if due > bot.jumps {
+                bot.jumps = due;
+                pending.input.jump = true;
+            }
         }
     }
     hold(pending, axes, player.yaw);
@@ -386,7 +398,7 @@ pub fn inventory_actions(
             InvAction::Place => actions.click_right = true,
             InvAction::Break => actions.click_left = true,
             InvAction::OpenScreen | InvAction::CloseScreen => actions.toggle_inventory = true,
-            InvAction::StepBack | InvAction::WalkOn => {}
+            InvAction::WalkOn => bot.jumps = 0,
         }
         bot.beat += 1;
     }

@@ -25,11 +25,11 @@ use std::time::Duration;
 
 /// Beats in the bot's inventory script (`INV_BEATS` in `soils-client::bot`).
 /// The take is only worth publishing if every one of them fired.
-const EXPECTED_BEATS: usize = 11;
+const EXPECTED_BEATS: usize = 10;
 
 /// Seconds of routine to record. The bot's script (`SOILS_BOT=inv`) runs about
 /// 24 s after landing, and landing from the spawn height costs ~5 s.
-const TAKE_SECS: &str = "34";
+const TAKE_SECS: &str = "30";
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -139,6 +139,11 @@ fn record_the_inventory_loop() {
     let start = root.join("target/soils-bot-start");
     let _ = std::fs::remove_file(&ready);
     let _ = std::fs::remove_file(&start);
+
+    // Check OBS *before* anything expensive. Streaming the world takes minutes,
+    // and discovering a dead recorder after that wastes the whole run — which is
+    // exactly how the fourth take was lost.
+    obs("status");
 
     let server = common::TestServer::start("invdemo");
     let addr = server.addr();

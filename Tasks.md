@@ -46,6 +46,21 @@ order that hurts:
 
 ## Next — hardening
 
+- [ ] **`forced_misprediction_reconciles_behind_the_wall` is load-sensitive.**
+      It asserts `max_divergence > 0.5` after walking a stale predictor into a
+      carved tunnel. Under full-suite contention it has landed on exactly 0.5
+      and failed; run alone it passes every time. The misprediction *does*
+      happen — the threshold is what is marginal, and 0.5 is an arbitrary
+      "half a block" rather than anything the scenario guarantees.
+      Two candidate fixes, neither of them lowering the bar: drive the walk
+      phase until the server is measurably N blocks ahead instead of for a
+      fixed 150 ticks, or measure divergence relative to the walk distance
+      actually achieved. Do **not** weaken the assertion to make a suite green
+      — see `docs/dev/debug.md` on tests that pass without testing anything.
+      Note this got closer to the edge when breaking a block started spawning
+      a dropped item: that test breaks 27 of them, so it now replicates and
+      steps 27 extra entities during the measurement.
+
 - [ ] **Opening a *new* world on login blocks the tick** for up to 5 s while the
       restore runs. Correct as written — pristine terrain must not be generated
       over chunks being recovered — but it is a stall one joining player imposes

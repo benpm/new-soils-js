@@ -2,7 +2,6 @@
 //! the JS pause menu: adjust load radius and toggle ambient occlusion and fog.
 
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::gi::GiSettings;
 use crate::player::Streaming;
@@ -201,20 +200,23 @@ fn labelled_button(
         });
 }
 
-/// Show the menu while the cursor is released, hide it while grabbed.
+/// Show the menu in [`UiMode::Menu`], hide it otherwise.
+///
+/// This used to key off the cursor being released, which made "pointer free"
+/// and "paused" the same thing and left no room for any other UI.
 pub fn pause_menu_visibility(
-    cursor: Query<&CursorOptions, With<PrimaryWindow>>,
+    mode: Res<State<crate::ui::UiMode>>,
     mut menu: Query<&mut Visibility, With<PauseMenu>>,
 ) {
-    let Ok(cursor) = cursor.single() else { return };
-    let Ok(mut vis) = menu.single_mut() else { return };
-    let want = if cursor.grab_mode == CursorGrabMode::None {
+    let want = if *mode.get() == crate::ui::UiMode::Menu {
         Visibility::Inherited
     } else {
         Visibility::Hidden
     };
-    if *vis != want {
-        *vis = want;
+    for mut vis in &mut menu {
+        if *vis != want {
+            *vis = want;
+        }
     }
 }
 
@@ -225,7 +227,7 @@ pub fn pause_menu_buttons(
     mut toggles: ResMut<RenderToggles>,
     mut sp: ResMut<Singleplayer>,
     mut gi: ResMut<GiSettings>,
-    mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
+    mut next_mode: ResMut<NextState<crate::ui::UiMode>>,
 ) {
     for (interaction, kind) in &buttons {
         if *interaction != Interaction::Pressed {
@@ -251,10 +253,8 @@ pub fn pause_menu_buttons(
                 sp.toggle_discovery();
             }
             MenuButton::Resume => {
-                if let Ok(mut cursor) = cursor.single_mut() {
-                    cursor.grab_mode = CursorGrabMode::Locked;
-                    cursor.visible = false;
-                }
+                // The mode owns the cursor; `ui::apply_cursor_mode` re-grabs.
+                next_mode.set(crate::ui::UiMode::Playing);
             }
         }
     }
@@ -339,6 +339,8 @@ mod tests {
         .expect("embedded server");
 
         let mut app = App::new();
+        app.add_plugins(bevy::state::app::StatesPlugin);
+        app.init_state::<crate::ui::UiMode>();
         app.insert_resource(Streaming::default());
         app.insert_resource(RenderToggles::default());
         app.insert_resource(GiSettings::default());

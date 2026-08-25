@@ -46,6 +46,13 @@ use crate::{BUNDLE_SIZE, DAY_SECONDS, DEFAULT_WORLD, NewConn, WAVE_SIZE, world_s
 /// Broadcast actor positions every Nth tick (matches the old 100 ms cadence
 /// at 20 Hz).
 const ACTOR_EVERY_N_TICKS: u64 = 2;
+/// Ticks before a freshly broken block's item can be collected. Short enough to
+/// feel instant while mining, long enough that the item actually exists in the
+/// world and a test can observe it there.
+const PICKUP_DELAY_TICKS: u64 = 10;
+/// The same gate for a deliberately thrown item, long enough that the thrower
+/// walks clear instead of instantly re-collecting it.
+const THROW_DELAY_TICKS: u64 = 30;
 /// Cap on chunk waves a single client can be served from cache/disk in one
 /// tick, bounding per-tick disk I/O. Generation is not capped this way — it
 /// runs off-thread and only adoption/serialization lands on the tick.
@@ -134,6 +141,15 @@ pub(crate) struct Client {
     subs: HashSet<IVec3>,
     /// Queued streaming jobs (subscription enters), served FIFO in waves.
     jobs: VecDeque<ChunkJob>,
+    /// The authoritative inventory. The client mirrors it for the UI but never
+    /// decides it — a client-owned inventory is a client-owned item spawner.
+    ///
+    /// Session-scoped: not yet persisted across logout. See `docs/plan-ui.md`.
+    inventory: soils_sim::Inventory,
+    /// Set when `inventory` changed this tick; drained into one
+    /// `InventoryUpdate` at the end of the drain rather than one per change,
+    /// so a single break/place cannot send several.
+    inventory_dirty: bool,
 }
 
 /// Server-allocated replication id; never reused within a session.
@@ -155,6 +171,14 @@ struct InWorld(String);
 #[derive(Component)]
 #[allow(dead_code)] // client id: read when gameplay systems need "who did it"
 struct PlayerControlled(u16);
+/// An item lying in the world. The stack rides on `EntitySpawn` rather than the
+/// per-tick snapshot because it never changes once dropped.
+#[derive(Component, Clone, Copy)]
+struct DroppedItem(soils_sim::ItemStack);
+/// Server tick before which this item cannot be picked up. Without it a player
+/// re-collects what they just dropped on the same tick they dropped it.
+#[derive(Component, Clone, Copy)]
+struct PickupAfter(u64);
 /// Marks an Avian rigid-body entity whose transform is driven by the physics
 /// world (not `soils-sim`). Its `SimState`/`BodyRot` are mirrored from Avian
 /// each tick so the existing replication path ships them.
@@ -293,6 +317,7 @@ struct AuthPool {
     tx: crossbeam_channel::Sender<AuthReq>,
     /// Highest number of checks ever running at once. Only read by tests, but
     /// it is the one property worth asserting and cannot be seen from outside.
+    #[cfg_attr(not(test), allow(dead_code))]
     peak: Arc<AtomicUsize>,
 }
 
@@ -555,10 +580,13 @@ pub(crate) fn run_app(
             accept_connections,
             drain_inboxes,
             wander_critters,
+            fall_dropped_items,
+            pick_up_items,
             // Scripts run after inputs/AI mutate state and before
             // replication, so their edits/spawns replicate the same tick.
             run_scripts,
             pump_chunk_jobs,
+            flush_inventory_updates,
             replicate_entities,
             tick_clock,
             stdb_heartbeat,
@@ -887,6 +915,8 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 center: None,
                 subs: HashSet::new(),
                 jobs: VecDeque::new(),
+                inventory: soils_sim::Inventory::default(),
+                inventory_dirty: false,
             },
         );
     }
@@ -919,6 +949,7 @@ fn send_world_subscribed(clients: &Clients, world: &str, except: u16, cpos: IVec
 #[allow(clippy::too_many_arguments)]
 fn drain_inboxes(
     time: Res<Time>,
+    ticks: Res<TickCount>,
     mut commands: Commands,
     mut clients: ResMut<Clients>,
     mut worlds: ResMut<Worlds>,
@@ -1078,6 +1109,7 @@ fn drain_inboxes(
                             spawn = [p.x, p.y, p.z];
                             println!("login: {name} resumed at {spawn:?}");
                         }
+                        let starter_kit = starter_block_ids(&world.registry);
                         let c = clients.0.get_mut(&id).unwrap();
                         // (Re)spawn this connection's player entity.
                         if let Some(old) = c.entity.take() {
@@ -1111,6 +1143,12 @@ fn drain_inboxes(
                             worldgen,
                             daytime: clock.daytime,
                         });
+                        // Seed the client's mirror. Flushed with everything
+                        // else at the end of the tick.
+                        c.inventory_dirty = true;
+                        if c.inventory.is_empty() {
+                            stock_starter_blocks(&mut c.inventory, &starter_kit);
+                        }
                         // Server-driven streaming: subscribing around the spawn
                         // point starts the join burst — no client request.
                         c.center = Some(chunk_at(spawn));
@@ -1211,13 +1249,50 @@ fn drain_inboxes(
                     c.edit_tokens -= 1.0;
                 }
                 let target = IVec3::new(pos[0], pos[1], pos[2]);
+                // Placing spends an item. Check stock *before* touching the
+                // world so a refused placement costs nothing and needs no
+                // refund path.
+                let placing = value != 0;
+                let stocked = !placing
+                    || clients.0[&id].inventory.count_of(soils_sim::ItemKind::Block(value)) > 0;
                 let world = worlds.get_or_create(&world_name);
                 let valid = rate_ok
+                    && stocked
                     && soils_sim::validate_edit(eye, target, value, &world.registry)
                     && world.ensure_resident(soils_protocol::chunk_of(target));
                 // Read the pre-edit block so scripts see the real `old` value.
                 let old = if valid { world.voxel(target) } else { 0 };
                 let applied = valid && world.edit(pos[0], pos[1], pos[2], value);
+                if applied {
+                    let c = clients.0.get_mut(&id).unwrap();
+                    if placing {
+                        let spent = c.inventory.remove(soils_sim::ItemKind::Block(value), 1);
+                        debug_assert_eq!(spent, 1, "stock was checked above");
+                        c.inventory_dirty = true;
+                    } else if old != 0 {
+                        // Breaking yields the block as an item, dropped where it
+                        // stood rather than teleported into the inventory: the
+                        // player may be out of room, and a drop the world can see
+                        // is the honest outcome either way.
+                        let net = next_net.0;
+                        next_net.0 += 1;
+                        commands.spawn((
+                            NetId(net),
+                            Kind(soils_sim::KIND_DROPPED_ITEM),
+                            SimState(soils_sim::PlayerState {
+                                pos: target.as_vec3() + Vec3::splat(0.5),
+                                flying: false,
+                                ..Default::default()
+                            }),
+                            Yaw(0.0),
+                            InWorld(world_name.clone()),
+                            DroppedItem(soils_sim::ItemStack::one(soils_sim::ItemKind::Block(
+                                old,
+                            ))),
+                            PickupAfter(ticks.0 + PICKUP_DELAY_TICKS),
+                        ));
+                    }
+                }
                 let c = &clients.0[&id];
                 if applied {
                     let _ = c.outbox.send(ServerMsg::EditAccepted { seq, pos, value });
@@ -1241,6 +1316,43 @@ fn drain_inboxes(
                 } else {
                     let _ = c.outbox.send(ServerMsg::EditRejected { seq });
                 }
+            }
+            ClientMsg::MoveItem { from, to } => {
+                let c = clients.0.get_mut(&id).unwrap();
+                if !c.authenticated {
+                    continue;
+                }
+                if c.inventory.move_slot(from as usize, to as usize) {
+                    c.inventory_dirty = true;
+                }
+            }
+            ClientMsg::DropItem { slot, count } => {
+                let c = clients.0.get_mut(&id).unwrap();
+                if !c.authenticated {
+                    continue;
+                }
+                let world_name = c.world.clone();
+                let Some(stack) = c.inventory.split(slot as usize, count) else { continue };
+                c.inventory_dirty = true;
+                let Some(entity) = c.entity else { continue };
+                let Ok((sim, yaw, ..)) = sims.get(entity) else { continue };
+                // Thrown a little ahead of the player so it does not land
+                // inside them and read as "nothing happened".
+                let facing = Vec3::new(-yaw.0.sin(), 0.0, -yaw.0.cos());
+                let pos = sim.0.pos - Vec3::Y * (soils_sim::EYE_TO_FEET * 0.5) + facing;
+                let net = next_net.0;
+                next_net.0 += 1;
+                commands.spawn((
+                    NetId(net),
+                    Kind(soils_sim::KIND_DROPPED_ITEM),
+                    SimState(soils_sim::PlayerState { pos, flying: false, ..Default::default() }),
+                    Yaw(0.0),
+                    InWorld(world_name),
+                    DroppedItem(stack),
+                    // Long enough that the thrower walks clear before it is
+                    // collectable; otherwise dropping is a no-op.
+                    PickupAfter(ticks.0 + THROW_DELAY_TICKS),
+                ));
             }
             ClientMsg::Inputs { ack_tick, frames } => {
                 // Server authority: the client sends *inputs*, the server
@@ -1798,6 +1910,115 @@ fn wander_critters(
     }
 }
 
+
+/// Blocks a new player starts with, by name. This keeps building available
+/// from the first second, as it was before placement cost anything; mining
+/// refills it. Names that a world's registry does not define are skipped.
+const STARTER_BLOCKS: [&str; 9] = [
+    "Cobblestone", "Moss Stone", "Stone Bricks", "Dirt", "Grass", "Wooden Crate", "Clay Pot",
+    "Log", "Leaves",
+];
+/// How many of each. One full stack apiece.
+const STARTER_COUNT: u16 = 64;
+
+fn starter_block_ids(registry: &soils_worldgen::BlockRegistry) -> Vec<u8> {
+    STARTER_BLOCKS.iter().filter_map(|n| registry.id_of(n)).collect()
+}
+
+fn stock_starter_blocks(inventory: &mut soils_sim::Inventory, ids: &[u8]) {
+    for &id in ids {
+        let Some(stack) = soils_sim::ItemStack::new(soils_sim::ItemKind::Block(id), STARTER_COUNT)
+        else {
+            continue;
+        };
+        // A default inventory has room for all nine; a remainder here would
+        // only mean someone shrank it, and dropping it is right.
+        let _ = inventory.insert(stack);
+    }
+}
+
+/// Dropped items fall under gravity and rest on the first solid voxel beneath
+/// them. Without this, breaking a block above your head leaves its item hanging
+/// permanently out of reach.
+fn fall_dropped_items(
+    mut worlds: ResMut<Worlds>,
+    mut items: Query<(&InWorld, &mut SimState), With<DroppedItem>>,
+) {
+    let dt = 1.0 / soils_sim::SERVER_TICK_HZ as f32;
+    for (in_world, mut sim) in &mut items {
+        let Some(world) = worlds.map.get_mut(&in_world.0) else { continue };
+        // Terrain not resident: hold position. Falling against a world that
+        // reads as all-air would sink the item through the floor forever.
+        if !world.has_chunk(chunk_at(sim.0.pos.to_array())) {
+            continue;
+        }
+        let (mut pos, mut vel) = (sim.0.pos, sim.0.vel);
+        soils_sim::fall_item(&mut pos, &mut vel, dt, &|v: IVec3| world.voxel(v));
+        sim.0.pos = pos;
+        sim.0.vel = vel;
+    }
+}
+
+/// Collect dropped items a player has walked into.
+fn pick_up_items(
+    ticks: Res<TickCount>,
+    mut commands: Commands,
+    mut clients: ResMut<Clients>,
+    mut items: Query<(Entity, &InWorld, &SimState, &mut DroppedItem, &PickupAfter)>,
+    players: Query<&SimState, With<PlayerControlled>>,
+) {
+    // An item despawned by one player is still visible to the next client in
+    // this loop — `commands` is deferred — so claims are tracked here. Without
+    // it, two players standing on one item each receive a copy.
+    let mut claimed: HashSet<Entity> = HashSet::new();
+    for c in clients.0.values_mut() {
+        if !c.authenticated {
+            continue;
+        }
+        let Some(player) = c.entity else { continue };
+        let Ok(psim) = players.get(player) else { continue };
+        let eye = psim.0.pos;
+        let feet_y = eye.y - soils_sim::EYE_TO_FEET;
+        for (entity, in_world, sim, mut item, after) in &mut items {
+            if claimed.contains(&entity) || in_world.0 != c.world || ticks.0 < after.0 {
+                continue;
+            }
+            // Nearest point on the player's vertical extent, so an item at the
+            // feet and one at head height are equally collectable.
+            let near = Vec3::new(eye.x, sim.0.pos.y.clamp(feet_y, eye.y), eye.z);
+            if sim.0.pos.distance(near) > soils_sim::PICKUP_RADIUS {
+                continue;
+            }
+            match c.inventory.insert(item.0) {
+                None => {
+                    claimed.insert(entity);
+                    commands.entity(entity).despawn();
+                    c.inventory_dirty = true;
+                }
+                // Partial: the inventory took what it could and the rest stays
+                // on the ground rather than evaporating.
+                Some(left) if left.count < item.0.count => {
+                    item.0 = left;
+                    c.inventory_dirty = true;
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// Push the authoritative inventory to every client whose copy changed this
+/// tick. One message per tick per client, however many changes landed.
+fn flush_inventory_updates(mut clients: ResMut<Clients>) {
+    for c in clients.0.values_mut() {
+        if !std::mem::take(&mut c.inventory_dirty) || !c.authenticated {
+            continue;
+        }
+        let slots = c.inventory.slots().to_vec();
+        let _ = c.outbox.send(ServerMsg::InventoryUpdate { slots });
+    }
+}
+
 /// Chunk coordinate containing a voxel.
 fn chunk_of(v: IVec3) -> IVec3 {
     IVec3::new(v.x >> CHUNK_BIT, v.y >> CHUNK_BIT, v.z >> CHUNK_BIT)
@@ -1821,6 +2042,7 @@ fn replicate_entities(
         &Yaw,
         Option<&BodyRot>,
         Option<&BodyAngVel>,
+        Option<&DroppedItem>,
     )>,
 ) {
     struct Snap {
@@ -1828,9 +2050,10 @@ fn replicate_entities(
         kind: u16,
         pos: [f32; 3],
         quant: QuantState,
+        item: Option<soils_sim::ItemStack>,
     }
     let mut by_col: HashMap<(&str, IVec2), Vec<Snap>> = HashMap::new();
-    for (net, kind, in_world, sim, yaw, body_rot, body_angvel) in &entities {
+    for (net, kind, in_world, sim, yaw, body_rot, body_angvel, dropped) in &entities {
         let col = IVec2::new(
             (sim.0.pos.x.floor() as i32) >> CHUNK_BIT,
             (sim.0.pos.z.floor() as i32) >> CHUNK_BIT,
@@ -1852,6 +2075,7 @@ fn replicate_entities(
             kind: kind.0,
             pos,
             quant,
+            item: dropped.map(|d| d.0),
         });
     }
     let tick = ticks.0 as u32;
@@ -1881,6 +2105,7 @@ fn replicate_entities(
                         id: snap.net,
                         kind: snap.kind,
                         pos: snap.pos,
+                        item: snap.item,
                     });
                 }
             }

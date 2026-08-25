@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 /// [`GenParams`] (worldgen v2 is bit-exact CPU==GPU); only edited chunks ship
 /// payloads. `Chunk`/`Bundle` replaced by `Manifest`; `Edit` broadcasts are
 /// interest-filtered.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// v4: inventory. `EntitySpawn` carries an item payload for dropped items,
+/// and the server pushes the authoritative inventory with `InventoryUpdate`.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Bincode configuration used on both ends. Standard little-endian, variable
 /// int encoding.
@@ -93,6 +96,13 @@ pub enum ClientMsg {
     /// position, and rate-limited like edits. Spawns a replicated
     /// `KIND_PHYSICS_CUBE` on success.
     SpawnCube { pos: [f32; 3] },
+    /// Move a whole slot onto another, or swap them. Slot indices are into the
+    /// server's authoritative inventory; out-of-range is ignored rather than
+    /// an error, since a stale UI can send one after a server-side change.
+    MoveItem { from: u16, to: u16 },
+    /// Throw `count` items out of `slot` into the world in front of the
+    /// player. `count` is clamped to what the slot holds.
+    DropItem { slot: u16, count: u16 },
 }
 
 /// One fixed tick of movement input (see `soils_sim::pack_input`). `seq`
@@ -135,7 +145,13 @@ pub enum ServerMsg {
     EditRejected { seq: u32 },
     /// An entity entered this client's interest set: create it. Kind ids
     /// index the shared `entities.yaml` registry.
-    EntitySpawn { id: u32, kind: u16, pos: [f32; 3] },
+    EntitySpawn {
+        id: u32,
+        kind: u16,
+        pos: [f32; 3],
+        /// What a dropped item is carrying. `None` for every other kind.
+        item: Option<crate::ItemStack>,
+    },
     /// An entity left interest (or despawned): drop it.
     EntityDespawn { id: u32 },
     /// Per-tick delta snapshot of entities in interest (see
@@ -151,6 +167,14 @@ pub enum ServerMsg {
     /// `spawn`, rebuild its generator from `gen` (each named world has its own
     /// seed), and re-stream the new world.
     Warp { spawn: [f32; 3], worldgen: GenParams, daytime: f32 },
+    /// The player's authoritative inventory, whole. Sent on join and after
+    /// every change (pickup, placement, drop, slot move).
+    ///
+    /// Whole rather than delta on purpose: an inventory is ~27 slots, it
+    /// changes at human speed rather than per tick, and a lost delta would
+    /// desync the UI from the authority with no way to notice. Snapshot deltas
+    /// exist because entity state is per-tick and large; this is neither.
+    InventoryUpdate { slots: Vec<Option<crate::ItemStack>> },
 }
 
 /// One chunk within a [`ServerMsg::Manifest`].

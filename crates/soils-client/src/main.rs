@@ -20,6 +20,7 @@ mod gpu_gen;
 mod gpu_light;
 mod gpu_mesh;
 mod hud;
+mod inventory;
 mod light;
 mod login;
 mod material;
@@ -33,6 +34,7 @@ mod world_draw;
 mod server_msg;
 mod singleplayer;
 mod social;
+mod ui;
 
 use bevy::app::{RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::camera::{Exposure, Hdr};
@@ -115,7 +117,10 @@ fn main() {
     .insert_resource(Blocks(default_registry()))
     .insert_resource(LocalPlayer::default())
     .insert_resource(ActorMap::default())
-    .insert_resource(edit::Hotbar::default())
+    .init_state::<ui::UiMode>()
+    .init_resource::<inventory::PlayerInventory>()
+    .init_resource::<inventory::DroppedItemVisuals>()
+    .init_resource::<ui::CursorFreed>()
     .insert_resource(pause::RenderToggles::default())
     .init_resource::<console::Console>()
     .init_resource::<login::LoginState>()
@@ -149,6 +154,8 @@ fn main() {
             hud::setup_hud,
             pause::setup_pause_menu,
             console::setup_console,
+            inventory::setup_item_icons,
+            inventory::setup_inventory_ui,
             login::setup_login,
             selftest_login,
         ),
@@ -240,11 +247,16 @@ fn main() {
         Update,
         (
             player::track_streaming,
-            player::cursor_toggle,
-            edit::selection_highlight,
+            ui::track_alt,
+            ui::ui_hotkeys.run_if(console::console_closed),
+            ui::click_to_grab,
+            ui::apply_cursor_mode,
             console::console_input,
             console::update_console_text,
             hud::update_hud,
+            inventory::update_inventory_visibility,
+            inventory::rebuild_inventory_ui,
+            inventory::inventory_slot_clicks,
             pause::pause_menu_visibility,
             pause::pause_menu_buttons,
             pause::update_pause_labels,
@@ -254,7 +266,14 @@ fn main() {
     // Direct player input: authenticated and console closed.
     .add_systems(
         Update,
-        (player::mouse_look, edit::edit_blocks, edit::hotbar_select)
+        (
+            player::mouse_look,
+            edit::edit_blocks,
+            edit::selection_highlight,
+            inventory::select_placeable,
+            inventory::drop_selected,
+        )
+            .run_if(ui::playing)
             .run_if(console::console_closed)
             .run_if(login::logged_in),
     )

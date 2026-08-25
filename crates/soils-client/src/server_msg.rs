@@ -114,6 +114,8 @@ pub struct EntitySpawned {
     pub id: u32,
     pub kind: u16,
     pub pos: [f32; 3],
+    /// What a dropped item carries; `None` for every other kind.
+    pub item: Option<soils_protocol::ItemStack>,
 }
 
 #[derive(Message)]
@@ -208,6 +210,7 @@ pub fn route_server_messages(
     net: Res<NetClient>,
     mut epoch: ResMut<WorldEpoch>,
     mut tracker: ResMut<SnapTracker>,
+    mut inventory: ResMut<crate::inventory::PlayerInventory>,
     mut cgen: ResMut<ClientGen>,
     mut dir_msgs: MessageWriter<DirMsg>,
     mut edits: MessageWriter<EditReceived>,
@@ -265,8 +268,13 @@ pub fn route_server_messages(
             ServerMsg::EditRejected { seq } => {
                 edit_acks.write(EditAck { seq, accepted: false });
             }
-            ServerMsg::EntitySpawn { id, kind, pos } => {
-                spawns.write(EntitySpawned { id, kind, pos });
+            ServerMsg::EntitySpawn { id, kind, pos, item } => {
+                spawns.write(EntitySpawned { id, kind, pos, item });
+            }
+            ServerMsg::InventoryUpdate { slots } => {
+                // Wholesale replacement: this message *is* the authority, so a
+                // merge would only be a way to keep stale slots alive.
+                inventory.slots = slots;
             }
             ServerMsg::Snapshot { tick, baseline_tick, last_input_seq, payload } => {
                 if let Some(updated) = tracker.0.apply(tick, baseline_tick, &payload) {
@@ -419,6 +427,11 @@ pub fn apply_entity_spawns(
     mut map: ResMut<ActorMap>,
     assets: Res<ActorAssets>,
     physics: Res<crate::physics::ClientPhysics>,
+    icons: Option<Res<crate::inventory::ItemIcons>>,
+    registry: Res<crate::chunk::Blocks>,
+    mut drops: ResMut<crate::inventory::DroppedItemVisuals>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     for msg in reader.read() {
         if msg.id == local.self_entity || map.map.contains_key(&msg.id) {
@@ -430,13 +443,30 @@ pub fn apply_entity_spawns(
             continue;
         }
         let target = Vec3::from_array(msg.pos);
-        let Some(kind) = assets.kinds.get(msg.kind as usize) else { continue };
+        // A dropped item wears the texture of the block it came from. Its
+        // position is the item's centre, not an eye, so it takes no body drop.
+        let visual = match (msg.kind == soils_sim::KIND_DROPPED_ITEM, msg.item, &icons) {
+            (true, Some(stack), Some(icons)) => {
+                let tile = icons.tile(stack.kind, &registry.0) as u8;
+                let (mesh, material) =
+                    drops.get(tile, &icons.atlas, &mut meshes, &mut materials);
+                Some((mesh, material, 0.0))
+            }
+            _ => None,
+        };
+        let (mesh, material, drop) = match visual {
+            Some(v) => v,
+            None => {
+                let Some(kind) = assets.kinds.get(msg.kind as usize) else { continue };
+                (kind.mesh.clone(), kind.material.clone(), kind.body_drop)
+            }
+        };
         let entity = commands
             .spawn((
                 Actor::new(msg.kind, 0, target),
-                Mesh3d(kind.mesh.clone()),
-                MeshMaterial3d(kind.material.clone()),
-                Transform::from_translation(target - Vec3::Y * kind.body_drop),
+                Mesh3d(mesh),
+                MeshMaterial3d(material),
+                Transform::from_translation(target - Vec3::Y * drop),
             ))
             .id();
         map.map.insert(msg.id, entity);

@@ -13,7 +13,6 @@
 
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use std::collections::VecDeque;
 
 use soils_protocol::{CHUNK_BIT, ClientMsg, InputFrame};
@@ -300,36 +299,12 @@ pub fn sync_camera(
     transform.translation = player.prev_pos.lerp(player.sim.pos, fixed_time.overstep_fraction());
 }
 
-/// Toggle pointer-lock with Escape; re-grab on click.
-pub fn cursor_toggle(
-    keys: Res<ButtonInput<KeyCode>>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
-) {
-    let Ok(mut cursor) = cursor.single_mut() else { return };
-    if keys.just_pressed(KeyCode::Escape) {
-        cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
-    } else if buttons.just_pressed(MouseButton::Left)
-        || buttons.just_pressed(MouseButton::Right)
-    {
-        cursor.grab_mode = CursorGrabMode::Locked;
-        cursor.visible = false;
-    }
-}
 
 /// Mouse-look: accumulate yaw/pitch and orient the camera.
 pub fn mouse_look(
     motion: Res<AccumulatedMouseMotion>,
-    cursor: Query<&CursorOptions, With<PrimaryWindow>>,
     mut query: Query<(&mut Player, &mut Transform)>,
 ) {
-    // Only look while the cursor is grabbed.
-    if let Ok(cursor) = cursor.single() {
-        if cursor.grab_mode == CursorGrabMode::None {
-            return;
-        }
-    }
     let delta = motion.delta;
     if delta == Vec2::ZERO {
         return;

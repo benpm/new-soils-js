@@ -135,6 +135,10 @@ pub struct Client {
     /// message it sees; so does this one.
     seen_chunks: std::collections::HashMap<[i32; 3], ChunkInfo>,
     seen_spawns: std::collections::HashMap<u32, u16>,
+    /// Item carried by each dropped-item entity, from its `EntitySpawn`.
+    seen_items: std::collections::HashMap<u32, soils_sim::ItemStack>,
+    /// Mirror of the server's authoritative inventory, from `InventoryUpdate`.
+    inventory: Vec<Option<soils_sim::ItemStack>>,
     /// Last position seen for each entity.
     ///
     /// Snapshots are deltas: an entity that has not moved is simply absent, so
@@ -175,6 +179,8 @@ impl Client {
             held: std::collections::VecDeque::new(),
             seen_chunks: std::collections::HashMap::new(),
             seen_spawns: std::collections::HashMap::new(),
+            seen_items: std::collections::HashMap::new(),
+            inventory: Vec::new(),
             known: std::collections::HashMap::new(),
             id: 0,
             self_entity: 0,
@@ -253,8 +259,11 @@ impl Client {
                     self.seen_chunks.insert(info.pos(), info.clone());
                 }
             }
-            ServerMsg::EntitySpawn { id, kind, pos } => {
+            ServerMsg::EntitySpawn { id, kind, pos, item } => {
                 self.seen_spawns.insert(*id, *kind);
+                if let Some(item) = item {
+                    self.seen_items.insert(*id, *item);
+                }
                 // Seed the position table from the spawn message. A body that
                 // settles never appears in a delta snapshot again, so without
                 // this its position would only ever be knowable if it happened
@@ -263,10 +272,51 @@ impl Client {
             }
             ServerMsg::EntityDespawn { id } => {
                 self.seen_spawns.remove(id);
+                self.seen_items.remove(id);
                 self.known.remove(id);
             }
+            ServerMsg::InventoryUpdate { slots } => self.inventory = slots.clone(),
             _ => {}
         }
+    }
+
+    /// NetIds of every dropped item the server has announced, with contents.
+    pub fn items_seen(&self) -> Vec<(u32, soils_sim::ItemStack)> {
+        let mut v: Vec<_> = self.seen_items.iter().map(|(id, s)| (*id, *s)).collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
+    }
+
+    /// The last inventory the server pushed.
+    pub fn inventory(&self) -> &[Option<soils_sim::ItemStack>] {
+        &self.inventory
+    }
+
+    /// How many of `kind` the server says we hold.
+    pub fn count_of(&self, kind: soils_sim::ItemKind) -> u32 {
+        self.inventory.iter().flatten().filter(|s| s.kind == kind).map(|s| s.count as u32).sum()
+    }
+
+    /// Pump messages until `cond` holds over the mirrored inventory, or the
+    /// deadline passes. Returns whether it held.
+    pub async fn await_inventory(
+        &mut self,
+        mut cond: impl FnMut(&Self) -> bool,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while !cond(self) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            let Ok(msg) = tokio::time::timeout(Duration::from_millis(500), self.inbox.recv()).await
+            else {
+                continue;
+            };
+            let Some(msg) = msg else { return false };
+            self.record(&msg);
+        }
+        true
     }
 
     /// Last known position of an entity, without waiting for it to move.

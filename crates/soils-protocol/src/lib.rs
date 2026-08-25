@@ -6,6 +6,7 @@ pub mod chunk_codec;
 pub mod chunk_key;
 pub mod coords;
 pub mod discovery;
+pub mod item;
 pub mod messages;
 pub mod netsim;
 pub mod rng;
@@ -19,6 +20,7 @@ pub use coords::{
     voxel_index,
 };
 pub use discovery::{DISCOVERY_PORT, PROBE_MAGIC, ServerInfo};
+pub use item::{ItemKind, ItemStack};
 pub use messages::{
     ChunkInfo, ClientMsg, EntityState, GenParams, InputFrame, PROTOCOL_VERSION, ServerMsg, decode,
     encode,

@@ -4,7 +4,6 @@
 //! `soils-sim`, shared with (future) server-side validation.
 
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use soils_protocol::{CHUNK_BIT, CHUNK_CLIP, ClientMsg};
 use soils_sim::{raycast_voxel, validate_edit};
 
@@ -29,61 +28,14 @@ impl PendingEdits {
     }
 }
 
-/// The nine right-click placement blocks, selectable with the 1-9 keys. Mirrors
-/// the JS hotbar (`player.placeBlock`), which defaults to "Stone Bricks".
-#[derive(Resource)]
-pub struct Hotbar {
-    pub slots: [&'static str; 9],
-    pub selected: usize,
-}
-
-impl Default for Hotbar {
-    fn default() -> Self {
-        Self {
-            slots: [
-                "Cobblestone", "Moss Stone", "Stone Bricks", "Dirt", "Grass",
-                "Wooden Crate", "Clay Pot", "Log", "Leaves",
-            ],
-            selected: 2, // Stone Bricks
-        }
-    }
-}
-
-impl Hotbar {
-    /// Name of the currently selected block.
-    pub fn block_name(&self) -> &'static str {
-        self.slots[self.selected]
-    }
-}
-
-/// Select the right-click block with the 1-9 number keys (JS hotbar).
-pub fn hotbar_select(keys: Res<ButtonInput<KeyCode>>, mut hotbar: ResMut<Hotbar>) {
-    const DIGITS: [KeyCode; 9] = [
-        KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4,
-        KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8,
-        KeyCode::Digit9,
-    ];
-    for (i, key) in DIGITS.iter().enumerate() {
-        if keys.just_pressed(*key) {
-            hotbar.selected = i;
-        }
-    }
-}
-
 /// Draw a wireframe box around the voxel the player is aiming at (JS selection
-/// box). Runs every frame while the cursor is grabbed.
+/// box). Runs while `UiMode::Playing` holds the cursor.
 pub fn selection_highlight(
-    cursor: Query<&CursorOptions, With<PrimaryWindow>>,
     map: Res<ChunkMap>,
     chunks: Query<&VoxelChunk>,
     camera: Query<&Transform, With<Player>>,
     mut gizmos: Gizmos,
 ) {
-    if let Ok(cursor) = cursor.single() {
-        if cursor.grab_mode == CursorGrabMode::None {
-            return;
-        }
-    }
     let Ok(transform) = camera.single() else { return };
     let dir = (transform.rotation * Vec3::NEG_Z).normalize();
     let sampler = |v: IVec3| voxel_at(&map, &chunks, v);
@@ -119,10 +71,9 @@ pub fn setup_crosshair(mut commands: Commands) {
 #[allow(clippy::too_many_arguments)]
 pub fn edit_blocks(
     buttons: Res<ButtonInput<MouseButton>>,
-    cursor: Query<&CursorOptions, With<PrimaryWindow>>,
     net: Res<NetClient>,
     registry: Res<Blocks>,
-    hotbar: Res<Hotbar>,
+    inventory: Res<crate::inventory::PlayerInventory>,
     map: Res<ChunkMap>,
     mut directory: ResMut<crate::demand::ChunkDirectory>,
     mut chunks: Query<&mut VoxelChunk>,
@@ -133,12 +84,6 @@ pub fn edit_blocks(
     mut pending: ResMut<PendingEdits>,
     camera: Query<&Transform, With<Player>>,
 ) {
-    // Ignore clicks while the cursor isn't grabbed (UI/escape state).
-    if let Ok(cursor) = cursor.single() {
-        if cursor.grab_mode == CursorGrabMode::None {
-            return;
-        }
-    }
     let break_block = buttons.just_pressed(MouseButton::Left);
     let place_block = buttons.just_pressed(MouseButton::Right);
     if !break_block && !place_block {
@@ -159,7 +104,10 @@ pub fn edit_blocks(
     let (target, value) = if break_block {
         (hit.voxel, 0u8)
     } else {
-        let id = registry.0.id_of(hotbar.block_name()).unwrap_or(1);
+        // Placement spends an item, so what is placeable is whatever the
+        // server says we hold. With nothing selected there is nothing to
+        // place; the server would refuse it anyway.
+        let Some(id) = inventory.selected_block() else { return };
         (hit.prev, id)
     };
 

@@ -8,13 +8,16 @@
 //! the voxel lookup is abstracted.
 
 pub mod entities;
+pub mod item;
 pub mod light;
 pub mod nav;
 
 pub use entities::{
-    ENTITIES_YAML, EntityDef, EntityRegistry, KIND_CRITTER, KIND_PHYSICS_CUBE, KIND_PLAYER,
+    ENTITIES_YAML, EntityDef, EntityRegistry, KIND_CRITTER, KIND_DROPPED_ITEM,
+    KIND_PHYSICS_CUBE, KIND_PLAYER,
     default_entity_registry,
 };
+pub use item::{ITEM_HALF, Inventory, ItemKind, ItemStack, PICKUP_RADIUS, fall_item};
 
 use glam::{IVec3, Quat, Vec2, Vec3};
 use soils_worldgen::BlockRegistry;

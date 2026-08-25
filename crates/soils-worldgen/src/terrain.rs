@@ -89,8 +89,11 @@ impl TerrainGen {
 
     /// A generator driven by a designed graph (e.g. loaded from a
     /// `*.terrain.ron` produced by `soils-terrainlab`). Panics on a graph that
-    /// fails [`TerrainGraph::validate`] — game paths validate at load time.
+    /// fails [`TerrainGraph::deterministic`] — game paths validate at load
+    /// time, and chunk generation must be bit-exact on every CPU and GPU
+    /// (design-only f32 noise nodes are rejected here).
     pub fn from_graph(graph: TerrainGraph, seed: u32, world_type: WorldType) -> Self {
+        graph.deterministic().expect("graph checked deterministic before from_graph");
         let compiled = graph.compile().expect("graph validated before from_graph");
         Self { seed, graph, compiled, world_type }
     }
@@ -101,7 +104,7 @@ impl TerrainGen {
         let graph: TerrainGraph = ron::from_str(&text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         graph
-            .validate()
+            .deterministic()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(Self::from_graph(graph, seed, world_type))
     }

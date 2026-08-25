@@ -195,6 +195,10 @@ CI renders release screenshots headlessly under Mesa lavapipe
 - [`docs/perf-report.md`](docs/perf-report.md) — the optimization arc with
   measurements (23 MB → 498 KB joins, 849 → 187 ms bursts, the GI rework),
   methodology, and the ranked list of what to optimize next.
+- [`docs/dev/build-times.md`](docs/dev/build-times.md) — what makes this
+  workspace slow to build, what was changed, and the measurements.
+- [`docs/dev/repo-hygiene.md`](docs/dev/repo-hygiene.md) — which branches were
+  retired and why, what was salvaged from them, and the read/ignore rules.
 - [`docs/dev/debug.md`](docs/dev/debug.md) — a symptom-first debugging field
   guide: the traps this codebase actually produced (the asset-path void, delta
   snapshots that omit unchanged entities, barrier deadlocks that hide the real

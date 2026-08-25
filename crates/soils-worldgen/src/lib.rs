@@ -6,6 +6,7 @@ pub mod fx;
 pub mod graph;
 pub mod greedy;
 pub mod noise_det;
+pub mod noise_modes;
 pub mod radiance;
 pub mod terrain;
 pub mod wgsl;
@@ -29,7 +30,7 @@ pub fn graph_hash(graph: &TerrainGraph) -> u64 {
 }
 
 pub use blocks::{BlockDef, BlockRegistry};
-pub use graph::{CaveParams, ColumnSample, CompiledGraph, NodeKind, TerrainGraph};
+pub use graph::{CaveParams, ColumnSample, CompiledGraph, NodeKind, NoiseMode, TerrainGraph};
 pub use greedy::{MeshData, greedy_mesh};
 pub use radiance::{LightGrid, Radiance};
 pub use terrain::{TerrainGen, WorldType};

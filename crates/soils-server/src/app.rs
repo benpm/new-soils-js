@@ -1204,7 +1204,15 @@ fn drain_inboxes(
                 let world_name = c.world.clone();
                 let eye = match c.entity.and_then(|e| sims.get(e).ok()) {
                     Some((sim, ..)) => sim.0.pos,
-                    None => continue,
+                    // Not yet queryable (the post-login pre-flush window).
+                    // Answer anyway: every Edit gets exactly one response, and
+                    // an edit has no snapshot echo to self-heal from, so a
+                    // dropped one leaves the client waiting forever. No token
+                    // is spent — the edit could not be evaluated.
+                    None => {
+                        let _ = c.outbox.send(ServerMsg::EditRejected { seq });
+                        continue;
+                    }
                 };
                 let rate_ok = c.edit_tokens >= 1.0;
                 if rate_ok {

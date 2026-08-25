@@ -9,3 +9,10 @@ serde = { workspace = true }
 bincode = { version = "2", features = ["serde"] }
 glam = { workspace = true }
 lz4_flex = "0.11"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "codec"
+harness = false

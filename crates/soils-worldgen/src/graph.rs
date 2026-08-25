@@ -38,6 +38,79 @@ pub enum Axis {
     Z,
 }
 
+/// A base noise function for [`NodeKind::Noise`] / [`NodeKind::FractalNoise`],
+/// ported from `noise.glsl` to both the CPU ([`crate::noise_modes`]) and the
+/// GPU (`crate::wgsl`'s `HASH_NOISE`) so the two agree. All output signed
+/// `~[-1, 1]`. Design-tool only for now: f32-evaluated, so not bit-exact
+/// across devices — see [`TerrainGraph::deterministic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoiseMode {
+    /// Smooth value noise (Hermite-interpolated cell hashes).
+    Value,
+    /// Classic Perlin gradient noise.
+    Perlin,
+    /// Hash-based simplex noise.
+    Simplex,
+    /// Cellular / Worley F1 (nearest feature-point distance).
+    Worley,
+    /// Smooth Voronoi; `param` is edge smoothness (default 0.5).
+    Voronoi,
+    /// Sinusoidal Gabor-like bands.
+    Gabor,
+    /// Impact-crater field (rings).
+    Crater,
+    /// Fibrous derivative noise.
+    Wool,
+    /// Domain-warped fBm (rock/stone look).
+    Stone,
+    /// Rotated wavelet noise; `param` is phase (default 0). NB: discontinuous
+    /// (per-cell random rotation), so its GPU 3D preview can differ from the CPU
+    /// map by ~0.02 at cell boundaries — the only mode not held to GPU/CPU parity.
+    Wavelet,
+}
+
+impl NoiseMode {
+    /// All modes, in palette/dropdown order.
+    pub const ALL: [NoiseMode; 10] = [
+        NoiseMode::Value,
+        NoiseMode::Perlin,
+        NoiseMode::Simplex,
+        NoiseMode::Worley,
+        NoiseMode::Voronoi,
+        NoiseMode::Gabor,
+        NoiseMode::Crater,
+        NoiseMode::Wool,
+        NoiseMode::Stone,
+        NoiseMode::Wavelet,
+    ];
+
+    /// Human-readable name (used for node titles and the editor dropdown).
+    pub fn label(self) -> &'static str {
+        match self {
+            NoiseMode::Value => "Value",
+            NoiseMode::Perlin => "Perlin",
+            NoiseMode::Simplex => "Simplex",
+            NoiseMode::Worley => "Worley",
+            NoiseMode::Voronoi => "Voronoi",
+            NoiseMode::Gabor => "Gabor",
+            NoiseMode::Crater => "Crater",
+            NoiseMode::Wool => "Wool",
+            NoiseMode::Stone => "Stone",
+            NoiseMode::Wavelet => "Wavelet",
+        }
+    }
+
+    /// Label for the mode-specific `param` slider, or `None` if the mode ignores
+    /// `param`.
+    pub fn param_label(self) -> Option<&'static str> {
+        match self {
+            NoiseMode::Voronoi => Some("smoothness"),
+            NoiseMode::Wavelet => Some("phase"),
+            _ => None,
+        }
+    }
+}
+
 /// An input slot on a node: either wired to another node's output, or left
 /// unwired (in which case `default` is used). Keeping a literal fallback on
 /// every slot means a partially-wired graph still evaluates, which matches how
@@ -78,6 +151,21 @@ pub enum NodeKind {
     /// Fractal Brownian motion: `octaves` of simplex with `lacunarity` /
     /// `persistence`, the node the original `terrain.rs` hand-unrolled.
     Fbm { octaves: u32, base_frequency: f32, lacunarity: f32, persistence: f32, offset: [f32; 2] },
+    /// One of the [`NoiseMode`] functions sampled at `(x, z) * frequency +
+    /// offset`. `param` is the mode's extra scalar (Voronoi smoothness / Wavelet
+    /// phase), ignored by other modes.
+    Noise { mode: NoiseMode, frequency: f32, offset: [f32; 2], param: f32 },
+    /// Fractal stack of a [`NoiseMode`] — like [`NodeKind::Fbm`] but over any
+    /// ported mode.
+    FractalNoise {
+        mode: NoiseMode,
+        octaves: u32,
+        base_frequency: f32,
+        lacunarity: f32,
+        persistence: f32,
+        offset: [f32; 2],
+        param: f32,
+    },
     /// Radial island falloff: `1` near `center`, decaying to `0` past `radius`
     /// with the given `exponent`. Multiply into height for islands.
     RadialFalloff { center: [f32; 2], radius: f32, exponent: f32 },
@@ -206,6 +294,34 @@ impl TerrainGraph {
         Ok(())
     }
 
+    /// The stricter gate for the *game* path (chunk generation, `graph_hash`
+    /// negotiation): everything [`Self::validate`] checks, plus rejection of
+    /// node kinds whose evaluation is not **bit-exact** across CPU and GPU.
+    /// The ported f32 hash-noise nodes ([`NodeKind::Noise`] /
+    /// [`NodeKind::FractalNoise`]) compile and preview fine in the design tool
+    /// — CPU and GPU agree to within f32 rounding — but worldgen v2 requires
+    /// byte-identical chunks from a seed on every device, which f32 cannot
+    /// promise (drivers may contract/reassociate float math). They stay
+    /// design-only until they get a fixed-point port.
+    pub fn deterministic(&self) -> Result<(), String> {
+        self.validate()?;
+        for node in &self.nodes {
+            if matches!(node.kind, NodeKind::Noise { .. } | NodeKind::FractalNoise { .. }) {
+                return Err(format!(
+                    "node {} ({}) is a design-tool noise node: f32-evaluated, not bit-exact \
+                     across devices, so it cannot drive deterministic worldgen v2 yet",
+                    node.id,
+                    match &node.kind {
+                        NodeKind::Noise { mode, .. } => format!("Noise/{}", mode.label()),
+                        NodeKind::FractalNoise { mode, .. } => format!("Fractal/{}", mode.label()),
+                        _ => unreachable!(),
+                    }
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Quantize parameters to Q16.16 and precompute inverses: the form both
     /// the CPU evaluator and the WGSL codegen consume. Call once, evaluate
     /// many. Errors on graphs that fail [`Self::validate`] (e.g. node kinds
@@ -235,6 +351,33 @@ impl TerrainGraph {
                         off: [fx::from_f32(offset[0]), fx::from_f32(offset[1])],
                     }
                 }
+                // Ported hash noise evaluates in f32 (see `noise_modes`):
+                // deterministic on one platform and ULP-close CPU vs GPU, but
+                // NOT bit-exact — [`Self::deterministic`] rejects these kinds
+                // for the game path; they are design-tool nodes for now.
+                NodeKind::Noise { mode, frequency, offset, param } => CKind::NoiseF32 {
+                    mode: *mode,
+                    freq: *frequency,
+                    off: *offset,
+                    param: *param,
+                },
+                NodeKind::FractalNoise {
+                    mode,
+                    octaves,
+                    base_frequency,
+                    lacunarity,
+                    persistence,
+                    offset,
+                    param,
+                } => CKind::FractalF32 {
+                    mode: *mode,
+                    octaves: *octaves,
+                    base: *base_frequency,
+                    lac: *lacunarity,
+                    per: *persistence,
+                    off: *offset,
+                    param: *param,
+                },
                 NodeKind::Abs { input } => CKind::Abs(cin(input)),
                 NodeKind::ScaleBias { input, scale, bias } => {
                     CKind::ScaleBias(cin(input), fx::from_f32(*scale), fx::from_f32(*bias))
@@ -375,6 +518,11 @@ pub enum CKind {
     Coord(Axis),
     Noise2 { freq: Fx, off: [Fx; 2] },
     Fbm { octaves: u32, base: Fx, lac: Fx, per: Fx, off: [Fx; 2] },
+    /// Ported hash noise, evaluated in **f32** (params stay f32 and cross the
+    /// GPU boundary as raw bit patterns): design-tool only, ULP-close but not
+    /// bit-exact across devices — see [`TerrainGraph::deterministic`].
+    NoiseF32 { mode: NoiseMode, freq: f32, off: [f32; 2], param: f32 },
+    FractalF32 { mode: NoiseMode, octaves: u32, base: f32, lac: f32, per: f32, off: [f32; 2], param: f32 },
     Abs(CIn),
     ScaleBias(CIn, Fx, Fx),
     Clamp(CIn, Fx, Fx),
@@ -487,6 +635,27 @@ impl CompiledGraph {
                 }
                 sum
             }
+            // f32 boundary: convert the Q16.16 coordinate exactly (power-of-two
+            // divide), evaluate the ported mode, quantize the result back. The
+            // WGSL mirror does the same conversions — see `wgsl::HASH_NOISE`.
+            CKind::NoiseF32 { mode, freq, off, param } => {
+                let px = fx::to_f32(x) * freq + off[0];
+                let pz = fx::to_f32(z) * freq + off[1];
+                fx::from_f32(crate::noise_modes::eval_mode(*mode, px, pz, *param))
+            }
+            CKind::FractalF32 { mode, octaves, base, lac, per, off, param } => {
+                let (xf, zf) = (fx::to_f32(x), fx::to_f32(z));
+                let mut f = *base;
+                let mut amp = 1.0f32;
+                let mut sum = 0.0f32;
+                for _ in 0..*octaves {
+                    sum += amp
+                        * crate::noise_modes::eval_mode(*mode, xf * f + off[0], zf * f + off[1], *param);
+                    f *= lac;
+                    amp *= per;
+                }
+                fx::from_f32(sum)
+            }
             CKind::Abs(i) => fx::abs(ev(*i, x, z)),
             CKind::ScaleBias(i, s, b) => fx::mul(ev(*i, x, z), *s).wrapping_add(*b),
             CKind::Clamp(i, lo, hi) => fx::clamp(ev(*i, x, z), *lo, *hi),
@@ -521,6 +690,8 @@ impl NodeKind {
             | NodeKind::Coord { .. }
             | NodeKind::Simplex2 { .. }
             | NodeKind::Fbm { .. }
+            | NodeKind::Noise { .. }
+            | NodeKind::FractalNoise { .. }
             | NodeKind::RadialFalloff { .. } => vec![],
             NodeKind::Abs { input }
             | NodeKind::ScaleBias { input, .. }

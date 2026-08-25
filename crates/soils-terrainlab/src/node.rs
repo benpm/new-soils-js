@@ -4,7 +4,7 @@
 //! [`In`](soils_worldgen::graph::In) slots by [`crate::graph_model`].
 
 use serde::{Deserialize, Serialize};
-use soils_worldgen::graph::Axis;
+use soils_worldgen::graph::{Axis, NoiseMode};
 
 /// Which terrain channel an [`EditorNode::Output`] sink drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +35,16 @@ pub enum EditorNode {
     Coord { axis: Axis },
     Simplex2 { frequency: f32, offset: [f32; 2] },
     Fbm { octaves: u32, base_frequency: f32, lacunarity: f32, persistence: f32, offset: [f32; 2] },
+    Noise { mode: NoiseMode, frequency: f32, offset: [f32; 2], param: f32 },
+    FractalNoise {
+        mode: NoiseMode,
+        octaves: u32,
+        base_frequency: f32,
+        lacunarity: f32,
+        persistence: f32,
+        offset: [f32; 2],
+        param: f32,
+    },
     RadialFalloff { center: [f32; 2], radius: f32, exponent: f32 },
     // unary
     Abs,
@@ -62,6 +72,10 @@ impl EditorNode {
             EditorNode::Coord { .. } => "Coord",
             EditorNode::Simplex2 { .. } => "Simplex2",
             EditorNode::Fbm { .. } => "Multi-scale Noise",
+            EditorNode::Noise { mode, .. } => return format!("Noise ({})", mode.label()),
+            EditorNode::FractalNoise { mode, .. } => {
+                return format!("Fractal ({})", mode.label());
+            }
             EditorNode::RadialFalloff { .. } => "Radial Falloff",
             EditorNode::Abs => "Abs",
             EditorNode::ScaleBias { .. } => "Scale + Bias",
@@ -87,6 +101,8 @@ impl EditorNode {
             | EditorNode::Coord { .. }
             | EditorNode::Simplex2 { .. }
             | EditorNode::Fbm { .. }
+            | EditorNode::Noise { .. }
+            | EditorNode::FractalNoise { .. }
             | EditorNode::RadialFalloff { .. } => 0,
             EditorNode::Abs
             | EditorNode::ScaleBias { .. }
@@ -141,6 +157,21 @@ impl EditorNode {
                 offset: [0.0, 0.0],
             },
             EditorNode::Simplex2 { frequency: 0.01, offset: [0.0, 0.0] },
+            EditorNode::Noise {
+                mode: NoiseMode::Perlin,
+                frequency: 0.01,
+                offset: [0.0, 0.0],
+                param: 0.5,
+            },
+            EditorNode::FractalNoise {
+                mode: NoiseMode::Worley,
+                octaves: 4,
+                base_frequency: 0.01,
+                lacunarity: 2.0,
+                persistence: 0.5,
+                offset: [0.0, 0.0],
+                param: 0.5,
+            },
             EditorNode::RadialFalloff { center: [0.0, 0.0], radius: 512.0, exponent: 2.0 },
             EditorNode::Coord { axis: Axis::X },
             EditorNode::Constant { value: 0.0 },

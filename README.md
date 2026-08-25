@@ -1,4 +1,5 @@
-# new-soils (Rust + Bevy port)
+# New Soils
+[CHANGELOG](CHANGELOG.md) - [TODO](TODO.md) - [docs](docs/README.md)
 
 A Rust/[Bevy](https://bevyengine.org) port of the original Node.js + Three.js
 `new-soils` voxel sandbox — now a **client/server multiplayer game** with a

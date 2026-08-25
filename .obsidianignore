@@ -1,0 +1,15 @@
+node_modules
+crates
+scripts
+target
+data
+artifact
+data
+.github
+.git
+.claude
+scripts
+stdb
+target
+*.toml
+*.json

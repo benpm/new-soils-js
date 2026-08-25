@@ -69,15 +69,11 @@ fn subscribe_all(conn: &DbConnection) {
 /// small-palette tiers.
 fn bulky_chunk(salt: u8) -> ChunkVolume {
     let mut v = ChunkVolume::empty();
-    let mut state: u32 = 0x9E37_79B9 ^ (salt as u32);
+    let mut rng = soils_protocol::Rng::new(0x9E37_79B9 ^ salt as u64);
     for z in 0..32 {
         for y in 0..32 {
             for x in 0..32 {
-                // xorshift keeps this deterministic per salt but incompressible.
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                v.set(x, y, z, (state % 128) as u8);
+                v.set(x, y, z, rng.below(128) as u8);
             }
         }
     }

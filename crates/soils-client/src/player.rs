@@ -214,7 +214,6 @@ pub fn reconcile_self(
     mut ring: ResMut<InputRing>,
     map: Res<ChunkMap>,
     chunks: Query<&VoxelChunk>,
-    actors: Query<&crate::actor::Actor>,
     mut query: Query<&mut Player>,
 ) {
     for msg in reader.read() {

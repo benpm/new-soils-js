@@ -8,6 +8,7 @@ pub mod coords;
 pub mod discovery;
 pub mod messages;
 pub mod netsim;
+pub mod rng;
 pub mod snapshot;
 pub mod voxel;
 
@@ -22,6 +23,7 @@ pub use messages::{
     ChunkInfo, ClientMsg, EntityState, GenParams, InputFrame, PROTOCOL_VERSION, ServerMsg, decode,
     encode,
 };
+pub use rng::{Rng, mix};
 pub use snapshot::{QuantState, SnapshotTracker, encode_snapshot};
 pub use voxel::{AIR, ChunkVolume, Voxel};
 

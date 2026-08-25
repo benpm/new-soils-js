@@ -221,6 +221,15 @@ impl StdbLink {
         true
     }
 
+    /// Whether a session is live right now.
+    ///
+    /// Distinct from [`Self::accounts_ready`], which reports the *subscription
+    /// cache*. Reducer calls need only the connection, so anything that goes
+    /// through a reducer — password verification above all — should ask this.
+    pub fn is_connected(&self) -> bool {
+        self.conn.read().is_ok_and(|g| g.as_ref().is_some_and(|c| c.is_active()))
+    }
+
     /// Whether the first subscription snapshot has arrived.
     ///
     /// Authentication no longer depends on this — passwords are checked by a
@@ -309,19 +318,25 @@ impl StdbLink {
     /// stay authoritative, so subscribing permanently would hold the whole
     /// stored world in memory to answer a question asked once at startup.
     ///
-    /// Returns what arrived before `timeout`. A partial restore is still better
-    /// than none — the missing chunks regenerate as pristine terrain, which is
-    /// exactly what they would have done with no database at all.
+    /// Returns what arrived, and whether the subscription actually applied
+    /// within `timeout`.
+    ///
+    /// That second flag matters: an empty result means "this world has no
+    /// stored edits" or "the database did not answer", and those call for
+    /// opposite responses. Restoring nothing because the query timed out
+    /// leaves the server generating pristine terrain over chunks that do
+    /// exist, and the next flush overwrites them — a silent world reset. The
+    /// caller has to be able to tell the difference.
     pub fn fetch_world_chunks(
         &self,
         world_id: u16,
         timeout: std::time::Duration,
-    ) -> Vec<ChunkBlob> {
+    ) -> (Vec<ChunkBlob>, bool) {
         let guard = match self.conn.read() {
             Ok(g) => g,
-            Err(_) => return Vec::new(),
+            Err(_) => return (Vec::new(), false),
         };
-        let Some(conn) = guard.as_ref() else { return Vec::new() };
+        let Some(conn) = guard.as_ref() else { return (Vec::new(), false) };
 
         let applied = Arc::new(AtomicBool::new(false));
         let flag = applied.clone();
@@ -345,7 +360,7 @@ impl StdbLink {
         if let Err(e) = handle.unsubscribe() {
             eprintln!("stdb: could not release the chunk restore subscription: {e}");
         }
-        rows
+        (rows, applied.load(Ordering::Relaxed))
     }
 
     /// Live game servers, most populated first.

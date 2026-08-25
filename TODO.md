@@ -4,7 +4,8 @@
 <!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. -->
 
 ## Design
-- Organize the information in [concepts.md](concepts.md). Some of it refers to Minecraft, so you should research Minecraft and take extensive notes on its mechanics before interpreting and rewriting concepts.md
+- [ ] Organize the information in [concepts.md](concepts.md). Some of it refers to Minecraft, so you should research Minecraft and take extensive notes on its mechanics before interpreting and rewriting concepts.md
+- [ ] Clean up this file, moving the finished tasks into [[CHANGELOG]]
 
 ## UI
 
@@ -178,7 +179,7 @@ as it was, region files only. Setup and schema notes in
 
 ### Done
 
-- [x] Module: 10 tables + reducers, every world-mutating one gated on a
+- [x] Module: 9 tables + reducers, every world-mutating one gated on a
       registered server identity (TOFU `grant_server` bootstrap).
 - [x] `chunk_key` shared with the server so the two cannot drift.
 - [x] `soils-stdb`: worker thread + channels shaped like the existing `NewConn`
@@ -252,6 +253,13 @@ as it was, region files only. Setup and schema notes in
       generated over chunks being recovered — but it is a stall a joining
       player imposes on everyone. Wants world creation to become asynchronous
       with joins held until it completes, not a shorter timeout.
+- [ ] **A database-only account cannot log in while the database is down.**
+      The local account file is a cache written when *this* server registers or
+      migrates an account, so a player who signed up against another server has
+      no local record here and `local_auth` answers "no such account". Keeping
+      a local verifier for every successful database login would fix it, at the
+      cost of scattering verifiers across every server a player touches —
+      a deliberate trade, not an oversight.
 - [ ] **`grant_server` is trust-on-first-use.** Whoever claims an empty
       allowlist first becomes a server. Fine for a local database, a race on a
       public one; seed the first identity from a trusted console instead.

@@ -25,6 +25,15 @@ pub const MAX_CHAT_LEN: usize = 512;
 /// Minimum gap between two chat messages from one account.
 pub const CHAT_COOLDOWN: Duration = Duration::from_millis(500);
 
+/// How long a chat message is kept.
+///
+/// Chat is `public` and every client subscribes to all of it, so without
+/// retention the table is an ever-growing broadcast: unbounded memory in each
+/// client's cache, and an initial sync that gets slower for the whole life of
+/// the database. An hour is well past the point where a backlog is interesting
+/// and well short of the point where it is expensive.
+pub const CHAT_TTL: Duration = Duration::from_secs(60 * 60);
+
 /// A `game_server` or `presence` row older than this is considered dead and
 /// reaped. Must comfortably exceed the server's heartbeat period.
 pub const LIVENESS_TTL: Duration = Duration::from_secs(30);
@@ -266,7 +275,8 @@ pub fn on_disconnect(ctx: &ReducerContext) -> Result<(), String> {
 }
 
 /// Drop game servers and presences whose heartbeat has gone stale, so a
-/// crashed server does not linger in the browser forever.
+/// crashed server does not linger in the browser forever, and expire chat
+/// past [`CHAT_TTL`].
 #[reducer]
 pub fn reap_stale(ctx: &ReducerContext, _timer: ReapTimer) -> Result<(), String> {
     let cutoff = ctx.timestamp - LIVENESS_TTL;
@@ -291,6 +301,17 @@ pub fn reap_stale(ctx: &ReducerContext, _timer: ReapTimer) -> Result<(), String>
         ctx.db.presence().iter().filter(|p| p.heartbeat < cutoff).map(|p| p.account).collect();
     for account in stale {
         ctx.db.presence().account().delete(&account);
+    }
+
+    let expired: Vec<u64> = ctx
+        .db
+        .chat_message()
+        .iter()
+        .filter(|m| m.at < ctx.timestamp - CHAT_TTL)
+        .map(|m| m.id)
+        .collect();
+    for id in expired {
+        ctx.db.chat_message().id().delete(id);
     }
     Ok(())
 }
@@ -547,16 +568,9 @@ pub fn put_chunk_blob(
     }
 
     if let Some(mut blob) = ctx.db.chunk_blob().chunk_key().find(key) {
-        // Late or duplicated flushes must not roll the chunk backwards — but
-        // only a flush from the *same* server process is comparable. The
-        // version is an in-memory edit counter that resets to 0 every time the
-        // chunk is evicted and reloaded from disk, so a version check spanning
-        // epochs would reject every edit made after a reload until the counter
-        // climbed past its own previous high-water mark: silently, permanently,
-        // and in the ordinary case of a long-lived world.
-        //
-        // Across epochs the later caller is by definition the current owner of
-        // the world, so its write wins.
+        // Late or duplicated flushes must not roll the chunk backwards, but
+        // versions only compare within one epoch: across epochs the later
+        // caller owns the world and wins. See docs/dev/debug.md.
         if writer_epoch == blob.writer_epoch && version < blob.version {
             return Err(format!(
                 "stale write: incoming version {version} < stored {} (epoch {writer_epoch})",
@@ -773,11 +787,11 @@ pub fn link_identity(
         .name()
         .find(&account)
         .ok_or_else(|| format!("no such account '{account}'"))?;
-    if let Some(existing) = row.identity
-        && existing != identity
-    {
-        return Err(format!("account '{account}' is already linked to another identity"));
-    }
+    // Rebinding is allowed, and has to be: an anonymous client is issued a
+    // fresh identity whenever it reconnects, and refusing the new one left the
+    // account bound to a dead identity and the player unable to chat for good.
+    // `require_server` is what makes this safe — only the game server calls
+    // this, and only for a connection it has already authenticated.
     row.identity = Some(identity);
     ctx.db.account().name().update(row);
     // Mirror onto the profile when there is one, so a profile row alone is

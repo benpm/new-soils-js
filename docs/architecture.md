@@ -232,7 +232,7 @@ concrete grounds: no threads for rayon worldgen, no nested WASM for the
 scripting engine, nowhere to host Avian, no unreliable lane, and no
 row-granular deltas.
 
-- **Module** (`stdb/soils-module`): 10 tables. Every world-mutating reducer is
+- **Module** (`stdb/soils-module`): 9 tables. Every world-mutating reducer is
   gated on `require_server`, an allowlist bootstrapped trust-on-first-use, so
   players cannot write world state even though the tables are `public` for
   future client reads. Excluded from the workspace, so no `wasm32` toolchain is
@@ -290,9 +290,17 @@ row-granular deltas.
   network round trip on top. Checked inline, a flood of logins froze the whole
   server for close to two seconds — a denial of service needing no bandwidth to
   mount, and measured as exactly that before the fix. A `Login` now dispatches
-  to a worker and returns; the verdict comes back through `AuthQueue`, which
-  replays the message so the join path stays in one place. One check per
-  connection at a time.
+  to a bounded worker pool and returns; the verdict comes back through
+  `AuthQueue`, which replays the message so the join path stays in one place.
+  One check per connection at a time, and a fixed cap across the server — a
+  thread per pending login would have traded the tick stall for an unbounded
+  memory amplifier, since each Argon2 costs ~19 MB. Past the backlog a login
+  is refused with a retryable error rather than queued behind a flood. The
+  database path is gated on the *connection* being live, not on the
+  subscription cache: verification is a reducer call and needs no cache, and
+  waiting for one would route every login during a reconnect backoff to the
+  local file, where a database-only account reads as "no such account".
+  See `docs/dev/server-tick.md`.
 - **The client** (`soils-client/src/social.rs`) subscribes to the *lobby* half —
   `game_server`, `world`, `chat_message` — and not to `chunk_blob`, which would
   stream the stored world into a player's memory. (`account` is private, so it
@@ -308,8 +316,20 @@ row-granular deltas.
 - **Reconnection**: the link retries with capped exponential backoff. A
   database restart used to end the mirror for the lifetime of the process.
 
-Known limits, tracked in `TODO.md`: nothing reads `chunk_blob`, so a server with
-an empty region directory does not rehydrate from the database.
+- **Restore**: a server whose region directory is *empty* seeds it from
+  `chunk_blob` before opening the world — a fresh deployment or a lost disk
+  gets its edited chunks back rather than a world reset to pristine terrain.
+  Only when empty: region files stay authoritative, and a restore over a
+  populated directory could roll live edits backwards. A restore that times
+  out is logged as such rather than treated as "nothing stored", because from
+  there the server generates pristine terrain and the next flush overwrites
+  what was really in the database.
+- **Chat retention**: `chat_message` is public and every client subscribes to
+  all of it, so the reaper expires messages past `CHAT_TTL` (1 h). Without
+  that the table is an ever-growing broadcast — unbounded memory in every
+  client's cache and an initial sync that never stops getting slower.
+
+Known limits are tracked in `TODO.md`.
 
 ## Testing
 

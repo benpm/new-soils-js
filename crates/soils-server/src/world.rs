@@ -383,7 +383,17 @@ impl World {
         // finish before anyone can join and generate pristine terrain over the
         // chunks it is recovering, so it cannot be moved off the critical path
         // — but it must not stall the first heartbeat either.
-        let blobs = link.fetch_world_chunks(world_id, std::time::Duration::from_secs(5));
+        let (blobs, complete) = link.fetch_world_chunks(world_id, std::time::Duration::from_secs(5));
+        if !complete {
+            // Not the same as "this world has nothing stored". Say so: from
+            // here the server generates pristine terrain, and the next flush
+            // of an edited chunk overwrites whatever was really in the
+            // database.
+            eprintln!(
+                "stdb restore: world {world_id} did not answer in time;                  continuing with {} recovered chunk(s) — stored edits may be                  overwritten once play resumes",
+                blobs.len()
+            );
+        }
         if blobs.is_empty() {
             return 0;
         }
@@ -813,7 +823,7 @@ impl World {
                 entry.dirty = false;
                 let key = world_id
                     .and_then(|id| soils_protocol::chunk_key::pack_chunk_key(id, pos.x, pos.y, pos.z));
-                self.persist.enqueue_with_key(
+                self.persist.enqueue(
                     dir.clone(),
                     *pos,
                     entry.volume.clone(),
@@ -838,7 +848,7 @@ impl World {
             let entry = self.chunks.remove(&pos).expect("collected above");
             if entry.dirty {
                 let key = self.stdb_key(pos);
-                self.persist.enqueue_with_key(
+                self.persist.enqueue(
                     self.regions_dir.clone(),
                     pos,
                     entry.volume,

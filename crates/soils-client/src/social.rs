@@ -94,15 +94,9 @@ pub fn configured() -> Social {
         return Social::default();
     }
     let database = std::env::var("SOILS_STDB_DB").unwrap_or_else(|_| "soils".into());
-    // Deliberately *not* `SOILS_STDB_TOKEN`, which on a host that also runs a
-    // game server is a server-identity credential sitting in the module's
-    // allowlist — handing it to a client would let that client call every
-    // server-only reducer. It also collapses every client sharing the machine
-    // onto one identity, so chat would attribute everyone's lines to whichever
-    // account linked last.
-    //
-    // Unset means an anonymous identity, which is the right default: a player
-    // is identified by their game account, and `link_identity` binds the two.
+    // Deliberately *not* `SOILS_STDB_TOKEN`, which is a server-identity
+    // credential. Unset means an anonymous identity, which is the right
+    // default. docs/dev/debug.md#spacetimedb.
     let token = std::env::var("SOILS_STDB_CLIENT_TOKEN").ok().filter(|t| !t.is_empty());
     info!("social: connecting to {uri} / {database}");
     Social {
@@ -125,9 +119,13 @@ pub fn refresh(time: Res<Time>, mut social: ResMut<Social>) {
     social.since_refresh = 0.0;
 
     let Some(link) = social.link.clone() else { return };
+    let mut reconnected = false;
     for event in link.drain() {
         match event {
-            soils_stdb::StdbEvent::Connected(id) => info!("social: connected as {id}"),
+            soils_stdb::StdbEvent::Connected(id) => {
+                info!("social: connected as {id}");
+                reconnected = true;
+            }
             soils_stdb::StdbEvent::ConnectError(e) => {
                 // Not fatal, and not worth a popup: the game is playable
                 // without a lobby.
@@ -138,6 +136,13 @@ pub fn refresh(time: Res<Time>, mut social: ResMut<Social>) {
                 warn!("social: {reducer} failed: {error}")
             }
         }
+    }
+
+    // A reconnect can land on a different identity (an anonymous client is
+    // issued a fresh one), which leaves the account bound to the old one and
+    // the player silently unable to chat. Re-link on every connect.
+    if reconnected {
+        social.linked = false;
     }
 
     social.servers = link

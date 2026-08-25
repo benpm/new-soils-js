@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use avian3d::prelude::{AngularVelocity, LinearVelocity, Position, Rotation};
@@ -244,9 +244,6 @@ struct Wave {
 struct NetRx(UnboundedReceiver<NewConn>);
 #[derive(Resource)]
 struct ShutdownRx(watch::Receiver<bool>);
-#[derive(Resource)]
-struct AccountsRes(Arc<Accounts>);
-
 /// A login checked off the tick thread, on its way back.
 struct AuthDone {
     id: u16,
@@ -256,16 +253,88 @@ struct AuthDone {
     verdict: Result<(), String>,
 }
 
-/// Where worker threads leave finished logins for the next tick to collect.
+/// Where workers leave finished logins for the next tick to collect.
 ///
-/// Password checking cannot happen inline. Argon2id is memory-hard *by design*
-/// — that is what makes a stolen verifier expensive to crack — and it costs
-/// tens of milliseconds against a 50 ms tick. Run inside `drain_inboxes` it
-/// stalls every player on the server for the duration, and a client sending
-/// logins in a loop is a denial of service that needs no bandwidth to mount.
-/// With SpacetimeDB configured the check is a network round trip on top.
+/// Password checking cannot happen inline: Argon2id is memory-hard by design
+/// and costs tens of milliseconds against a 15.6 ms tick. See
+/// `docs/dev/server-tick.md#login-runs-off-the-tick-thread`.
 #[derive(Resource, Clone, Default)]
 struct AuthQueue(Arc<Mutex<Vec<AuthDone>>>);
+
+/// A login waiting for a worker.
+struct AuthReq {
+    id: u16,
+    name: String,
+    password: String,
+    signup: bool,
+    protocol: u32,
+}
+
+/// How many passwords may be checked at once.
+///
+/// This is the number that matters. Argon2id at the default parameters costs
+/// 19 MB of RAM per hash *by design*, so "one thread per pending login" hands
+/// anyone who can open sockets an unbounded memory and CPU amplifier. Capping
+/// concurrency turns a login flood into a queue instead of an outage.
+const AUTH_WORKERS: usize = 4;
+
+/// How many logins may be *waiting* for a worker.
+///
+/// Deliberately generous, and not a security control: a queued `AuthReq` is a
+/// name and a password, on the order of a hundred bytes, so the queue is three
+/// orders of magnitude cheaper per entry than a hash. Sizing it tightly only
+/// refuses honest bursts — a hundred players joining at once is a normal
+/// Saturday, not an attack. Overflow past this is a genuine last resort.
+const AUTH_BACKLOG: usize = 1024;
+
+/// A fixed pool of password-checking threads.
+#[derive(Resource)]
+struct AuthPool {
+    tx: crossbeam_channel::Sender<AuthReq>,
+    /// Highest number of checks ever running at once. Only read by tests, but
+    /// it is the one property worth asserting and cannot be seen from outside.
+    peak: Arc<AtomicUsize>,
+}
+
+impl AuthPool {
+    fn new(accounts: Arc<Accounts>, queue: AuthQueue) -> Self {
+        let (tx, rx) = crossbeam_channel::bounded::<AuthReq>(AUTH_BACKLOG);
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        for n in 0..AUTH_WORKERS {
+            let (rx, accounts, queue) = (rx.clone(), accounts.clone(), queue.clone());
+            let (live, peak) = (live.clone(), peak.clone());
+            let spawned = std::thread::Builder::new()
+                .name(format!("soils-auth-{n}"))
+                .spawn(move || {
+                    for req in rx {
+                        let now = live.fetch_add(1, Ordering::Relaxed) + 1;
+                        peak.fetch_max(now, Ordering::Relaxed);
+                        let verdict = accounts.authenticate(&req.name, &req.password, req.signup);
+                        live.fetch_sub(1, Ordering::Relaxed);
+                        if let Ok(mut q) = queue.0.lock() {
+                            q.push(AuthDone {
+                                id: req.id,
+                                name: req.name,
+                                signup: req.signup,
+                                protocol: req.protocol,
+                                verdict,
+                            });
+                        }
+                    }
+                });
+            if let Err(e) = spawned {
+                eprintln!("auth: could not spawn worker {n}: {e}");
+            }
+        }
+        Self { tx, peak }
+    }
+
+    /// Queue a login. `false` means the backlog is full.
+    fn submit(&self, req: AuthReq) -> bool {
+        self.tx.try_send(req).is_ok()
+    }
+}
 /// Shared with the LAN discovery responder on the tokio side.
 #[derive(Resource)]
 struct PlayerCount(Arc<AtomicU16>);
@@ -452,6 +521,9 @@ pub(crate) fn run_app(
 
     let physics = PhysicsCfg { enabled: physics_enabled };
 
+    let auth_queue = AuthQueue::default();
+    let auth_pool = AuthPool::new(accounts.clone(), auth_queue.clone());
+
     let mut app = App::new();
     app.add_plugins((
         TimePlugin,
@@ -462,8 +534,8 @@ pub(crate) fn run_app(
     .insert_resource(Time::<Fixed>::from_hz(soils_sim::SERVER_TICK_HZ))
     .insert_resource(NetRx(conns))
     .insert_resource(ShutdownRx(shutdown))
-    .insert_resource(AccountsRes(accounts))
-    .insert_resource(AuthQueue::default())
+    .insert_resource(auth_pool)
+    .insert_resource(auth_queue)
     .insert_resource(PlayerCount(player_count))
     .insert_resource(Clients(HashMap::new()))
     .insert_resource(worlds)
@@ -685,13 +757,8 @@ fn spawn_physics_demo(
         return;
     }
 
-    // A loose cube pile. Laid out on a square lattice with a small
-    // deterministic jitter: a perfectly aligned grid drops into a stable
-    // lattice and barely interacts, which would make a load test of settling
-    // bodies measure almost nothing.
-    // Wide and shallow, not cubic. A cubic lattice of a few hundred bodies is
-    // taller than a player, so anyone walking in is simply buried and the pile
-    // reads as a wall — spread it out and keep it waist-high.
+    // A loose cube pile: jittered, wide and shallow. See
+    // docs/dev/server-tick.md#demo-fixtures for why it is laid out this way.
     let n = props.0 as u32;
     let layers = 3u32;
     let side = ((n as f32 / layers as f32).sqrt().ceil()).max(1.0) as u32;
@@ -703,8 +770,7 @@ fn spawn_physics_demo(
                 if spawned >= n {
                     break 'pile;
                 }
-                // Cheap hash → jitter, so the pile is identical every run.
-                let h = (spawned as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let h = soils_protocol::mix(spawned as u64);
                 let jx = ((h >> 8) & 0xFF) as f32 / 255.0 - 0.5;
                 let jz = ((h >> 24) & 0xFF) as f32 / 255.0 - 0.5;
                 let spin = ((h >> 40) & 0xFF) as f32 / 255.0 * 2.0 - 1.0;
@@ -857,8 +923,8 @@ fn drain_inboxes(
     mut clients: ResMut<Clients>,
     mut worlds: ResMut<Worlds>,
     clock: Res<Clock>,
-    accounts: Res<AccountsRes>,
     auth_queue: Res<AuthQueue>,
+    auth_pool: Res<AuthPool>,
     player_count: Res<PlayerCount>,
     mut next_net: ResMut<NextNetId>,
     critter_count: Res<CritterCount>,
@@ -873,8 +939,11 @@ fn drain_inboxes(
     // so the join path stays in one place.
     let mut msgs: Vec<(u16, ClientMsg)> = Vec::new();
     for done in auth_queue.0.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default() {
-        // The connection may have gone while the hash was running.
-        let Some(c) = clients.0.get_mut(&done.id) else { continue };
+        // The connection may have gone while the hash was running. `id` comes
+        // from a wrapping counter, so require that this connection is the one
+        // still waiting: without it, a verdict outliving its connection could
+        // land on a reused id and log a stranger in as the wrong account.
+        let Some(c) = clients.0.get_mut(&done.id).filter(|c| c.auth_inflight) else { continue };
         c.auth_inflight = false;
         match done.verdict {
             Err(reason) => {
@@ -915,22 +984,13 @@ fn drain_inboxes(
             }
         }
     }
-    // `Clients` is a HashMap, so the order clients came out of that loop is
-    // randomized per process. Sort by client id — stably, so each client's own
-    // messages keep their arrival order — or two servers replaying identical
-    // input reach different states.
+    // Deterministic order over a HashMap's randomized one; stable, so each
+    // client keeps its own FIFO. docs/dev/server-tick.md#determinism-rules.
     msgs.sort_by_key(|(id, _)| *id);
 
-    // Player positions as of the tick boundary: the obstacle set for
-    // player-vs-player collision, frozen for the whole tick.
-    //
-    // Frozen, not refreshed as players move through the loop. Refreshing looks
-    // more accurate, but it makes the outcome depend on the order the
-    // messages happen to be processed in: of two players walking head-on, the
-    // one stepped second would collide against the other's already-updated
-    // position and stop further back. Freezing also gives the client something
-    // it can reproduce — it knows every peer's tick-boundary position, and
-    // nothing about the server's intra-tick ordering.
+    // The obstacle set for player-vs-player collision, frozen for the whole
+    // tick so the result cannot depend on message order and the client can
+    // reproduce it. docs/dev/server-tick.md#determinism-rules.
     let peer_snapshot: Vec<(Entity, String, Vec3)> = sims
         .iter()
         .filter(|(.., is_player)| *is_player)
@@ -953,31 +1013,28 @@ fn drain_inboxes(
                     });
                     continue;
                 }
-                // Off-thread: see [`AuthQueue`]. The first Login only starts
-                // the check and returns; the answer comes back through the
-                // queue, which replays this message with `auth_verified` set
-                // so the success path below runs unchanged.
+                // Already in: the real client opens a fresh connection per
+                // attempt, so a second Login here is a client re-sending on a
+                // live session. Honouring it would pay for another Argon2 and
+                // respawn the player, which is a free reset anyone can spam.
+                if c.authenticated && c.auth_verified.is_none() {
+                    continue;
+                }
+                // The first Login only starts the check; the answer comes
+                // back via [`AuthQueue`] and replays this message with
+                // `auth_verified` set. docs/dev/server-tick.md.
                 let verdict: Result<(), String> = match c.auth_verified.take() {
                     Some(()) => Ok(()),
                     None => {
+                        // One check in flight per connection; the pool bounds
+                        // the total. A full backlog is refused, not queued —
+                        // and `auth_inflight` must be left clear on that path,
+                        // or this connection could never log in again.
                         if !c.auth_inflight {
-                            c.auth_inflight = true;
-                            let queue = auth_queue.0.clone();
-                            let accounts = accounts.0.clone();
-                            let spawned = std::thread::Builder::new()
-                                .name(format!("auth-{id}"))
-                                .spawn(move || {
-                                    let verdict =
-                                        accounts.authenticate(&name, &password, signup);
-                                    if let Ok(mut q) = queue.lock() {
-                                        q.push(AuthDone { id, name, signup, protocol, verdict });
-                                    }
-                                });
-                            if let Err(e) = spawned {
-                                // Nothing will ever clear the flag otherwise,
-                                // and this connection could never log in again.
-                                c.auth_inflight = false;
-                                eprintln!("auth: could not spawn worker: {e}");
+                            let req = AuthReq { id, name, password, signup, protocol };
+                            if auth_pool.submit(req) {
+                                c.auth_inflight = true;
+                            } else {
                                 let _ = c.outbox.send(ServerMsg::LoginError {
                                     message: "server busy; try again".into(),
                                 });
@@ -1731,9 +1788,7 @@ fn wander_critters(
             wander.goal = None;
             wander.path.clear();
             if ticks.0 >= wander.next_turn {
-                let h = (net.0 as u64)
-                    .wrapping_mul(0x9E3779B97F4A7C15)
-                    .wrapping_add(ticks.0.wrapping_mul(0xD1B54A32D192ED03));
+                let h = soils_protocol::mix(net.0 as u64 ^ soils_protocol::mix(ticks.0));
                 yaw.0 = (h % 6283) as f32 / 1000.0;
                 wander.next_turn = ticks.0 + 30 + (h >> 32) % 40;
             }
@@ -1983,5 +2038,69 @@ fn tick_clock(time: Res<Time>, mut clock: ResMut<Clock>, clients: Res<Clients>) 
     clock.daytime = (clock.daytime + 1.0 / DAY_SECONDS) % 1.0;
     for c in clients.0.values() {
         let _ = c.outbox.send(ServerMsg::Time { daytime: clock.daytime });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pool's whole reason to exist: however many logins arrive, only
+    /// `AUTH_WORKERS` Argon2 hashes may be in memory at once. Nothing outside
+    /// the process can observe this, so it is asserted here rather than
+    /// inferred from timing.
+    #[test]
+    fn the_auth_pool_bounds_concurrent_hashing() {
+        let dir = std::env::temp_dir().join(format!("soils-authpool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let accounts = Arc::new(Accounts::load(&dir));
+        let queue = AuthQueue::default();
+        let pool = AuthPool::new(accounts, queue.clone());
+
+        // Comfortably more than the worker count, and every one a signup, so
+        // each pays a full hash rather than bailing out early.
+        const N: usize = 40;
+        for i in 0..N {
+            assert!(
+                pool.submit(AuthReq {
+                    id: i as u16,
+                    name: format!("pooluser{i}"),
+                    password: "hunter2".into(),
+                    signup: true,
+                    protocol: soils_protocol::PROTOCOL_VERSION,
+                }),
+                "the backlog must absorb an ordinary join burst"
+            );
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let done = queue.0.lock().map(|q| q.len()).unwrap_or(0);
+            if done == N {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "only {done}/{N} logins finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let peak = pool.peak.load(Ordering::Relaxed);
+        assert!(peak > 0, "the pool never ran anything");
+        assert!(
+            peak <= AUTH_WORKERS,
+            "{peak} passwords were hashed at once against a cap of {AUTH_WORKERS}; \
+             each costs ~19 MB, so this is an unbounded memory amplifier"
+        );
+        // `peak <= AUTH_WORKERS` alone is satisfied by raising AUTH_WORKERS,
+        // so pin what the cap is actually for: the memory it admits.
+        const ARGON2_MB: usize = 19;
+        const BUDGET_MB: usize = 128;
+        assert!(
+            AUTH_WORKERS * ARGON2_MB <= BUDGET_MB,
+            "AUTH_WORKERS = {AUTH_WORKERS} admits {} MB of concurrent Argon2, past a              {BUDGET_MB} MB budget",
+            AUTH_WORKERS * ARGON2_MB
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

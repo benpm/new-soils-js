@@ -15,6 +15,7 @@
 //!   nothing; dropping an `Inputs` bundle or a `Snapshot` is exactly what the
 //!   redundancy and delta-baseline schemes exist to absorb.
 
+use crate::rng::Rng;
 use std::time::{Duration, Instant};
 
 /// Which delivery guarantee a message rides on.
@@ -26,53 +27,6 @@ pub enum Lane {
     /// Everything else — login, manifests, edit acks, warps. Delayed, never
     /// dropped.
     Reliable,
-}
-
-/// Deterministic xorshift64*, plus a cached Box-Muller normal.
-#[derive(Clone, Debug)]
-struct Rng {
-    state: u64,
-    spare: Option<f64>,
-}
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        // 0 is a fixed point of xorshift; substitute an arbitrary nonzero.
-        Self { state: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed }, spare: None }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.state = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    /// Uniform in `[0, 1)`, from the top 53 bits (the exactly-representable
-    /// range of an f64 mantissa).
-    fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-
-    /// Standard normal via polar Box-Muller. Generates two at a time; the
-    /// second is cached so the cost amortizes.
-    fn next_normal(&mut self) -> f64 {
-        if let Some(z) = self.spare.take() {
-            return z;
-        }
-        loop {
-            let u = self.next_f64() * 2.0 - 1.0;
-            let v = self.next_f64() * 2.0 - 1.0;
-            let s = u * u + v * v;
-            if s > 0.0 && s < 1.0 {
-                let f = (-2.0 * s.ln() / s).sqrt();
-                self.spare = Some(v * f);
-                return u * f;
-            }
-        }
-    }
 }
 
 /// A simulated link. One instance per direction; a round trip through two of

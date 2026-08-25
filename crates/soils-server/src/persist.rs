@@ -47,16 +47,13 @@ pub struct PersistHandle {
 }
 
 impl PersistHandle {
-    /// Queue a chunk for background persistence. Never blocks on disk; the only
-    /// cost is cloning the volume (done by the caller) and a channel send. If
-    /// the writer has gone away the job is silently dropped.
-    pub fn enqueue(&self, dir: PathBuf, pos: IVec3, volume: ChunkVolume, edited: bool) {
-        self.enqueue_with_key(dir, pos, volume, edited, None, 0);
-    }
-
-    /// As [`enqueue`](Self::enqueue), but also mirrors the chunk into
-    /// SpacetimeDB under `stdb_key` when mirroring is enabled.
-    pub fn enqueue_with_key(
+    /// Queue a chunk for background persistence, mirroring it into SpacetimeDB
+    /// under `stdb_key` when mirroring is enabled.
+    ///
+    /// Never blocks on disk; the only cost is cloning the volume (done by the
+    /// caller) and a channel send. If the writer has gone away the job is
+    /// silently dropped.
+    pub fn enqueue(
         &self,
         dir: PathBuf,
         pos: IVec3,
@@ -78,12 +75,12 @@ pub struct Persister {
 }
 
 impl Persister {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::with_stdb(None)
     }
 
-    /// As [`new`](Self::new), but every save carrying a `stdb_key` is also
-    /// mirrored into SpacetimeDB.
+    /// Every save carrying a `stdb_key` is also mirrored into SpacetimeDB.
     ///
     /// Region files stay the source of truth: the mirror is written *after* a
     /// successful disk write, and a SpacetimeDB failure is logged rather than
@@ -176,16 +173,8 @@ fn flush_batch(batch: Vec<SaveJob>, stdb: Option<&StdbLink>) {
             if let Err(e) = stdb.send(StdbCmd::PutChunkBlob {
                 key: *key,
                 payload,
-                // The chunk's own edit counter, not a clock. A wall-clock
-                // stamp looked monotonic but a backwards step (NTP correction,
-                // VM resume) would make every write for the next N seconds fail
-                // the module's stale-write guard — and since the region file is
-                // authoritative and the chunk is no longer dirty, those edits
-                // would never be retried, wedging the mirror silently.
-                //
-                // The counter is only meaningful within one server process,
-                // hence the epoch: it lives in memory and restarts at 0 every
-                // time a chunk is evicted and read back from its region file.
+                // An edit counter, not a clock, and only comparable within
+                // one process — hence the epoch. docs/dev/debug.md.
                 version: *version,
                 writer_epoch: writer_epoch(),
             }) {

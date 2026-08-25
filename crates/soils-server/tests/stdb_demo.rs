@@ -92,15 +92,9 @@ fn spawn_client(
         // one database — this is what lights up the lobby and chat.
         .env("SOILS_STDB_URI", &cfg.uri)
         .env("SOILS_STDB_DB", &cfg.database);
-    // No token: each client takes an anonymous identity of its own. Sharing the
-    // server's would make both clients one identity — and that identity is in
-    // the module's server allowlist.
-    //
-    // Removed explicitly, not merely left unset: a child inherits this
-    // process's environment, and the recording session is started with the
-    // server's token exported. Both clients silently connected *as the server*
-    // until this was added, so every chat line was attributed to whichever
-    // account linked last.
+    // Removed, not merely left unset: a child inherits this process's
+    // environment, and the server's token is a server-identity credential.
+    // docs/dev/debug.md#spacetimedb.
     cmd.env_remove("SOILS_STDB_TOKEN").env_remove("SOILS_STDB_CLIENT_TOKEN");
     cmd.spawn().expect("launch client")
 }

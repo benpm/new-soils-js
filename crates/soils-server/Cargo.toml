@@ -11,6 +11,7 @@ soils-worldgen = { workspace = true }
 soils-script = { workspace = true }
 soils-physics = { workspace = true }
 soils-stdb = { workspace = true }
+crossbeam-channel = "0.5"
 avian3d = { workspace = true }
 glam = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }

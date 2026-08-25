@@ -135,10 +135,14 @@ impl Accounts {
         }
         let link = self.stdb.lock().unwrap().clone();
         match link {
-            Some(link) if link.accounts_ready() => self.stdb_auth(&link, name, password, signup),
-            // No database, or its cache is not warm yet. Falling back keeps
-            // offline play working and keeps a slow database from locking
-            // everyone out; the local file is still maintained in both modes.
+            // Gated on the *connection*, not on `accounts_ready`: verification
+            // is a reducer call and needs no subscription cache. Waiting for
+            // the cache would route every login during a reconnect backoff to
+            // the local file, where a database-only account reads as "no such
+            // account" — and a signup would then shadow it locally.
+            Some(link) if link.is_connected() => self.stdb_auth(&link, name, password, signup),
+            // No database at all. Falling back keeps offline play working; the
+            // local file is maintained in both modes.
             _ => self.local_auth(name, password, signup),
         }
     }
@@ -166,12 +170,9 @@ impl Accounts {
         signup: bool,
     ) -> Result<(), String> {
         let verdict = link.verify_login(name, password, Self::AUTH_TIMEOUT);
-        // A database that did not answer must not lock players out of a server
-        // that can still serve them: the local file is maintained in both modes
-        // precisely so it can answer here. Only a *credential* verdict is
-        // authoritative; anything else means the store was unavailable, and the
-        // original design's promise — that a slow database costs the lobby, not
-        // the game — has to survive verification moving into the module.
+        // Only a *credential* verdict is authoritative; anything else means
+        // the store was unavailable, and a slow database must cost the lobby,
+        // not the game. docs/dev/server-tick.md#login-runs-off-the-tick-thread.
         if let Err(reason) = &verdict
             && reason != NO_SUCH_ACCOUNT
             && reason != WRONG_PASSWORD

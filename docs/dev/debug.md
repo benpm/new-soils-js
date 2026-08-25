@@ -5,7 +5,8 @@ what you arrive with. Each entry says what it looked like, what it really was,
 and how to tell the difference quickly.
 
 Companion docs: [`architecture.md`](../architecture.md) (how it works),
-[`perf-report.md`](../perf-report.md) (where the time goes),
+[`server-tick.md`](server-tick.md) (the tick's ordering rules and off-thread
+login), [`perf-report.md`](../perf-report.md) (where the time goes),
 [`stdb/README.md`](../../stdb/README.md) (SpacetimeDB setup and gotchas).
 
 ---
@@ -330,11 +331,21 @@ are indistinguishable unless you track readiness — treat them differently or
 you will reject every existing account on startup. `StdbLink::wait_ready`
 exists for this, and startup blocks (bounded) on it.
 
-### An account cannot be re-linked
+### A player can read chat but not send it
 
-`link_identity` refuses to rebind an account already linked to a *different*
-identity. Deliberate, but it means a database carrying links from an earlier
-run rejects new ones. Republish with `--delete-data=always` when starting over.
+`send_chat` finds the sender by scanning `account` for `identity == sender`, so
+a client whose identity is not bound to its account gets *"no account linked to
+this identity"* — while still seeing everyone else's lines, because reads come
+from a subscription and need no binding. Almost always a stale link: an
+anonymous client is issued a **fresh identity on every reconnect**, and the
+client only sends `LinkIdentity` once per session.
+
+`link_identity` used to refuse to rebind an account already linked to a
+different identity, which turned every lobby reconnect into a permanent mute
+and made a database carrying links from an earlier run reject new ones (the
+old advice here was to republish with `--delete-data=always`). Rebinding is now
+allowed — `require_server` is what makes it safe — and the client re-sends
+`LinkIdentity` on every `Connected` event.
 
 ### Every chat line is attributed to one player
 

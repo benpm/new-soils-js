@@ -391,10 +391,13 @@ pub fn update_server_list(
 
     commands.entity(container).with_children(|list| {
         if rows.is_empty() {
-            let msg = if social.enabled() {
-                "searching for servers…"
-            } else {
-                "searching for LAN servers…"
+            // A configured lobby that has not answered yet is not the same as
+            // an empty one — saying "searching" while the connection is still
+            // coming up reads as "there is nothing there".
+            let msg = match (social.enabled(), social.ready()) {
+                (true, true) => "searching for servers…",
+                (true, false) => "connecting to the lobby…",
+                _ => "searching for LAN servers…",
             };
             list.spawn((
                 Text::new(msg),

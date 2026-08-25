@@ -204,10 +204,11 @@ attributes every line to whichever linked last, and the per-account chat
 cooldown starts throttling both. Child processes inherit the environment, so a
 launcher that exports `SOILS_STDB_TOKEN` has to clear it explicitly.
 
-Note also that `link_identity` refuses to rebind an account already linked to a
-*different* identity. That is deliberate, but it means a database carrying links
-from an earlier run will reject new ones — republish with `--delete-data` when
-starting over.
+`link_identity` rebinds freely: an anonymous client is issued a fresh identity
+on every reconnect, so refusing a new one left the account bound to a dead
+identity and the player permanently unable to chat. `require_server` is the
+control that matters — only the game server calls it, and only for a connection
+it has already authenticated.
 
 ## Not wired yet
 

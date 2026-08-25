@@ -568,17 +568,12 @@ mod tests {
         let chunks = w.chunk_list();
         relight_full(&mut w, &chunks);
 
-        // Deterministic LCG for reproducibility (no rand dep).
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (state >> 33) as u32
-        };
+        let mut rng = soils_protocol::Rng::new(0x50115);
         for _ in 0..120 {
-            let x = (next() % 32) as i32;
-            let y = (next() % 24) as i32; // keep some open sky above
-            let z = (next() % 32) as i32;
-            let id = match next() % 4 {
+            let x = rng.below(32) as i32;
+            let y = rng.below(24) as i32; // keep some open sky above
+            let z = rng.below(32) as i32;
+            let id = match rng.below(4) {
                 0 => 0u8, // break
                 1 => 9,   // diamond emitter
                 2 => 11,  // ruby emitter

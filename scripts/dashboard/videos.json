@@ -1,7 +1,7 @@
 {
   "repo": "https://github.com/benpm/new-soils-js",
-  "_ref": "Git ref the per-video `test` links point at. Flip to \"master\" once the branch that added these tests is merged, or the links 404.",
-  "ref": "spacetimedb-integration",
+  "_ref": "Git ref the per-video `test` links point at. Keep on \"master\"; point it at a branch only while that branch's tests are unmerged, or the links 404.",
+  "ref": "master",
   "videos": [
     {
       "id": "2026-08-24_private-accounts-and-chat",

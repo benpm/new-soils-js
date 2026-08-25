@@ -10,11 +10,54 @@
 ## UI
 
 ### Inventory
+
+Design intent (the source of truth for the plan below):
+
 User interface is not like Minecraft's very much.
 - No hotbar, just a ring indicating all tools and weapons and consumables in your inventory.
 - You can use various hotkeys to navigate the UI or pressing Alt to release the mouse cursor for UI interaction.
 - Inventory screen comes up by pressing E, I, Tab, or Escape.
 - A backpack icon with a cirled "E" on it is shown in the left corner of screen, indicating how to open inventory.
+
+Phasing, rationale and per-phase test gates: [plan-ui.md](docs/plan-ui.md).
+Do these in order — phase 0 is a prerequisite for every UI below it, not a
+nicety.
+
+- [ ] **Decide the Escape binding.** The intent above lists Escape as an
+      inventory key, but Escape is currently the cursor release and therefore
+      the pause menu; both cannot hold. Recommendation and the alternative:
+      [plan-ui.md §6](docs/plan-ui.md#6-open-decisions). Blocks phase 0.
+- [ ] **Phase 0 — `UiMode` state.** The client has no UI state machine: the
+      pause menu is shown whenever the cursor is released (`pause.rs:211`), and
+      any click re-grabs it (`player.rs:313`), so an inventory screen cannot be
+      clicked without dismissing itself. Replace the inferred state with a real
+      one, give cursor grab a single owner, and add Alt as a modifier over it.
+      Ships alone with no new UI. Gate: transitions both ways, plus a test that
+      a click in `Inventory` does not re-grab.
+- [ ] **Phase 1 — item model in `soils-sim`.** `ItemKind` / `ItemStack` /
+      `Inventory` as plain data, so the server can reuse it unchanged when
+      inventory becomes authoritative. Gate: stacking and count-conservation
+      tests, including insert-into-full returning the remainder.
+- [ ] **Phase 2 — item icons.** `blocks.png` is an 8x8 grid of 16x16 tiles and
+      `BlockDef.faces[1]` is the top face, so block icons need no new art.
+      Placeholder tiles for tools/weapons/consumables. Gate: every block in
+      `blocks.yaml` resolves to an in-range tile.
+- [ ] **Phase 3 — the ring.** Radial selector over the carried
+      tools/weapons/consumables, replacing the 1-9 `Hotbar`; `edit.rs` reads
+      the ring's selection. Retire `Hotbar` and the HUD's `block [n]` line only
+      once the screen lands. Gate: angle-to-index at sector boundaries and the
+      wrap seam; empty ring does not panic.
+- [ ] **Phase 4 — inventory screen.** E/I/Tab into `UiMode::Inventory`, slot
+      grid, click-to-pick/click-to-place, and the backpack affordance with the
+      circled "E". Gate: open/close per binding; moving a stack conserves it;
+      closing with a stack in hand returns it rather than voiding it.
+- [ ] **Phase 5 — authority and persistence.** Out of scope for the UI work and
+      listed so the phases above do not foreclose it: inventory messages,
+      `PROTOCOL_VERSION` to 4, server-owned during a session, mirrored to
+      SpacetimeDB on logout (same shape as `player_profile` — see the Inventory
+      / UI note under SpacetimeDB → Considerations). Until this lands the
+      client inventory is local and unvalidated, which is fine for building the
+      UI and must not ship as multiplayer.
 
 ## BigRefactor
 
@@ -292,4 +335,6 @@ to get right if the interaction is settled first.
 - [ ] Robust, neural texture gen techniques for tile gen with constraints to create complex 3d structures based on inferred structural relationships and probabilies from example. Ingest minecraft builds from the internet, parsing them, converting them to a compressed structure format. These should be editable in a new mode in game: structure design. Structure design should allow the instant output of applying the structure generation algorithm to your structure as input. You should be aple to tweak the ruleset that gets generated from your source map. Use techniques from the internet
 - [ ] Create block types (even with no real properties yet) to match all blocks in this Minecraft texture pack: (https://github.com/Unity-Resource-Pack/Unity-Modded). Use data files from the texture pack to help understand which tiles are what. Also, start creating some amount of data parity with minecraft files. Replace existing textures with these.
 - [ ] Biomes. Biomes should blend into each other oranically. The color of grass should able to shift in a subtle gradient stored a individual block data. Some biomes have tall trees, some short, some none. Some have rain, clouds, storms. Others, a barren moon-like landscape. Biome transitions might be able to have unique structures, such as small, sparse ponds between wetlands and a desert, or a desert and a tundra. Some biomes are more unique and have more extreme boundaries, such as the Crater Forest, where the boundary is a sheer cliff straight into the dense cannopy of massive trees. Make sure structures can be generated at great quantity along chunk boundaries use blue noise to place structure "seeds", which can fully generate as structures and thus "completing" the chunks it resides, only if all chunks it intersects are otherwise fully generated. Generate chunks in 2x2 blocks of chunks to mitigate large structures being incomplete.
-- [ ] Upgrade to Bevy 0.19
+- [x] Upgrade to Bevy 0.19 — headless crates in `bcb1acd`, `soils-client` in
+      `d701362` (2026-08-02, `master`). Workspace is on 0.19.1; Avian 0.7.0
+      tracks it.

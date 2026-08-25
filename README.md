@@ -204,6 +204,8 @@ CI renders release screenshots headlessly under Mesa lavapipe
 - [`docs/plan-rendering.md`](docs/plan-rendering.md) /
   [`docs/plan-game-systems.md`](docs/plan-game-systems.md) — the original
   plans the phases implement.
+- [`docs/plan-ui.md`](docs/plan-ui.md) — the inventory/UI plan: the item ring,
+  the inventory screen, and the `UiMode` refactor they depend on.
 
 ## Deliberate simplifications vs. the JS original
 

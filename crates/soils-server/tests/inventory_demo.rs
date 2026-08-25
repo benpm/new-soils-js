@@ -19,8 +19,13 @@
 
 mod common;
 
-use std::process::{Child, Command};
+use std::io::Read;
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+/// Beats in the bot's inventory script (`INV_BEATS` in `soils-client::bot`).
+/// The take is only worth publishing if every one of them fired.
+const EXPECTED_BEATS: usize = 11;
 
 /// Seconds of routine to record. The bot's script (`SOILS_BOT=inv`) runs about
 /// 24 s after landing, and landing from the spawn height costs ~5 s.
@@ -101,6 +106,10 @@ fn spawn_bot(
         // make the take depend on a service being up.
         .env_remove("SOILS_STDB_URI")
         .env_remove("SOILS_STDB_TOKEN")
+        // Captured so the test can prove the routine ran. Reading it is
+        // deferred until after the client exits, which is safe only because
+        // the pipe is drained in one go at the end — see the wait below.
+        .stderr(Stdio::piped())
         .spawn()
         .expect("launch bot client")
 }
@@ -144,9 +153,26 @@ fn record_the_inventory_loop() {
     std::fs::write(&start, "go").expect("write bot start file");
     println!("client ready; bot released");
 
+    // Drain stderr *before* waiting: a client that fills the pipe buffer would
+    // block forever on a write while we block forever on the exit.
+    let mut log = String::new();
+    if let Some(mut err) = kid.stderr.take() {
+        let _ = err.read_to_string(&mut log);
+    }
     let status = kid.wait().expect("client");
     println!("client exited: {status}");
     let recorded = obs("stop");
+
+    // A stalled routine produces a file of the right length full of nothing
+    // happening. That is indistinguishable from a good take by size alone —
+    // the first attempt at this recorded 34s of empty fog and passed.
+    let beats = log.matches("bot: beat ").count();
+    assert!(log.contains("inventory routine starts"), "the bot never landed:
+{log}");
+    assert_eq!(
+        beats, EXPECTED_BEATS,
+        "only {beats} of {EXPECTED_BEATS} script beats fired — the take shows a          routine that stalled partway through"
+    );
 
     let path = recorded
         .lines()

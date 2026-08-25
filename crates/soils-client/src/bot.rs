@@ -378,6 +378,10 @@ pub fn inventory_actions(
     }
     // Everything scheduled at or before now that has not fired yet.
     while bot.beat < INV_BEATS.len() && t >= INV_BEATS[bot.beat].0 {
+        // Logged so the demo test can assert the routine actually ran. A take
+        // where the script silently stalls looks exactly like a good one from
+        // the outside: right duration, right file size, plausible first frame.
+        info!("bot: beat {} of {}", bot.beat + 1, INV_BEATS.len());
         match INV_BEATS[bot.beat].1 {
             InvAction::Place => actions.click_right = true,
             InvAction::Break => actions.click_left = true,
@@ -399,13 +403,21 @@ pub fn press_bot_buttons(
     mut mouse: ResMut<ButtonInput<MouseButton>>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
 ) {
+    // `reset` before `press` is load-bearing. `ButtonInput::press` only sets
+    // `just_pressed` when the button was not already pressed, and nothing here
+    // ever releases — so without the reset, the first beat fires and every
+    // later one is silently a no-op. The symptom is a demo that places exactly
+    // one block and then does nothing for thirty seconds.
     if std::mem::take(&mut actions.click_left) {
+        mouse.reset(MouseButton::Left);
         mouse.press(MouseButton::Left);
     }
     if std::mem::take(&mut actions.click_right) {
+        mouse.reset(MouseButton::Right);
         mouse.press(MouseButton::Right);
     }
     if std::mem::take(&mut actions.toggle_inventory) {
+        keys.reset(KeyCode::KeyE);
         keys.press(KeyCode::KeyE);
     }
 }

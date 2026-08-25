@@ -52,9 +52,21 @@ code that had been deleted.
 | `test/walk-physics-scenarios` | #5 | Work salvaged. |
 | `rust` | — | Remote already deleted; the local ref was a leftover tracking a branch that no longer existed. |
 
-`.claude/worktrees/light-pad-cache` — a 7.8 GB second checkout of the whole
-repo — was removed with it. It duplicated every source file, so every
-repo-wide search returned each hit twice.
+`.claude/worktrees/light-pad-cache` is a 7.8 GB second checkout of the whole
+repo. It duplicates every source file, so every repo-wide search returns each
+hit twice, and it is easy to edit the wrong copy by accident.
+
+Everything unique to it has been salvaged (the two benches above), so removing
+it loses nothing:
+
+```
+git worktree remove --force .claude/worktrees/light-pad-cache
+```
+
+`--force` is needed because the worktree still holds the uncommitted Cargo.toml
+edits that wired those benches up — they are reproduced on `audit`. Until it is
+removed, the local `worktree-light-pad-cache` branch stays checked out there and
+cannot be deleted; its remote is already gone.
 
 ## Keeping the working tree cheap to search
 

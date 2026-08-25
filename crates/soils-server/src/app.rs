@@ -1153,7 +1153,20 @@ fn drain_inboxes(
                         // else at the end of the tick.
                         c.inventory_dirty = true;
                         if c.inventory.is_empty() {
-                            stock_starter_blocks(&mut c.inventory, &starter_kit);
+                            // A returning player gets what they logged out
+                            // with; only a genuinely new one is stocked.
+                            // `None` covers both "nothing stored" and "cache
+                            // not warm", and the two must be treated alike:
+                            // stocking on a cold cache would hand a returning
+                            // player a second starter kit every reconnect.
+                            let restored = stdb
+                                .as_ref()
+                                .and_then(|s| s.link.inventory(&name))
+                                .and_then(|bytes| restore_inventory(&bytes));
+                            match restored {
+                                Some(inv) => c.inventory = inv,
+                                None => stock_starter_blocks(&mut c.inventory, &starter_kit),
+                            }
                         }
                         // Server-driven streaming: subscribing around the spawn
                         // point starts the join burst — no client request.
@@ -1485,6 +1498,14 @@ fn drain_inboxes(
             }
             if c.authenticated {
                 if let Some(stdb) = &stdb {
+                    // Inventory first, and deliberately outside the entity
+                    // lookup below: a player whose entity has already gone
+                    // still owns what they were carrying, and gating this on a
+                    // live entity would quietly lose it.
+                    let _ = stdb.link.send(soils_stdb::StdbCmd::SaveInventory {
+                        account: c.account.clone(),
+                        items: soils_protocol::encode(&c.inventory.slots().to_vec()),
+                    });
                     // Last known position, so a returning player resumes where
                     // they left off rather than at spawn.
                     if let Some((sim, yaw, ..)) = c.entity.and_then(|e| sims.get(e).ok()) {
@@ -1938,6 +1959,23 @@ const STARTER_COUNT: u16 = 128;
 
 fn starter_block_ids(registry: &soils_worldgen::BlockRegistry) -> Vec<u8> {
     STARTER_BLOCKS.iter().filter_map(|n| registry.id_of(n)).collect()
+}
+
+/// Rebuild an inventory from stored bytes.
+///
+/// Returns `None` on anything unparseable rather than panicking or silently
+/// yielding an empty inventory: a decode failure means the stored format moved
+/// on, and the honest response is to fall back to the starter kit rather than
+/// to hand the player nothing and call it their inventory.
+fn restore_inventory(bytes: &[u8]) -> Option<soils_sim::Inventory> {
+    let slots: Vec<Option<soils_sim::ItemStack>> = soils_protocol::decode(bytes)?;
+    let mut inv = soils_sim::Inventory::new(slots.len().max(soils_sim::Inventory::DEFAULT_SLOTS));
+    for (i, slot) in slots.into_iter().enumerate() {
+        if let Some(stack) = slot {
+            let _ = inv.put(i, stack);
+        }
+    }
+    Some(inv)
 }
 
 fn stock_starter_blocks(inventory: &mut soils_sim::Inventory, ids: &[u8]) {

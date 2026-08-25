@@ -23,17 +23,21 @@ use spacetimedb_sdk::{DbContext, Table};
 use module_bindings::{
     DbConnection, RemoteReducers,
     chat_message_table::ChatMessageTableAccess, chunk_blob_table::ChunkBlobTableAccess,
-    game_server_table::GameServerTableAccess, player_profile_table::PlayerProfileTableAccess,
-    world_table::WorldTableAccess,
+    game_server_table::GameServerTableAccess,
+    player_inventory_table::PlayerInventoryTableAccess,
+    player_profile_table::PlayerProfileTableAccess, world_table::WorldTableAccess,
 };
 // Each reducer is generated as its own snake_case extension trait; they must be
 // in scope for `reducers.<name>(..)` to resolve.
 use module_bindings::{
     heartbeat, heartbeat_presence, link_identity, mark_absent, mark_present, put_chunk_blob,
-    register_account, save_profile, send_chat, set_password, upsert_world, verify_login,
+    register_account, save_inventory, save_profile, send_chat, set_password, upsert_world,
+    verify_login,
 };
 
-pub use module_bindings::{ChatMessage, ChunkBlob, GameServer, PlayerProfile, World};
+pub use module_bindings::{
+    ChatMessage, ChunkBlob, GameServer, PlayerInventory, PlayerProfile, World,
+};
 
 /// What a game server reads back: profiles, to restore a returning player's
 /// position.
@@ -41,7 +45,8 @@ pub use module_bindings::{ChatMessage, ChunkBlob, GameServer, PlayerProfile, Wor
 /// `account` is absent because it is a *private* table and has no client-side
 /// accessor at all — passwords are checked by the `verify_login` reducer,
 /// inside the database, so the verifier never crosses the wire.
-pub const SERVER_SUBSCRIPTIONS: &[&str] = &["SELECT * FROM player_profile"];
+pub const SERVER_SUBSCRIPTIONS: &[&str] =
+    &["SELECT * FROM player_profile", "SELECT * FROM player_inventory"];
 
 /// What a game *client* reads: the lobby. Excludes `chunk_blob`, which would
 /// stream the stored world into a player's memory. (`account` is private, so
@@ -89,6 +94,9 @@ pub enum StdbCmd {
     LinkIdentity { account: String, identity: Identity },
     /// Post a chat message as this connection's own identity.
     SendChat { world_id: u16, text: String },
+    /// Persist a player's inventory, keyed by account name. `items` is a
+    /// bincode-encoded `Vec<Option<ItemStack>>`; the module stores it opaquely.
+    SaveInventory { account: String, items: Vec<u8> },
     /// Persist a player's last known position, keyed by account name.
     SaveProfile {
         account: String,
@@ -418,6 +426,25 @@ impl StdbLink {
         let conn = guard.as_ref()?;
         conn.db().player_profile().iter().find(|p| p.account == account)
     }
+
+    /// A player's stored inventory bytes, from the subscription cache.
+    ///
+    /// `None` covers both "cache not warm" and "never logged out here", which
+    /// the caller cannot distinguish and must not: both mean "no inventory to
+    /// restore", and the difference only matters to a caller that would
+    /// otherwise overwrite good data with an empty one.
+    pub fn inventory(&self, account: &str) -> Option<Vec<u8>> {
+        if !self.ready.load(Ordering::Relaxed) {
+            return None;
+        }
+        let guard = self.conn.read().ok()?;
+        let conn = guard.as_ref()?;
+        conn.db()
+            .player_inventory()
+            .iter()
+            .find(|p| p.account == account)
+            .map(|p| p.items)
+    }
 }
 
 impl Drop for StdbLink {
@@ -667,6 +694,9 @@ fn apply(reducers: &RemoteReducers, cmd: StdbCmd, event_tx: &Sender<StdbEvent>) 
         }
         StdbCmd::SendChat { world_id, text } => {
             report("send_chat", reducers.send_chat(world_id, text))
+        }
+        StdbCmd::SaveInventory { account, items } => {
+            report("save_inventory", reducers.save_inventory(account, items))
         }
         StdbCmd::SaveProfile { account, world_id, x, y, z, yaw, view_radius } => report(
             "save_profile",

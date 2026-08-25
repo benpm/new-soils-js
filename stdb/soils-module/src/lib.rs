@@ -22,6 +22,11 @@ mod password;
 /// Longest accepted chat message, in bytes.
 pub const MAX_CHAT_LEN: usize = 512;
 
+/// Cap on a stored inventory blob. A few dozen slots encode to a few hundred
+/// bytes; this is loose enough never to bite an honest server and tight enough
+/// that a compromised one cannot use the table as free storage.
+pub const MAX_INVENTORY_BYTES: usize = 64 * 1024;
+
 /// Minimum gap between two chat messages from one account.
 pub const CHAT_COOLDOWN: Duration = Duration::from_millis(500);
 
@@ -142,6 +147,25 @@ pub struct PlayerProfile {
     pub yaw: f32,
     pub view_radius: u8,
     pub last_seen: Timestamp,
+}
+
+/// What a player was carrying when they last logged out.
+///
+/// A separate table rather than columns on [`PlayerProfile`], for a boring but
+/// load-bearing reason: adding a column to a live table is a breaking schema
+/// change, and this module's only answer to that is `--delete-data=always`,
+/// which destroys the account table. Adding a *table* migrates additively.
+///
+/// `items` is opaque here on purpose. The module has no business knowing what
+/// an item is; the game server owns that model and ships the bytes. Keeping it
+/// opaque also means the item format can change without a schema migration.
+#[table(accessor = player_inventory, public)]
+pub struct PlayerInventory {
+    #[primary_key]
+    pub account: String,
+    /// Bincode-encoded `Vec<Option<ItemStack>>`, written by the game server.
+    pub items: Vec<u8>,
+    pub updated: Timestamp,
 }
 
 /// Who is online, and on which game server. Keyed by account name for the same
@@ -633,6 +657,26 @@ pub fn save_profile(
         ctx.db.player_profile().account().update(profile);
     } else {
         ctx.db.player_profile().try_insert(profile).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Store a player's inventory, replacing whatever was there.
+///
+/// Whole rather than incremental: an inventory is a few dozen slots written
+/// once at logout, so there is nothing to gain from deltas and a lost delta
+/// would silently corrupt what a player owns.
+#[reducer]
+pub fn save_inventory(ctx: &ReducerContext, account: String, items: Vec<u8>) -> Result<(), String> {
+    require_server(ctx)?;
+    if items.len() > MAX_INVENTORY_BYTES {
+        return Err(format!("inventory too large: {} bytes", items.len()));
+    }
+    let row = PlayerInventory { account, items, updated: ctx.timestamp };
+    if ctx.db.player_inventory().account().find(&row.account).is_some() {
+        ctx.db.player_inventory().account().update(row);
+    } else {
+        ctx.db.player_inventory().try_insert(row).map_err(|e| e.to_string())?;
     }
     Ok(())
 }

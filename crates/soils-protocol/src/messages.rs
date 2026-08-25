@@ -170,7 +170,7 @@ pub enum ServerMsg {
     /// The player's authoritative inventory, whole. Sent on join and after
     /// every change (pickup, placement, drop, slot move).
     ///
-    /// Whole rather than delta on purpose: an inventory is ~27 slots, it
+    /// Whole rather than delta on purpose: an inventory is a few dozen slots,
     /// changes at human speed rather than per tick, and a lost delta would
     /// desync the UI from the authority with no way to notice. Snapshot deltas
     /// exist because entity state is per-tick and large; this is neither.

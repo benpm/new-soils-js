@@ -109,6 +109,14 @@ pub struct ItemRing;
 /// The "press E" backpack affordance.
 #[derive(Component)]
 pub struct BackpackHint;
+/// The one-slot indicator of what right-click will place.
+///
+/// Not a hotbar: the design calls for none, and the ring deliberately shows
+/// only tools/weapons/consumables. But with the old hotbar gone, and the block
+/// name living on the F3 debug overlay, a player otherwise has no way to see
+/// what they are about to build with.
+#[derive(Component)]
+pub struct HeldItem;
 /// One clickable slot, carrying its index into the server's slot array.
 #[derive(Component, Clone, Copy)]
 pub struct SlotButton(pub usize);
@@ -160,12 +168,37 @@ pub fn setup_inventory_ui(mut commands: Commands) {
                     },
                 ));
                 panel.spawn((
-                    Text::new("click a slot to move it onto the selected one  ·  Q drops one"),
+                    Text::new("click a slot to pick it up, click another to place it"),
                     TextFont { font_size: 12.0.into(), ..default() },
                     TextColor(Color::srgba(0.75, 0.75, 0.78, 0.9)),
                 ));
+                panel.spawn((
+                    Text::new("1-9 choose what to build with  ·  Q throws one while playing"),
+                    TextFont { font_size: 12.0.into(), ..default() },
+                    TextColor(Color::srgba(0.65, 0.65, 0.68, 0.85)),
+                ));
             });
         });
+
+    // What right-click will place, bottom-centre above the ring.
+    commands.spawn((
+        HeldItem,
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(14.0),
+            left: Val::Percent(50.0),
+            margin: UiRect::left(Val::Px(-26.0)),
+            width: Val::Px(52.0),
+            height: Val::Px(52.0),
+            align_items: AlignItems::FlexEnd,
+            justify_content: JustifyContent::FlexEnd,
+            border: UiRect::all(Val::Px(2.0)),
+            border_radius: BorderRadius::all(Val::Px(5.0)),
+            ..default()
+        },
+        BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.35)),
+        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.4)),
+    ));
 
     // Always-visible ring along the bottom.
     commands.spawn((
@@ -180,33 +213,88 @@ pub fn setup_inventory_ui(mut commands: Commands) {
         },
     ));
 
-    // Backpack affordance, bottom-left, as the design note asks.
+    // Backpack affordance, bottom-left, as the design note asks: a pack with a
+    // circled "E" on it.
+    //
+    // Drawn from nodes rather than set as an emoji — Bevy's default font is a
+    // FiraMono subset with no emoji coverage, so a "🎒" renders as nothing at
+    // all. The circled E is the part that actually teaches the binding.
     commands
         .spawn((
             BackpackHint,
             Node {
                 position_type: PositionType::Absolute,
-                bottom: Val::Px(8.0),
-                left: Val::Px(8.0),
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(6.0),
-                padding: UiRect::axes(Val::Px(6.0), Val::Px(4.0)),
-                border_radius: BorderRadius::all(Val::Px(4.0)),
+                bottom: Val::Px(10.0),
+                left: Val::Px(10.0),
+                width: Val::Px(38.0),
+                height: Val::Px(40.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.45)),
         ))
         .with_children(|hint| {
+            // Straps.
             hint.spawn((
-                Text::new("🎒"),
-                TextFont { font_size: 18.0.into(), ..default() },
-                TextColor(Color::srgb(0.85, 0.7, 0.45)),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(9.0),
+                    top: Val::Px(0.0),
+                    width: Val::Px(20.0),
+                    height: Val::Px(12.0),
+                    border_radius: BorderRadius::all(Val::Px(5.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.42, 0.30, 0.18)),
             ));
+            // Body of the pack.
             hint.spawn((
-                Text::new("(E)"),
-                TextFont { font_size: 13.0.into(), ..default() },
-                TextColor(Color::srgba(0.95, 0.95, 0.95, 0.9)),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(0.0),
+                    top: Val::Px(7.0),
+                    width: Val::Px(38.0),
+                    height: Val::Px(33.0),
+                    border_radius: BorderRadius::all(Val::Px(7.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.55, 0.38, 0.22)),
             ));
+            // Front pocket, so it reads as a bag and not a box.
+            hint.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(7.0),
+                    top: Val::Px(22.0),
+                    width: Val::Px(24.0),
+                    height: Val::Px(12.0),
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.40, 0.27, 0.15)),
+            ));
+            // The circled key hint, overlapping the corner.
+            hint.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    right: Val::Px(-7.0),
+                    top: Val::Px(-2.0),
+                    width: Val::Px(19.0),
+                    height: Val::Px(19.0),
+                    border: UiRect::all(Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Percent(50.0)),
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    ..default()
+                },
+                BorderColor::all(Color::srgb(0.96, 0.96, 0.96)),
+                BackgroundColor(Color::srgba(0.05, 0.05, 0.06, 0.92)),
+            ))
+            .with_children(|c| {
+                c.spawn((
+                    Text::new("E"),
+                    TextFont { font_size: 11.0.into(), ..default() },
+                    TextColor(Color::srgb(0.98, 0.98, 0.98)),
+                ));
+            });
         });
 }
 
@@ -217,7 +305,10 @@ pub fn update_inventory_visibility(
     mut screen: Query<&mut Visibility, With<InventoryScreen>>,
     mut others: Query<
         &mut Visibility,
-        (Or<(With<ItemRing>, With<BackpackHint>)>, Without<InventoryScreen>),
+        (
+            Or<(With<ItemRing>, With<BackpackHint>, With<HeldItem>)>,
+            Without<InventoryScreen>,
+        ),
     >,
 ) {
     let open = *mode.get() == UiMode::Inventory;
@@ -237,8 +328,8 @@ pub fn update_inventory_visibility(
 
 /// Rebuild the slot grid and the ring from the mirror.
 ///
-/// Rebuilt wholesale rather than diffed: an inventory is ~27 slots and changes
-/// at human speed, so the simplest correct thing is also fast enough, and a
+/// Rebuilt wholesale rather than diffed: an inventory is a few dozen slots and
+/// changes at human speed, so the simplest correct thing is also fast enough, and a
 /// diff would be one more place for the view to drift from the authority.
 pub fn rebuild_inventory_ui(
     mut commands: Commands,
@@ -247,6 +338,7 @@ pub fn rebuild_inventory_ui(
     registry: Res<Blocks>,
     grid: Query<Entity, With<InventoryGrid>>,
     ring: Query<Entity, With<ItemRing>>,
+    held: Query<Entity, With<HeldItem>>,
 ) {
     if !inventory.is_changed() {
         return;
@@ -311,6 +403,40 @@ pub fn rebuild_inventory_ui(
                 }
             }
         });
+    }
+
+    if let Ok(held) = held.single() {
+        commands.entity(held).despawn_related::<Children>();
+        if let Some(stack) = inventory
+            .placeable()
+            .get(inventory.selected.min(inventory.placeable().len().saturating_sub(1)))
+            .map(|(_, s)| *s)
+        {
+            commands.entity(held).with_children(|c| {
+                c.spawn((
+                    icons.node(stack.kind, &registry.0),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(4.0),
+                        top: Val::Px(4.0),
+                        width: Val::Px(40.0),
+                        height: Val::Px(40.0),
+                        ..default()
+                    },
+                ));
+                c.spawn((
+                    Text::new(stack.count.to_string()),
+                    TextFont { font_size: 12.0.into(), ..default() },
+                    TextColor(Color::WHITE),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        right: Val::Px(4.0),
+                        bottom: Val::Px(2.0),
+                        ..default()
+                    },
+                ));
+            });
+        }
     }
 
     if let Ok(ring) = ring.single() {
@@ -529,6 +655,120 @@ mod tests {
 
         let empty = inv(vec![None, None]);
         assert_eq!(empty.selected_block(), None, "nothing held, nothing placeable");
+    }
+
+    /// Every block must resolve to a tile inside the atlas grid. Cheap, and it
+    /// catches a widened `blocks.png` or a re-ordered `blocks.yaml` silently
+    /// pointing every icon at the wrong cell.
+    #[test]
+    fn every_block_resolves_to_a_tile_inside_the_atlas() {
+        let registry = soils_worldgen::default_registry();
+        assert!(registry.len() > 1, "registry must actually be loaded");
+        for id in 0..registry.len() as u8 {
+            let def = registry.get(id).expect("id came from len()");
+            let tile = def.faces[1];
+            assert!(
+                (tile as u32) < ATLAS_COLS * ATLAS_ROWS,
+                "block {} ({}) points at tile {tile}, outside the {ATLAS_COLS}x{ATLAS_ROWS} grid",
+                id,
+                def.name,
+            );
+        }
+    }
+
+    /// The UV remap must land strictly inside the tile, or a dropped item
+    /// samples its neighbour along the seam under linear filtering.
+    #[test]
+    fn remapped_uvs_stay_inside_their_tile() {
+        for tile in [0u8, 7, 8, 63] {
+            let mut mesh = Mesh::from(Cuboid::new(1.0, 1.0, 1.0));
+            remap_uvs_to_tile(&mut mesh, tile);
+            let Some(bevy::render::mesh::VertexAttributeValues::Float32x2(uvs)) =
+                mesh.attribute(Mesh::ATTRIBUTE_UV_0)
+            else {
+                panic!("cuboid must carry UVs");
+            };
+            let (col, row) = ((tile % ATLAS_COLS as u8) as f32, (tile / ATLAS_COLS as u8) as f32);
+            let (w, h) = (1.0 / ATLAS_COLS as f32, 1.0 / ATLAS_ROWS as f32);
+            for uv in uvs {
+                assert!(
+                    uv[0] > col * w && uv[0] < (col + 1.0) * w,
+                    "u {} escaped tile {tile}",
+                    uv[0]
+                );
+                assert!(
+                    uv[1] > row * h && uv[1] < (row + 1.0) * h,
+                    "v {} escaped tile {tile}",
+                    uv[1]
+                );
+            }
+        }
+    }
+
+    /// Build the real UI tree headlessly. Bevy UI mistakes — a bad grid track,
+    /// a component that is really a `Node` field — surface at *runtime*, so a
+    /// compiling `setup_inventory_ui` proves very little on its own.
+    fn ui_app(inventory: PlayerInventory) -> App {
+        let mut app = App::new();
+        app.add_plugins(bevy::state::app::StatesPlugin);
+        app.init_state::<UiMode>();
+        app.insert_resource(inventory);
+        app.insert_resource(Blocks(soils_worldgen::default_registry()));
+        app.insert_resource(ItemIcons {
+            atlas: Handle::default(),
+            layout: Handle::default(),
+        });
+        app.add_systems(Startup, setup_inventory_ui);
+        app.add_systems(Update, rebuild_inventory_ui);
+        app.update();
+        app.update();
+        app
+    }
+
+    fn count<C: Component>(app: &mut App) -> usize {
+        // Bound first: `world_mut()` and `world()` in one expression would
+        // overlap a mutable and an immutable borrow of the same `App`.
+        let mut q = app.world_mut().query_filtered::<Entity, With<C>>();
+        q.iter(app.world()).count()
+    }
+
+    #[test]
+    fn the_inventory_ui_builds_a_slot_per_slot() {
+        let mut inv = PlayerInventory {
+            slots: vec![None; soils_sim::Inventory::DEFAULT_SLOTS],
+            selected: 0,
+        };
+        inv.slots[0] = ItemStack::new(ItemKind::Block(4), 12);
+        inv.slots[3] = Some(ItemStack::one(ItemKind::Tool(0)));
+        let mut app = ui_app(inv);
+
+        assert_eq!(count::<InventoryScreen>(&mut app), 1);
+        assert_eq!(count::<BackpackHint>(&mut app), 1);
+        assert_eq!(count::<HeldItem>(&mut app), 1);
+        assert_eq!(
+            count::<SlotButton>(&mut app),
+            soils_sim::Inventory::DEFAULT_SLOTS,
+            "one clickable slot per inventory slot, filled or not"
+        );
+    }
+
+    #[test]
+    fn the_screen_is_hidden_until_the_inventory_mode_is_entered() {
+        let mut app = ui_app(PlayerInventory::default());
+        app.add_systems(Update, update_inventory_visibility);
+        app.update();
+        let mut q = app.world_mut().query_filtered::<&Visibility, With<InventoryScreen>>();
+        assert_eq!(*q.iter(app.world()).next().unwrap(), Visibility::Hidden);
+
+        app.world_mut().resource_mut::<NextState<UiMode>>().set(UiMode::Inventory);
+        app.update();
+        app.update();
+        let mut q = app.world_mut().query_filtered::<&Visibility, With<InventoryScreen>>();
+        assert_eq!(
+            *q.iter(app.world()).next().unwrap(),
+            Visibility::Inherited,
+            "opening the inventory must show it"
+        );
     }
 
     #[test]

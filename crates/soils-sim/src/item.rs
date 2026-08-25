@@ -59,7 +59,11 @@ impl Default for Inventory {
 }
 
 impl Inventory {
-    pub const DEFAULT_SLOTS: usize = 27;
+    /// Four rows of nine, matching the inventory screen's grid.
+    ///
+    /// The starter kit alone occupies two rows, and there are 19 block kinds to
+    /// collect — 27 slots left too little room to mine into.
+    pub const DEFAULT_SLOTS: usize = 36;
 
     pub fn new(slots: usize) -> Self {
         Self { slots: vec![None; slots] }

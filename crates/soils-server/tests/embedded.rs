@@ -25,12 +25,7 @@ async fn spawn_login_and_stream_chunks() {
 
     // An in-reach edit is validated and applied (persisted via the dirty
     // flush; the join burst's generated chunks persist right away).
-    let seq = c.edit([282, 280, 268], 3).await;
-    c.recv_until(|msg| match msg {
-        soils_protocol::ServerMsg::EditAccepted { seq: s, .. } if s == seq => Some(()),
-        _ => None,
-    })
-    .await;
+    c.place([282, 280, 268], common::HELD_BLOCK).await;
 
     assert!(server.data_dir.join("accounts.bin").is_file());
     // Pristine chunks are never persisted (worldgen v2 regenerates them);

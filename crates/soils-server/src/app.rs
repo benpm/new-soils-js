@@ -53,6 +53,12 @@ const PICKUP_DELAY_TICKS: u64 = 10;
 /// The same gate for a deliberately thrown item, long enough that the thrower
 /// walks clear instead of instantly re-collecting it.
 const THROW_DELAY_TICKS: u64 = 30;
+/// How long an uncollected item lies in the world before it is reaped
+/// (5 minutes at 20 Hz).
+///
+/// Without this every block ever broken and not picked up stays an entity
+/// forever — replicated to everyone in range, for the life of the world.
+const DROP_TTL_TICKS: u64 = 5 * 60 * soils_sim::SERVER_TICK_HZ as u64;
 /// Cap on chunk waves a single client can be served from cache/disk in one
 /// tick, bounding per-tick disk I/O. Generation is not capped this way — it
 /// runs off-thread and only adoption/serialization lands on the tick.
@@ -1918,8 +1924,9 @@ const STARTER_BLOCKS: [&str; 9] = [
     "Cobblestone", "Moss Stone", "Stone Bricks", "Dirt", "Grass", "Wooden Crate", "Clay Pot",
     "Log", "Leaves",
 ];
-/// How many of each. One full stack apiece.
-const STARTER_COUNT: u16 = 64;
+/// How many of each. Two full stacks apiece — one stack is 64, and a single
+/// 13x5 platform is 65 blocks, so one stack runs out during ordinary building.
+const STARTER_COUNT: u16 = 128;
 
 fn starter_block_ids(registry: &soils_worldgen::BlockRegistry) -> Vec<u8> {
     STARTER_BLOCKS.iter().filter_map(|n| registry.id_of(n)).collect()
@@ -1938,14 +1945,24 @@ fn stock_starter_blocks(inventory: &mut soils_sim::Inventory, ids: &[u8]) {
 }
 
 /// Dropped items fall under gravity and rest on the first solid voxel beneath
-/// them. Without this, breaking a block above your head leaves its item hanging
+/// them, and are reaped once they have lain around for [`DROP_TTL_TICKS`].
+///
+/// Without the fall, breaking a block above your head leaves its item hanging
 /// permanently out of reach.
 fn fall_dropped_items(
+    ticks: Res<TickCount>,
+    mut commands: Commands,
     mut worlds: ResMut<Worlds>,
-    mut items: Query<(&InWorld, &mut SimState), With<DroppedItem>>,
+    mut items: Query<(Entity, &InWorld, &mut SimState, &PickupAfter), With<DroppedItem>>,
 ) {
     let dt = 1.0 / soils_sim::SERVER_TICK_HZ as f32;
-    for (in_world, mut sim) in &mut items {
+    for (entity, in_world, mut sim, after) in &mut items {
+        // `PickupAfter` is set from the spawn tick, so it doubles as the item's
+        // age without a second component.
+        if ticks.0 > after.0 + DROP_TTL_TICKS {
+            commands.entity(entity).despawn();
+            continue;
+        }
         let Some(world) = worlds.map.get_mut(&in_world.0) else { continue };
         // Terrain not resident: hold position. Falling against a world that
         // reads as all-air would sink the item through the floor forever.
@@ -2011,7 +2028,9 @@ fn pick_up_items(
 /// tick. One message per tick per client, however many changes landed.
 fn flush_inventory_updates(mut clients: ResMut<Clients>) {
     for c in clients.0.values_mut() {
-        if !std::mem::take(&mut c.inventory_dirty) || !c.authenticated {
+        // Authentication is checked *first*: taking the flag from a client that
+        // cannot be sent to would clear it and lose the update.
+        if !c.authenticated || !std::mem::take(&mut c.inventory_dirty) {
             continue;
         }
         let slots = c.inventory.slots().to_vec();

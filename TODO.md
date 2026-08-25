@@ -20,44 +20,54 @@ User interface is not like Minecraft's very much.
 - A backpack icon with a cirled "E" on it is shown in the left corner of screen, indicating how to open inventory.
 
 Phasing, rationale and per-phase test gates: [plan-ui.md](docs/plan-ui.md).
-Do these in order — phase 0 is a prerequisite for every UI below it, not a
-nicety.
 
-- [ ] **Decide the Escape binding.** The intent above lists Escape as an
+**Shipped 2026-08-25 (`ui-inventory`).** The loop works: breaking a block drops
+it as a world entity, walking into the drop collects it, placing spends it, and
+the server owns the inventory (protocol v4). What is left is listed under
+[plan-ui.md §9](docs/plan-ui.md#9-what-is-left) — persistence across logout, the
+radial *shape* of the ring, and a TTL for uncollected drops.
+
+- [x] **Decide the Escape binding.** The intent above lists Escape as an
       inventory key, but Escape is currently the cursor release and therefore
       the pause menu; both cannot hold. Recommendation and the alternative:
       [plan-ui.md §6](docs/plan-ui.md#6-open-decisions). Blocks phase 0.
-- [ ] **Phase 0 — `UiMode` state.** The client has no UI state machine: the
+- [x] **Phase 0 — `UiMode` state.** The client has no UI state machine: the
       pause menu is shown whenever the cursor is released (`pause.rs:211`), and
       any click re-grabs it (`player.rs:313`), so an inventory screen cannot be
       clicked without dismissing itself. Replace the inferred state with a real
       one, give cursor grab a single owner, and add Alt as a modifier over it.
       Ships alone with no new UI. Gate: transitions both ways, plus a test that
       a click in `Inventory` does not re-grab.
-- [ ] **Phase 1 — item model in `soils-sim`.** `ItemKind` / `ItemStack` /
+- [x] **Phase 1 — item model in `soils-sim`.** `ItemKind` / `ItemStack` /
       `Inventory` as plain data, so the server can reuse it unchanged when
       inventory becomes authoritative. Gate: stacking and count-conservation
       tests, including insert-into-full returning the remainder.
-- [ ] **Phase 2 — item icons.** `blocks.png` is an 8x8 grid of 16x16 tiles and
+- [x] **Phase 2 — item icons.** `blocks.png` is an 8x8 grid of 16x16 tiles and
       `BlockDef.faces[1]` is the top face, so block icons need no new art.
       Placeholder tiles for tools/weapons/consumables. Gate: every block in
       `blocks.yaml` resolves to an in-range tile.
-- [ ] **Phase 3 — the ring.** Radial selector over the carried
+- [~] **Phase 3 — the ring.** Radial selector over the carried
       tools/weapons/consumables, replacing the 1-9 `Hotbar`; `edit.rs` reads
       the ring's selection. Retire `Hotbar` and the HUD's `block [n]` line only
       once the screen lands. Gate: angle-to-index at sector boundaries and the
       wrap seam; empty ring does not panic.
-- [ ] **Phase 4 — inventory screen.** E/I/Tab into `UiMode::Inventory`, slot
+      *Partly done:* `Hotbar` is retired and the strip shows exactly the right
+      items, but the layout is horizontal rather than radial and it is not a
+      selector yet — nothing in the game is a tool, so there is nothing to
+      select between. Worth finishing when tools exist and it can be felt.
+- [x] **Phase 4 — inventory screen.** E/I/Tab into `UiMode::Inventory`, slot
       grid, click-to-pick/click-to-place, and the backpack affordance with the
       circled "E". Gate: open/close per binding; moving a stack conserves it;
       closing with a stack in hand returns it rather than voiding it.
-- [ ] **Phase 5 — authority and persistence.** Out of scope for the UI work and
+- [~] **Phase 5 — authority and persistence.** Out of scope for the UI work and
       listed so the phases above do not foreclose it: inventory messages,
       `PROTOCOL_VERSION` to 4, server-owned during a session, mirrored to
       SpacetimeDB on logout (same shape as `player_profile` — see the Inventory
-      / UI note under SpacetimeDB → Considerations). Until this lands the
-      client inventory is local and unvalidated, which is fine for building the
-      UI and must not ship as multiplayer.
+      / UI note under SpacetimeDB → Considerations).
+      *Partly done:* authority shipped — the server owns the inventory and the
+      client only mirrors it, so this is safe in multiplayer. Persistence did
+      not: inventory is session state, and a reconnecting player is re-stocked
+      with the starter kit.
 
 ## BigRefactor
 

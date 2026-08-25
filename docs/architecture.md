@@ -75,6 +75,13 @@ flowchart TB
   snapshot lane safe.
 - **Inputs**: packed frames (buttons/flags/quantized yaw), the last 3 bundled
   per send for loss tolerance, `ack_tick` piggybacked for snapshot acking.
+- **Inventory** (v4): `InventoryUpdate` carries the player's slots *whole*,
+  not as a delta. It is a few dozen slots changing at human speed, so a delta
+  would buy nothing and a lost one would desync the UI from the authority with no
+  way to notice. `EntitySpawn` carries an `ItemStack` for dropped items —
+  what an item *is* never changes, so it rides the spawn rather than the
+  per-tick snapshot. `MoveItem`/`DropItem` are requests; the server answers
+  with the resulting inventory.
 
 ## Transports
 
@@ -98,9 +105,9 @@ apart.
 
 - **Tick** (`FixedUpdate`, 20 Hz): accept new connections → drain inboxes
   (auth, input token bucket at the 64 Hz sim rate ×32 burst, edit validation:
-  seq, rate bucket, reach, block id, residency) → critter AI → **scripts**
-  (when enabled) → chunk job pumping → entity replication → clock → world
-  lifecycle. Player movement integrates client inputs through the shared
+  seq, rate bucket, reach, block id, residency) → critter AI → item fall +
+  pickup → **scripts** (when enabled) → chunk job pumping → inventory flush →
+  entity replication → clock → world lifecycle. Player movement integrates client inputs through the shared
   `step_player` at the client dt, so speed-hacking is structurally impossible
   (scenario-verified).
 - **Player-vs-player collision**: `step_player_peers` sweeps the player AABB
@@ -135,6 +142,25 @@ apart.
   neighbors). Critters seek nearby players via budgeted A*, fall back to
   HPA* (region-portal graph + flat refinement) when the budget can't reach,
   and validate each waypoint against live voxels so edits force repaths.
+
+- **Inventory and dropped items**: the server owns every player's inventory;
+  the client mirrors it and never decides it, because a client-authoritative
+  inventory is a client-authoritative item spawner. Breaking a block spawns a
+  `KIND_DROPPED_ITEM` entity holding the block; placing one spends it from the
+  inventory and is refused when the stack is empty (checked *before* the world
+  is touched, so a refusal needs no refund path). Dropped items fall with
+  `soils_sim::fall_item` — deliberately not `step_player`, which integrates a
+  0.3x1.6 capsule and would wedge a 0.15 cube in one-block gaps. Pickup is a
+  proximity sweep against the player's vertical extent; a claim set stops two
+  players standing on one item from each receiving a copy, since despawns are
+  deferred commands. An uncollected item is reaped after `DROP_TTL_TICKS`
+  (5 min) — without that, every block ever broken and abandoned stays a
+  replicated entity for the life of the world. Inventory is **session state**:
+  it is not yet persisted across logout (see `docs/plan-ui.md`).
+
+  Only *player* edits take part in this. `ScriptCommand::Edit` writes to the
+  world directly and neither spends nor yields items, so a script carving
+  terrain does not spray drops or need a stocked inventory.
 
 ## Scripting (server-side WASM)
 
@@ -189,6 +215,19 @@ mutations replicate the same tick.
   inputs; remote entities render from per-entity snapshot buffers at a
   2-tick interpolation delay with capped extrapolation. Edits apply
   optimistically with rollback on rejection.
+- **UI state**: an explicit `UiMode` (Playing / Menu / Inventory) owns the
+  cursor; `ui::apply_cursor_mode` is its only writer, and Alt frees the
+  pointer without leaving the current mode. This replaced inferring the state
+  *from* the cursor — the pause menu used to be whatever was on screen when
+  the pointer was free, and any click re-grabbed it, so a second full-screen
+  UI could not be clicked without dismissing itself.
+- **Inventory UI**: the screen (E/I/Tab), the item strip, and the backpack
+  affordance all render from the last `InventoryUpdate`; slot clicks and drops
+  are requests, and the view only changes once the server answers. Icons come
+  from `blocks.png` via a `TextureAtlasLayout` over its 8x8 grid of 16x16
+  tiles, indexed by each block's top face — so blocks needed no new art.
+  Items lying in the world are small cubes with their UVs remapped into the
+  same tile.
 
 ## Physics (Avian, behind `SOILS_PHYSICS`)
 
@@ -361,6 +400,16 @@ Known limits are tracked in `TODO.md`.
   nothing. Unit tests assert the distribution really is gaussian (mean, sigma,
   1-sigma/2-sigma coverage), not merely random. Available to the real client as
   `SOILS_NETSIM=<latency_ms>,<jitter_ms>,<loss>[,<seed>]`.
+- **Inventory** (`soils-server/tests/inventory.rs`): the loop end to end
+  against an embedded server — a starter inventory arrives on join, placing
+  spends a block, breaking it drops an entity carrying that block, walking into
+  the drop collects it, throwing and re-collecting conserves the stack, and
+  placing a block the player does not hold is refused without touching the
+  world. Every assertion reads the server's pushed `InventoryUpdate`, never a
+  count the test computed for itself. Two fixtures are load-bearing: players
+  spawn ~29 voxels above the surface in fly mode, so a test that does not lay a
+  floor watches every drop fall out of pickup range; and edits are rate-limited
+  to 32/s, so unpaced placements are silently dropped and read as a logic bug.
 - **Physics** (`soils-server/tests/physics.rs`): a dropped cube falls and its
   orientation replicates as a unit quaternion, two clients converge on the same
   rest state, and the `SpawnCube` command creates a replicated cube.

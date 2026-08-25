@@ -119,6 +119,13 @@ impl Drop for TestServer {
 ///
 /// Messages travel through [`spawn_link`], so an optional [`NetSim`] can add
 /// latency, gaussian jitter, and loss without any test needing to know.
+/// A block every new player is stocked with (`STARTER_BLOCKS` in the server).
+///
+/// Placement spends an item, so a test that places a block the player does not
+/// hold gets `EditRejected` — and a wait for `EditAccepted` then spins forever,
+/// because other traffic keeps the receive deadline alive.
+pub const HELD_BLOCK: u8 = 4; // Cobblestone
+
 pub struct Client {
     out: UnboundedSender<ClientMsg>,
     inbox: UnboundedReceiver<ServerMsg>,
@@ -584,6 +591,26 @@ impl Client {
         let seq = self.edit_seq;
         self.send(&ClientMsg::Edit { seq, pos, value }).await;
         seq
+    }
+
+    /// Wait for the server's verdict on `seq`. Returns whether it was applied.
+    ///
+    /// Always prefer this to matching `EditAccepted` alone: a rejection sends
+    /// no accept, and the surrounding traffic keeps `next_msg` from ever timing
+    /// out, so the bare version hangs instead of failing.
+    pub async fn edit_verdict(&mut self, seq: u32) -> bool {
+        self.recv_until(|msg| match msg {
+            ServerMsg::EditAccepted { seq: s, .. } if s == seq => Some(true),
+            ServerMsg::EditRejected { seq: s } if s == seq => Some(false),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Place `value` and assert the server applied it.
+    pub async fn place(&mut self, pos: [i32; 3], value: u8) {
+        let seq = self.edit(pos, value).await;
+        assert!(self.edit_verdict(seq).await, "edit {seq} at {pos:?} (value {value}) was rejected");
     }
 
     /// Apply the next snapshot and return the entities it updated.

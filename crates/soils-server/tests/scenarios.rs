@@ -214,14 +214,14 @@ async fn edits_are_acked_and_replicate_without_echo() {
     // B replies with its own edit. Per-connection order means the FIRST plain
     // edit A receives must be B's — no echo of A's own.
     let pb = [NEAR_VOXEL[0] + 1, NEAR_VOXEL[1], NEAR_VOXEL[2]];
-    b.edit(pb, 7).await;
+    b.edit(pb, 11).await;
     let got = a
         .recv_until(|msg| match msg {
             ServerMsg::Edit { pos, value } => Some((pos, value)),
             _ => None,
         })
         .await;
-    assert_eq!(got, (pb, 7), "first edit at A must be B's, never an echo of A's own");
+    assert_eq!(got, (pb, 11), "first edit at A must be B's, never an echo of A's own");
 }
 
 #[tokio::test]
@@ -306,14 +306,14 @@ async fn warp_isolates_edits_and_actors_by_world() {
     })
     .await;
     let pb = [NEAR_VOXEL[0] + 1, NEAR_VOXEL[1], NEAR_VOXEL[2]];
-    a.edit(pb, 7).await;
+    a.edit(pb, 11).await;
     let got = b
         .recv_until(|msg| match msg {
             ServerMsg::Edit { pos, value } => Some((pos, value)),
             _ => None,
         })
         .await;
-    assert_eq!(got, (pb, 7), "edit made while B was in another world leaked through");
+    assert_eq!(got, (pb, 11), "edit made while B was in another world leaked through");
 }
 
 #[tokio::test]

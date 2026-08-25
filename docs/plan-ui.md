@@ -1,8 +1,12 @@
 # Plan: inventory, the item ring, and a real UI mode
 
-> **Status: not started.** Companion to `plan-game-systems.md` (authority,
-> protocol) and `architecture.md` (current state). Task checkoffs live in
-> `TODO.md` under `## UI`.
+> **Status (2026-08-25): phases 0-4 shipped, and phase 5's authority half with
+> them.** The loop works end to end: breaking a block drops it, walking into
+> the drop collects it, placing spends it. What is left is persistence across
+> logout and the radial *shape* of the ring — see [§9](#9-what-is-left).
+> Companion to `plan-game-systems.md` (authority, protocol) and
+> `architecture.md` (current state). Task checkoffs live in `TODO.md` under
+> `## UI`.
 
 Goal: replace the placeholder nine-slot block hotbar with an actual inventory —
 an item model, a radial selector for tools/weapons/consumables, and a full
@@ -170,17 +174,16 @@ inventory rather than voiding it.
 
 ## 6. Open decisions
 
-**Escape.** `TODO.md` lists Escape among the inventory keys, but Escape is
-currently the cursor release and so the pause menu. Both cannot be true.
+**Escape — decided: it backs out.** The design note lists Escape among the
+inventory keys, but Escape was already the cursor release and so the pause
+menu, and both could not be true. Escape now closes whatever is open and
+reaches the pause menu only when nothing else is: it is the one key that must
+always mean "get me out of here", and E/I/Tab already give the inventory three
+bindings. Worth revisiting if that reads wrong in play.
 
-Recommendation: **Escape closes whatever is open, and opens the pause menu only
-when nothing is.** That is the near-universal convention, it keeps a guaranteed
-way out of any UI, and E/I/Tab already give the inventory three bindings. The
-alternative — Escape opens the inventory and the pause menu moves elsewhere —
-is defensible but costs the "get me out of here" key.
-
-**Alt: hold or toggle.** Hold is more predictable; toggle is kinder for long
-interactions. Suggest hold, with a toggle if it proves annoying.
+**Alt — decided: hold.** Held, it frees the pointer without leaving the current
+mode. A toggle is kinder for long interactions and is a one-line change if hold
+proves annoying.
 
 ## 7. Later: authority and persistence
 
@@ -198,15 +201,37 @@ item spawner.
 
 ## 8. Milestones
 
-| # | Phase | Ships | Gate |
+| # | Phase | Ships | Status |
 |---|---|---|---|
-| 0 | UI mode | State machine, single cursor owner, Alt | Transition + no-re-grab tests |
-| 1 | Item model | `soils-sim` items, stacks, `Inventory` | Stacking/conservation tests |
-| 2 | Icons | Atlas layout + `icon(kind)` | Every block resolves in range |
-| 3 | Ring | Radial selector; `Hotbar` retired | Angle mapping, wrap seam |
-| 4 | Screen | E/I/Tab, slot grid, backpack affordance | Open/close, move conserves |
-| 5 | Authority | Protocol v4, server-owned, STDB on logout | Out of scope here |
+| 0 | UI mode | `UiMode`, single cursor owner, Alt | **done** — `ui.rs`, 7 tests |
+| 1 | Item model | `ItemKind`/`ItemStack`, `Inventory` | **done** — 25 tests |
+| 2 | Icons | Atlas layout, in-world drop textures | **done** — `inventory.rs` |
+| 3 | Ring | Item strip; `Hotbar` retired | **partly** — see below |
+| 4 | Screen | E/I/Tab, slot grid, backpack affordance | **done** |
+| 5 | Authority | Protocol v4, server-owned inventory | **done**, minus persistence |
 
-Phases 0-2 are invisible to a player and are most of the risk. Phase 0 in
-particular is a refactor of code that currently works, so it ships and is
-verified on its own before anything is built on it.
+Phase 0 was a refactor of code that already worked, and shipped on its own
+before anything was built on it.
+
+## 9. What is left
+
+* **The ring is a strip, not a ring.** It shows exactly what the design asks
+  for — every carried tool, weapon and consumable, and no blocks — but laid out
+  horizontally rather than radially, and it is not yet a *selector*: nothing in
+  the game is a tool yet, so there is nothing to select between. The radial
+  layout and hold-to-open selection are worth doing when tools exist and can be
+  felt, not before. Because the ring excludes blocks by design and the old
+  hotbar is gone, a separate one-slot `HeldItem` indicator shows what
+  right-click will place — otherwise that lived only on the F3 debug overlay
+  and the player had no way to see it.
+* **Inventory does not survive logout.** It is session state on the server. The
+  shape to copy is `player_profile` in SpacetimeDB — the same "authoritative in
+  `soils-server` during a session, persisted on logout" split recorded in
+  `TODO.md`. Until then a reconnecting player is re-stocked with the starter
+  kit, which is generous rather than correct.
+* **Nearby drops do not merge.** An uncollected item is reaped after
+  `DROP_TTL_TICKS` (5 min), so they no longer accumulate forever, but strip
+  mining still puts one entity per block in the world until they expire.
+  Merging drops within a voxel or two would cut that hard.
+* **No crafting, durability, or drop tables.** `ItemStack::durability` is
+  carried and never decremented, and a broken block yields exactly itself.

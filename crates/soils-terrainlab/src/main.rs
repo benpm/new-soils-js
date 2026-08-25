@@ -156,6 +156,16 @@ fn ui(
     };
     let ctx = ctx.clone();
 
+    // egui 0.35 made panels `Ui`-based rather than `Context`-based, so the
+    // integration has to supply the root viewport `Ui` panels attach to.
+    let mut viewport_ui = egui::Ui::new(
+        ctx.clone(),
+        "viewport".into(),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(ctx.viewport_rect()),
+    );
+
     // Keyboard undo/redo, applied before lowering so the restored graph takes
     // effect this frame. Ctrl+Z = undo; Ctrl+Y or Ctrl+Shift+Z = redo.
     let (do_undo, do_redo) = ctx.input_mut(|i| {
@@ -186,10 +196,10 @@ fn ui(
         Err(e) => state.status = format!("⚠ {e}"),
     }
 
-    top_bar(&ctx, &mut state, &mut mode);
-    preview_panel(&ctx, &mut state);
+    top_bar(&mut viewport_ui, &mut state, &mut mode);
+    preview_panel(&mut viewport_ui, &mut state);
 
-    let pointer_idle = !ctx.is_using_pointer();
+    let pointer_idle = !ctx.egui_is_using_pointer();
 
     // Per-node intermediate previews: lazily computed off-thread, keyed by node
     // content signature. Lower a fresh graph from the *current* edit so the
@@ -212,7 +222,7 @@ fn ui(
         let prev = if show_previews { Some(&preview_map) } else { None };
         // Transparent frame so the 3D terrain (rendered by the Camera3d) shows
         // through behind the node graph.
-        egui::CentralPanel::default().frame(egui::Frame::NONE).show(&ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(&mut viewport_ui, |ui| {
             let LabState { edit, canvas, .. } = &mut *state;
             canvas::show(ui, edit, canvas, &sigs, prev);
         });
@@ -231,8 +241,8 @@ fn ui(
     preview_input.seed = state.seed;
 }
 
-fn top_bar(ctx: &egui::Context, state: &mut LabState, mode: &mut ViewMode) {
-    egui::TopBottomPanel::top("top").show(ctx, |ui| {
+fn top_bar(viewport_ui: &mut egui::Ui, state: &mut LabState, mode: &mut ViewMode) {
+    egui::Panel::top("top").show(viewport_ui, |ui| {
         ui.horizontal(|ui| {
             if ui.button("New").clicked() {
                 let graph = TerrainGraph::default_soils();
@@ -303,10 +313,10 @@ fn top_bar(ctx: &egui::Context, state: &mut LabState, mode: &mut ViewMode) {
     });
 }
 
-fn preview_panel(ctx: &egui::Context, state: &mut LabState) {
-    egui::SidePanel::right("preview").min_width(PREVIEW_PX as f32 + 24.0).show(ctx, |ui| {
+fn preview_panel(viewport_ui: &mut egui::Ui, state: &mut LabState) {
+    egui::Panel::right("preview").min_size(PREVIEW_PX as f32 + 24.0).show(viewport_ui, |ui| {
         ui.heading("Height / density");
-        rebuild_preview_if_stale(ctx, state);
+        rebuild_preview_if_stale(&ui.ctx().clone(), state);
         if let Some(tex) = &state.preview {
             ui.image((tex.id(), egui::vec2(PREVIEW_PX as f32, PREVIEW_PX as f32)));
         }

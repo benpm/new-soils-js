@@ -317,6 +317,9 @@ pub struct World {
     /// lifecycle with the right count.
     refs: HashMap<IVec3, u32>,
     regions_dir: PathBuf,
+    /// Stable id this world's chunks are keyed under when SpacetimeDB
+    /// mirroring is on; `None` leaves persistence disk-only.
+    stdb_world_id: Option<u16>,
     /// Handle to the background writer: chunk saves are enqueued here instead
     /// of being written on the tick path.
     persist: PersistHandle,
@@ -351,6 +354,80 @@ pub struct World {
 }
 
 impl World {
+    /// Turn on SpacetimeDB mirroring for this world's chunk saves.
+    pub fn enable_stdb(&mut self, world_id: u16) {
+        self.stdb_world_id = Some(world_id);
+    }
+
+    /// Seed the region files from SpacetimeDB when there are none.
+    ///
+    /// This is the case that makes the mirror worth its cost: a fresh
+    /// deployment, or a host whose disk was lost, gets its edited chunks back
+    /// instead of a world reset to pristine terrain. Only edited chunks were
+    /// ever stored — everything else is bit-exact reproducible from
+    /// `GenParams`, so a full restore is exactly the edits and nothing more.
+    ///
+    /// Deliberately only when the directory is empty. Region files stay
+    /// authoritative, and a restore that ran over a populated directory could
+    /// roll live edits backwards to whatever the mirror last received.
+    pub fn restore_from_stdb(&mut self, link: &soils_stdb::StdbLink) -> usize {
+        let Some(world_id) = self.stdb_world_id else { return 0 };
+        let populated = std::fs::read_dir(&self.regions_dir)
+            .map(|d| d.filter_map(Result::ok).any(|e| e.path().is_file()))
+            .unwrap_or(false);
+        if populated {
+            return 0;
+        }
+
+        // Short, because this runs on the tick thread: the restore has to
+        // finish before anyone can join and generate pristine terrain over the
+        // chunks it is recovering, so it cannot be moved off the critical path
+        // — but it must not stall the first heartbeat either.
+        let (blobs, complete) = link.fetch_world_chunks(world_id, std::time::Duration::from_secs(5));
+        if !complete {
+            // Not the same as "this world has nothing stored". Say so: from
+            // here the server generates pristine terrain, and the next flush
+            // of an edited chunk overwrites whatever was really in the
+            // database.
+            eprintln!(
+                "stdb restore: world {world_id} did not answer in time;                  continuing with {} recovered chunk(s) — stored edits may be                  overwritten once play resumes",
+                blobs.len()
+            );
+        }
+        if blobs.is_empty() {
+            return 0;
+        }
+        let mut restored = Vec::new();
+        for blob in &blobs {
+            let Some(volume) = soils_protocol::decode_chunk(&blob.payload) else {
+                eprintln!(
+                    "stdb restore: chunk ({}, {}, {}) has an undecodable payload; skipping",
+                    blob.cx, blob.cy, blob.cz
+                );
+                continue;
+            };
+            restored.push((IVec3::new(blob.cx, blob.cy, blob.cz), volume));
+        }
+        // Written straight to disk rather than into the resident map: the
+        // normal load path picks them up from there, and a restore should look
+        // to the rest of the server exactly like a world that was always there.
+        let refs: Vec<(IVec3, &ChunkVolume, bool)> =
+            restored.iter().map(|(p, v)| (*p, v, true)).collect();
+        if let Err(e) = region::save_many(&self.regions_dir, &refs) {
+            eprintln!("stdb restore: could not write region files: {e}");
+            return 0;
+        }
+        println!("stdb restore: recovered {} edited chunks from SpacetimeDB", refs.len());
+        refs.len()
+    }
+
+    /// The chunk key this position mirrors under, if mirroring is on and the
+    /// position is representable.
+    fn stdb_key(&self, pos: IVec3) -> Option<u64> {
+        let id = self.stdb_world_id?;
+        soils_protocol::chunk_key::pack_chunk_key(id, pos.x, pos.y, pos.z)
+    }
+
     /// Create (or open) a named world under `data_dir`. Each world persists to
     /// its own region directory and generates from its own `seed`, so different
     /// names yield different terrain.
@@ -372,6 +449,7 @@ impl World {
             light_queue: Vec::new(),
             light_inflight: None,
             regions_dir,
+            stdb_world_id: None,
             persist,
             header_cache: HashMap::new(),
             navs: HashMap::new(),
@@ -736,14 +814,22 @@ impl World {
     /// Enqueue every dirty chunk for background persistence. Called on an
     /// interval and at shutdown.
     pub fn flush_dirty(&mut self) {
+        // `stdb_key` borrows self immutably, so resolve keys before the
+        // mutable iteration.
+        let world_id = self.stdb_world_id;
+        let dir = self.regions_dir.clone();
         for (pos, entry) in self.chunks.iter_mut() {
             if entry.dirty {
                 entry.dirty = false;
+                let key = world_id
+                    .and_then(|id| soils_protocol::chunk_key::pack_chunk_key(id, pos.x, pos.y, pos.z));
                 self.persist.enqueue(
-                    self.regions_dir.clone(),
+                    dir.clone(),
                     *pos,
                     entry.volume.clone(),
                     entry.edited,
+                    key,
+                    entry.version,
                 );
             }
         }
@@ -761,7 +847,15 @@ impl World {
         for pos in expired {
             let entry = self.chunks.remove(&pos).expect("collected above");
             if entry.dirty {
-                self.persist.enqueue(self.regions_dir.clone(), pos, entry.volume, entry.edited);
+                let key = self.stdb_key(pos);
+                self.persist.enqueue(
+                    self.regions_dir.clone(),
+                    pos,
+                    entry.volume,
+                    entry.edited,
+                    key,
+                    entry.version,
+                );
             }
             // The background writer will rewrite this chunk's region header;
             // the memoised copy is stale the moment the write lands.

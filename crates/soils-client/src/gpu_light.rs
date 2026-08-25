@@ -17,7 +17,6 @@ use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::render_asset::RenderAssets;
-use bevy::render::render_graph::{self, RenderGraph, RenderLabel};
 use bevy::render::render_resource::binding_types::{
     storage_buffer_read_only_sized, storage_buffer_sized,
 };
@@ -26,8 +25,11 @@ use bevy::render::render_resource::{
     CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
     RawBufferVec, ShaderStages,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
-use bevy::render::storage::{GpuShaderStorageBuffer, ShaderStorageBuffer};
+use bevy::core_pipeline::schedule::camera_driver;
+use bevy::render::renderer::{
+    RenderContext, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue,
+};
+use bevy::render::storage::{GpuShaderBuffer, ShaderBuffer};
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 use soils_protocol::chunk_of;
 
@@ -66,7 +68,7 @@ pub struct LightBatch {
 
 /// Per-block emission levels as a GPU table (u32 rows).
 #[derive(Resource, Clone, ExtractResource)]
-pub struct EmittersTable(pub Handle<ShaderStorageBuffer>);
+pub struct EmittersTable(pub Handle<ShaderBuffer>);
 
 /// Mirrored render→main once the flood pipelines have compiled: the planner
 /// must not drain the LightQueue before the node can actually dispatch (see
@@ -85,22 +87,29 @@ impl Plugin for GpuLightPlugin {
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app
-            .add_systems(
-                RenderStartup,
-                (init_pipeline, add_render_graph_node.after(crate::gpu_mesh::add_render_graph_node)),
-            )
+            .add_systems(RenderStartup, init_pipeline)
             .add_systems(bevy::render::ExtractSchedule, mirror_ready)
-            .add_systems(Render, prepare_light.in_set(RenderSystems::PrepareBindGroups));
+            .add_systems(Render, prepare_light.in_set(RenderSystems::PrepareBindGroups))
+            // After the mesher and before the draw; voxel uploads for this
+            // frame land in PrepareResources, so the flood sees this frame's
+            // volumes.
+            .add_systems(
+                RenderGraph,
+                light_pass
+                    .in_set(RenderGraphSystems::Render)
+                    .after(crate::gpu_mesh::voxel_mesh_pass)
+                    .before(camera_driver),
+            );
     }
 }
 
 fn setup_emitters(
     mut commands: Commands,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
     blocks: Res<Blocks>,
 ) {
     let rows: Vec<u32> = blocks.0.light_table().into_iter().map(u32::from).collect();
-    commands.insert_resource(EmittersTable(buffers.add(ShaderStorageBuffer::from(rows))));
+    commands.insert_resource(EmittersTable(buffers.add(ShaderBuffer::from(rows))));
 }
 
 /// Turn queued light events into this frame's GPU job batch (replaces the CPU
@@ -213,7 +222,7 @@ fn mirror_ready(
 // ---------------- Render world ----------------
 
 #[derive(Resource)]
-struct LightPipeline {
+pub(crate) struct LightPipeline {
     layout: BindGroupLayoutDescriptor,
     reseed: CachedComputePipelineId,
     beam: CachedComputePipelineId,
@@ -221,7 +230,7 @@ struct LightPipeline {
 }
 
 #[derive(Resource, Default)]
-struct LightJobsGpu {
+pub(crate) struct LightJobsGpu {
     core: Option<RawBufferVec<GpuLightJob>>,
     relax: Option<RawBufferVec<GpuLightJob>>,
     core_bg: Option<BindGroup>,
@@ -230,9 +239,6 @@ struct LightJobsGpu {
     relax_count: u32,
     beam_rounds: u32,
 }
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct LightLabel;
 
 fn init_pipeline(
     mut commands: Commands,
@@ -268,14 +274,6 @@ fn init_pipeline(
     commands.insert_resource(LightJobsGpu::default());
 }
 
-fn add_render_graph_node(mut render_graph: ResMut<RenderGraph>) {
-    render_graph.add_node(LightLabel, LightNode);
-    // After the mesher (which shares no state but keeps diagnostics tidy) and
-    // before the draw; voxel uploads for this frame land in PrepareResources,
-    // so the flood sees this frame's volumes.
-    render_graph.add_node_edge(crate::gpu_mesh::VoxelMeshLabel, LightLabel);
-    render_graph.add_node_edge(LightLabel, bevy::render::graph::CameraDriverLabel);
-}
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_light(
@@ -286,7 +284,7 @@ fn prepare_light(
     emitters: Option<Res<EmittersTable>>,
     device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    buffers: Res<RenderAssets<GpuShaderStorageBuffer>>,
+    buffers: Res<RenderAssets<GpuShaderBuffer>>,
     pipeline_cache: Res<PipelineCache>,
 ) {
     jobs.core_bg = None;
@@ -342,44 +340,38 @@ fn prepare_light(
     jobs.beam_rounds = batch.beam_rounds;
 }
 
-struct LightNode;
+/// Flood L0 light over the pooled caches.
+pub(crate) fn light_pass(
+    mut render_context: RenderContext,
+    pipeline_cache: Res<PipelineCache>,
+    pipeline: Res<LightPipeline>,
+    jobs: Option<Res<LightJobsGpu>>,
+) {
+    let Some(jobs) = jobs else { return };
+    let (Some(core_bg), Some(relax_bg)) = (&jobs.core_bg, &jobs.relax_bg) else {
+        return;
+    };
+    let (Some(reseed), Some(beam), Some(relax)) = (
+        pipeline_cache.get_compute_pipeline(pipeline.reseed),
+        pipeline_cache.get_compute_pipeline(pipeline.beam),
+        pipeline_cache.get_compute_pipeline(pipeline.relax),
+    ) else {
+        return;
+    };
 
-impl render_graph::Node for LightNode {
-    fn run(
-        &self,
-        _graph: &mut render_graph::RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), render_graph::NodeRunError> {
-        let pipeline_cache = world.resource::<PipelineCache>();
-        let pipeline = world.resource::<LightPipeline>();
-        let Some(jobs) = world.get_resource::<LightJobsGpu>() else { return Ok(()) };
-        let (Some(core_bg), Some(relax_bg)) = (&jobs.core_bg, &jobs.relax_bg) else {
-            return Ok(());
-        };
-        let (Some(reseed), Some(beam), Some(relax)) = (
-            pipeline_cache.get_compute_pipeline(pipeline.reseed),
-            pipeline_cache.get_compute_pipeline(pipeline.beam),
-            pipeline_cache.get_compute_pipeline(pipeline.relax),
-        ) else {
-            return Ok(());
-        };
-
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor { label: Some("light_flood"), ..default() });
-        pass.set_bind_group(0, core_bg, &[]);
-        pass.set_pipeline(reseed);
-        pass.dispatch_workgroups(128, jobs.core_count, 1);
-        pass.set_pipeline(beam);
-        for _ in 0..jobs.beam_rounds.max(1) {
-            pass.dispatch_workgroups(4, jobs.core_count, 1);
-        }
-        pass.set_bind_group(0, relax_bg, &[]);
-        pass.set_pipeline(relax);
-        for _ in 0..RELAX_ROUNDS {
-            pass.dispatch_workgroups(128, jobs.relax_count, 1);
-        }
-        Ok(())
+    let mut pass = render_context
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor { label: Some("light_flood"), ..default() });
+    pass.set_bind_group(0, core_bg, &[]);
+    pass.set_pipeline(reseed);
+    pass.dispatch_workgroups(128, jobs.core_count, 1);
+    pass.set_pipeline(beam);
+    for _ in 0..jobs.beam_rounds.max(1) {
+        pass.dispatch_workgroups(4, jobs.core_count, 1);
+    }
+    pass.set_bind_group(0, relax_bg, &[]);
+    pass.set_pipeline(relax);
+    for _ in 0..RELAX_ROUNDS {
+        pass.dispatch_workgroups(128, jobs.relax_count, 1);
     }
 }

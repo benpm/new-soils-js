@@ -120,9 +120,15 @@ pub fn collect_input(
 pub struct InputRing {
     seq: u32,
     frames: Vec<InputFrame>,
-    /// `(seq, input, predicted state after stepping it)` — the rewind/replay
-    /// source for reconciliation.
-    history: VecDeque<(u32, PlayerInput, PlayerState)>,
+    /// `(seq, input, predicted state after stepping it, peers that tick)` —
+    /// the rewind/replay source for reconciliation.
+    ///
+    /// Peer positions are recorded per tick, not read fresh at replay time. The
+    /// server steps each tick against that tick's peer snapshot; replaying a
+    /// whole ring against one current set would reproduce a different history
+    /// than the server's, so the prediction could never converge while anyone
+    /// was moving nearby — a permanent rewind every snapshot.
+    history: VecDeque<(u32, PlayerInput, PlayerState, Vec<Vec3>)>,
 }
 
 /// History depth: ~4 s at 64 Hz, far beyond any sane RTT.
@@ -146,6 +152,7 @@ pub fn predict_and_send(
     tracker: Res<crate::server_msg::SnapTracker>,
     map: Res<ChunkMap>,
     chunks: Query<&VoxelChunk>,
+    actors: Query<&crate::actor::Actor>,
     mut query: Query<&mut Player>,
 ) {
     let Ok(mut player) = query.single_mut() else { return };
@@ -156,11 +163,20 @@ pub fn predict_and_send(
     let player = &mut *player;
     player.prev_pos = player.sim.pos;
     let sampler = |v: IVec3| voxel_at(&map, &chunks, v);
-    soils_sim::step_player(&mut player.sim, &input, 1.0 / soils_sim::TICK_HZ as f32, &sampler);
+    let peers = peer_positions(&actors);
+    soils_sim::step_player_peers(
+        &mut player.sim,
+        &input,
+        1.0 / soils_sim::TICK_HZ as f32,
+        &sampler,
+        &peers,
+    );
+    // `peers` moves into the ring below, so this tick's obstacle set can be
+    // replayed exactly if reconciliation rewinds through it.
 
     ring.seq += 1;
     let seq = ring.seq;
-    ring.history.push_back((seq, input, player.sim));
+    ring.history.push_back((seq, input, player.sim, peers));
     if ring.history.len() > HISTORY_CAP {
         ring.history.pop_front();
     }
@@ -173,6 +189,17 @@ pub fn predict_and_send(
         ack_tick: tracker.0.latest_tick,
         frames: ring.frames.clone(),
     });
+}
+
+/// Eye positions of the other players we know about. The local player has no
+/// `Actor` body (`spawn_actors` skips `self_entity`), so this is exactly the
+/// peer set the server steps us against.
+fn peer_positions(actors: &Query<&crate::actor::Actor>) -> Vec<Vec3> {
+    actors
+        .iter()
+        .filter(|a| a.kind == soils_sim::KIND_PLAYER)
+        .filter_map(|a| a.latest_pos())
+        .collect()
 }
 
 /// Predicted-vs-authoritative tolerance (world units) before a rewind+replay.
@@ -202,7 +229,7 @@ pub fn reconcile_self(
             ring.history.pop_front();
         }
         let predicted_then = match ring.history.front() {
-            Some((s, _, st)) if *s == seq => *st,
+            Some((s, _, st, _)) if *s == seq => *st,
             // No matching entry (fresh join, warp, or pre-input echo): adopt
             // the server state outright only if we're far off.
             _ => {
@@ -237,8 +264,16 @@ pub fn reconcile_self(
         }
         let mut sim = base;
         let sampler = |v: IVec3| voxel_at(&map, &chunks, v);
-        for (_, input, recorded) in ring.history.iter_mut().skip(1) {
-            soils_sim::step_player(&mut sim, input, 1.0 / soils_sim::TICK_HZ as f32, &sampler);
+        // Each tick replays against the peers recorded *for that tick*, which
+        // is what the server stepped it against.
+        for (_, input, recorded, peers) in ring.history.iter_mut().skip(1) {
+            soils_sim::step_player_peers(
+                &mut sim,
+                input,
+                1.0 / soils_sim::TICK_HZ as f32,
+                &sampler,
+                peers,
+            );
             *recorded = sim;
         }
         player.sim = sim;

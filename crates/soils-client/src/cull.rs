@@ -13,7 +13,6 @@ use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::gpu_readback::{Readback, ReadbackComplete};
 use bevy::render::render_asset::RenderAssets;
-use bevy::render::render_graph::{self, RenderGraph, RenderLabel};
 use bevy::render::render_resource::binding_types::{
     storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer_sized,
 };
@@ -22,8 +21,11 @@ use bevy::render::render_resource::{
     BufferDescriptor, BufferUsages, CachedComputePipelineId, ComputePassDescriptor,
     ComputePipelineDescriptor, PipelineCache, ShaderStages,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
-use bevy::render::storage::{GpuShaderStorageBuffer, ShaderStorageBuffer};
+use bevy::core_pipeline::schedule::camera_driver;
+use bevy::render::renderer::{
+    RenderContext, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue,
+};
+use bevy::render::storage::{GpuShaderBuffer, ShaderBuffer};
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 use soils_protocol::CHUNK_BIT;
 
@@ -80,7 +82,7 @@ pub struct DemandedChunks {
 
 /// Handle to the demand buffer asset (main world, for the Readback entity).
 #[derive(Resource, Clone, ExtractResource)]
-pub struct DemandBuffer(pub Handle<ShaderStorageBuffer>);
+pub struct DemandBuffer(pub Handle<ShaderBuffer>);
 
 pub struct CullPlugin;
 
@@ -102,20 +104,22 @@ impl Plugin for CullPlugin {
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app
+            .add_systems(RenderStartup, init_pipeline)
+            .add_systems(Render, prepare_cull.in_set(RenderSystems::PrepareBindGroups))
+            // After the mesher (finalize writes instance_count 1; cull's
+            // verdict must win) and before the camera draws.
             .add_systems(
-                RenderStartup,
-                (
-                    init_pipeline,
-                    // The mesher's node must exist before our edge references it.
-                    add_render_graph_node.after(crate::gpu_mesh::add_render_graph_node),
-                ),
-            )
-            .add_systems(Render, prepare_cull.in_set(RenderSystems::PrepareBindGroups));
+                RenderGraph,
+                cull_pass
+                    .in_set(RenderGraphSystems::Render)
+                    .after(crate::gpu_mesh::voxel_mesh_pass)
+                    .before(camera_driver),
+            );
     }
 }
 
-fn setup_demand_buffer(mut commands: Commands, mut buffers: ResMut<Assets<ShaderStorageBuffer>>) {
-    let mut buf = ShaderStorageBuffer::with_size(DEMAND_BYTES, Default::default());
+fn setup_demand_buffer(mut commands: Commands, mut buffers: ResMut<Assets<ShaderBuffer>>) {
+    let mut buf = ShaderBuffer::with_size(DEMAND_BYTES, Default::default());
     buf.buffer_description.usage = BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST;
     let handle = buffers.add(buf);
     commands.insert_resource(DemandBuffer(handle.clone()));
@@ -162,7 +166,7 @@ fn update_cull_params(
 // ---------------- Render world ----------------
 
 #[derive(Resource)]
-struct CullPipeline {
+pub(crate) struct CullPipeline {
     layout: BindGroupLayoutDescriptor,
     cull: CachedComputePipelineId,
     scan: CachedComputePipelineId,
@@ -170,13 +174,10 @@ struct CullPipeline {
 }
 
 #[derive(Resource, Default)]
-struct CullJob {
+pub(crate) struct CullJob {
     bind_group: Option<BindGroup>,
     radius: i32,
 }
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct CullLabel;
 
 fn init_pipeline(
     mut commands: Commands,
@@ -218,13 +219,6 @@ fn init_pipeline(
     commands.insert_resource(CullJob::default());
 }
 
-fn add_render_graph_node(mut render_graph: ResMut<RenderGraph>) {
-    render_graph.add_node(CullLabel, CullNode);
-    // After the mesher (finalize writes instance_count 1; cull's verdict must
-    // win) and before the camera draws.
-    render_graph.add_node_edge(crate::gpu_mesh::VoxelMeshLabel, CullLabel);
-    render_graph.add_node_edge(CullLabel, bevy::render::graph::CameraDriverLabel);
-}
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_cull(
@@ -235,7 +229,7 @@ fn prepare_cull(
     demand: Option<Res<DemandBuffer>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
-    buffers: Res<RenderAssets<GpuShaderStorageBuffer>>,
+    buffers: Res<RenderAssets<GpuShaderBuffer>>,
     pipeline_cache: Res<PipelineCache>,
 ) {
     let (Some(mut job), Some(pipeline)) = (job, pipeline) else { return };
@@ -262,42 +256,39 @@ fn prepare_cull(
     job.radius = params.radius;
 }
 
-struct CullNode;
-
-impl render_graph::Node for CullNode {
-    fn run(
-        &self,
-        _graph: &mut render_graph::RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), render_graph::NodeRunError> {
-        let pipeline_cache = world.resource::<PipelineCache>();
-        let pipeline = world.resource::<CullPipeline>();
-        let Some(job) = world.get_resource::<CullJob>() else { return Ok(()) };
-        let Some(bind_group) = &job.bind_group else { return Ok(()) };
-        let (Some(cull), Some(scan)) = (
-            pipeline_cache.get_compute_pipeline(pipeline.cull),
-            pipeline_cache.get_compute_pipeline(pipeline.scan),
-        ) else {
-            return Ok(());
-        };
-        // Reset the demand counter, then cull + scan in one pass.
-        let demand = world.resource::<RenderAssets<GpuShaderStorageBuffer>>();
-        if let Some(db) = world.get_resource::<DemandBuffer>()
-            && let Some(buf) = demand.get(&db.0)
-        {
-            render_context.command_encoder().clear_buffer(&buf.buffer, 0, Some(16));
-        }
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor { label: Some("cull_demand"), ..default() });
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.set_pipeline(cull);
-        pass.dispatch_workgroups((crate::pool::N_MESH).div_ceil(64), 1, 1);
-        pass.set_pipeline(scan);
-        let side = (job.radius * 2 + 1) as u32;
-        let groups = side.div_ceil(4);
-        pass.dispatch_workgroups(groups, groups, groups);
-        Ok(())
+/// Frustum-cull the mesh slots into `instance_count`, then scan the view
+/// window for chunks the streamer should demand.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cull_pass(
+    mut render_context: RenderContext,
+    pipeline_cache: Res<PipelineCache>,
+    pipeline: Res<CullPipeline>,
+    job: Option<Res<CullJob>>,
+    demand: Res<RenderAssets<GpuShaderBuffer>>,
+    demand_buffer: Option<Res<DemandBuffer>>,
+) {
+    let Some(job) = job else { return };
+    let Some(bind_group) = &job.bind_group else { return };
+    let (Some(cull), Some(scan)) = (
+        pipeline_cache.get_compute_pipeline(pipeline.cull),
+        pipeline_cache.get_compute_pipeline(pipeline.scan),
+    ) else {
+        return;
+    };
+    // Reset the demand counter, then cull + scan in one pass.
+    if let Some(db) = demand_buffer
+        && let Some(buf) = demand.get(&db.0)
+    {
+        render_context.command_encoder().clear_buffer(&buf.buffer, 0, Some(16));
     }
+    let mut pass = render_context
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor { label: Some("cull_demand"), ..default() });
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.set_pipeline(cull);
+    pass.dispatch_workgroups((crate::pool::N_MESH).div_ceil(64), 1, 1);
+    pass.set_pipeline(scan);
+    let side = (job.radius * 2 + 1) as u32;
+    let groups = side.div_ceil(4);
+    pass.dispatch_workgroups(groups, groups, groups);
 }

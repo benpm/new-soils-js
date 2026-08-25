@@ -7,9 +7,14 @@ members = [
     "crates/soils-script",
     "crates/soils-physics",
     "crates/soils-server",
+    "crates/soils-stdb",
     "crates/soils-client",
     "crates/soils-terrainlab",
 ]
+# The SpacetimeDB module is a wasm32 cdylib built by `spacetime publish`, with
+# its own lockfile. Excluded so `cargo test --workspace` doesn't build it for
+# the host.
+exclude = ["stdb/soils-module"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,13 +28,14 @@ soils-worldgen = { path = "crates/soils-worldgen" }
 soils-script = { path = "crates/soils-script" }
 soils-physics = { path = "crates/soils-physics" }
 soils-server = { path = "crates/soils-server" }
+soils-stdb = { path = "crates/soils-stdb" }
 serde = { version = "1", features = ["derive"] }
 bincode = "2"
-# 3D rigid-body physics (Avian). 0.6.1 is the last release tracking bevy 0.18
-# (0.7 needs bevy 0.19). default-features off to drop `parallel` — a
+# 3D rigid-body physics (Avian). 0.7.0 tracks bevy 0.19 (0.6.1 was the last
+# release on bevy 0.18). default-features off to drop `parallel` — a
 # single-threaded, deterministic step keeps client prediction/rollback
 # re-simulation matching the original run; `enhanced-determinism` shrinks drift.
-avian3d = { version = "0.6.1", default-features = false, features = [
+avian3d = { version = "0.7.0", default-features = false, features = [
     "3d",
     "f32",
     "parry-f32",
@@ -37,8 +43,8 @@ avian3d = { version = "0.6.1", default-features = false, features = [
     "enhanced-determinism",
 ] }
 # Kept in lockstep with the glam version Bevy re-exports, so sim/protocol math
-# types flow into client code without array bridging.
-glam = "0.30"
+# types flow into client code without array bridging. Bevy 0.19 → glam 0.32.
+glam = "0.32"
 
 # Keep debug builds snappy for the deep dependency graph (bevy).
 [profile.dev]

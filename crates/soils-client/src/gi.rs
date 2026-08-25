@@ -14,7 +14,6 @@ use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::render_asset::RenderAssets;
-use bevy::render::render_graph::{self, RenderGraph, RenderLabel};
 use bevy::render::render_resource::binding_types::{
     storage_buffer_read_only_sized, storage_buffer_sized,
 };
@@ -23,8 +22,9 @@ use bevy::render::render_resource::{
     CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
     ShaderStages,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice};
-use bevy::render::storage::{GpuShaderStorageBuffer, ShaderStorageBuffer};
+use bevy::core_pipeline::schedule::camera_driver;
+use bevy::render::renderer::{RenderContext, RenderDevice, RenderGraph, RenderGraphSystems};
+use bevy::render::storage::{GpuShaderBuffer, ShaderBuffer};
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 use soils_protocol::CHUNK_BIT;
 
@@ -90,19 +90,19 @@ impl Default for GiSettings {
 /// same `cascade0` and `params` buffers the compute pass writes.
 #[derive(Resource, Clone, ExtractResource)]
 pub struct GiAssets {
-    world_vox: Handle<ShaderStorageBuffer>,
+    world_vox: Handle<ShaderBuffer>,
     /// Packed L0 light per volume voxel (sky nibble hi, block nibble lo),
     /// blitted from the chunks' padded light buffers alongside occupancy;
     /// seeds the top cascade's sky-visibility term.
-    world_light: Handle<ShaderStorageBuffer>,
-    emission: Handle<ShaderStorageBuffer>,
-    cascades: [Handle<ShaderStorageBuffer>; CASCADES],
-    metas: [Handle<ShaderStorageBuffer>; CASCADES],
+    world_light: Handle<ShaderBuffer>,
+    emission: Handle<ShaderBuffer>,
+    cascades: [Handle<ShaderBuffer>; CASCADES],
+    metas: [Handle<ShaderBuffer>; CASCADES],
     /// Per-probe ambient-cube irradiance (6 vec4 faces per cascade-0 probe),
     /// projected from merged cascade 0 each GI cycle; what the terrain
     /// material actually samples.
-    irradiance: Handle<ShaderStorageBuffer>,
-    params: Handle<ShaderStorageBuffer>,
+    irradiance: Handle<ShaderBuffer>,
+    params: Handle<ShaderBuffer>,
     /// Pending GPU volume refill: (mesh slot, light slot, offset relative to
     /// the volume origin) per overlapped chunk, blitted straight out of the
     /// pooled caches. Populated on refill frames, consumed by the render node
@@ -111,7 +111,7 @@ pub struct GiAssets {
     /// Placeholder bound to the unused `far` slot during trace (can't reuse the
     /// write target — a buffer may not be both read-write and read-only in one
     /// dispatch).
-    dummy: Handle<ShaderStorageBuffer>,
+    dummy: Handle<ShaderBuffer>,
     /// Center voxel the volume is currently built around (`None` until first
     /// fill), so we only rebuild when the player drifts far enough.
     center: Option<IVec3>,
@@ -123,7 +123,7 @@ impl GiAssets {
     /// The per-probe ambient-cube irradiance buffer the chunk material
     /// samples. Its GPU buffer is written only by the compute shader and never
     /// recreated, so it is safe to hold in a cached material bind group.
-    pub fn irradiance(&self) -> Handle<ShaderStorageBuffer> {
+    pub fn irradiance(&self) -> Handle<ShaderBuffer> {
         self.irradiance.clone()
     }
 
@@ -155,44 +155,48 @@ impl Plugin for GiPlugin {
             return;
         };
         render_app
-            .add_systems(RenderStartup, (init_pipeline, add_render_graph_node))
-            .add_systems(Render, prepare_bind_groups.in_set(RenderSystems::PrepareBindGroups));
+            .add_systems(RenderStartup, init_pipeline)
+            .add_systems(Render, prepare_bind_groups.in_set(RenderSystems::PrepareBindGroups))
+            .add_systems(
+                RenderGraph,
+                gi_pass.in_set(RenderGraphSystems::Render).before(camera_driver),
+            );
     }
 }
 
 /// Allocate all GI buffers up front (fixed sizes).
 fn setup_gi_assets(
     mut commands: Commands,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
     blocks: Res<Blocks>,
 ) {
     let usage = RenderAssetUsages::default();
 
     // One byte (block id) per voxel; the shader reads it as packed u32s.
     let world_vox =
-        buffers.add(ShaderStorageBuffer::with_size((GI_DIM * GI_DIM * GI_DIM) as usize, usage));
+        buffers.add(ShaderBuffer::with_size((GI_DIM * GI_DIM * GI_DIM) as usize, usage));
     // One packed L0 light byte per voxel, same layout.
     let world_light =
-        buffers.add(ShaderStorageBuffer::with_size((GI_DIM * GI_DIM * GI_DIM) as usize, usage));
+        buffers.add(ShaderBuffer::with_size((GI_DIM * GI_DIM * GI_DIM) as usize, usage));
 
     // Per-block emitted radiance as vec4<f32> rows, indexed by block id.
     let emission_rows: Vec<Vec4> =
         blocks.0.emission_table().into_iter().map(Vec4::from_array).collect();
-    let emission = buffers.add(ShaderStorageBuffer::from(emission_rows));
+    let emission = buffers.add(ShaderBuffer::from(emission_rows));
 
     let cascades = std::array::from_fn(|c| {
-        buffers.add(ShaderStorageBuffer::with_size(cascade_entries(c) as usize * 16, usage))
+        buffers.add(ShaderBuffer::with_size(cascade_entries(c) as usize * 16, usage))
     });
     let metas = std::array::from_fn(|c| {
-        buffers.add(ShaderStorageBuffer::from(vec![c as u32]))
+        buffers.add(ShaderBuffer::from(vec![c as u32]))
     });
     // 6 vec4 ambient-cube faces per cascade-0 probe.
     let irradiance = buffers
-        .add(ShaderStorageBuffer::with_size(PROBES[0].pow(3) as usize * 6 * 16, usage));
+        .add(ShaderBuffer::with_size(PROBES[0].pow(3) as usize * 6 * 16, usage));
 
     // 12 f32 = origin(3)+day, zenith(3)+lux, horizon(3)+enabled.
-    let params = buffers.add(ShaderStorageBuffer::from(vec![0.0f32; 12]));
-    let dummy = buffers.add(ShaderStorageBuffer::with_size(16, usage));
+    let params = buffers.add(ShaderBuffer::from(vec![0.0f32; 12]));
+    let dummy = buffers.add(ShaderBuffer::with_size(16, usage));
 
     commands.insert_resource(GiAssets {
         world_vox,
@@ -230,7 +234,7 @@ fn update_gi_volume(
     slots: Res<crate::pool::ChunkSlots>,
     player: Query<&Transform, With<crate::player::Player>>,
     mut gi: ResMut<GiAssets>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut refill: Local<u32>,
 ) {
     gi.enabled = settings.enabled;
@@ -298,7 +302,7 @@ fn update_gi_volume(
 /// Pack the params buffer (origin, daylight, sky colours, enabled flag).
 fn write_params(
     gi: &GiAssets,
-    buffers: &mut Assets<ShaderStorageBuffer>,
+    buffers: &mut Assets<ShaderBuffer>,
     origin: IVec3,
     day: f32,
     enabled: bool,
@@ -312,7 +316,7 @@ fn write_params(
         zenith[0], zenith[1], zenith[2], 0.0,
         horizon[0], horizon[1], horizon[2], if enabled { 1.0 } else { 0.0 },
     ];
-    if let Some(buf) = buffers.get_mut(&gi.params) {
+    if let Some(mut buf) = buffers.get_mut(&gi.params) {
         buf.data = Some(f32_bytes(&data));
     }
 }
@@ -320,7 +324,7 @@ fn write_params(
 // ---------------- Render world ----------------
 
 #[derive(Resource)]
-struct GiPipeline {
+pub(crate) struct GiPipeline {
     layout: BindGroupLayoutDescriptor,
     trace: CachedComputePipelineId,
     merge: CachedComputePipelineId,
@@ -333,7 +337,7 @@ struct GiPipeline {
 
 /// Bind groups + dispatch sizes for one frame's cascades.
 #[derive(Resource, Default)]
-struct GiJobs {
+pub(crate) struct GiJobs {
     /// Occupancy refill: clear the volume, then blit each chunk.
     clear: Option<BindGroup>,
     blits: Vec<BindGroup>,
@@ -342,9 +346,6 @@ struct GiJobs {
     /// Ambient-cube projection, queued the frame cascade 0 finishes merging.
     irradiance: Option<BindGroup>,
 }
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct GiLabel;
 
 fn init_pipeline(
     mut commands: Commands,
@@ -443,10 +444,6 @@ fn init_pipeline(
     commands.insert_resource(GiJobs::default());
 }
 
-fn add_render_graph_node(mut render_graph: ResMut<RenderGraph>) {
-    render_graph.add_node(GiLabel, GiNode);
-    render_graph.add_node_edge(GiLabel, bevy::render::graph::CameraDriverLabel);
-}
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_bind_groups(
@@ -456,7 +453,7 @@ fn prepare_bind_groups(
     pipeline_cache: Res<PipelineCache>,
     gi: Option<Res<GiAssets>>,
     pools: Option<Res<crate::pool::ChunkPools>>,
-    buffers: Res<RenderAssets<GpuShaderStorageBuffer>>,
+    buffers: Res<RenderAssets<GpuShaderBuffer>>,
     mut frame: Local<u32>,
 ) {
     jobs.clear = None;
@@ -593,27 +590,21 @@ fn prepare_bind_groups(
     }
 }
 
-struct GiNode;
+/// Radiance-cascades GI: occupancy blit, cascade trace/merge, irradiance.
+pub(crate) fn gi_pass(
+    mut render_context: RenderContext,
+    pipeline_cache: Res<PipelineCache>,
+    pipeline: Res<GiPipeline>,
+    jobs: Option<Res<GiJobs>>,
+) {
+    let Some(jobs) = jobs else { return };
+    if jobs.trace.is_empty() && jobs.merge.is_empty() && jobs.blits.is_empty() {
+        return;
+    }
 
-impl render_graph::Node for GiNode {
-    fn run(
-        &self,
-        _graph: &mut render_graph::RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), render_graph::NodeRunError> {
-        let pipeline_cache = world.resource::<PipelineCache>();
-        let pipeline = world.resource::<GiPipeline>();
-        let Some(jobs) = world.get_resource::<GiJobs>() else {
-            return Ok(());
-        };
-        if jobs.trace.is_empty() && jobs.merge.is_empty() && jobs.blits.is_empty() {
-            return Ok(());
-        }
-
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor { label: Some("gi"), ..default() });
+    let mut pass = render_context
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor { label: Some("gi"), ..default() });
 
         // Occupancy refill first, so this frame's (or the next) trace reads
         // fresh geometry: one clear over the volume, then a blit per chunk.
@@ -658,6 +649,4 @@ impl render_graph::Node for GiNode {
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups((PROBES[0].pow(3) * 6).div_ceil(64), 1, 1);
         }
-        Ok(())
-    }
 }

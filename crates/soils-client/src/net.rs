@@ -14,9 +14,25 @@
 use bevy::prelude::*;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use futures_util::{SinkExt, StreamExt};
+use soils_protocol::netsim::{Lane, NetSim};
 use soils_protocol::{ClientMsg, ServerMsg, decode, encode};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_tungstenite::tungstenite::Message;
+
+/// Artificial link conditions from `SOILS_NETSIM=<latency_ms>,<jitter_ms>,
+/// <loss>[,<seed>]`, e.g. `SOILS_NETSIM=120,40,0.05`. Unset (the default)
+/// leaves the connection untouched.
+///
+/// This exists to make interpolation and reconciliation *visible*: a link bad
+/// enough to see is the only way to check that remote players still move
+/// smoothly and that the local player still reconciles without snapping.
+///
+/// Wired into the WebSocket transport only. WebTransport already splits
+/// reliable and unreliable lanes itself, so simulating loss on top of it would
+/// describe a link that does not exist.
+pub fn configured_netsim() -> Option<NetSim> {
+    NetSim::from_env("SOILS_NETSIM")
+}
 
 /// Preferred URL scheme for bare `host:port` addresses: `wt` (WebTransport)
 /// when `SOILS_WT=1`, `ws` otherwise. WebTransport is opt-in while it soaks —
@@ -113,28 +129,90 @@ async fn ws_session(
     info!("connected to {url}");
     let _ = from_tx.send(NetEvent::Connected);
     let (mut ws_tx, mut ws_rx) = ws.split();
+    let (mut up, mut down) = match configured_netsim() {
+        Some(sim) => {
+            warn!("SOILS_NETSIM active: {sim} each way");
+            let (u, d) = sim.split_direction();
+            (Some(u), Some(d))
+        }
+        None => (None, None),
+    };
 
-    // Reader: server -> ECS.
+    // Delay is applied by stamping a deadline on arrival and sleeping until it
+    // in a *separate* task. Sleeping inline would stall the next read too, so a
+    // 100 ms link fed every 10 ms would accumulate delay without bound instead
+    // of holding steady. `NetSim` deadlines are non-decreasing, so FIFO plus
+    // `sleep_until` preserves order exactly.
+
+    // Reader: server -> (link) -> ECS.
     let rtx = from_tx.clone();
+    let (dq_tx, mut dq_rx) = unbounded_channel::<(tokio::time::Instant, ServerMsg)>();
+    let delayer = tokio::spawn(async move {
+        while let Some((at, msg)) = dq_rx.recv().await {
+            tokio::time::sleep_until(at).await;
+            if rtx.send(NetEvent::Msg(msg)).is_err() {
+                break;
+            }
+        }
+    });
     let reader = tokio::spawn(async move {
         while let Some(Ok(frame)) = ws_rx.next().await {
-            if let Message::Binary(bytes) = frame {
-                if let Some(msg) = decode::<ServerMsg>(bytes.as_ref()) {
-                    if rtx.send(NetEvent::Msg(msg)).is_err() {
-                        break;
+            let Message::Binary(bytes) = frame else { continue };
+            let Some(msg) = decode::<ServerMsg>(bytes.as_ref()) else { continue };
+            let at = match &mut down {
+                None => tokio::time::Instant::now(),
+                Some(sim) => {
+                    // Snapshots are delta-coded against acked baselines, so a
+                    // dropped one costs precision, not correctness.
+                    let lane = match msg {
+                        ServerMsg::Snapshot { .. } => Lane::Unreliable,
+                        _ => Lane::Reliable,
+                    };
+                    if sim.should_drop(lane) {
+                        continue;
                     }
+                    tokio::time::Instant::now() + sim.delay(std::time::Instant::now())
                 }
+            };
+            if dq_tx.send((at, msg)).is_err() {
+                break;
             }
         }
     });
 
-    // Writer: ECS -> server.
+    // Writer: ECS -> (link) -> server.
+    let (uq_tx, mut uq_rx) = unbounded_channel::<(tokio::time::Instant, ClientMsg)>();
+    let writer = tokio::spawn(async move {
+        while let Some((at, msg)) = uq_rx.recv().await {
+            tokio::time::sleep_until(at).await;
+            if ws_tx.send(Message::Binary(encode(&msg).into())).await.is_err() {
+                break;
+            }
+        }
+    });
     while let Some(msg) = to_rx.recv().await {
-        if ws_tx.send(Message::Binary(encode(&msg).into())).await.is_err() {
+        let at = match &mut up {
+            None => tokio::time::Instant::now(),
+            Some(sim) => {
+                // Every `Inputs` re-sends the last 3 frames precisely so the
+                // link may drop them.
+                let lane = match msg {
+                    ClientMsg::Inputs { .. } => Lane::Unreliable,
+                    _ => Lane::Reliable,
+                };
+                if sim.should_drop(lane) {
+                    continue;
+                }
+                tokio::time::Instant::now() + sim.delay(std::time::Instant::now())
+            }
+        };
+        if uq_tx.send((at, msg)).is_err() {
             break;
         }
     }
     reader.abort();
+    writer.abort();
+    delayer.abort();
 }
 
 /// One WebTransport session (mirrors the server's `pump_wt_connection`):

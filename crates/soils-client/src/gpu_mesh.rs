@@ -8,7 +8,6 @@ use bevy::image::{ImageLoaderSettings, ImageSampler};
 use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::render_asset::RenderAssets;
-use bevy::render::render_graph::{self, RenderGraph, RenderLabel};
 use bevy::render::render_resource::binding_types::{
     storage_buffer_read_only_sized, storage_buffer_sized,
 };
@@ -17,8 +16,11 @@ use bevy::render::render_resource::{
     CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
     RawBufferVec, ShaderStages,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
-use bevy::render::storage::{GpuShaderStorageBuffer, ShaderStorageBuffer};
+use bevy::core_pipeline::schedule::camera_driver;
+use bevy::render::renderer::{
+    RenderContext, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue,
+};
+use bevy::render::storage::{GpuShaderBuffer, ShaderBuffer};
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 
 use crate::chunk::Blocks;
@@ -34,7 +36,7 @@ pub struct AtlasAssets {
 
 /// The block-faces table buffer (`vec4<u32>` rows), extracted to the render world.
 #[derive(Resource, Clone, ExtractResource)]
-pub struct FacesTable(pub Handle<ShaderStorageBuffer>);
+pub struct FacesTable(pub Handle<ShaderBuffer>);
 
 pub struct GpuMeshPlugin;
 
@@ -47,8 +49,16 @@ impl Plugin for GpuMeshPlugin {
             return;
         };
         render_app
-            .add_systems(RenderStartup, (init_pipeline, add_render_graph_node))
-            .add_systems(Render, prepare_jobs.in_set(RenderSystems::PrepareBindGroups));
+            .add_systems(RenderStartup, init_pipeline)
+            .add_systems(Render, prepare_jobs.in_set(RenderSystems::PrepareBindGroups))
+            // Bevy 0.19 replaced the render graph with schedules: passes are
+            // plain systems in the root `RenderGraph` schedule, ordered by
+            // system relations rather than node edges. Meshing must land
+            // before the cameras draw.
+            .add_systems(
+                RenderGraph,
+                voxel_mesh_pass.in_set(RenderGraphSystems::Render).before(camera_driver),
+            );
     }
 }
 
@@ -56,15 +66,18 @@ impl Plugin for GpuMeshPlugin {
 fn setup_gpu_assets(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
     blocks: Res<Blocks>,
 ) {
-    let texture = asset_server.load_with_settings("blocks.png", |s: &mut ImageLoaderSettings| {
-        s.sampler = ImageSampler::nearest();
-    });
+    let texture = asset_server
+        .load_builder()
+        .with_settings(|s: &mut ImageLoaderSettings| {
+            s.sampler = ImageSampler::nearest();
+        })
+        .load("blocks.png");
 
     let faces: Vec<UVec4> = blocks.0.faces_table().into_iter().map(UVec4::from_array).collect();
-    let faces_buf = buffers.add(ShaderStorageBuffer::from(faces));
+    let faces_buf = buffers.add(ShaderBuffer::from(faces));
 
     commands.insert_resource(crate::world_draw::ExtractedAtlas(texture.clone()));
     commands.insert_resource(AtlasAssets { texture });
@@ -74,7 +87,7 @@ fn setup_gpu_assets(
 // ---------- Render world ----------
 
 #[derive(Resource)]
-struct VoxelMeshPipeline {
+pub(crate) struct VoxelMeshPipeline {
     layout: BindGroupLayoutDescriptor,
     clear: CachedComputePipelineId,
     mesh: CachedComputePipelineId,
@@ -84,14 +97,11 @@ struct VoxelMeshPipeline {
 /// This frame's remesh batch: the jobs buffer holds the mesh-slot ids, the
 /// bind group binds it with the pools.
 #[derive(Resource, Default)]
-struct VoxelMeshJobs {
+pub(crate) struct VoxelMeshJobs {
     jobs: Option<RawBufferVec<u32>>,
     bind_group: Option<BindGroup>,
     count: u32,
 }
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-pub struct VoxelMeshLabel;
 
 fn init_pipeline(
     mut commands: Commands,
@@ -126,11 +136,6 @@ fn init_pipeline(
     commands.insert_resource(VoxelMeshJobs::default());
 }
 
-pub fn add_render_graph_node(mut render_graph: ResMut<RenderGraph>) {
-    render_graph.add_node(VoxelMeshLabel, VoxelMeshNode);
-    render_graph.add_node_edge(VoxelMeshLabel, bevy::render::graph::CameraDriverLabel);
-}
-
 /// Upload this frame's dirty-slot list and build the batch bind group.
 #[allow(clippy::too_many_arguments)]
 fn prepare_jobs(
@@ -142,7 +147,7 @@ fn prepare_jobs(
     render_queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
     faces: Option<Res<FacesTable>>,
-    buffers: Res<RenderAssets<GpuShaderStorageBuffer>>,
+    buffers: Res<RenderAssets<GpuShaderBuffer>>,
 ) {
     jobs.bind_group = None;
     jobs.count = 0;
@@ -189,41 +194,33 @@ fn prepare_jobs(
     jobs.count = dirty.len() as u32;
 }
 
-struct VoxelMeshNode;
+/// Greedy-mesh every dirty slot into the shared quad pool.
+pub(crate) fn voxel_mesh_pass(
+    mut render_context: RenderContext,
+    pipeline_cache: Res<PipelineCache>,
+    pipeline: Res<VoxelMeshPipeline>,
+    jobs: Option<Res<VoxelMeshJobs>>,
+) {
+    let Some(jobs) = jobs else { return };
+    let Some(bind_group) = &jobs.bind_group else {
+        return;
+    };
+    let (Some(clear), Some(mesh), Some(finalize)) = (
+        pipeline_cache.get_compute_pipeline(pipeline.clear),
+        pipeline_cache.get_compute_pipeline(pipeline.mesh),
+        pipeline_cache.get_compute_pipeline(pipeline.finalize),
+    ) else {
+        return;
+    };
 
-impl render_graph::Node for VoxelMeshNode {
-    fn run(
-        &self,
-        _graph: &mut render_graph::RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), render_graph::NodeRunError> {
-        let pipeline_cache = world.resource::<PipelineCache>();
-        let pipeline = world.resource::<VoxelMeshPipeline>();
-        let Some(jobs) = world.get_resource::<VoxelMeshJobs>() else {
-            return Ok(());
-        };
-        let Some(bind_group) = &jobs.bind_group else {
-            return Ok(());
-        };
-        let (Some(clear), Some(mesh), Some(finalize)) = (
-            pipeline_cache.get_compute_pipeline(pipeline.clear),
-            pipeline_cache.get_compute_pipeline(pipeline.mesh),
-            pipeline_cache.get_compute_pipeline(pipeline.finalize),
-        ) else {
-            return Ok(());
-        };
-
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor { label: Some("voxel_mesh"), ..default() });
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.set_pipeline(clear);
-        pass.dispatch_workgroups(jobs.count, 1, 1);
-        pass.set_pipeline(mesh);
-        pass.dispatch_workgroups(3, 33, jobs.count);
-        pass.set_pipeline(finalize);
-        pass.dispatch_workgroups(jobs.count, 1, 1);
-        Ok(())
-    }
+    let mut pass = render_context
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor { label: Some("voxel_mesh"), ..default() });
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.set_pipeline(clear);
+    pass.dispatch_workgroups(jobs.count, 1, 1);
+    pass.set_pipeline(mesh);
+    pass.dispatch_workgroups(3, 33, jobs.count);
+    pass.set_pipeline(finalize);
+    pass.dispatch_workgroups(jobs.count, 1, 1);
 }

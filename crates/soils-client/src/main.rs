@@ -7,6 +7,7 @@
 //! `server_msg` (one consumer system per type instead of one god-system).
 
 mod actor;
+mod bot;
 mod chunk;
 mod console;
 mod cull;
@@ -27,15 +28,21 @@ mod pause;
 mod physics;
 mod player;
 mod pool;
+mod record;
 mod world_draw;
 mod server_msg;
 mod singleplayer;
+mod social;
 
 use bevy::app::{RunFixedMainLoop, RunFixedMainLoopSystems};
-use bevy::camera::Exposure;
+use bevy::camera::{Exposure, Hdr};
 use bevy::core_pipeline::tonemapping::Tonemapping;
-use bevy::light::{AtmosphereEnvironmentMapLight, light_consts::lux};
-use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
+// Bevy 0.19 moved the atmosphere *description* types into `bevy_light`; the
+// render-side `AtmosphereSettings` stayed in `bevy_pbr`.
+use bevy::light::{
+    Atmosphere, AtmosphereEnvironmentMapLight, atmosphere::ScatteringMedium, light_consts::lux,
+};
+use bevy::pbr::AtmosphereSettings;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use soils_protocol::ClientMsg;
@@ -63,7 +70,13 @@ fn main() {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
-            title: "new-soils (Rust/Bevy)".into(),
+            // The player name is in the title so two clients of the same
+            // executable are separable — OBS matches capture sources by
+            // window title, and identical titles capture the same window twice.
+            title: match std::env::var("SOILS_NAME") {
+                Ok(n) if !n.is_empty() => format!("new-soils [{n}]"),
+                _ => "new-soils (Rust/Bevy)".into(),
+            },
             // `SOILS_VSYNC=0` uncaps the frame clock. Perf runs need this: with
             // vsync on, fps just reports the display refresh and says nothing
             // about how much headroom the frame actually has.
@@ -72,6 +85,16 @@ fn main() {
             } else {
                 bevy::window::PresentMode::AutoVsync
             },
+            // `SOILS_NOFOCUS=1` spawns the window visible but without taking
+            // focus, so a perf run doesn't steal the desktop while you work.
+            // Prefer this over `SOILS_HEADLESS` for measurements: the window
+            // still presents through the normal swapchain path.
+            focused: std::env::var("SOILS_NOFOCUS").as_deref() != Ok("1"),
+            // `SOILS_HEADLESS=1` leaves the window unmapped entirely. Rendering
+            // and `Screenshot::primary_window` still work (useful for CI), but
+            // an unmapped window takes a different present path and measured
+            // ~2 ms/frame slower here — do NOT use it for perf numbers.
+            visible: std::env::var("SOILS_HEADLESS").as_deref() != Ok("1"),
             ..default()
         }),
         ..default()
@@ -193,6 +216,23 @@ fn main() {
             screenshot_once.after(player::sync_camera),
             gi_demo::setup_gi_demo,
             gi_demo::gi_demo_keep_dirty,
+            // After the camera moves, so a captured frame matches the frame
+            // the player would have seen.
+            // After mouse_look too: it writes the camera rotation every frame
+            // from accumulated look state, and would otherwise fight the
+            // parked framing depending on system order.
+            spectator_camera.after(player::sync_camera).after(player::mouse_look),
+            record::cue.run_if(resource_exists::<record::CaptureCue>),
+        ),
+    )
+    // A second block: Bevy's system tuples cap at 20 elements.
+    .add_systems(
+        Update,
+        (
+            social::refresh,
+            hud::update_chat.after(social::refresh),
+            social::link_identity.run_if(login::logged_in),
+            bot::chatter.run_if(bot::active),
         ),
     )
     // Gameplay: only once authenticated.
@@ -222,16 +262,31 @@ fn main() {
     // input, no frame of latency), step inside it.
     .add_systems(
         RunFixedMainLoop,
-        player::collect_input
+        (
+            player::collect_input
+                .run_if(not(bot::active))
+                .run_if(console::console_closed),
+            // Same slot as the keyboard it stands in for: freshest input, no
+            // frame of latency before the fixed tick consumes it.
+            bot::drive.run_if(bot::active),
+        )
             .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop)
-            .run_if(login::logged_in)
-            .run_if(console::console_closed),
+            .run_if(login::logged_in),
     )
     .add_systems(
         FixedUpdate,
         player::predict_and_send.run_if(login::logged_in).run_if(console::console_closed),
-    )
-    .run();
+    );
+    // Only present when SOILS_READY_FILE is set; `record::cue` is gated on it.
+    if let Some(cue) = record::configured() {
+        app.insert_resource(cue);
+    }
+    app.insert_resource(social::configured());
+    // Only present when SOILS_BOT names a role.
+    if let Some(b) = bot::configured() {
+        app.insert_resource(b);
+    }
+    app.run();
 }
 
 /// In self-test mode, save one screenshot a few seconds in so the rendered
@@ -298,15 +353,43 @@ fn screenshot_once(
     }
 }
 
+/// `SOILS_SPECTATE=px,py,pz,tx,ty,tz` parks the camera at `p` looking at `t`
+/// and holds it there, turning the client into a fixed camera on the world.
+///
+/// Recording player-vs-player interaction needs a viewpoint that is not one of
+/// the participants: a first-person camera cannot show two bodies meeting, and
+/// driving a third player by hand would not be reproducible.
+fn spectator_camera(
+    mut hold: ResMut<player::CameraHold>,
+    mut camera: Query<(&mut Player, &mut Transform)>,
+) {
+    let Ok(spec) = std::env::var("SOILS_SPECTATE") else { return };
+    let v: Vec<f32> = spec.split(',').filter_map(|f| f.trim().parse().ok()).collect();
+    if v.len() != 6 {
+        return;
+    }
+    // Held every frame, not once: the server keeps echoing this client's own
+    // authoritative position, which would otherwise drag the camera back.
+    hold.0 = true;
+    if let Ok((mut p, mut t)) = camera.single_mut() {
+        let eye = Vec3::new(v[0], v[1], v[2]);
+        player::teleport(&mut p, &mut t, eye);
+        t.look_at(Vec3::new(v[3], v[4], v[5]), Vec3::Y);
+    }
+}
+
 /// In self-test mode, pin the time of day so screenshots are deterministic
 /// (the server's clock drifts with wall-time). `SOILS_DAYTIME` overrides the
 /// default noon (0.0); e.g. 0.25 = dawn/dusk, 0.5 = midnight.
 fn self_test_daytime(mut world_time: ResMut<WorldTime>) {
-    if std::env::var("SOILS_SELFTEST").is_err() {
+    // Honour SOILS_DAYTIME on its own, not only under SOILS_SELFTEST: a
+    // recording session needs the light pinned too, or the take drifts into
+    // night partway through.
+    let explicit = std::env::var("SOILS_DAYTIME").ok().and_then(|v| v.parse::<f32>().ok());
+    if explicit.is_none() && std::env::var("SOILS_SELFTEST").is_err() {
         return;
     }
-    let d = std::env::var("SOILS_DAYTIME").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    world_time.daytime = d;
+    world_time.daytime = explicit.unwrap_or(0.0);
 }
 
 /// When `SOILS_SELFTEST` is set, report how much of the world streamed in and
@@ -382,7 +465,8 @@ fn env_secs(key: &str, default: f32) -> f32 {
 
 /// Spawn the camera/player and the sun.
 fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) {
-    commands.spawn((
+    let camera = commands
+        .spawn((
         Camera3d::default(),
         Projection::from(PerspectiveProjection {
             fov: 65.0_f32.to_radians(),
@@ -397,44 +481,74 @@ fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) 
         Transform::from_translation(PROVISIONAL_SPAWN)
             .with_rotation(Quat::from_axis_angle(Vec3::X, -0.5)),
         Player::at(PROVISIONAL_SPAWN),
-        // Physically-based sky. `Atmosphere` requires (and auto-inserts) `Hdr`;
-        // pair it with a tonemapper, an exposure the day/night cycle drives, and
-        // sky-derived image-based lighting for the lit actors. 1 world unit ==
-        // 1 block ~= 1 metre, so the default `scene_units_to_m` is correct.
-        //
-        // NOTE: no `Bloom` — with our unlit, manually-exposed terrain the bright
-        // HDR sky bloom washes the whole frame to a flat haze regardless of
-        // prefilter threshold; the atmosphere still draws the sun disc itself.
-        Atmosphere::earthlike(mediums.add(ScatteringMedium::default())),
-        AtmosphereSettings::default(),
-        AtmosphereEnvironmentMapLight::default(),
+        // Bevy 0.19 splits the sky in two: `Atmosphere` on the planet entity
+        // (below), `AtmosphereSettings` on the camera. No `Bloom` — over unlit,
+        // manually-exposed terrain it hazes the whole frame at any threshold.
+        Hdr,
         Exposure { ev100: EV100_DAY },
         Tonemapping::AcesFitted,
-    ));
+        ))
+        .id();
+
+    // Sky + sky-derived image-based lighting for the lit actors. Measured
+    // ~0.7 ms/frame combined on an RTX 5070 (0.55 env-map + 0.16 sky), and the
+    // env-map cost is *not* resolution-bound — dropping `size` from 512 to 64
+    // changed nothing, so it is fixed per-frame probe overhead.
+    commands
+        .entity(camera)
+        .insert((AtmosphereSettings::default(), AtmosphereEnvironmentMapLight::default()));
+
+    // The planet. Its `GlobalTransform` *is* the planet centre, so this must be
+    // its own entity: left on the camera (which carries a real `Transform`) the
+    // `on_add` hook that sinks the planet to `-inner_radius` on Y is skipped,
+    // the centre lands on the camera, and the sky renders as a flat haze with
+    // black aerial-perspective artefacts above the horizon.
+    commands.spawn(Atmosphere::earth(mediums.add(ScatteringMedium::default())));
 
     commands.spawn((
         Sun,
         // RAW (pre-atmosphere) sunlight is the correct input for the atmosphere
         // to filter; `day_night` rotates it and dims it toward night.
-        DirectionalLight { illuminance: lux::RAW_SUNLIGHT, shadows_enabled: false, ..default() },
+        DirectionalLight { illuminance: lux::RAW_SUNLIGHT, shadow_maps_enabled: false, ..default() },
         Transform::default(),
     ));
 }
 
-/// In self-test mode there's no login screen, so auto-authenticate as a guest.
+/// Skip the login screen and authenticate as a guest.
+///
+/// Driven by `SOILS_SELFTEST` (fixed `127.0.0.1:9001`, user `player`) or by
+/// `SOILS_AUTOLOGIN=<host:port>` with an optional `SOILS_NAME`. The latter
+/// exists so a recording session can point a spectating client at a server on
+/// an ephemeral port without anyone typing into a dialog.
 fn selftest_login(net: Res<NetClient>) {
     if gi_demo::demo_enabled() {
         return; // demo builds a local scene; no server/login
     }
-    if std::env::var("SOILS_SELFTEST").is_ok() && std::env::var("SOILS_LOGINSHOT").is_err() {
-        net.connect(format!("{}://127.0.0.1:9001", net::default_scheme()));
-        net.send(ClientMsg::Login {
-            name: "player".into(),
-            password: String::new(),
-            signup: true,
-            protocol: soils_protocol::PROTOCOL_VERSION,
-        });
-    }
+    let addr = match std::env::var("SOILS_AUTOLOGIN") {
+        Ok(a) if !a.is_empty() => a,
+        _ => {
+            if std::env::var("SOILS_SELFTEST").is_err()
+                || std::env::var("SOILS_LOGINSHOT").is_ok()
+            {
+                return;
+            }
+            "127.0.0.1:9001".to_string()
+        }
+    };
+    let name = std::env::var("SOILS_NAME").unwrap_or_else(|_| "player".into());
+    let url = if addr.contains("://") {
+        addr
+    } else {
+        format!("{}://{addr}", net::default_scheme())
+    };
+    info!("auto-login: {url} as {name}");
+    net.connect(url);
+    net.send(ClientMsg::Login {
+        name,
+        password: String::new(),
+        signup: true,
+        protocol: soils_protocol::PROTOCOL_VERSION,
+    });
 }
 
 /// Swing the sun with the day/night cycle and dim the world toward night.

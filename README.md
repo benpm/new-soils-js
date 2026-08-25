@@ -1,4 +1,5 @@
-# new-soils (Rust + Bevy port)
+# New Soils
+[CHANGELOG](CHANGELOG.md) - [TODO](TODO.md) - [docs](docs/README.md)
 
 A Rust/[Bevy](https://bevyengine.org) port of the original Node.js + Three.js
 `new-soils` voxel sandbox — now a **client/server multiplayer game** with a
@@ -23,6 +24,23 @@ two emissive ore clusters. With GI on, their light bounces onto the floor and
 walls through a fully GPU-resident probe hierarchy — occupancy blit, cascade
 trace/merge, and per-probe ambient-cube irradiance, all validated against CPU
 oracles.*
+
+## Networked physics, from both sides
+
+[![Two first-person views of the same 300-body rigid-body pile — click to play](docs/media/two-views.png)](docs/media/two-views.webm)
+
+*Both players' first-person views composited into one frame — `alice` left,
+`bob` right — walking through 300 server-simulated rigid bodies and into each
+other. Two independent connections, two independent reconstructions from delta
+snapshots; [the tests](crates/soils-server/tests/props.rs) put the worst
+cross-client disagreement at **0.000 units**. Try it with
+`SOILS_PROPS=300 cargo run -p soils-server`. Click through for the
+[10 s clip](docs/media/two-views.webm) — GitHub strips `<video>` from
+markdown, so the still links to it instead.*
+
+**More clips: [the public test-recording dashboard](http://34.41.84.40/)** —
+every recording the test suite produces, newest first, each naming the test
+that made it. Rebuilt with `python scripts/deploy_dashboard.py`.
 
 ## What works today
 
@@ -64,6 +82,23 @@ oracles.*
   generates in ~3.5 ms), persisted to zlib region files.
 - **Editing** — raycast break/place with optimistic application and rollback:
   the server validates reach/rate/residency and acks or rejects each edit.
+- **Player-vs-player collision** — players block, stand and jump on each other.
+  Peers are resolved from a tick-boundary snapshot so the client can predict
+  the same thing the server will, and a peer already interpenetrating at the
+  start of a tick is ignored, so two players sharing a spawn point can walk
+  apart instead of locking each other in place.
+- **Rigid bodies at scale** — a few hundred Avian props replicate through the
+  ordinary entity pipeline (`SOILS_PROPS=n`); players shove them via a
+  kinematic proxy. 300 settling bodies cost ~621 B per snapshot (12 KB/s at the
+  20 Hz tick), and two clients converge on identical rest states.
+- **Simulated bad links** — latency, gaussian jitter and loss
+  (`SOILS_NETSIM=120,40,0.05`), with loss confined to the lanes built to absorb
+  it and delivery kept in order, since the real transports are ordered streams.
+- **SpacetimeDB mirror** (opt-in, `SOILS_STDB_URI`) — the cold, relational half:
+  worlds, edited-chunk blobs, a server registry, player profiles and presence.
+  Region files stay authoritative and the hot path never touches it, so with the
+  variable unset the server behaves exactly as before. A returning player
+  resumes where they logged out. See [`stdb/README.md`](stdb/README.md).
 - **The rest** — login/signup accounts, multiple named worlds (`/warp`),
   LAN discovery, day/night cycle, HUD/console/pause menu.
 
@@ -75,6 +110,8 @@ oracles.*
 | `soils-worldgen` | Block registry, terrain generation, and the CPU oracles (reference mesher, GI math). Pure, benched, unit-tested. |
 | `soils-sim` | The shared simulation: movement/collision, edit rules, L0 light flood, entity registry, pathfinding. Both sides run this — prediction and authority can't drift. |
 | `soils-server` | Headless Bevy ECS app at a 20 Hz tick behind a tokio edge; worldgen waves, lighting jobs, replication, persistence, WS + WebTransport. |
+| `soils-physics` | Shared Avian rigid-body setup: body/collider builders, voxel→collider conversion, the kinematic player proxy. Server and client both run it. |
+| `soils-stdb` | Native SpacetimeDB client: a worker thread plus channels shaped like the transport seam, with checked-in bindings so a normal build needs no CLI. |
 | `soils-client` | The Bevy game: streaming, GPU meshing + indirect draws, L0/GI shading, prediction, interpolation, editing, UI. |
 
 ## Running
@@ -158,6 +195,10 @@ CI renders release screenshots headlessly under Mesa lavapipe
 - [`docs/perf-report.md`](docs/perf-report.md) — the optimization arc with
   measurements (23 MB → 498 KB joins, 849 → 187 ms bursts, the GI rework),
   methodology, and the ranked list of what to optimize next.
+- [`docs/dev/debug.md`](docs/dev/debug.md) — a symptom-first debugging field
+  guide: the traps this codebase actually produced (the asset-path void, delta
+  snapshots that omit unchanged entities, barrier deadlocks that hide the real
+  failure), and how to tell them apart quickly.
 - [`TODO.md`](TODO.md) — the 14-phase implementation log; each checkoff
   records what shipped, what was measured, and what was deferred and why.
 - [`docs/plan-rendering.md`](docs/plan-rendering.md) /

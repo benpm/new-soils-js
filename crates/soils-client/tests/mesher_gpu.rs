@@ -163,8 +163,8 @@ fn gpu_mesh_chunk(
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("mesher_pl"),
-        bind_group_layouts: &[&layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
     });
     let pipeline = |entry: &str| {
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -388,7 +388,7 @@ fn gpu_mesher_overflow_is_clamped_and_valid() {
 
 /// Create a headless device, or `None` if the machine has no usable GPU.
 fn init_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,

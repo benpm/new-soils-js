@@ -1,0 +1,28 @@
+[package]
+name = "soils-module"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# SpacetimeDB modules are WASM cdylibs, built for wasm32-unknown-unknown by
+# `spacetime publish`. Excluded from the root workspace (see its `exclude`)
+# so `cargo test --workspace` doesn't try to build it for the host.
+#
+# This crate only builds for wasm32: spacetimedb-bindings-sys resolves the
+# datastore/console ABI as WASM host imports, so a host link fails with
+# ~21 unresolved externals. Typecheck with
+#   cargo check --target wasm32-unknown-unknown
+# There are deliberately no unit tests here — the host-testable logic
+# (chunk-key packing) lives in soils-protocol, which both this module and the
+# server depend on so the layout cannot drift.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spacetimedb = "2.7.1"
+# The module reuses the shipping chunk codec and coordinate math rather than
+# reimplementing them; soils-protocol is deliberately Bevy/tokio-free and
+# builds clean for wasm32-unknown-unknown (verified 2026-08-02).
+soils-protocol = { path = "../../crates/soils-protocol" }
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }

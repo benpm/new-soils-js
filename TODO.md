@@ -1,5 +1,21 @@
 # Todo
 
+<!-- As you complete tasks, add descriptions of your implementation to CHANGELOG.md, and then reference them here, removing their descriptions from here. -->
+<!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. -->
+
+## Design
+- [ ] Organize the information in [concepts.md](concepts.md). Some of it refers to Minecraft, so you should research Minecraft and take extensive notes on its mechanics before interpreting and rewriting concepts.md
+- [ ] Clean up this file, moving the finished tasks into [[CHANGELOG]]
+
+## UI
+
+### Inventory
+User interface is not like Minecraft's very much.
+- No hotbar, just a ring indicating all tools and weapons and consumables in your inventory.
+- You can use various hotkeys to navigate the UI or pressing Alt to release the mouse cursor for UI interaction.
+- Inventory screen comes up by pressing E, I, Tab, or Escape.
+- A backpack icon with a cirled "E" on it is shown in the left corner of screen, indicating how to open inventory.
+
 ## BigRefactor
 
 Focus on this refactor unles instructed otherwise. Commit for each, make sure to pull as well.
@@ -152,6 +168,125 @@ what was measured, and what was deferred with rationale. Current-state documenta
 - [x] Kinematic player proxy (server + client) so props are shoved by the player, movement feel unchanged.
 - [x] `spawn`/`cube` console command → `ClientMsg::SpawnCube` (reach-checked, rate-limited); test.
 - [ ] Optional follow-ups: replicate angular velocity (smoother predicted spin); full two-way player via an Avian character controller (ride on / be pushed by props); interpolation plugin for sub-tick smoothing.
+
+## SpacetimeDB (`stdb/soils-module`, `soils-stdb`) — behind `SOILS_STDB_URI`
+
+Hybrid by design: SpacetimeDB owns cold/relational/persistent/social state,
+`soils-server` stays authoritative for movement, chunks, entities and physics.
+Mirroring is strictly opt-in — unset `SOILS_STDB_URI` and the server is exactly
+as it was, region files only. Setup and schema notes in
+[`stdb/README.md`](stdb/README.md).
+
+### Done
+
+- [x] Module: 9 tables + reducers, every world-mutating one gated on a
+      registered server identity (TOFU `grant_server` bootstrap).
+- [x] `chunk_key` shared with the server so the two cannot drift.
+- [x] `soils-stdb`: worker thread + channels shaped like the existing `NewConn`
+      transport seam. Bindings checked in, so a normal build needs no CLI.
+- [x] Mirrored end-to-end and live-verified: world registration, edited-chunk
+      blobs (only after a successful disk write), server registry heartbeat,
+      logout profile save, login/logout presence.
+- [x] Presence stays alive while a player is online (`heartbeat_presence`
+      refreshes the roster in one transaction per world and prunes leavers).
+- [x] `link_identity` is server-only — it was player-callable with a check that
+      was vacuous for an unlinked account.
+- [x] Read path: `player_profile` subscription + synchronous cache lookup;
+      startup waits (bounded) for the first snapshot so a login cannot race it.
+- [x] A returning player resumes where they logged out.
+- [x] `chunk_blob.version` is the chunk's edit counter, not a wall clock, and
+      the stale-write guard compares versions only within one `writer_epoch`.
+      The counter lives in memory and restarts at 0 when a chunk is evicted and
+      reloaded, so comparing across server processes silently rejected every
+      edit to a reloaded chunk — permanently, since the region file is
+      authoritative and nothing retries.
+- [x] Edit journal removed: built on both sides, unreachable, and its
+      `edits_through` column was hardcoded to 0 in every row it wrote.
+- [x] Accounts live in SpacetimeDB, hashed with Argon2id and per-account salts,
+      replacing the `DefaultHasher`-and-fixed-salt scheme. Offline play keeps
+      the local file; existing accounts migrate on their next login.
+- [x] `account` is a **private** table and verification happens inside the
+      module (`verify_login`/`register_account`/`set_password`). It was public,
+      which in SpacetimeDB means every connected client could subscribe and
+      read every Argon2 verifier; limiting our own client's subscription list
+      was politeness, not a boundary. Row-level security would be the natural
+      tool and is not usable in 2.7.1 — `client_visibility_filter` is behind
+      the `unstable` feature and documented in its own source as not enforced.
+- [x] Logins run on a worker thread. Argon2id inline on the 64 Hz tick froze
+      every player for 1.95 s under a 40-login flood — measured, and now
+      guarded by `logins_do_not_stall_the_tick`, which watches the longest gap
+      between ticks rather than total elapsed time.
+- [x] The one-off `chunk_blob` restore subscription is released when it is
+      done. Dropping the handle does not unsubscribe, so it stayed live for the
+      process lifetime and held the whole stored world in memory — exactly what
+      taking a one-off subscription was meant to avoid.
+- [x] Client-side layer: `soils-client` depends on `soils-stdb`, with an
+      optional non-blocking connection, a server browser merging the registry
+      with LAN discovery, chat (`/say` + HUD), and identity linking through a
+      new `ClientMsg::LinkIdentity` (protocol 3).
+- [x] `World.daytime` refreshed on the heartbeat instead of sitting at 0.0.
+- [x] The link reconnects with capped backoff after a database restart.
+
+- [x] A server with an empty region directory rehydrates from the database
+      (`World::restore_from_stdb`), which is what makes the mirror worth its
+      cost for a fresh deployment rather than a write-only backup.
+- [x] Chat reads `<ben>`, not `<a1b2c3>`: the speaker's account name is
+      denormalised into `chat_message.sender_name` at write time, because
+      clients cannot resolve an identity to a name themselves.
+
+### Remaining
+
+- [ ] **`player_profile` is world-readable**, and it holds every player's last
+      known position. It has to be public: the game server reads it from the
+      SDK cache on login, and a private table has no client accessor at all.
+      Row-level security is the fix and is unimplemented in 2.7.1 — revisit
+      when upstream lands it, rather than declaring a filter that does nothing.
+      The same applies to `chunk_blob`, where the exposure is the stored world
+      rather than player locations.
+- [ ] **`send_chat` trusts the caller's `world_id`.** A client can post into
+      any world's channel. The check wants a presence row for the sender's
+      account in that world, which needs the client to know its real
+      `world_id_for(name)` first — today `Social::chat_world` defaults to 0.
+      Worth doing together with per-world chat channels rather than alone.
+- [ ] **Opening a *new* world on login blocks the tick** for up to 5 s while
+      the restore runs. Correct as written — pristine terrain must not be
+      generated over chunks being recovered — but it is a stall a joining
+      player imposes on everyone. Wants world creation to become asynchronous
+      with joins held until it completes, not a shorter timeout.
+- [ ] **A database-only account cannot log in while the database is down.**
+      The local account file is a cache written when *this* server registers or
+      migrates an account, so a player who signed up against another server has
+      no local record here and `local_auth` answers "no such account". Keeping
+      a local verifier for every successful database login would fix it, at the
+      cost of scattering verifiers across every server a player touches —
+      a deliberate trade, not an oversight.
+- [ ] **`grant_server` is trust-on-first-use.** Whoever claims an empty
+      allowlist first becomes a server. Fine for a local database, a race on a
+      public one; seed the first identity from a trusted console instead.
+- [ ] Decision gate: re-evaluate whether the hybrid split still earns its keep,
+      or whether more should move across.
+
+### Considerations for other work on this list
+
+These are not SpacetimeDB tasks, but they interact with it and will be cheaper
+to get right if the interaction is settled first.
+
+- **Biomes / structures** (Content Expansion below): structure "seeds" placed by
+  blue noise across chunk boundaries are exactly the kind of sparse relational
+  state SpacetimeDB is good at, and a structure spanning chunks needs a claim
+  that survives a server restart. Worth deciding before the generator is written
+  whether seed ownership lives in region files or the database.
+- **Inventory / UI** (above): item stacks are cold relational state and a natural
+  fit for a table, but inventory is also latency-sensitive during play. The
+  likely split is authoritative in `soils-server` during a session, persisted to
+  SpacetimeDB on logout — the same shape as `player_profile`.
+- **Blocks with data-parity to Minecraft**: a larger block registry changes the
+  chunk payload size, and `chunk_blob` payloads above 992 bytes land in
+  SpacetimeDB's content-addressed blob store. Worth re-measuring dedupe rates
+  once palettes get wider.
+- **Networked physics follow-ups**: prop state is hot and per-tick; it should
+  stay out of the database entirely. Anything persisted should be the *resting*
+  state at unload, if at all.
 
 ## The First Content Expansion
 - [ ] Robust, neural texture gen techniques for tile gen with constraints to create complex 3d structures based on inferred structural relationships and probabilies from example. Ingest minecraft builds from the internet, parsing them, converting them to a compressed structure format. These should be editable in a new mode in game: structure design. Structure design should allow the instant output of applying the structure generation algorithm to your structure as input. You should be aple to tweak the ruleset that gets generated from your source map. Use techniques from the internet

@@ -8,3 +8,14 @@ scripts/.cache/
 # AssemblyScript toolchain for server scripts (package.json pins the version;
 # run `npm install` to get `asc` so .ts scripts compile).
 node_modules/
+# Locally pinned SpacetimeDB CLI + standalone (see stdb/README).
+.tools/
+# Raw OBS captures and the web encodes derived from them (see
+# scripts/obs_record.py). The short clip that ships lives in docs/media/.
+recordings/
+# Generated artifact pages — the videos are inlined as data URIs, so these are
+# tens of megabytes of build output (see scripts/build_*_artifact.py).
+artifact/
+# Obsidian settings are not to be included
+.obsidian
+*.stackdump

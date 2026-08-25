@@ -7,15 +7,15 @@ complete. This is the "what is" companion to the "what should be" plans
 
 ## Workspace
 
-| Crate | Role |
-|-------|------|
-| `soils-protocol` | Wire types + codecs: `ClientMsg`/`ServerMsg` (bincode), the palette+LZ4 chunk codec (`chunk_codec.rs`), the quantized delta-snapshot codec + `SnapshotTracker` (`snapshot.rs`), chunk/voxel coordinates. No Bevy, no tokio. |
-| `soils-worldgen` | Block registry, terrain generation (lattice-interpolated cave noise, early-outs), and the *CPU oracles*: reference greedy mesher (`greedy.rs`) and radiance-cascades math (`radiance.rs`). Pure, unit-tested, criterion-benched. |
-| `soils-sim` | The shared simulation both sides run: player movement/collision (`step_player`), input packing, edit validation, the L0 light flood (`light.rs`), entity registry (`entities.yaml`), and pathfinding (`nav.rs`: walk grids, budgeted A*, HPA*, flow fields). Engine-free, everything over a `VoxelSampler` trait (unloaded space reads as air). |
-| `soils-script` | Server-side scripting host: a wasmtime (Cranelift JIT) runtime that loads AssemblyScript (`.ts`, compiled at runtime via `asc`) or precompiled `.wasm`/`.wat`, exposes a scalar host ABI (`host.rs`) for reading/mutating world state, and runs scripts under a per-call fuel + memory budget (`lib.rs`). No Bevy/tokio. |
-| `soils-physics` | Shared Avian rigid-body physics: config + body/collider builders, `Collider::voxels` terrain conversion (`collider.rs`), the kinematic player-proxy, and the `add_physics` app setup. Used by both server (authority) and client (local prediction), like `soils-sim`. Behind `SOILS_PHYSICS`. |
-| `soils-server` | Headless authoritative server: a Bevy ECS app (`app.rs`) at a 20 Hz fixed tick behind a tokio network edge (`lib.rs`), world/chunk lifecycle + persistence (`world.rs`, `region.rs`, `persist.rs`), accounts (`auth.rs`). |
-| `soils-client` | The Bevy game: net bridge (`net.rs`), chunk streaming + GPU meshing (`server_msg.rs`, `gpu_mesh.rs`, `indirect_draw.rs`), materials + L0 shading (`material.rs`, `light.rs`), radiance-cascades GI (`gi.rs`), prediction (`player.rs`), remote-entity interpolation (`actor.rs`), optimistic edits (`edit.rs`), UI. |
+| Crate            | Role                                                                                                                                                                                                                                                                                                                                            |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `soils-protocol` | Wire types + codecs: `ClientMsg`/`ServerMsg` (bincode), the palette+LZ4 chunk codec (`chunk_codec.rs`), the quantized delta-snapshot codec + `SnapshotTracker` (`snapshot.rs`), chunk/voxel coordinates. No Bevy, no tokio.                                                                                                                     |
+| `soils-worldgen` | Block registry, terrain generation (lattice-interpolated cave noise, early-outs), and the *CPU oracles*: reference greedy mesher (`greedy.rs`) and radiance-cascades math (`radiance.rs`). Pure, unit-tested, criterion-benched.                                                                                                                |
+| `soils-sim`      | The shared simulation both sides run: player movement/collision (`step_player`), input packing, edit validation, the L0 light flood (`light.rs`), entity registry (`entities.yaml`), and pathfinding (`nav.rs`: walk grids, budgeted A*, HPA*, flow fields). Engine-free, everything over a `VoxelSampler` trait (unloaded space reads as air). |
+| `soils-script`   | Server-side scripting host: a wasmtime (Cranelift JIT) runtime that loads AssemblyScript (`.ts`, compiled at runtime via `asc`) or precompiled `.wasm`/`.wat`, exposes a scalar host ABI (`host.rs`) for reading/mutating world state, and runs scripts under a per-call fuel + memory budget (`lib.rs`). No Bevy/tokio.                        |
+| `soils-physics`  | Shared Avian rigid-body physics: config + body/collider builders, `Collider::voxels` terrain conversion (`collider.rs`), the kinematic player-proxy, and the `add_physics` app setup. Used by both server (authority) and client (local prediction), like `soils-sim`. Behind `SOILS_PHYSICS`.                                                  |
+| `soils-server`   | Headless authoritative server: a Bevy ECS app (`app.rs`) at a 20 Hz fixed tick behind a tokio network edge (`lib.rs`), world/chunk lifecycle + persistence (`world.rs`, `region.rs`, `persist.rs`), accounts (`auth.rs`).                                                                                                                       |
+| `soils-client`   | The Bevy game: net bridge (`net.rs`), chunk streaming + GPU meshing (`server_msg.rs`, `gpu_mesh.rs`, `indirect_draw.rs`), materials + L0 shading (`material.rs`, `light.rs`), radiance-cascades GI (`gi.rs`), prediction (`player.rs`), remote-entity interpolation (`actor.rs`), optimistic edits (`edit.rs`), UI.                             |
 
 One rule holds everything together: **client and server share one simulation**
 (`soils-sim`) and one set of codecs (`soils-protocol`), so predicted movement,
@@ -24,29 +24,41 @@ the remaining risks are pinned by oracle tests.
 
 ## Data flow
 
-```
-             ┌────────────────────── soils-server ──────────────────────┐
- tokio edge  │  ECS app (20 Hz FixedUpdate)                             │
-┌─────────┐  │  accept → drain_inboxes → wander_critters →              │
-│ WS pump │──┼─▶ inbox   (auth, inputs, edits, view radius)             │
-│ WT pump │◀─┼── outbox  (reliable: chunks/edits/control)               │
-└─────────┘  │   snapshot lane (latest-wins watch channel)              │
-             │  pump_chunk_jobs ── rayon: worldgen waves, light jobs    │
-             │  replicate_entities ─ interest diff + delta snapshots    │
-             │  world_lifecycle ── refcounts, evict, flush, compaction  │
-             └───────────────────────────────────────────────────────────┘
-                     ▲ inputs (datagram/WS)        │ chunks, snapshots
-                     │                             ▼
-             ┌────────────────────── soils-client ──────────────────────┐
-             │ net thread (ws:// or wt://) → NetEvent channel           │
-             │ apply_chunks (ordered stream, time-boxed)                │
-             │   → GPU voxel buffers → compute mesher → indirect draws  │
-             │   → L0 light flood → padded light buffers → material     │
-             │   → GI volume blit → trace/merge round-robin → probes    │
-             │ snapshots → SnapshotTracker → reconcile self / buffer    │
-             │             remote actors (interp @ 2-tick delay)        │
-             │ FixedUpdate 64 Hz: predict_and_send (shared step_player) │
-             └───────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph SERVER["soils-server"]
+        subgraph EDGE["tokio edge"]
+            WSP["WS pump"]
+            WTP["WT pump"]
+        end
+        subgraph TICK["ECS app — 20 Hz FixedUpdate"]
+            direction TB
+            T1["accept → drain_inboxes → wander_critters"]
+            T2["pump_chunk_jobs<br/>rayon: worldgen waves, light jobs"]
+            T3["replicate_entities<br/>interest diff + delta snapshots"]
+            T4["world_lifecycle<br/>refcounts, evict, flush, compaction"]
+            T1 --> T2 --> T3 --> T4
+        end
+        EDGE -- "inbox: auth, inputs, edits, view radius" --> TICK
+        TICK -- "outbox, reliable: chunks / edits / control" --> EDGE
+        TICK -- "snapshot lane: latest-wins watch channel" --> EDGE
+    end
+
+    subgraph CLIENT["soils-client"]
+        NET["net thread (ws:// or wt://) → NetEvent channel"]
+        C1["apply_chunks — ordered stream, time-boxed"]
+        C2["GPU voxel buffers → compute mesher → indirect draws"]
+        C3["L0 light flood → padded light buffers → material"]
+        C4["GI volume blit → trace/merge round-robin → probes"]
+        S1["snapshots → SnapshotTracker"]
+        S2["reconcile self / buffer remote actors<br/>(interp @ 2-tick delay)"]
+        P1["FixedUpdate 64 Hz: predict_and_send<br/>(shared step_player)"]
+        NET --> C1 --> C2 --> C3 --> C4
+        NET --> S1 --> S2 --> P1
+    end
+
+    EDGE -- "chunks, snapshots" --> NET
+    P1 -- "inputs (datagram/WS)" --> EDGE
 ```
 
 ## Protocol
@@ -91,6 +103,18 @@ apart.
   lifecycle. Player movement integrates client inputs through the shared
   `step_player` at the client dt, so speed-hacking is structurally impossible
   (scenario-verified).
+- **Player-vs-player collision**: `step_player_peers` sweeps the player AABB
+  against other players' bodies as well as voxels, per axis. Being blocked on
+  the vertical axis while falling sets `grounded`, so players stand — and jump
+  — on one another. Two rules keep it stable: peers are read from a
+  *tick-boundary snapshot* (so the result does not depend on ECS iteration
+  order, and the client can predict the same thing), and a peer already
+  interpenetrating at the start of a tick is ignored, so players sharing a
+  spawn point can walk apart instead of locking each other in place forever.
+  Fly mode stays noclip. The client feeds the same peer set into both
+  prediction and rollback replay, taking each peer's *newest* snapshot rather
+  than its render-delayed interpolated position — the newest is what the server
+  resolved against, so contact does not spray reconciliations.
 - **Chunk lifecycle**: subscriptions are server-owned boxes around each
   client (radius + hysteresis); wanted chunks are probed cache→disk on the
   tick and generated on rayon in nearest-first waves (≤8 in flight per
@@ -191,9 +215,121 @@ share-one-simulation rule as movement, but through the `soils-physics` crate.
   `soils-sim` (`player_proxy`), so props are shoved by the player without
   changing the tuned movement. Full two-way (riding on props) would require
   moving the player onto an Avian character controller — deferred.
+  Note this proxy is *not* how players collide with each other: it is one-way
+  and its position is overwritten from `SimState` every tick. Player-vs-player
+  collision lives in `step_player_peers` (below), independent of Avian, so it
+  works with `SOILS_PHYSICS` off.
 - **Spawning**: the `spawn`/`cube` console command (→ `ClientMsg::SpawnCube`,
   reach-checked + rate-limited) drops a cube ahead of the camera; a demo stack
   also falls near the first player on join.
+
+## SpacetimeDB mirror (behind `SOILS_STDB_URI`)
+
+A hybrid split, not a port. SpacetimeDB owns cold, relational, persistent and
+social state; `soils-server` stays authoritative for movement, chunks, entities
+and physics. The hot path never touches it. A full port was rejected on
+concrete grounds: no threads for rayon worldgen, no nested WASM for the
+scripting engine, nowhere to host Avian, no unreliable lane, and no
+row-granular deltas.
+
+- **Module** (`stdb/soils-module`): 9 tables. Every world-mutating reducer is
+  gated on `require_server`, an allowlist bootstrapped trust-on-first-use, so
+  players cannot write world state even though the tables are `public` for
+  future client reads. Excluded from the workspace, so no `wasm32` toolchain is
+  needed for a normal build; generated bindings are checked in, so no CLI is
+  either.
+- **Link** (`soils-stdb`): a worker thread plus channels, deliberately the same
+  shape as the `NewConn` transport seam. The ECS sends `StdbCmd`s and drains
+  `StdbEvent`s, unaware of the database. No Bevy dependency, so a client could
+  use it too.
+- **What is mirrored**: world registration on first open, edited-chunk blobs
+  (only after a successful region write — disk stays authoritative), the server
+  registry heartbeat, the logout profile save, and login/logout presence.
+  Pristine chunks are reproducible from `GenParams` and are never stored.
+- **Failure is non-fatal by design.** A database that is down or misconfigured
+  logs and is otherwise ignored; losing it must never take the game down.
+  Unset `SOILS_STDB_URI` and the server behaves exactly as it did before.
+- **Liveness**: the server refreshes its registry row and its whole presence
+  roster on one 5 s clock, comfortably inside the module's 30 s TTL, and the
+  module reaps anything staler. Presence writes are batched into a single
+  transaction per world rather than one reducer call per player.
+- **Chunk versions** are the chunk's own edit counter, not a clock, and are
+  compared only *within one writer epoch*. A wall clock looked monotonic but a
+  backwards step would fail the module's stale-write guard for every write
+  until it caught up. The edit counter that replaced it has its own catch: it
+  lives in memory and restarts at 0 whenever a chunk is evicted and reloaded
+  from its region file, so comparing versions across server processes rejected
+  every edit to a reloaded chunk until the counter climbed past its previous
+  high-water mark. Both failures are silent and permanent in the same way —
+  the region file is authoritative and the chunk is no longer dirty, so nothing
+  retries. Hence `writer_epoch`: a value identifying the server *process*, with
+  no ordering to get wrong. Across epochs the later writer simply wins.
+
+- **Reads** go through the SDK's client-side cache, which the worker keeps
+  current from a `player_profile` subscription. That makes a lookup synchronous,
+  which the login path needs — it cannot wait on a round trip mid-tick. Startup
+  blocks (bounded) on the first snapshot: a login racing it would fall back to
+  the world spawn and quietly lose the player's saved position. On login, a
+  profile for that account in that world restores their position; a miss just
+  spawns them normally.
+
+- **Accounts** live in the `account` table when a database is configured, and
+  that table is **private**: verifiers are never readable by any client. Since a
+  private table generates no client-side accessor, the game server cannot read
+  it either — so hashing and verification happen *inside the module*, in the
+  server-only `verify_login`, `register_account` and `set_password` reducers,
+  and only a verdict comes back. Passing a password to a reducer is safe
+  because SpacetimeDB 2.0 delivers a reducer's outcome only to the connection
+  that called it; under 1.0 it would have broadcast every password to every
+  client. Without a database the local file is authoritative exactly as before,
+  and existing accounts migrate on their next successful login — the one moment
+  a plaintext is in hand to re-register with.
+
+- **Logins run off the tick thread.** Argon2id is memory-hard by design and
+  costs tens of milliseconds, against a 15.6 ms tick; with a database it is a
+  network round trip on top. Checked inline, a flood of logins froze the whole
+  server for close to two seconds — a denial of service needing no bandwidth to
+  mount, and measured as exactly that before the fix. A `Login` now dispatches
+  to a bounded worker pool and returns; the verdict comes back through
+  `AuthQueue`, which replays the message so the join path stays in one place.
+  One check per connection at a time, and a fixed cap across the server — a
+  thread per pending login would have traded the tick stall for an unbounded
+  memory amplifier, since each Argon2 costs ~19 MB. Past the backlog a login
+  is refused with a retryable error rather than queued behind a flood. The
+  database path is gated on the *connection* being live, not on the
+  subscription cache: verification is a reducer call and needs no cache, and
+  waiting for one would route every login during a reconnect backoff to the
+  local file, where a database-only account reads as "no such account".
+  See `docs/dev/server-tick.md`.
+- **The client** (`soils-client/src/social.rs`) subscribes to the *lobby* half —
+  `game_server`, `world`, `chat_message` — and not to `chunk_blob`, which would
+  stream the stored world into a player's memory. (`account` is private, so it
+  is not so much excluded as unreachable.) It is optional and non-blocking throughout: every accessor
+  returns an empty list rather than an error, so a database that is down or
+  absent costs the lobby and chat, never the game. The server browser merges
+  the registry with UDP LAN discovery, which still works with no database at
+  all.
+- **Identity** is bound by the server, not claimed by the client: the client
+  sends its SpacetimeDB identity over the game protocol
+  (`ClientMsg::LinkIdentity`) after logging in, and the server — which has
+  already checked the password — calls `link_identity`.
+- **Reconnection**: the link retries with capped exponential backoff. A
+  database restart used to end the mirror for the lifetime of the process.
+
+- **Restore**: a server whose region directory is *empty* seeds it from
+  `chunk_blob` before opening the world — a fresh deployment or a lost disk
+  gets its edited chunks back rather than a world reset to pristine terrain.
+  Only when empty: region files stay authoritative, and a restore over a
+  populated directory could roll live edits backwards. A restore that times
+  out is logged as such rather than treated as "nothing stored", because from
+  there the server generates pristine terrain and the next flush overwrites
+  what was really in the database.
+- **Chat retention**: `chat_message` is public and every client subscribes to
+  all of it, so the reaper expires messages past `CHAT_TTL` (1 h). Without
+  that the table is an ever-growing broadcast — unbounded memory in every
+  client's cache and an initial sync that never stops getting slower.
+
+Known limits are tracked in `TODO.md`.
 
 ## Testing
 
@@ -208,6 +344,23 @@ share-one-simulation rule as movement, but through the `soils-physics` crate.
   gate — parallel embedded servers starve the shared rayon pool.
 - **Prediction**: a TCP delay proxy (75 ms each way, 2% input loss) drives a
   headless client twin through convergence and forced-misprediction cases.
+- **Concurrency** (`soils-server/tests/concurrent.rs`): every client runs on its
+  own OS thread with its own runtime, so connection handling, input integration
+  and replication are exercised in real parallel rather than interleaved on one
+  executor. Covers mutual observation, player-vs-player blocking, standing and
+  jumping on another player's head, the same under a degraded link, and 100
+  simultaneous clients (both clean and adverse links). Barrier waits carry
+  deadlines: a peer thread that panics would otherwise hang the binary and bury
+  the real failure.
+- **Network conditions** (`soils-protocol/src/netsim.rs`): latency, gaussian
+  jitter (Box-Muller) and loss, seeded so a failure reproduces. Delivery is
+  monotonic — the modelled transports are ordered streams, so reordering them
+  would test a network that cannot occur — and loss applies only to lanes built
+  for it (`Inputs`, which re-sends the last 3 frames; `Snapshot`, delta-coded
+  against acked baselines). Dropping a manifest would strand a chunk and prove
+  nothing. Unit tests assert the distribution really is gaussian (mean, sigma,
+  1-sigma/2-sigma coverage), not merely random. Available to the real client as
+  `SOILS_NETSIM=<latency_ms>,<jitter_ms>,<loss>[,<seed>]`.
 - **Physics** (`soils-server/tests/physics.rs`): a dropped cube falls and its
   orientation replicates as a unit quaternion, two clients converge on the same
   rest state, and the `SpawnCube` command creates a replicated cube.
@@ -220,6 +373,14 @@ share-one-simulation rule as movement, but through the `soils-physics` crate.
 - **Visual**: `SOILS_SELFTEST=1` renders, screenshots, and asserts terrain
   presence headlessly; the GI demo scene isolates the bounce for eyeballing;
   CI renders release screenshots under Mesa lavapipe.
+- **Recording** (`soils-server/tests/demo.rs`, ignored by default): hosts a
+  server, scripts two participants, and points a third client at them as a
+  fixed camera (`SOILS_SPECTATE`) recording frames (`SOILS_RECORD`). A
+  spectator is necessary rather than convenient — a first-person camera cannot
+  show two bodies meeting. `scripts/mux_recording.py` muxes the result using
+  each frame's *recorded* timestamp: PNG encoding perturbs the frame clock, so
+  assuming a constant rate would stamp fabricated judder onto the video and
+  make good interpolation look broken.
 
 ## Known deferrals
 

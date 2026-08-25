@@ -88,7 +88,10 @@ const BTN_BG: Color = Color::srgba(0.20, 0.34, 0.46, 1.0);
 pub fn setup_login(mut commands: Commands) {
     // Self-test auto-logs in, so the screen is skipped — unless SOILS_LOGINSHOT
     // forces it up for a screenshot.
-    if std::env::var("SOILS_SELFTEST").is_ok() && std::env::var("SOILS_LOGINSHOT").is_err() {
+    let auto = std::env::var("SOILS_AUTOLOGIN").is_ok_and(|v| !v.is_empty());
+    if (auto || std::env::var("SOILS_SELFTEST").is_ok())
+        && std::env::var("SOILS_LOGINSHOT").is_err()
+    {
         return;
     }
     commands
@@ -118,7 +121,7 @@ pub fn setup_login(mut commands: Commands) {
             .with_children(|panel| {
                 panel.spawn((
                     Text::new("new-soils"),
-                    TextFont { font_size: 30.0, ..default() },
+                    TextFont { font_size: 30.0.into(), ..default() },
                     TextColor(Color::WHITE),
                 ));
                 // Local-first path: no server, no account details needed.
@@ -148,7 +151,7 @@ pub fn setup_login(mut commands: Commands) {
                     });
                 panel.spawn((
                     Text::new("click a field, then type"),
-                    TextFont { font_size: 14.0, ..default() },
+                    TextFont { font_size: 14.0.into(), ..default() },
                     TextColor(Color::srgb(0.8, 0.7, 0.5)),
                     StatusText,
                 ));
@@ -162,7 +165,7 @@ fn field(parent: &mut ChildSpawnerCommands, label: &str, kind: LoginButton, mark
         .with_children(|row| {
             row.spawn((
                 Text::new(format!("{label}:")),
-                TextFont { font_size: 18.0, ..default() },
+                TextFont { font_size: 18.0.into(), ..default() },
                 TextColor(Color::WHITE),
             ));
             row.spawn((
@@ -174,7 +177,7 @@ fn field(parent: &mut ChildSpawnerCommands, label: &str, kind: LoginButton, mark
             .with_children(|f| {
                 f.spawn((
                     Text::new(""),
-                    TextFont { font_size: 18.0, ..default() },
+                    TextFont { font_size: 18.0.into(), ..default() },
                     TextColor(Color::WHITE),
                     marker,
                 ));
@@ -193,7 +196,7 @@ fn action(parent: &mut ChildSpawnerCommands, label: &str, kind: LoginButton) {
         .with_children(|b| {
             b.spawn((
                 Text::new(label),
-                TextFont { font_size: 18.0, ..default() },
+                TextFont { font_size: 18.0.into(), ..default() },
                 TextColor(Color::WHITE),
             ));
         });
@@ -355,10 +358,11 @@ pub fn finish_login(
 /// per server, or a placeholder while none are found.
 pub fn update_server_list(
     servers: Res<DiscoveredServers>,
+    social: Res<crate::social::Social>,
     container: Query<(Entity, Option<&Children>), With<ServerListContainer>>,
     mut commands: Commands,
 ) {
-    if !servers.is_changed() {
+    if !servers.is_changed() && !social.is_changed() {
         return;
     }
     let Ok((container, children)) = container.single() else {
@@ -369,17 +373,41 @@ pub fn update_server_list(
             commands.entity(child).despawn();
         }
     }
+    // Two sources, one list. LAN discovery finds servers on this network with
+    // no database involved; the SpacetimeDB registry finds servers anywhere.
+    // A server that answers both is shown once — discovery wins, because its
+    // address is the one that definitely routes from here.
+    let mut rows: Vec<(String, String, u32, bool)> = servers
+        .list
+        .iter()
+        .map(|s| (s.name.clone(), s.addr.to_string(), s.players as u32, true))
+        .collect();
+    for s in &social.servers {
+        if rows.iter().any(|(_, addr, ..)| addr == &s.addr) {
+            continue;
+        }
+        rows.push((s.name.clone(), s.addr.clone(), s.players, false));
+    }
+
     commands.entity(container).with_children(|list| {
-        if servers.list.is_empty() {
+        if rows.is_empty() {
+            // A configured lobby that has not answered yet is not the same as
+            // an empty one — saying "searching" while the connection is still
+            // coming up reads as "there is nothing there".
+            let msg = match (social.enabled(), social.ready()) {
+                (true, true) => "searching for servers…",
+                (true, false) => "connecting to the lobby…",
+                _ => "searching for LAN servers…",
+            };
             list.spawn((
-                Text::new("searching for LAN servers…"),
-                TextFont { font_size: 14.0, ..default() },
+                Text::new(msg),
+                TextFont { font_size: 14.0.into(), ..default() },
                 TextColor(Color::srgb(0.55, 0.55, 0.55)),
             ));
             return;
         }
-        for s in &servers.list {
-            let addr = s.addr.to_string();
+        for (name, addr, players, lan) in &rows {
+            let tag = if *lan { "LAN" } else { "net" };
             list.spawn((
                 Button,
                 ServerButton { addr: addr.clone() },
@@ -388,8 +416,8 @@ pub fn update_server_list(
             ))
             .with_children(|b| {
                 b.spawn((
-                    Text::new(format!("{} ({}) — {}", s.name, s.players, addr)),
-                    TextFont { font_size: 14.0, ..default() },
+                    Text::new(format!("[{tag}] {name} ({players}) — {addr}")),
+                    TextFont { font_size: 14.0.into(), ..default() },
                     TextColor(Color::WHITE),
                 ));
             });

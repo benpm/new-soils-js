@@ -9,9 +9,18 @@ from the tree (see git history) and only matters as a behavioral reference.
 soils-protocol   coords, ChunkVolume, bincode wire enums, LAN discovery types. No Bevy/tokio.
 soils-worldgen   BlockRegistry (blocks.yaml, embedded), TerrainGen, CPU greedy mesher,
                  CPU radiance-cascades oracle. Pure, unit-tested.
+soils-sim        the shared simulation both sides run: movement/collision, edit rules,
+                 L0 light flood, entity registry, pathfinding. Engine-free.
+soils-physics    shared Avian setup: body/collider builders, voxel colliders, player proxy.
+soils-stdb       native SpacetimeDB client. No Bevy, so either side can use it.
 soils-server     tokio + tungstenite WebSocket server. Depends on protocol + worldgen.
-soils-client     Bevy 0.18 app. Depends on protocol + worldgen + soils-server (embedded SP).
+soils-client     Bevy app. Depends on protocol + worldgen + soils-server (embedded SP).
 ```
+
+> This document is the **pre-reorganization** analysis, kept for its record of why
+> the refactor happened. The crate list above has been refreshed, but the limits
+> table below describes the state *before* the work in `plan-game-systems.md` and
+> `plan-rendering.md`. For how the system works now, read `architecture.md`.
 
 Dependencies point strictly downward; `soils-protocol` and `soils-worldgen` are engine-free. This
 layering is the codebase's best structural asset and the reorganization plan preserves it.

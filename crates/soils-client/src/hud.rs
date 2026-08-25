@@ -13,12 +13,20 @@ use crate::player::{Player, Streaming};
 #[derive(Component)]
 pub struct DebugHud;
 
+/// Marker for the chat overlay text node.
+#[derive(Component)]
+pub struct ChatHud;
+
+/// Chat lines shown at once. Enough to follow a conversation without covering
+/// the view; the full backlog lives in the `Social` resource.
+const CHAT_LINES: usize = 8;
+
 /// Spawn the (initially visible) debug overlay in the top-left corner.
 pub fn setup_hud(mut commands: Commands) {
     commands.spawn((
         DebugHud,
         Text::new(""),
-        TextFont { font_size: 13.0, ..default() },
+        TextFont { font_size: 13.0.into(), ..default() },
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.92)),
         Node {
             position_type: PositionType::Absolute,
@@ -27,6 +35,42 @@ pub fn setup_hud(mut commands: Commands) {
             ..default()
         },
     ));
+
+    // Bottom-left, above the console line, and always visible — chat is not
+    // debug output and should not vanish with F3.
+    commands.spawn((
+        ChatHud,
+        Text::new(""),
+        TextFont { font_size: 13.0.into(), ..default() },
+        TextColor(Color::srgba(1.0, 1.0, 1.0, 0.85)),
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(40.0),
+            left: Val::Px(8.0),
+            ..default()
+        },
+    ));
+}
+
+/// Render the newest chat lines. Empty (and so invisible) when there is no
+/// database configured or nothing has been said.
+pub fn update_chat(
+    social: Res<crate::social::Social>,
+    mut hud: Query<&mut Text, With<ChatHud>>,
+) {
+    if !social.is_changed() {
+        return;
+    }
+    let Ok(mut text) = hud.single_mut() else { return };
+    let start = social.chat.len().saturating_sub(CHAT_LINES);
+    let body = social.chat[start..]
+        .iter()
+        .map(|l| format!("<{}> {}", l.sender, l.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.0 != body {
+        text.0 = body;
+    }
 }
 
 /// F3 toggles the debug overlay.

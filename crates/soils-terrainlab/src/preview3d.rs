@@ -17,7 +17,7 @@ use bevy::render::render_resource::{
     AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
 };
 use bevy::shader::ShaderRef;
-use bevy::render::storage::ShaderStorageBuffer;
+use bevy::render::storage::ShaderBuffer;
 use bevy_egui::{EguiContexts, PrimaryEguiContext};
 use soils_worldgen::graph::TerrainGraph;
 
@@ -62,7 +62,7 @@ struct PreviewParams {
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 struct TerrainMaterial {
     #[storage(0, read_only)]
-    params: Handle<ShaderStorageBuffer>,
+    params: Handle<ShaderBuffer>,
     #[uniform(1)]
     pv: PreviewParams,
 }
@@ -103,7 +103,7 @@ struct Orbit {
 #[derive(Resource)]
 struct Terrain3dState {
     material: Handle<TerrainMaterial>,
-    params: Handle<ShaderStorageBuffer>,
+    params: Handle<ShaderBuffer>,
 }
 
 pub struct TerrainPreviewPlugin;
@@ -123,7 +123,7 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut shaders: ResMut<Assets<Shader>>,
 ) {
     // Seed the shader asset with a trivial flat shader; the first sync replaces
@@ -134,7 +134,7 @@ fn setup(
         Shader::from_wgsl(wgsl_gen::generate_material(&flat), "terrain_preview.wgsl"),
     );
 
-    let params = buffers.add(ShaderStorageBuffer::from(vec![0i32]));
+    let params = buffers.add(ShaderBuffer::from(vec![0i32]));
     let step = SPAN / RES as f32;
     let material = materials.add(TerrainMaterial {
         params: params.clone(),
@@ -169,7 +169,7 @@ fn setup(
         PrimaryEguiContext,
     ));
     commands.spawn((
-        DirectionalLight { illuminance: 12000.0, shadows_enabled: false, ..default() },
+        DirectionalLight { illuminance: 12000.0, shadow_maps_enabled: false, ..default() },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.6, 0.0)),
     ));
 }
@@ -182,7 +182,7 @@ fn sync_terrain(
     state: Res<Terrain3dState>,
     mut shaders: ResMut<Assets<Shader>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut state_mut: ResMut<Terrain3dStateHash>,
 ) {
     let Some(graph) = &input.graph else { return };
@@ -201,12 +201,12 @@ fn sync_terrain(
     if params.is_empty() {
         params.push(0);
     }
-    if let Some(buf) = buffers.get_mut(&state.params) {
+    if let Some(mut buf) = buffers.get_mut(&state.params) {
         buf.data = Some(bytemuck::cast_slice(&params).to_vec());
     }
 
     // Colour range + seed (bit-passed through the f32 uniform).
-    if let Some(mat) = materials.get_mut(&state.material) {
+    if let Some(mut mat) = materials.get_mut(&state.material) {
         mat.pv.b.x = input.hmin;
         mat.pv.b.y = input.hmax.max(input.hmin + 1.0);
         mat.pv.b.z = f32::from_bits(input.seed);
@@ -232,7 +232,7 @@ fn orbit_camera(
     if *mode != ViewMode::Terrain3d {
         return;
     }
-    let egui_wants = contexts.ctx_mut().map(|c| c.wants_pointer_input()).unwrap_or(false);
+    let egui_wants = contexts.ctx_mut().map(|c| c.egui_wants_pointer_input()).unwrap_or(false);
 
     let Ok((mut orbit, mut tf)) = q.single_mut() else { return };
     // Keep the target near the terrain's mid height.

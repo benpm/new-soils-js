@@ -15,6 +15,14 @@ async fn main() {
         config.critters = n.parse().unwrap_or(0);
     }
     config.physics = std::env::var("SOILS_PHYSICS").is_ok_and(|v| v != "0");
+    // A prop pile implies physics: asking for props with physics off would
+    // silently drop nothing.
+    if let Some(n) = std::env::var("SOILS_PROPS").ok().and_then(|v| v.parse().ok()) {
+        config.props = n;
+        if n > 0 {
+            config.physics = true;
+        }
+    }
     // Scripting: SOILS_SCRIPTS_DIR wins; else SOILS_SCRIPTS=1 loads ./scripts.
     if let Ok(dir) = std::env::var("SOILS_SCRIPTS_DIR") {
         config.scripts_dir = Some(dir.into());

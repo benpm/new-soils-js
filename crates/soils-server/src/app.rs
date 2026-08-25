@@ -17,15 +17,15 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use avian3d::prelude::{AngularVelocity, LinearVelocity, Position, Rotation};
 use bevy_app::{App, AppExit, FixedUpdate, ScheduleRunnerPlugin, Update};
 use bevy_ecs::message::MessageWriter;
 use bevy_ecs::prelude::{
-    Commands, Component, Entity, IntoScheduleConfigs, Local, NonSendMut, Query, Res, ResMut,
+    Commands, Component, Entity, Has, IntoScheduleConfigs, Local, NonSendMut, Query, Res, ResMut,
     Resource, With, Without,
 };
 use bevy_time::{Fixed, Time, TimePlugin};
@@ -90,6 +90,17 @@ pub(crate) struct Client {
     /// are just never acked. Everything else stays on the reliable `outbox`.
     snapshot: watch::Sender<Option<ServerMsg>>,
     authenticated: bool,
+    /// A login is being checked on a worker thread. Bounds each connection to
+    /// one outstanding check, so a client cannot queue unlimited Argon2 work.
+    auth_inflight: bool,
+    /// Set by [`AuthQueue`] when a check came back good, and taken by the
+    /// replayed `Login` message. Carrying the verdict on the connection is
+    /// what lets the success path stay exactly where it was, in the message
+    /// loop, rather than being duplicated for the deferred case.
+    auth_verified: Option<()>,
+    /// Account name this connection authenticated as; keys the SpacetimeDB
+    /// profile/presence rows.
+    account: String,
     world: String,
     /// This client's player entity (spawned on login) and its NetId.
     entity: Option<Entity>,
@@ -203,6 +214,10 @@ impl Wander {
 
 #[derive(Resource)]
 struct NextNetId(u32);
+/// Rigid-body props dropped near spawn (from `ServerConfig::props`).
+#[derive(Resource)]
+struct PropCount(u16);
+
 /// Ambient test critters per world (from `ServerConfig::critters`).
 #[derive(Resource)]
 struct CritterCount(u16);
@@ -229,8 +244,97 @@ struct Wave {
 struct NetRx(UnboundedReceiver<NewConn>);
 #[derive(Resource)]
 struct ShutdownRx(watch::Receiver<bool>);
+/// A login checked off the tick thread, on its way back.
+struct AuthDone {
+    id: u16,
+    name: String,
+    signup: bool,
+    protocol: u32,
+    verdict: Result<(), String>,
+}
+
+/// Where workers leave finished logins for the next tick to collect.
+///
+/// Password checking cannot happen inline: Argon2id is memory-hard by design
+/// and costs tens of milliseconds against a 15.6 ms tick. See
+/// `docs/dev/server-tick.md#login-runs-off-the-tick-thread`.
+#[derive(Resource, Clone, Default)]
+struct AuthQueue(Arc<Mutex<Vec<AuthDone>>>);
+
+/// A login waiting for a worker.
+struct AuthReq {
+    id: u16,
+    name: String,
+    password: String,
+    signup: bool,
+    protocol: u32,
+}
+
+/// How many passwords may be checked at once.
+///
+/// This is the number that matters. Argon2id at the default parameters costs
+/// 19 MB of RAM per hash *by design*, so "one thread per pending login" hands
+/// anyone who can open sockets an unbounded memory and CPU amplifier. Capping
+/// concurrency turns a login flood into a queue instead of an outage.
+const AUTH_WORKERS: usize = 4;
+
+/// How many logins may be *waiting* for a worker.
+///
+/// Deliberately generous, and not a security control: a queued `AuthReq` is a
+/// name and a password, on the order of a hundred bytes, so the queue is three
+/// orders of magnitude cheaper per entry than a hash. Sizing it tightly only
+/// refuses honest bursts — a hundred players joining at once is a normal
+/// Saturday, not an attack. Overflow past this is a genuine last resort.
+const AUTH_BACKLOG: usize = 1024;
+
+/// A fixed pool of password-checking threads.
 #[derive(Resource)]
-struct AccountsRes(Arc<Accounts>);
+struct AuthPool {
+    tx: crossbeam_channel::Sender<AuthReq>,
+    /// Highest number of checks ever running at once. Only read by tests, but
+    /// it is the one property worth asserting and cannot be seen from outside.
+    peak: Arc<AtomicUsize>,
+}
+
+impl AuthPool {
+    fn new(accounts: Arc<Accounts>, queue: AuthQueue) -> Self {
+        let (tx, rx) = crossbeam_channel::bounded::<AuthReq>(AUTH_BACKLOG);
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        for n in 0..AUTH_WORKERS {
+            let (rx, accounts, queue) = (rx.clone(), accounts.clone(), queue.clone());
+            let (live, peak) = (live.clone(), peak.clone());
+            let spawned = std::thread::Builder::new()
+                .name(format!("soils-auth-{n}"))
+                .spawn(move || {
+                    for req in rx {
+                        let now = live.fetch_add(1, Ordering::Relaxed) + 1;
+                        peak.fetch_max(now, Ordering::Relaxed);
+                        let verdict = accounts.authenticate(&req.name, &req.password, req.signup);
+                        live.fetch_sub(1, Ordering::Relaxed);
+                        if let Ok(mut q) = queue.0.lock() {
+                            q.push(AuthDone {
+                                id: req.id,
+                                name: req.name,
+                                signup: req.signup,
+                                protocol: req.protocol,
+                                verdict,
+                            });
+                        }
+                    }
+                });
+            if let Err(e) = spawned {
+                eprintln!("auth: could not spawn worker {n}: {e}");
+            }
+        }
+        Self { tx, peak }
+    }
+
+    /// Queue a login. `false` means the backlog is full.
+    fn submit(&self, req: AuthReq) -> bool {
+        self.tx.try_send(req).is_ok()
+    }
+}
 /// Shared with the LAN discovery responder on the tokio side.
 #[derive(Resource)]
 struct PlayerCount(Arc<AtomicU16>);
@@ -247,18 +351,58 @@ struct Clock {
 #[derive(Resource)]
 struct Clients(HashMap<u16, Client>);
 
+/// How often the server refreshes its `game_server` registry row. Must stay
+/// comfortably under the module's `LIVENESS_TTL` or the reaper will drop a
+/// live server.
+const HEARTBEAT_SECS: f32 = 5.0;
+
+/// The SpacetimeDB mirror plus this server's registry identity, when enabled.
+#[derive(Resource)]
+struct StdbMirror {
+    link: Arc<soils_stdb::StdbLink>,
+    server_id: u32,
+    name: String,
+    addr: String,
+}
+
 #[derive(Resource)]
 struct Worlds {
     map: HashMap<String, World>,
     data_dir: PathBuf,
     persist: PersistHandle,
+    /// SpacetimeDB mirror, when enabled. Each world registers itself here on
+    /// first open and then keys its chunk saves by `world_id_for(name)`.
+    stdb: Option<Arc<soils_stdb::StdbLink>>,
 }
 
 impl Worlds {
     /// Fetch a world by name, creating (opening) it on first request.
     fn get_or_create(&mut self, name: &str) -> &mut World {
         if !self.map.contains_key(name) {
-            let world = World::new(&self.data_dir, name, world_seed(name), self.persist.clone());
+            let mut world = World::new(&self.data_dir, name, world_seed(name), self.persist.clone());
+            if let Some(stdb) = &self.stdb {
+                // The id is a stable hash of the name, so this needs no
+                // round-trip and survives restarts; the module rejects a
+                // collision rather than merging two worlds' chunks.
+                let world_id = soils_protocol::chunk_key::world_id_for(name);
+                let params = world.gen_params();
+                if let Err(e) = stdb.send(soils_stdb::StdbCmd::UpsertWorld {
+                    world_id,
+                    name: name.to_string(),
+                    seed: params.seed,
+                    world_type: params.world_type,
+                    graph_hash: params.graph_hash,
+                    daytime: 0.0,
+                }) {
+                    eprintln!("spacetimedb: could not register world '{name}': {e}");
+                } else {
+                    world.enable_stdb(world_id);
+                    // An empty region directory means a fresh host: pull back
+                    // whatever edits the database still holds before anyone
+                    // joins and starts generating pristine terrain over them.
+                    world.restore_from_stdb(stdb);
+                }
+            }
             self.map.insert(name.to_string(), world);
         }
         self.map.get_mut(name).unwrap()
@@ -267,6 +411,11 @@ impl Worlds {
     /// Read-only lookup (physics colliders read chunk voxels without mutating).
     fn world(&self, name: &str) -> Option<&World> {
         self.map.get(name)
+    }
+
+    /// Names of the worlds currently open.
+    fn names(&self) -> Vec<String> {
+        self.map.keys().cloned().collect()
     }
 }
 
@@ -326,8 +475,27 @@ pub(crate) fn run_app(
     critters: u16,
     scripts_dir: Option<PathBuf>,
     physics_enabled: bool,
+    props: u16,
+    stdb: Option<Arc<soils_stdb::StdbLink>>,
+    server_name: String,
+    bind_addr: String,
 ) {
-    let mut worlds = Worlds { map: HashMap::new(), data_dir, persist };
+    let mirror = stdb.clone().map(|link| StdbMirror {
+        link,
+        // Stable per (name, bind) so a restart refreshes its own row instead of
+        // leaving an orphan for the reaper.
+        server_id: {
+            let mut h: u32 = 2166136261;
+            for b in server_name.bytes().chain(bind_addr.bytes()) {
+                h ^= b as u32;
+                h = h.wrapping_mul(16777619);
+            }
+            h
+        },
+        name: server_name,
+        addr: bind_addr,
+    });
+    let mut worlds = Worlds { map: HashMap::new(), data_dir, persist, stdb };
     // Pre-create the default world so it's ready before the first client.
     worlds.get_or_create(DEFAULT_WORLD);
 
@@ -353,6 +521,9 @@ pub(crate) fn run_app(
 
     let physics = PhysicsCfg { enabled: physics_enabled };
 
+    let auth_queue = AuthQueue::default();
+    let auth_pool = AuthPool::new(accounts.clone(), auth_queue.clone());
+
     let mut app = App::new();
     app.add_plugins((
         TimePlugin,
@@ -363,18 +534,20 @@ pub(crate) fn run_app(
     .insert_resource(Time::<Fixed>::from_hz(soils_sim::SERVER_TICK_HZ))
     .insert_resource(NetRx(conns))
     .insert_resource(ShutdownRx(shutdown))
-    .insert_resource(AccountsRes(accounts))
+    .insert_resource(auth_pool)
+    .insert_resource(auth_queue)
     .insert_resource(PlayerCount(player_count))
     .insert_resource(Clients(HashMap::new()))
     .insert_resource(worlds)
     .insert_resource(NextNetId(1))
     .insert_resource(CritterCount(critters))
+    .insert_resource(PropCount(props))
     .insert_resource(physics)
     .init_resource::<CrittersSpawned>()
     .init_resource::<TickCount>()
     .init_resource::<Clock>()
     .init_resource::<ScriptEvents>()
-    .insert_non_send_resource(ScriptRt(script_rt))
+    .insert_non_send(ScriptRt(script_rt))
     .add_systems(Update, check_shutdown)
     .add_systems(
         FixedUpdate,
@@ -388,6 +561,7 @@ pub(crate) fn run_app(
             pump_chunk_jobs,
             replicate_entities,
             tick_clock,
+            stdb_heartbeat,
             world_lifecycle,
         )
             .chain(),
@@ -414,6 +588,10 @@ pub(crate) fn run_app(
                 .after(drain_inboxes)
                 .before(replicate_entities),
         );
+    }
+
+    if let Some(mirror) = mirror {
+        app.insert_resource(mirror);
     }
 
     app.run();
@@ -537,6 +715,7 @@ fn spawn_physics_demo(
     mut done: Local<bool>,
     players: Query<(&SimState, &InWorld), With<PlayerControlled>>,
     worlds: Res<Worlds>,
+    props: Res<PropCount>,
     mut commands: Commands,
     mut next_net: ResMut<NextNetId>,
 ) {
@@ -562,12 +741,57 @@ fn spawn_physics_demo(
     *done = true;
 
     let base = Vec3::new(feet.x, surface_y as f32 + 6.0, feet.z);
-    // A 3-cube stack, each given a spin so the replicated orientation is
-    // non-trivial as they fall and settle.
-    for i in 0..3u32 {
-        let pos = base + Vec3::Y * (i as f32 * 1.2);
-        spawn_physics_cube(&mut commands, &mut next_net, &in_world.0, pos, Vec3::new(1.5, 2.0, 0.5));
+    if props.0 == 0 {
+        // A 3-cube stack, each given a spin so the replicated orientation is
+        // non-trivial as they fall and settle.
+        for i in 0..3u32 {
+            let pos = base + Vec3::Y * (i as f32 * 1.2);
+            spawn_physics_cube(
+                &mut commands,
+                &mut next_net,
+                &in_world.0,
+                pos,
+                Vec3::new(1.5, 2.0, 0.5),
+            );
+        }
+        return;
     }
+
+    // A loose cube pile: jittered, wide and shallow. See
+    // docs/dev/server-tick.md#demo-fixtures for why it is laid out this way.
+    let n = props.0 as u32;
+    let layers = 3u32;
+    let side = ((n as f32 / layers as f32).sqrt().ceil()).max(1.0) as u32;
+    let spacing = 1.35; // > the 1.0 cube, so nothing starts interpenetrating
+    let mut spawned = 0u32;
+    'pile: for y in 0..layers {
+        for x in 0..side {
+            for z in 0..side {
+                if spawned >= n {
+                    break 'pile;
+                }
+                let h = soils_protocol::mix(spawned as u64);
+                let jx = ((h >> 8) & 0xFF) as f32 / 255.0 - 0.5;
+                let jz = ((h >> 24) & 0xFF) as f32 / 255.0 - 0.5;
+                let spin = ((h >> 40) & 0xFF) as f32 / 255.0 * 2.0 - 1.0;
+                let pos = base
+                    + Vec3::new(
+                        (x as f32 - side as f32 / 2.0) * spacing + jx * 0.3,
+                        y as f32 * spacing,
+                        (z as f32 - side as f32 / 2.0) * spacing + jz * 0.3,
+                    );
+                spawn_physics_cube(
+                    &mut commands,
+                    &mut next_net,
+                    &in_world.0,
+                    pos,
+                    Vec3::new(spin, spin * 1.5, -spin),
+                );
+                spawned += 1;
+            }
+        }
+    }
+    println!("physics: dropped {spawned} props near spawn");
 }
 
 /// Spawn one replicated rigid-body cube at `pos` with initial angular velocity
@@ -645,6 +869,9 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 outbox: conn.outbox,
                 snapshot: conn.snapshot,
                 authenticated: false,
+                auth_inflight: false,
+                auth_verified: None,
+                account: String::new(),
                 world: DEFAULT_WORLD.to_string(),
                 entity: None,
                 self_net: 0,
@@ -696,18 +923,52 @@ fn drain_inboxes(
     mut clients: ResMut<Clients>,
     mut worlds: ResMut<Worlds>,
     clock: Res<Clock>,
-    accounts: Res<AccountsRes>,
+    auth_queue: Res<AuthQueue>,
+    auth_pool: Res<AuthPool>,
     player_count: Res<PlayerCount>,
     mut next_net: ResMut<NextNetId>,
     critter_count: Res<CritterCount>,
     mut critters_spawned: ResMut<CrittersSpawned>,
     mut script_events: ResMut<ScriptEvents>,
     physics: Res<PhysicsCfg>,
-    mut sims: Query<(&mut SimState, &mut Yaw, &mut InWorld)>,
+    mut sims: Query<(&mut SimState, &mut Yaw, &mut InWorld, Entity, Has<PlayerControlled>)>,
+    stdb: Option<Res<StdbMirror>>,
 ) {
+    // Phase 0: collect logins that finished on a worker thread. A rejection is
+    // answered here; a success is replayed as the `Login` message it came from,
+    // so the join path stays in one place.
+    let mut msgs: Vec<(u16, ClientMsg)> = Vec::new();
+    for done in auth_queue.0.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default() {
+        // The connection may have gone while the hash was running. `id` comes
+        // from a wrapping counter, so require that this connection is the one
+        // still waiting: without it, a verdict outliving its connection could
+        // land on a reused id and log a stranger in as the wrong account.
+        let Some(c) = clients.0.get_mut(&done.id).filter(|c| c.auth_inflight) else { continue };
+        c.auth_inflight = false;
+        match done.verdict {
+            Err(reason) => {
+                println!("login denied: {} (id {}): {reason}", done.name, done.id);
+                let _ = c.outbox.send(ServerMsg::LoginError { message: reason });
+            }
+            Ok(()) => {
+                c.auth_verified = Some(());
+                msgs.push((
+                    done.id,
+                    ClientMsg::Login {
+                        name: done.name,
+                        // Already checked; never read again on this path, and
+                        // not worth keeping a plaintext alive for.
+                        password: String::new(),
+                        signup: done.signup,
+                        protocol: done.protocol,
+                    },
+                ));
+            }
+        }
+    }
+
     // Phase 1: refill rate buckets and pull everything out of the inboxes.
     let dt = time.delta_secs();
-    let mut msgs: Vec<(u16, ClientMsg)> = Vec::new();
     let mut gone: Vec<u16> = Vec::new();
     for (&id, c) in clients.0.iter_mut() {
         c.input_tokens = (c.input_tokens + dt * soils_sim::TICK_HZ as f32).min(INPUT_BURST);
@@ -723,6 +984,19 @@ fn drain_inboxes(
             }
         }
     }
+    // Deterministic order over a HashMap's randomized one; stable, so each
+    // client keeps its own FIFO. docs/dev/server-tick.md#determinism-rules.
+    msgs.sort_by_key(|(id, _)| *id);
+
+    // The obstacle set for player-vs-player collision, frozen for the whole
+    // tick so the result cannot depend on message order and the client can
+    // reproduce it. docs/dev/server-tick.md#determinism-rules.
+    let peer_snapshot: Vec<(Entity, String, Vec3)> = sims
+        .iter()
+        .filter(|(.., is_player)| *is_player)
+        .map(|(sim, _, w, e, _)| (e, w.0.clone(), sim.0.pos))
+        .collect();
+    let mut peers: Vec<Vec3> = Vec::new();
 
     // Phase 2: apply, in per-client arrival order (all the old per-connection
     // loop guaranteed across clients was per-client FIFO too).
@@ -739,7 +1013,37 @@ fn drain_inboxes(
                     });
                     continue;
                 }
-                match accounts.0.authenticate(&name, &password, signup) {
+                // Already in: the real client opens a fresh connection per
+                // attempt, so a second Login here is a client re-sending on a
+                // live session. Honouring it would pay for another Argon2 and
+                // respawn the player, which is a free reset anyone can spam.
+                if c.authenticated && c.auth_verified.is_none() {
+                    continue;
+                }
+                // The first Login only starts the check; the answer comes
+                // back via [`AuthQueue`] and replays this message with
+                // `auth_verified` set. docs/dev/server-tick.md.
+                let verdict: Result<(), String> = match c.auth_verified.take() {
+                    Some(()) => Ok(()),
+                    None => {
+                        // One check in flight per connection; the pool bounds
+                        // the total. A full backlog is refused, not queued —
+                        // and `auth_inflight` must be left clear on that path,
+                        // or this connection could never log in again.
+                        if !c.auth_inflight {
+                            let req = AuthReq { id, name, password, signup, protocol };
+                            if auth_pool.submit(req) {
+                                c.auth_inflight = true;
+                            } else {
+                                let _ = c.outbox.send(ServerMsg::LoginError {
+                                    message: "server busy; try again".into(),
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                };
+                match verdict {
                     Err(reason) => {
                         println!("login denied: {name} (id {id}): {reason}");
                         let _ = c.outbox.send(ServerMsg::LoginError { message: reason });
@@ -750,9 +1054,30 @@ fn drain_inboxes(
                             player_count.0.fetch_add(1, Ordering::Relaxed);
                         }
                         c.authenticated = true;
+                        c.account = name.clone();
+                        if let Some(stdb) = &stdb {
+                            let _ = stdb.link.send(soils_stdb::StdbCmd::MarkPresent {
+                                account: name.clone(),
+                                server_id: stdb.server_id,
+                                world_id: soils_protocol::chunk_key::world_id_for(&c.world),
+                            });
+                        }
                         let world_name = c.world.clone();
                         let world = worlds.get_or_create(&world_name);
-                        let (spawn, worldgen) = (world.spawn, world.gen_params());
+                        let (mut spawn, worldgen) = (world.spawn, world.gen_params());
+                        // Resume where they logged out, when SpacetimeDB has a
+                        // profile for them in this world. Read from the SDK's
+                        // local cache, so this costs no round trip; a miss —
+                        // no mirror, cache not warm yet, or a first-time player
+                        // — just leaves them at the world spawn.
+                        if let Some(stdb) = &stdb
+                            && let Some(p) = stdb.link.profile(&name)
+                            && p.world_id == soils_protocol::chunk_key::world_id_for(&world_name)
+                            && [p.x, p.y, p.z].iter().all(|v| v.is_finite())
+                        {
+                            spawn = [p.x, p.y, p.z];
+                            println!("login: {name} resumed at {spawn:?}");
+                        }
                         let c = clients.0.get_mut(&id).unwrap();
                         // (Re)spawn this connection's player entity.
                         if let Some(old) = c.entity.take() {
@@ -821,6 +1146,21 @@ fn drain_inboxes(
             // Everything below requires authentication; silently drop otherwise
             // (same as the old pre-auth gate).
             _ if !clients.0[&id].authenticated => {}
+            ClientMsg::LinkIdentity { identity } => {
+                // Only meaningful once authenticated: the whole point is that
+                // the *server* vouches for the account, having checked the
+                // password. An unauthenticated caller has nothing to bind.
+                let c = clients.0.get_mut(&id).unwrap();
+                if !c.authenticated {
+                    continue;
+                }
+                if let Some(stdb) = &stdb {
+                    let _ = stdb.link.send(soils_stdb::StdbCmd::LinkIdentity {
+                        account: c.account.clone(),
+                        identity: soils_stdb::Identity::from_byte_array(identity),
+                    });
+                }
+            }
             ClientMsg::ViewRadius { radius, full_streams } => {
                 let c = clients.0.get_mut(&id).unwrap();
                 c.radius = (radius as i32).clamp(1, MAX_RADIUS);
@@ -911,8 +1251,20 @@ fn drain_inboxes(
                 let c = clients.0.get_mut(&id).unwrap();
                 c.ack_tick = c.ack_tick.max(ack_tick);
                 let Some(entity) = c.entity else { continue };
-                let Ok((mut sim, mut yaw, _)) = sims.get_mut(entity) else { continue };
-                let world = worlds.get_or_create(&c.world.clone());
+                let world_name = c.world.clone();
+                // Everyone else in this world is a solid body to walk into and
+                // stand on. Peers are read from the tick-boundary snapshot, not
+                // the live query, so this stays a plain `&[Vec3]` and cannot
+                // alias the `&mut SimState` being stepped.
+                peers.clear();
+                peers.extend(
+                    peer_snapshot
+                        .iter()
+                        .filter(|(e, w, _)| *e != entity && *w == world_name)
+                        .map(|(.., p)| *p),
+                );
+                let Ok((mut sim, mut yaw, ..)) = sims.get_mut(entity) else { continue };
+                let world = worlds.get_or_create(&world_name);
                 let sim_dt = 1.0 / soils_sim::TICK_HZ as f32;
                 for f in frames {
                     if f.seq <= c.last_seq || c.input_tokens < 1.0 {
@@ -922,7 +1274,13 @@ fn drain_inboxes(
                     c.last_seq = f.seq;
                     let input = soils_sim::unpack_input(f.buttons, f.flags, f.yaw);
                     yaw.0 = input.yaw;
-                    soils_sim::step_player(&mut sim.0, &input, sim_dt, &|v| world.voxel(v));
+                    soils_sim::step_player_peers(
+                        &mut sim.0,
+                        &input,
+                        sim_dt,
+                        &|v| world.voxel(v),
+                        &peers,
+                    );
                 }
                 // Crossing a chunk boundary moves the subscription window.
                 let pc = chunk_at(sim.0.pos.to_array());
@@ -975,7 +1333,7 @@ fn drain_inboxes(
                 let spawn = world.spawn;
                 let c = clients.0.get_mut(&id).unwrap();
                 if let Some(entity) = c.entity
-                    && let Ok((mut sim, _, mut in_world)) = sims.get_mut(entity)
+                    && let Ok((mut sim, _, mut in_world, ..)) = sims.get_mut(entity)
                 {
                     sim.0.pos = Vec3::from_array(spawn);
                     sim.0.vel = Vec3::ZERO;
@@ -1000,6 +1358,24 @@ fn drain_inboxes(
                 commands.entity(entity).despawn();
             }
             if c.authenticated {
+                if let Some(stdb) = &stdb {
+                    // Last known position, so a returning player resumes where
+                    // they left off rather than at spawn.
+                    if let Some((sim, yaw, ..)) = c.entity.and_then(|e| sims.get(e).ok()) {
+                        let _ = stdb.link.send(soils_stdb::StdbCmd::SaveProfile {
+                            account: c.account.clone(),
+                            world_id: soils_protocol::chunk_key::world_id_for(&c.world),
+                            x: sim.0.pos.x,
+                            y: sim.0.pos.y,
+                            z: sim.0.pos.z,
+                            yaw: yaw.0,
+                            view_radius: c.radius.clamp(0, u8::MAX as i32) as u8,
+                        });
+                    }
+                    let _ = stdb
+                        .link
+                        .send(soils_stdb::StdbCmd::MarkAbsent { account: c.account.clone() });
+                }
                 player_count.0.fetch_sub(1, Ordering::Relaxed);
                 script_events.0.push(ScriptEvent::PlayerLeave { netid: c.self_net as u32 });
                 let world = worlds.get_or_create(&c.world);
@@ -1412,9 +1788,7 @@ fn wander_critters(
             wander.goal = None;
             wander.path.clear();
             if ticks.0 >= wander.next_turn {
-                let h = (net.0 as u64)
-                    .wrapping_mul(0x9E3779B97F4A7C15)
-                    .wrapping_add(ticks.0.wrapping_mul(0xD1B54A32D192ED03));
+                let h = soils_protocol::mix(net.0 as u64 ^ soils_protocol::mix(ticks.0));
                 yaw.0 = (h % 6283) as f32 / 1000.0;
                 wander.next_turn = ticks.0 + 30 + (h >> 32) % 40;
             }
@@ -1588,6 +1962,73 @@ fn replicate_entities(
 
 /// Advance and broadcast the day/night clock once per second (global, all
 /// worlds — and, like the old broadcast forwarder, all connections).
+/// Registry heartbeat: keeps this server's `game_server` row fresh so it shows
+/// up in a server browser, and lets the module's reaper drop it if we crash.
+///
+/// The `players` list is empty for now: presence is per-*identity*, and game
+/// players authenticate to the game server with a name/password, so they have
+/// no SpacetimeDB identity until the client connects to SpacetimeDB itself.
+/// Wiring real presence therefore waits on the client-side identity work; the
+/// player *count* still travels, which is what a browser actually shows.
+fn stdb_heartbeat(
+    time: Res<Time>,
+    mut acc: Local<Option<f32>>,
+    stdb: Option<Res<StdbMirror>>,
+    clients: Res<Clients>,
+    worlds: Res<Worlds>,
+    clock: Res<Clock>,
+) {
+    let Some(stdb) = stdb else { return };
+    // Seeded at the interval so the very first tick registers the server: a
+    // browser should see it immediately, not `HEARTBEAT_SECS` later.
+    let elapsed = acc.get_or_insert(HEARTBEAT_SECS);
+    *elapsed += time.delta_secs();
+    if *elapsed < HEARTBEAT_SECS {
+        return;
+    }
+    *elapsed = 0.0;
+    let online: Vec<&Client> = clients.0.values().filter(|c| c.authenticated).collect();
+    let _ = stdb.link.send(soils_stdb::StdbCmd::Heartbeat {
+        server_id: stdb.server_id,
+        name: stdb.name.clone(),
+        addr: stdb.addr.clone(),
+        player_count: online.len() as u32,
+    });
+
+    // Presence has to be refreshed on the same clock, not just written at
+    // login: the module reaps any presence row older than its liveness TTL, so
+    // a login-only row vanishes out from under a player who is still connected.
+    // Rosters are per world, since a presence row records which world its
+    // player is in.
+    let mut by_world: HashMap<&str, Vec<String>> = HashMap::new();
+    for c in &online {
+        by_world.entry(c.world.as_str()).or_default().push(c.account.clone());
+    }
+    for (world, accounts) in by_world {
+        let _ = stdb.link.send(soils_stdb::StdbCmd::HeartbeatPresence {
+            server_id: stdb.server_id,
+            world_id: soils_protocol::chunk_key::world_id_for(world),
+            accounts,
+        });
+    }
+
+    // Refresh each live world's clock. Written once at world creation, the
+    // column sat at 0.0 forever while the day/night cycle ran, which made it
+    // worse than absent — a reader would have believed it.
+    for name in worlds.names() {
+        let Some(world) = worlds.world(&name) else { continue };
+        let params = world.gen_params();
+        let _ = stdb.link.send(soils_stdb::StdbCmd::UpsertWorld {
+            world_id: soils_protocol::chunk_key::world_id_for(&name),
+            name: name.clone(),
+            seed: params.seed,
+            world_type: params.world_type,
+            graph_hash: params.graph_hash,
+            daytime: clock.daytime,
+        });
+    }
+}
+
 fn tick_clock(time: Res<Time>, mut clock: ResMut<Clock>, clients: Res<Clients>) {
     clock.acc += time.delta_secs();
     if clock.acc < 1.0 {
@@ -1597,5 +2038,69 @@ fn tick_clock(time: Res<Time>, mut clock: ResMut<Clock>, clients: Res<Clients>) 
     clock.daytime = (clock.daytime + 1.0 / DAY_SECONDS) % 1.0;
     for c in clients.0.values() {
         let _ = c.outbox.send(ServerMsg::Time { daytime: clock.daytime });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pool's whole reason to exist: however many logins arrive, only
+    /// `AUTH_WORKERS` Argon2 hashes may be in memory at once. Nothing outside
+    /// the process can observe this, so it is asserted here rather than
+    /// inferred from timing.
+    #[test]
+    fn the_auth_pool_bounds_concurrent_hashing() {
+        let dir = std::env::temp_dir().join(format!("soils-authpool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let accounts = Arc::new(Accounts::load(&dir));
+        let queue = AuthQueue::default();
+        let pool = AuthPool::new(accounts, queue.clone());
+
+        // Comfortably more than the worker count, and every one a signup, so
+        // each pays a full hash rather than bailing out early.
+        const N: usize = 40;
+        for i in 0..N {
+            assert!(
+                pool.submit(AuthReq {
+                    id: i as u16,
+                    name: format!("pooluser{i}"),
+                    password: "hunter2".into(),
+                    signup: true,
+                    protocol: soils_protocol::PROTOCOL_VERSION,
+                }),
+                "the backlog must absorb an ordinary join burst"
+            );
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let done = queue.0.lock().map(|q| q.len()).unwrap_or(0);
+            if done == N {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "only {done}/{N} logins finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let peak = pool.peak.load(Ordering::Relaxed);
+        assert!(peak > 0, "the pool never ran anything");
+        assert!(
+            peak <= AUTH_WORKERS,
+            "{peak} passwords were hashed at once against a cap of {AUTH_WORKERS}; \
+             each costs ~19 MB, so this is an unbounded memory amplifier"
+        );
+        // `peak <= AUTH_WORKERS` alone is satisfied by raising AUTH_WORKERS,
+        // so pin what the cap is actually for: the memory it admits.
+        const ARGON2_MB: usize = 19;
+        const BUDGET_MB: usize = 128;
+        assert!(
+            AUTH_WORKERS * ARGON2_MB <= BUDGET_MB,
+            "AUTH_WORKERS = {AUTH_WORKERS} admits {} MB of concurrent Argon2, past a              {BUDGET_MB} MB budget",
+            AUTH_WORKERS * ARGON2_MB
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

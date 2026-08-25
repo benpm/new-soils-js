@@ -166,13 +166,27 @@ pub fn unpack_input(buttons: u8, flags: u8, yaw: u16) -> PlayerInput {
     }
 }
 
-/// Advance a player by `dt`. Fly mode is free 6-DOF; walk mode applies gravity
-/// and axis-separated AABB voxel collision, stopping on contact.
+/// Advance a player by `dt` against the voxel world only. Equivalent to
+/// [`step_player_peers`] with no peers.
 pub fn step_player(
     state: &mut PlayerState,
     input: &PlayerInput,
     dt: f32,
     world: &impl VoxelSampler,
+) {
+    step_player_peers(state, input, dt, world, &[]);
+}
+
+/// Advance a player by `dt`. Fly mode is free 6-DOF noclip; walk mode applies
+/// gravity and axis-separated AABB collision against both solid voxels and
+/// `peers` (other players' eye positions), stopping on contact. Blocking on a
+/// peer while falling sets `grounded`, so players stand on one another.
+pub fn step_player_peers(
+    state: &mut PlayerState,
+    input: &PlayerInput,
+    dt: f32,
+    world: &impl VoxelSampler,
+    peers: &[Vec3],
 ) {
     if input.toggle_fly {
         state.flying = !state.flying;
@@ -213,20 +227,30 @@ pub fn step_player(
     let delta = state.vel * dt;
     let mut pos = state.pos;
 
+    // A peer already interpenetrating at the start of the tick is not an
+    // obstacle: players share a spawn point, and terrain can push two bodies
+    // into each other. Treating those as solid would lock both in place
+    // forever, so overlap may only be *entered* into, never deepened.
+    let start = state.pos;
+    let blocked = |pos: Vec3| {
+        collides(world, pos)
+            || peers.iter().any(|&p| peers_overlap(pos, p) && !peers_overlap(start, p))
+    };
+
     // Resolve one axis at a time; stop on contact.
     pos.x += delta.x;
-    if collides(world, pos) {
+    if blocked(pos) {
         pos.x -= delta.x;
         state.vel.x = 0.0;
     }
     pos.z += delta.z;
-    if collides(world, pos) {
+    if blocked(pos) {
         pos.z -= delta.z;
         state.vel.z = 0.0;
     }
     pos.y += delta.y;
     state.grounded = false;
-    if collides(world, pos) {
+    if blocked(pos) {
         pos.y -= delta.y;
         if state.vel.y < 0.0 {
             state.grounded = true;
@@ -235,6 +259,16 @@ pub fn step_player(
     }
 
     state.pos = pos;
+}
+
+/// True if two player AABBs, given by their eye positions, overlap. The body
+/// is `2 * HALF_WIDTH` square and spans `EYE_TO_FEET` below the eye to
+/// `EYE_TO_HEAD` above it.
+fn peers_overlap(a: Vec3, b: Vec3) -> bool {
+    (a.x - b.x).abs() < HALF_WIDTH * 2.0
+        && (a.z - b.z).abs() < HALF_WIDTH * 2.0
+        && a.y - EYE_TO_FEET < b.y + EYE_TO_HEAD
+        && b.y - EYE_TO_FEET < a.y + EYE_TO_HEAD
 }
 
 /// True if the player AABB at eye position `eye` overlaps any solid voxel.
@@ -590,6 +624,117 @@ mod tests {
         assert!(!validate_edit(eye, IVec3::new(REACH + 1, 0, 0), 1, &reg), "out of reach");
         assert!(validate_edit(eye, IVec3::new(1, 0, 0), 0, &reg), "break (Air) is legal");
         assert!(!validate_edit(eye, IVec3::new(1, 0, 0), 99, &reg), "unknown id");
+    }
+
+    // --- player-vs-player collision -------------------------------------
+
+    #[test]
+    fn peer_blocks_horizontal_movement() {
+        let world = SparseWorld::with_floor(0, 20);
+        let mut state = standing_state(&world);
+        // A peer standing 2 units along +X, at the same height.
+        let peer = Vec3::new(state.pos.x + 2.0, state.pos.y, state.pos.z);
+        // yaw=0 => move_axes.x is +X.
+        let input = PlayerInput { move_axes: Vec2::new(1.0, 0.0), ..default_input() };
+        for _ in 0..100 {
+            step_player_peers(&mut state, &input, DT, &world, &[peer]);
+        }
+        // Stopped against the peer's -X face rather than walking through it.
+        assert!(
+            state.pos.x < peer.x - HALF_WIDTH * 2.0 + 1e-3,
+            "should stop against the peer, got x={} (peer at {})",
+            state.pos.x,
+            peer.x
+        );
+        assert!(state.pos.x > peer.x - 2.0 * HALF_WIDTH - 0.2, "should reach it: {}", state.pos.x);
+        assert_eq!(state.vel.x, 0.0);
+    }
+
+    #[test]
+    fn peer_is_not_solid_without_peer_awareness() {
+        // The voxel-only entry point must keep its old behavior: pass through.
+        let world = SparseWorld::with_floor(0, 20);
+        let mut state = standing_state(&world);
+        let peer = Vec3::new(state.pos.x + 2.0, state.pos.y, state.pos.z);
+        let input = PlayerInput { move_axes: Vec2::new(1.0, 0.0), ..default_input() };
+        for _ in 0..100 {
+            step_player(&mut state, &input, DT, &world);
+        }
+        assert!(state.pos.x > peer.x + 1.0, "step_player ignores peers: {}", state.pos.x);
+    }
+
+    #[test]
+    fn player_lands_on_top_of_a_peer() {
+        let world = SparseWorld::with_floor(0, 20);
+        let below = standing_state(&world);
+        // Drop in from directly above the peer's head.
+        let mut state = PlayerState {
+            pos: Vec3::new(below.pos.x, below.pos.y + 4.0, below.pos.z),
+            vel: Vec3::ZERO,
+            flying: false,
+            grounded: false,
+        };
+        for _ in 0..300 {
+            step_player_peers(&mut state, &default_input(), DT, &world, &[below.pos]);
+        }
+        assert!(state.grounded, "should come to rest standing on the peer");
+        assert_eq!(state.vel.y, 0.0);
+        // Feet rest on the peer's head, not on the floor far below.
+        let feet = state.pos.y - EYE_TO_FEET;
+        let head = below.pos.y + EYE_TO_HEAD;
+        assert!(
+            (head - 0.05..head + 0.25).contains(&feet),
+            "feet at {feet} should rest on the peer's head at {head}"
+        );
+    }
+
+    #[test]
+    fn coincident_players_can_separate() {
+        // Everyone spawns on the same point: if initial overlap counted as
+        // solid, both players would be frozen for the rest of the session.
+        let world = SparseWorld::with_floor(0, 20);
+        let mut state = standing_state(&world);
+        let peer = state.pos;
+        let input = PlayerInput { move_axes: Vec2::new(1.0, 0.0), ..default_input() };
+        for _ in 0..100 {
+            step_player_peers(&mut state, &input, DT, &world, &[peer]);
+        }
+        assert!(state.pos.x > peer.x + 1.0, "must be able to walk apart: {}", state.pos.x);
+    }
+
+    #[test]
+    fn flying_players_pass_through_peers() {
+        // Fly mode is noclip by design; peers must not change that.
+        let world = SparseWorld::with_floor(0, 20);
+        let peer = Vec3::new(2.0, 5.0, 0.5);
+        let mut state = PlayerState { pos: Vec3::new(0.5, 5.0, 0.5), ..Default::default() };
+        assert!(state.flying);
+        let input = PlayerInput { move_axes: Vec2::new(1.0, 0.0), ..default_input() };
+        for _ in 0..100 {
+            step_player_peers(&mut state, &input, DT, &world, &[peer]);
+        }
+        assert!(state.pos.x > peer.x + 1.0, "fly is noclip: {}", state.pos.x);
+    }
+
+    #[test]
+    fn peer_collision_is_deterministic() {
+        // Client prediction replays these steps; any divergence desyncs.
+        let world = SparseWorld::with_floor(0, 20);
+        let peers = [Vec3::new(2.0, 1.0 + EYE_TO_FEET, 0.5), Vec3::new(-2.0, 3.0, 1.5)];
+        let run = || {
+            let mut state = standing_state(&world);
+            for i in 0..500u32 {
+                let input = PlayerInput {
+                    move_axes: Vec2::new(1.0, if i % 5 == 0 { -1.0 } else { 1.0 }),
+                    yaw: (i as f32) * 0.02,
+                    jump: i % 40 == 0,
+                    ..default_input()
+                };
+                step_player_peers(&mut state, &input, DT, &world, &peers);
+            }
+            state
+        };
+        assert_eq!(run(), run(), "identical inputs give bit-identical states");
     }
 
     fn default_input() -> PlayerInput {

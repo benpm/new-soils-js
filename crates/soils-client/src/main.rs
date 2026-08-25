@@ -119,6 +119,7 @@ fn main() {
     .insert_resource(ActorMap::default())
     .init_state::<ui::UiMode>()
     .init_resource::<inventory::PlayerInventory>()
+    .init_resource::<bot::BotActions>()
     .init_resource::<inventory::DroppedItemVisuals>()
     .init_resource::<ui::CursorFreed>()
     .insert_resource(pause::RenderToggles::default())
@@ -247,6 +248,13 @@ fn main() {
         Update,
         (
             player::track_streaming,
+            // Bot presses land before anything reads them, and outside the
+            // `ui::playing` gate below — otherwise the bot could open the
+            // inventory and never press the key that closes it again.
+            bot::press_bot_buttons
+                .run_if(bot::active)
+                .before(ui::ui_hotkeys)
+                .before(edit::edit_blocks),
             ui::track_alt,
             ui::ui_hotkeys.run_if(console::console_closed),
             ui::click_to_grab,
@@ -288,6 +296,7 @@ fn main() {
             // Same slot as the keyboard it stands in for: freshest input, no
             // frame of latency before the fixed tick consumes it.
             bot::drive.run_if(bot::active),
+            bot::inventory_actions.run_if(bot::active),
         )
             .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop)
             .run_if(login::logged_in),

@@ -1,6 +1,9 @@
 /target
 **/target
-Cargo.lock
+# Cargo.lock IS committed: this workspace builds applications, not libraries.
+# Pinning it makes builds reproducible, stops a silent `cargo update` from
+# triggering a full rebuild of the Bevy graph, and lets CI cache by lockfile
+# hash. (stdb/soils-module is excluded from the workspace and keeps its own.)
 /crates/soils-server/data
 data/
 .claude/worktrees

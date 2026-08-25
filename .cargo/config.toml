@@ -1,0 +1,11 @@
+# Link with LLVM's lld instead of MSVC link.exe.
+#
+# Linking dominates an incremental rebuild of this workspace — the client links
+# ~450 rlibs — and link.exe is the slow part. lld-link is a drop-in for the MSVC
+# flavour and cuts that step by a large factor. It also stopped the intermittent
+# LNK1104/LNK1181 "cannot open file" failures we hit under parallel test builds.
+#
+# Requires LLVM on PATH (https://releases.llvm.org). If lld-link is missing,
+# delete this file and cargo falls back to link.exe.
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link.exe"

@@ -288,7 +288,9 @@ fn assert_matches(name: &str, world: &TestWorld, gpu: &HashMap<IVec3, Vec<u8>>) 
     for (c, (_, cl)) in &world.chunks {
         assert_eq!(
             gpu[c].as_slice(),
-            cl.as_bytes(),
+            // ChunkLight is Uniform|Dense now; a uniform chunk has no byte
+            // array to borrow, so the oracle comparison materializes one.
+            cl.as_dense_bytes().as_ref(),
             "{name}: chunk {c:?} light differs from the CPU oracle"
         );
     }

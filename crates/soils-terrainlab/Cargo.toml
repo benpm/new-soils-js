@@ -9,7 +9,21 @@ soils-worldgen = { workspace = true }
 soils-protocol = { workspace = true }
 glam = { workspace = true }
 serde = { workspace = true }
-bevy = "0.19"
+# Same trim as soils-client (see its Cargo.toml). This one matters even if
+# terrainlab is rarely built: cargo unifies features across workspace members,
+# so leaving `default` here quietly restores audio and glTF for every
+# `--workspace` build, undoing the client's trim.
+# `2d_bevy_render` is kept — the node canvas draws through the sprite path.
+bevy = { version = "0.19", default-features = false, features = [
+    "async_executor", "bevy_asset", "bevy_log", "bevy_state", "reflect_auto_register",
+    "std", "bevy_winit", "bevy_clipboard", "default_font", "multi_threaded",
+    "webgl2", "custom_cursor", "sysinfo_plugin",
+    "3d_api", "bevy_render", "bevy_core_pipeline", "bevy_gizmos_render",
+    "bevy_anti_alias", "bevy_pbr", "bevy_post_process",
+    "2d_api", "2d_bevy_render",
+    "ui_api", "bevy_ui_render", "bevy_ui_widgets",
+    "scene", "picking",
+] }
 # bevy_egui 0.41 targets Bevy 0.19 and pins egui 0.35.
 # Keep these two in lockstep on any Bevy bump (see docs/analysis.md upgrade note).
 bevy_egui = "0.41"

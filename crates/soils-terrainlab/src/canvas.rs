@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, TextureId, Ui, UiBuilder, Vec2, epaint::PathShape};
-use soils_worldgen::graph::Axis;
+use soils_worldgen::graph::{Axis, NoiseMode};
 
 use crate::graph_model::EditorGraph;
 use crate::node::{EditorNode, OutChannel};
@@ -172,7 +172,7 @@ fn draw_node(
                 {
                     *to_remove = Some(i);
                 }
-                params_ui(&mut graph.nodes[i].kind, ui);
+                params_ui(&mut graph.nodes[i].kind, ui, i);
                 // Intermediate-output thumbnail (value nodes only). Draws the
                 // cached image, or a placeholder while it's still computing.
                 if !is_output {
@@ -254,7 +254,7 @@ fn pin_y(rect: Rect, k: usize, count: usize) -> f32 {
 }
 
 fn pin(ui: &Ui, p: Pos2, color: Color32) {
-    ui.painter().circle(p, PIN_R, color, Stroke::new(1.0, Color32::from_gray(20)));
+    ui.painter().circle(p, PIN_R, color, Stroke::new(1.0_f32, Color32::from_gray(20)));
 }
 
 /// Faint alignment grid covering the visible scene rect, with brighter lines
@@ -267,7 +267,7 @@ fn grid_shape(view: Rect) -> Shape {
     }
     let line = |a: Pos2, b: Pos2, major: bool| {
         let color = if major { GRID_MAJOR } else { GRID_MINOR };
-        Shape::line_segment([a, b], Stroke::new(1.0, color))
+        Shape::line_segment([a, b], Stroke::new(1.0_f32, color))
     };
     let first = |lo: f32| (lo / GRID).ceil() as i32;
     let last = |hi: f32| (hi / GRID).floor() as i32;
@@ -295,7 +295,7 @@ fn wire_shape(from: Pos2, to: Pos2) -> Shape {
             cubic(from, c1, c2, to, t)
         })
         .collect();
-    Shape::Path(PathShape::line(pts, Stroke::new(2.0, WIRE_COLOR)))
+    Shape::Path(PathShape::line(pts, Stroke::new(2.0_f32, WIRE_COLOR)))
 }
 
 fn cubic(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, t: f32) -> Pos2 {
@@ -320,11 +320,41 @@ pub fn add_node_menu(ui: &mut Ui, graph: &mut EditorGraph, state: &mut CanvasSta
 }
 
 /// Editable parameters for a node.
-fn params_ui(node: &mut EditorNode, ui: &mut Ui) {
+/// Draw a node's parameter widgets. `id` (the node index) scopes every widget
+/// ID so identical widgets on sibling nodes (e.g. the `from_id_salt` combo boxes)
+/// don't collide.
+fn params_ui(node: &mut EditorNode, ui: &mut Ui, id: usize) {
+    ui.push_id(id, |ui| params_body(node, ui));
+}
+
+fn params_body(node: &mut EditorNode, ui: &mut Ui) {
     fn drag(ui: &mut Ui, label: &str, v: &mut f32, speed: f32) {
         ui.horizontal(|ui| {
             ui.label(label);
             ui.add(egui::DragValue::new(v).speed(speed));
+        });
+    }
+    /// The shared octave-stack sliders (`Fbm` and `FractalNoise`).
+    fn fractal_params(ui: &mut Ui, octaves: &mut u32, freq: &mut f32, lac: &mut f32, gain: &mut f32) {
+        ui.horizontal(|ui| {
+            ui.label("octaves").on_hover_text("Number of noise layers stacked internally");
+            ui.add(egui::DragValue::new(octaves).range(1..=10));
+        });
+        drag(ui, "frequency", freq, 0.0005);
+        ui.horizontal(|ui| {
+            ui.label("lacunarity").on_hover_text("Frequency × per octave (adds finer detail)");
+            ui.add(egui::DragValue::new(lac).speed(0.01));
+        });
+        ui.horizontal(|ui| {
+            ui.label("gain").on_hover_text("Amplitude × per octave (layer roughness)");
+            ui.add(egui::DragValue::new(gain).speed(0.01));
+        });
+    }
+    fn mode_combo(ui: &mut Ui, id: &str, mode: &mut NoiseMode) {
+        egui::ComboBox::from_id_salt(id).selected_text(mode.label()).show_ui(ui, |ui| {
+            for m in NoiseMode::ALL {
+                ui.selectable_value(mode, m, m.label());
+            }
         });
     }
     match node {
@@ -343,19 +373,31 @@ fn params_ui(node: &mut EditorNode, ui: &mut Ui) {
             drag(ui, "off z", &mut offset[1], 1.0);
         }
         EditorNode::Fbm { octaves, base_frequency, lacunarity, persistence, .. } => {
-            ui.horizontal(|ui| {
-                ui.label("octaves").on_hover_text("Number of noise layers stacked internally");
-                ui.add(egui::DragValue::new(octaves).range(1..=10));
-            });
-            drag(ui, "frequency", base_frequency, 0.0005);
-            ui.horizontal(|ui| {
-                ui.label("lacunarity").on_hover_text("Frequency × per octave (adds finer detail)");
-                ui.add(egui::DragValue::new(lacunarity).speed(0.01));
-            });
-            ui.horizontal(|ui| {
-                ui.label("gain").on_hover_text("Amplitude × per octave (layer roughness)");
-                ui.add(egui::DragValue::new(persistence).speed(0.01));
-            });
+            fractal_params(ui, octaves, base_frequency, lacunarity, persistence);
+        }
+        EditorNode::Noise { mode, frequency, offset, param } => {
+            mode_combo(ui, "nmode", mode);
+            drag(ui, "freq", frequency, 0.0005);
+            drag(ui, "off x", &mut offset[0], 1.0);
+            drag(ui, "off z", &mut offset[1], 1.0);
+            if let Some(label) = mode.param_label() {
+                drag(ui, label, param, 0.01);
+            }
+        }
+        EditorNode::FractalNoise {
+            mode,
+            octaves,
+            base_frequency,
+            lacunarity,
+            persistence,
+            param,
+            ..
+        } => {
+            mode_combo(ui, "fnmode", mode);
+            fractal_params(ui, octaves, base_frequency, lacunarity, persistence);
+            if let Some(label) = mode.param_label() {
+                drag(ui, label, param, 0.01);
+            }
         }
         EditorNode::RadialFalloff { center, radius, exponent } => {
             drag(ui, "cx", &mut center[0], 1.0);

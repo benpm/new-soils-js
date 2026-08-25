@@ -3,6 +3,9 @@
 > **Open work lives in [`Tasks.md`](Tasks.md).** This file is the historical
 > record: what shipped in each phase, what was measured, and what was deferred
 > with the reasoning. Checkoffs here are not re-litigated; they are evidence.
+>
+> `soils-terrainlab` keeps its own:
+> [`crates/soils-terrainlab/TODO.md`](crates/soils-terrainlab/TODO.md).
 
 <!-- As you complete tasks, add descriptions of your implementation to CHANGELOG.md, and then reference them here, removing their descriptions from here. -->
 <!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. -->

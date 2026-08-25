@@ -1,7 +1,7 @@
 {
   "repo": "https://github.com/benpm/new-soils-js",
-  "_ref": "Git ref the per-video `test` links point at. Flip to \"master\" once the branch that added these tests is merged, or the links 404.",
-  "ref": "spacetimedb-integration",
+  "_ref": "Git ref the per-video `test` links point at. Keep on \"master\"; point it at a branch only while that branch's tests are unmerged, or the links 404.",
+  "ref": "master",
   "videos": [
     {
       "id": "2026-08-24_private-accounts-and-chat",
@@ -30,7 +30,7 @@
         "two-client",
         "obs"
       ],
-      "blurb": "Two real GPU clients on one database-backed server. Both see the server registry that SpacetimeDB published, and the chat travelling between them never touches the game server — it goes client → database → client. Each client holds its own anonymous identity, bound to its game account by a server-only <code>link_identity</code> reducer."
+      "blurb": "Two real GPU clients on one database-backed server. Both see the server registry that SpacetimeDB published, and the chat travelling between them never touches the game server \u2014 it goes client \u2192 database \u2192 client. Each client holds its own anonymous identity, bound to its game account by a server-only <code>link_identity</code> reducer."
     },
     {
       "id": "2026-08-23_two-first-person-views",
@@ -44,7 +44,7 @@
         "replication",
         "two-client"
       ],
-      "blurb": "<code>alice</code> left, <code>bob</code> right — the same 300 server-simulated rigid bodies, reconstructed independently from delta snapshots over two separate connections. The paired assertion suite (<code>props.rs</code>) puts the worst cross-client disagreement at <strong>0.000 units</strong>."
+      "blurb": "<code>alice</code> left, <code>bob</code> right \u2014 the same 300 server-simulated rigid bodies, reconstructed independently from delta snapshots over two separate connections. The paired assertion suite (<code>props.rs</code>) puts the worst cross-client disagreement at <strong>0.000 units</strong>."
     },
     {
       "id": "2026-08-23_player-collision-lossy-link",
@@ -58,7 +58,7 @@
         "netsim",
         "two-client"
       ],
-      "blurb": "Two players walking into each other, jumping on top of each other, through simulated latency, gaussian jitter and packet loss (<code>SOILS_NETSIM</code>). Peer collision is resolved on the server and re-predicted on each client against that tick's recorded peer set — replaying against <em>current</em> peers is what caused permanent rubber-banding before."
+      "blurb": "Two players walking into each other, jumping on top of each other, through simulated latency, gaussian jitter and packet loss (<code>SOILS_NETSIM</code>). Peer collision is resolved on the server and re-predicted on each client against that tick's recorded peer set \u2014 replaying against <em>current</em> peers is what caused permanent rubber-banding before."
     }
   ]
 }

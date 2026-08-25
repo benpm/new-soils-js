@@ -19,11 +19,26 @@ the branches did not have to be untangled.
 
 | From | What | Why it was worth keeping |
 |---|---|---|
-| `worktree-light-pad-cache` (PR #3) | Version-keyed cache for padded light volumes | `process_light` rebuilt each dirty chunk's ~39 KB padded volume from scratch every drain — full CPU re-derive, whole-buffer GPU re-upload, bind-group invalidation — with no memoization. Addresses `perf-report.md` item #7. |
-| `worktree-uniform-light` (PR #4) | `ChunkLight` as `Uniform(u8) \| Dense(..)` plus a full-sky flood fast path | Every all-air open-sky chunk paid a 32768-cell flood and stored 32 KB purely so neighbours read correct border light. Full-sky flood ~953 µs → ~188 µs, and uniform chunks store one byte. Oracle-equivalence property tests included. |
-| `test/walk-physics-scenarios` (PR #5) | "Every `Edit` gets exactly one response" + robustness/perf scenarios | A real bug, still live on `master`: the Edit handler's entity-not-queryable arm dropped the message with no reply, so a client in the post-login pre-flush window waited forever. Edits have no snapshot echo to self-heal from. |
+| `worktree-uniform-light` (PR #4) | `ChunkLight` as `Uniform(u8) \| Dense(..)` plus a full-sky flood fast path | Every all-air open-sky chunk paid a 32768-cell flood and stored 32 KB purely so neighbours read correct border light. Full-sky flood ~953 µs → ~188 µs, and uniform chunks store one byte. Oracle-equivalence property tests included. **Its client half was dropped** — it patched the padded light volumes, which no longer exist (see below). |
+| `test/walk-physics-scenarios` (PR #5) | "Every `Edit` gets exactly one response" + `robustness.rs`, `movement_perf.rs` | A real bug, still live on `master`: the Edit handler's entity-not-queryable arm dropped the message with no reply, so a client in the post-login pre-flush window waited forever. Edits have no snapshot echo to self-heal from. The branch's third commit rewrote the shared test harness and was **not** taken — master's harness already provides everything these tests call. |
 | `terrainlab-node-terrain-designer` | Multi-mode `Noise` + `Fractal Noise` nodes (10 modes, CPU+GPU parity) | Landed after PR #2 merged and was never pushed onward. Safe to take: it adds a `TerrainGraph::deterministic()` gate that rejects the new f32 design-only nodes from game paths, so chunk generation is unchanged and no golden re-pinning was needed. |
-| `.claude/worktrees/light-pad-cache` (uncommitted) | Criterion benches for `soils-protocol` and `soils-worldgen` | Never committed anywhere; would have been lost with the worktree. |
+| `.claude/worktrees/light-pad-cache` (uncommitted) | Criterion benches for the chunk codec and the greedy mesher | Never committed anywhere; would have been lost with the worktree. |
+
+### Dropped — the work no longer applies
+
+**`worktree-light-pad-cache` (PR #3), a version-keyed cache for padded light
+volumes.** It memoized a rebuild that master no longer performs: the stream
+pipeline moved the light flood onto the GPU over a pooled cache and deleted
+`build_padded` outright. `soils-client/src/light.rs` says so in as many words —
+*"pads died with the padded volumes"*. Cherry-picking it would have
+resurrected the machinery it was written to speed up.
+
+The same reasoning removed the client half of PR #4, which patched the same
+dead path. Its sim and server halves are independent and were kept.
+
+This is the case for reading a stale branch before merging it. Both PRs looked
+like clean perf wins in their commit messages, and one of them was optimizing
+code that had been deleted.
 
 ### Removed
 
@@ -32,8 +47,8 @@ the branches did not have to be untangled.
 | `spacetimedb-integration` | #6 (merged) | Merged into `master` as `ed29e92`. |
 | `terrainlab-node-terrain-designer` | #2 (merged) | Base merged as `5a290af`; the later noise-node commits were salvaged first (above). |
 | `claude/rust-bevy-port-ftJBP` | #1 | Two commits, and the second reverts the first ("probe MCP write permission (temporary)" → "remove MCP write-permission probe"). Net content: nothing. 121 commits behind. |
-| `worktree-light-pad-cache` | #3 | Work salvaged. |
-| `worktree-uniform-light` | #4 | Work salvaged. The branch also carried a walk-physics test commit and its own revert, which is why the useful commit was cherry-picked rather than the branch merged. |
+| `worktree-light-pad-cache` | #3 | Premise obsolete — see above. Nothing salvaged. |
+| `worktree-uniform-light` | #4 | Sim/server halves salvaged. The branch also carried a walk-physics test commit and its own revert, which is why the useful commit was cherry-picked rather than the branch merged. |
 | `test/walk-physics-scenarios` | #5 | Work salvaged. |
 | `rust` | — | Remote already deleted; the local ref was a leftover tracking a branch that no longer existed. |
 

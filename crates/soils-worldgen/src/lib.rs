@@ -15,7 +15,7 @@ pub mod wgsl;
 /// type) — noise algorithm changes, threshold retunes, table edits. The server
 /// stamps worlds with it (chunks that no longer reproduce reclassify as
 /// edited) and it feeds the protocol's `graph_hash`.
-pub const WORLDGEN_ALGO_VERSION: u32 = 2;
+pub const WORLDGEN_ALGO_VERSION: u32 = 3;
 
 /// Stable identity of a generator: FNV-1a over the RON-serialized graph plus
 /// [`WORLDGEN_ALGO_VERSION`]. Client and server compare these to decide

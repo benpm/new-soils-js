@@ -73,7 +73,11 @@ async fn await_props(c: &mut Client, want: usize) -> HashMap<u32, [f32; 3]> {
 async fn await_settled(c: &mut Client) -> HashMap<u32, [f32; 3]> {
     let mut last = await_props(c, PROPS as usize).await;
     let mut still = 0;
-    for _ in 0..60 {
+    // 120 x 700 ms. Was 60: the continental octave changed the microtopography
+    // the pile lands on and it takes measurably longer to come to rest (the
+    // suite went from ~51 s to ~90 s). Raising the budget lets the pile
+    // actually settle; failing to settle at all is still a panic.
+    for _ in 0..120 {
         c.idle_for(Duration::from_millis(700)).await;
         let now = await_props(c, PROPS as usize).await;
         let moved = now
@@ -115,8 +119,20 @@ fn hundreds_of_props_stay_synced_across_two_clients() {
         let (settled, done) = (settled.clone(), done.clone());
         spawn_peer(addr, name, None, move |mut c| async move {
             c.await_chunk(SPAWN_CHUNK).await;
-            let rest = await_settled(&mut c).await;
+            await_settled(&mut c).await;
             sync(&settled, "settled").await;
+            // The reading that gets compared is taken *after* both peers have
+            // independently reached rest, not whenever each of them happened
+            // to stop looking. Each peer decides "settled" from its own delta
+            // stream, and under load the snapshot budget can starve a prop's
+            // updates long enough to look still while the pile is still
+            // creeping — so two independently-timed readings can describe two
+            // different instants, which is not what "the two connections agree"
+            // is supposed to mean. One more drain from a common barrier makes
+            // both sides describe the same moment; the 0.5 tolerance is
+            // unchanged.
+            c.idle_for(Duration::from_millis(700)).await;
+            let rest = await_props(&mut c, PROPS as usize).await;
             sync(&done, "done").await;
             assert!(
                 rest.len() >= PROPS as usize,

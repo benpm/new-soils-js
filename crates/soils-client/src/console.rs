@@ -1,5 +1,6 @@
 //! A small command console (open with `/`), mirroring the JS command box.
-//! Supported: `tp x y z`, `daytime t`, `loadradius n`, `fog on|off`,
+//! Supported: `tp x y z`, `daytime t`, `loadradius n`, `sens n`, `playerlight n`,
+//! `fog on|off`,
 //! `ao on|off`, `gi on|off`, `spawn`/`cube` (drop a physics cube ahead of the
 //! camera). While open, gameplay input is suppressed (see `console_closed`).
 
@@ -12,8 +13,9 @@ use soils_protocol::ClientMsg;
 use crate::chunk::WorldTime;
 use crate::gi::GiSettings;
 use crate::net::NetClient;
+use crate::light::PlayerLight;
 use crate::pause::RenderToggles;
-use crate::player::{self, PendingInput, Player, Streaming};
+use crate::player::{self, LookSettings, PendingInput, Player, Streaming};
 
 /// Console open-state and current input buffer.
 #[derive(Resource, Default)]
@@ -59,6 +61,8 @@ pub fn console_input(
     mut player: Query<(&mut Player, &mut Transform)>,
     mut world_time: ResMut<WorldTime>,
     mut streaming: ResMut<Streaming>,
+    mut look: ResMut<LookSettings>,
+    mut player_light: ResMut<PlayerLight>,
     mut toggles: ResMut<RenderToggles>,
     mut gi: ResMut<GiSettings>,
     net: Res<NetClient>,
@@ -83,8 +87,8 @@ pub fn console_input(
                 let cmd = std::mem::take(&mut console.buffer);
                 console.open = false;
                 run_command(
-                    &cmd, &mut player, &mut world_time, &mut streaming, &mut toggles,
-                    &mut gi, &net, &social,
+                    &cmd, &mut player, &mut world_time, &mut streaming, &mut look,
+                    &mut player_light, &mut toggles, &mut gi, &net, &social,
                 );
             }
             Key::Escape => {
@@ -117,11 +121,14 @@ pub fn update_console_text(
 }
 
 /// Parse and apply a single console command line.
+#[allow(clippy::too_many_arguments)]
 fn run_command(
     line: &str,
     player: &mut Query<(&mut Player, &mut Transform)>,
     world_time: &mut WorldTime,
     streaming: &mut Streaming,
+    look: &mut LookSettings,
+    player_light: &mut PlayerLight,
     toggles: &mut RenderToggles,
     gi: &mut GiSettings,
     net: &NetClient,
@@ -152,6 +159,20 @@ fn run_command(
             if let Ok(n) = args[0].parse::<i32>() {
                 streaming.load_radius = n.clamp(2, 8);
                 streaming.last_chunk = None;
+            }
+        }
+        // Multiplier over the base radians-per-count, clamped by `set`.
+        "sens" | "sensitivity" if !args.is_empty() => {
+            if let Ok(n) = args[0].parse::<f32>() {
+                look.set(n);
+            }
+        }
+        // Emission level of the player's own light, 0-15 (0 = off). The
+        // emitter follows the camera's voxel; `track_player_light` refloods.
+        "playerlight" if !args.is_empty() => {
+            if let Ok(n) = args[0].parse::<i32>() {
+                player_light.set_level(n);
+                player_light.voxel = None; // force a reseed at the new level
             }
         }
         // The toggles flow into the terrain uniform every frame

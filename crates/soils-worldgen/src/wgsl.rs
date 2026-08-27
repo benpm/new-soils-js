@@ -513,11 +513,16 @@ mod tests {
 
     #[test]
     fn params_quantize_like_cpu_compile() {
-        // The Simplex2 frequency must land as the same integer the CPU
-        // evaluator uses (1/1000 -> 66; the documented retune drift).
+        // Every Simplex2 frequency must land as the same integer the CPU
+        // evaluator uses, or the GPU mirror generates different terrain.
+        // Params are emitted in node order and a Simplex2 contributes three
+        // (frequency then a 2D offset), so p[0] is the continental octave's
+        // frequency (1/2000 -> 33); 1/1000 -> 66 is the documented retune
+        // drift and must still appear.
         let g = TerrainGraph::default_soils();
         let p = collect_params(&g);
-        assert_eq!(p[0], 66);
+        assert_eq!(p[0], 33, "continental octave frequency");
+        assert!(p.contains(&66), "1/1000 octave frequency missing from {p:?}");
     }
 
     #[test]

@@ -44,7 +44,47 @@ order that hurts:
       icon. They need the `entities.yaml`/`blocks.yaml` treatment — a data file,
       stable ids, and a name.
 
+## Next — lighting
+
+- [ ] **RGB blocklight, range 31.** Coloured light blocks and doubled range are
+      the same change: one `u32` per voxel (`R5 G5 B5 S5`) replacing the packed
+      byte, `N_SLOTS` halved to pay for it. Designed in full, including phasing
+      and the pool-sizing risk:
+      [plan-rgb-light-rework.md](docs/plan-rgb-light-rework.md). A sketch of
+      step 1 is in a git stash (`wip: rgb light format`) — read the plan, not
+      the stash.
+- [ ] **Author the lamp blocks.** `blocks.yaml` has exactly two emissive blocks
+      (Diamond Ore, Ruby Ore), which is not enough to see colour blending at
+      all. A hue-circle set plus atlas tiles, and a `SOILS_LIGHT_DEMO` room in
+      the shape of `gi_demo.rs` to look at them in.
+- [ ] **Semidirectional sunlight.** Skylight has no direction, so overhangs are
+      lit identically at dawn and noon and a wall lights the same on both sides.
+      A second 5-bit channel in the light word's spare bits, flooded along a
+      quantized sun direction:
+      [plan-sun.md](docs/plan-sun.md). The re-flood cadence is the whole gamble
+      — measure before committing.
+
+## Next — streaming
+
+- [ ] **Cull all-air chunks.** Occlusion culling withholds sealed chunks
+      (26% of a radius-8 subscription) but sends every empty chunk above the
+      terrain, and roughly half the cube is sky. An all-air chunk renders
+      nothing and collides with nothing, so withholding it should be free —
+      but check what a missing chunk means to the client's `voxel_at` and to
+      `reseed`'s "chunk above unmapped = open sky" heuristic before assuming it.
+      This is also what buys the headroom the RGB pool halving spends.
+
 ## Next — hardening
+
+- [ ] **The 300-prop pile settles slowly on the new terrain.** The continental
+      octave changed the microtopography the pile lands on, and
+      `hundreds_of_props_stay_synced_across_two_clients` went from ~51 s to
+      ~90 s; its settle budget was doubled to 120 x 700 ms to compensate. The
+      comparison was also unsound — each peer decided "settled" from its own
+      delta stream and the two readings could describe different instants — and
+      now samples from a common barrier. Both are treatments, not a diagnosis:
+      worth finding out whether the pile is genuinely creeping on a slope or
+      whether the snapshot budget is starving prop updates under load.
 
 - [ ] **`forced_misprediction_reconciles_behind_the_wall` is load-sensitive.**
       It asserts `max_divergence > 0.5` after walking a stale predictor into a

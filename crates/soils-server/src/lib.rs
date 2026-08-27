@@ -33,9 +33,10 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
-/// Real seconds for a full day cycle (JS used ~20 minutes; shortened so the
-/// effect is visible while testing the slice).
-pub(crate) const DAY_SECONDS: f32 = 120.0;
+/// Real seconds for a full day cycle: 30 minutes. The clock advances (and
+/// broadcasts) once a second, which is 0.2 degrees of sun rotation per step —
+/// far below anything visible.
+pub(crate) const DAY_SECONDS: f32 = 30.0 * 60.0;
 /// Chunks per `Bundle` response. Small because solid chunks are ~32 KB each.
 pub(crate) const BUNDLE_SIZE: usize = 16;
 /// Chunks generated per wave. A fresh world's first request is up to 9³=729

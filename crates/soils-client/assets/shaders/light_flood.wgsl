@@ -43,12 +43,21 @@ struct LightJob {
     _p2: u32,
 };
 
+// A blocklight emitter that is not a block: the player. `level` 0 is a
+// disabled row (the binding cannot be zero-sized), so a level of 0 is
+// naturally "no light" rather than a special case.
+struct PointLight {
+    voxel: vec3<i32>,
+    level: u32,
+}
+
 @group(0) @binding(0) var<storage, read_write> light_pool: array<u32>; // N_SLOTS × 8192 words
 @group(0) @binding(1) var<storage, read> voxel_pool: array<u32>;       // N_MESH × 8192 words
 @group(0) @binding(2) var<storage, read> desc: array<ChunkSlot>;
 @group(0) @binding(3) var<storage, read> slot_table: array<u32>;
 @group(0) @binding(4) var<storage, read> emitters: array<u32>;         // block id → emission (u32 rows)
 @group(0) @binding(5) var<storage, read> jobs: array<LightJob>;
+@group(0) @binding(6) var<storage, read> point_lights: array<PointLight>;
 
 const TABLE_EMPTY: u32 = 0xffffffffu;
 const NO_MESH: u32 = 0xffffffffu;
@@ -101,6 +110,19 @@ fn world_solid(v: vec3<i32>) -> bool {
 // per word. To avoid intra-dispatch races on shared words, relax processes
 // one word (4 cells) per thread too.
 
+// Strongest non-block emitter sitting exactly in this voxel, 0 for none.
+fn point_emission(world: vec3<i32>) -> u32 {
+    var best = 0u;
+    let n = arrayLength(&point_lights);
+    for (var i = 0u; i < n; i = i + 1u) {
+        let p = point_lights[i];
+        if (p.level > 0u && all(p.voxel == world)) {
+            best = max(best, min(p.level, MAX_LIGHT));
+        }
+    }
+    return best;
+}
+
 @compute @workgroup_size(64)
 fn reseed(@builtin(global_invocation_id) gid: vec3<u32>) {
     // One thread per word: 8192 words per slot → dispatch (128, jobs, 1).
@@ -124,7 +146,8 @@ fn reseed(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Solid: pack(0, emission).
             b = emitters[id] & 15u;
         } else {
-            let e = emitters[id] & 15u; // air emission is 0; kept for parity
+            // Air: block emission is 0, but a point light may be standing here.
+            let e = point_emission(job.cpos * vec3<i32>(32) + l);
             var s = 0u;
             if (y == 31 && above_open) {
                 s = MAX_LIGHT;

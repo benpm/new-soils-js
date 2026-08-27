@@ -126,12 +126,14 @@ fn main() {
     .init_resource::<console::Console>()
     .init_resource::<login::LoginState>()
     .init_resource::<singleplayer::Singleplayer>()
+    .init_resource::<player::LookSettings>()
     .init_resource::<player::PendingInput>()
     .init_resource::<player::InputRing>()
     .init_resource::<player::CameraHold>()
     .init_resource::<actor::InterpClock>()
     .init_resource::<edit::PendingEdits>()
     .init_resource::<light::LightQueue>()
+    .init_resource::<light::PlayerLight>()
     .init_resource::<light::SkyTerm>()
     .insert_resource(net::connect())
     .insert_resource(discovery::spawn());
@@ -195,12 +197,17 @@ fn main() {
                 .after(server_msg::apply_init)
                 .after(server_msg::apply_warp)
                 .after(demand::process_demands),
+            // The player's own emitter moves before the batch is planned, so
+            // the voxel it vacated and the one it now occupies are both in
+            // this frame's flood rather than a frame late.
+            light::track_player_light.after(player::reconcile_self),
             // Light job planning runs once all voxel changes for the frame
             // landed (the flood itself is GPU compute — see gpu_light.rs).
             gpu_light::plan_light_jobs
                 .after(demand::process_demands)
                 .after(server_msg::apply_edits)
-                .after(edit::edit_blocks),
+                .after(edit::edit_blocks)
+                .after(light::track_player_light),
             light::update_sky_term.after(server_msg::apply_time),
         ),
     )

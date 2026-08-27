@@ -77,11 +77,18 @@ that made it. Rebuilt with `python scripts/deploy_dashboard.py`.
   pathfind to them: per-chunk walkability grids, budgeted A* with jump/fall
   moves, an HPA* region-portal fallback for long routes, and flow fields
   ready for crowds — all invalidated by chunk edit versions.
-- **Worldgen** — multi-octave simplex heightmap, soil gradient, rock
-  outcrops, and 3D-noise caves (lattice-interpolated; a 48-chunk wave
-  generates in ~3.5 ms), persisted to zlib region files.
+- **Worldgen** — multi-octave simplex heightmap over a long-wavelength
+  continental octave (amplitude 300 against 115 for the rest combined, so
+  surfaces run roughly 60-430), soil gradient, rock outcrops, and 3D-noise
+  caves (lattice-interpolated; a 48-chunk wave generates in ~3.5 ms), persisted
+  to zlib region files. Spawn follows the generator's own surface height.
 - **Editing** — raycast break/place with optimistic application and rollback:
   the server validates reach/rate/residency and acks or rejects each edit.
+- **Occlusion-culled streaming** — the server withholds chunks that are sealed
+  behind solid neighbours on all six faces: nothing can see into them or walk
+  into them, so the client never generates, meshes or holds them. 26% of a
+  radius-8 subscription (4913 chunks) at the default terrain. Breaking a seal
+  hands the chunk over.
 - **Inventory and dropped items** — breaking a block yields it as an entity
   lying in the world; walking into it collects it. Placing spends the block and
   is refused when the stack is empty. The server owns the inventory and pushes
@@ -105,7 +112,8 @@ that made it. Rebuilt with `python scripts/deploy_dashboard.py`.
   variable unset the server behaves exactly as before. A returning player
   resumes where they logged out. See [`stdb/README.md`](stdb/README.md).
 - **The rest** — login/signup accounts, multiple named worlds (`/warp`),
-  LAN discovery, day/night cycle, HUD/console/pause menu.
+  LAN discovery, a 30-minute day/night cycle, a player who is himself a light
+  source, HUD/console/pause menu.
 
 ## Workspace layout
 
@@ -150,7 +158,9 @@ break/place, **1-9** pick a block, **F3** debug overlay, **/** command
 console, **Esc** pause/settings.
 
 Console commands: `tp x y z`, `warp <world>`, `daytime t`, `loadradius n`,
-`fog on|off`, `ao on|off`, `light on|off`, `gi on|off`.
+`sens n` (mouse sensitivity, 0.1-5.0, also in the pause menu), `playerlight n`
+(the player's own emission, 0-15; 0 turns it off), `fog on|off`, `ao on|off`,
+`light on|off`, `gi on|off`.
 
 ### Linux build dependencies
 

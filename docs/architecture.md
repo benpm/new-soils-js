@@ -128,7 +128,20 @@ apart.
   client), delivered in request order. Residency is refcounted; zero-ref
   chunks evict after 60 s (save-if-dirty through the background persister);
   region files compact on open past a 25% leak ratio.
-- **Lighting**: the shared L0 flood (skylight + blocklight nibbles) runs
+- **Occlusion culling**: a generated chunk is *withheld* when all six
+  neighbours present a solid boundary layer towards it — nothing can see into
+  it and nothing can walk into it, so the client never needs it. The test is on
+  the neighbours' layers, not the chunk's own contents: at depth almost every
+  chunk has cave air in it, but the layer between two of them is usually still
+  solid. Verdicts that need an ungenerated neighbour defer rather than guess;
+  neighbours outside the client's radius count as exposed, which terminates the
+  question at the shell. Withheld chunks stay subscribed and resident, so an
+  edit that breaks a seal hands the chunk over (`expose_neighbours`). The
+  player's own 3×3×3 is never withheld. Measured: 26% of a radius-8
+  subscription (4913 chunks) at the default terrain.
+- **Lighting**: the shared L0 flood (skylight + blocklight nibbles — see
+  [plan-rgb-light-rework.md](plan-rgb-light-rework.md) for the RGB successor)
+  runs
   against dense cloned regions on rayon, version-guarded on write-back;
   edits relight inline (small), and per-chunk summaries (dark walkable-air
   counts + sampled cells) power gameplay queries like
@@ -202,7 +215,17 @@ mutations replicate the same tick.
   culling, and no CPU meshing or readback anywhere.
 - **Shading**: the material samples the padded per-chunk L0 light volume
   (sky nibble scaled by the day curve + warm blocklight) plus meshed-in AO;
-  with GI on it adds the radiance-cascades term.
+  with GI on it adds the radiance-cascades term. The player is itself a
+  blocklight emitter, stamped into the grid by the flood's reseed pass so it is
+  occluded by geometry like a placed torch rather than glowing through walls.
+- **Mouse-look**: reads individual `MouseMotion` reports rather than the
+  accumulated resource, so a single absolute-mode report can be dropped on its
+  own. Some pointing devices (Wacom tablets, VM and remote-desktop pointers)
+  send raw mouse input in absolute mode and winit's Windows backend passes the
+  screen coordinate through as if it were a delta; integrated, it pins pitch to
+  its clamp and spins yaw by tens of radians. Sensitivity is a multiplier over
+  a base radians-per-count, settable from the pause menu, `/sens` or
+  `SOILS_SENS`.
 - **GI** (opt-in): a 64³ occupancy+light volume around the player is
   refilled by a GPU blit of resident chunk buffers; 4 probe cascades trace
   against it (top-cascade escapes gated by baked skylight), merge top-down

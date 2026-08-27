@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glam::IVec3;
-use soils_protocol::{CHUNK_BIT, CHUNK_CLIP, ChunkVolume};
+use soils_protocol::{AIR, CHUNK_BIT, CHUNK_CLIP, CHUNK_SIZE, ChunkVolume};
 use soils_worldgen::{BlockRegistry, TerrainGen, WorldType, default_registry};
 
 use soils_sim::light::{self, ChunkLight, LightWorld};
@@ -53,6 +53,9 @@ struct ChunkEntry {
     /// Ever edited (from the region header's EDITED_FLAG, set by `edit`).
     /// Pristine chunks stream as manifest positions; edited ones as payloads.
     edited: bool,
+    /// Which of the chunk's six boundary layers are solid all the way across
+    /// (see [`face_mask`]). Drives occlusion culling; recomputed on edit.
+    faces: u8,
     zero_since: Option<Instant>,
 }
 
@@ -353,6 +356,78 @@ pub struct World {
     graph_hash: u64,
 }
 
+/// The six axis directions, in the order [`face_mask`] indexes its bits.
+pub const FACE_DIRS: [IVec3; 6] = [
+    IVec3::new(1, 0, 0),
+    IVec3::new(-1, 0, 0),
+    IVec3::new(0, 1, 0),
+    IVec3::new(0, -1, 0),
+    IVec3::new(0, 0, 1),
+    IVec3::new(0, 0, -1),
+];
+
+/// Index of `dir` in [`FACE_DIRS`], or `None` if it is not an axis step.
+fn face_index(dir: IVec3) -> Option<usize> {
+    FACE_DIRS.iter().position(|d| *d == dir)
+}
+
+/// One bit per direction in [`FACE_DIRS`]: set when that boundary layer of the
+/// chunk is solid across all 32x32 of it.
+///
+/// This is what occlusion culling is built on. A chunk whose neighbours all
+/// present a solid layer towards it cannot be seen into and cannot be walked
+/// into, whatever it contains — so the client never needs it, caves and all.
+/// Testing the *neighbours'* layers rather than the chunk's own contents is
+/// what makes the test useful: at depth almost every chunk has some cave air
+/// in it, but the layer between two of them is usually still solid.
+fn face_mask(vol: &ChunkVolume) -> u8 {
+    let n = CHUNK_SIZE - 1;
+    let mut mask = 0u8;
+    for (bit, dir) in FACE_DIRS.iter().enumerate() {
+        let solid = (0..CHUNK_SIZE).all(|a| {
+            (0..CHUNK_SIZE).all(|b| {
+                let (x, y, z) = match (dir.x, dir.y, dir.z) {
+                    (1, 0, 0) => (n, a, b),
+                    (-1, 0, 0) => (0, a, b),
+                    (0, 1, 0) => (a, n, b),
+                    (0, -1, 0) => (a, 0, b),
+                    (0, 0, 1) => (a, b, n),
+                    _ => (a, b, 0),
+                };
+                vol.get(x, y, z) != AIR
+            })
+        });
+        if solid {
+            mask |= 1 << bit;
+        }
+    }
+    mask
+}
+
+/// The traditional spawn column. Only x/z are fixed; the height follows the
+/// terrain.
+const SPAWN_X: i32 = 282;
+const SPAWN_Z: i32 = 268;
+/// Eye height above the surface voxel at spawn.
+///
+/// 29 preserves the drop the fixed `[282, 285, 268]` spawn used to have over a
+/// ~256 surface. It is not cosmetic: players spawn flying, and the open air
+/// under them is where scripted tests build platforms and place blocks within
+/// reach. Shrinking it puts the spawn inside whatever the terrain does there.
+const SPAWN_CLEARANCE: f32 = 29.0;
+
+/// Spawn eye position for a world: the generator's own surface height at the
+/// spawn column, plus clearance.
+///
+/// Hardcoding the height stopped being viable when the continental octave
+/// landed — the surface at this column can now sit anywhere across hundreds of
+/// voxels, so a fixed y is either buried in rock or hundreds of blocks up in
+/// the air.
+fn surface_spawn(terrain: &TerrainGen, x: i32, z: i32) -> [f32; 3] {
+    let h = terrain.surface_height(x, z) as f32;
+    [x as f32, h + SPAWN_CLEARANCE, z as f32]
+}
+
 impl World {
     /// Turn on SpacetimeDB mirroring for this world's chunk saves.
     pub fn enable_stdb(&mut self, world_id: u16) {
@@ -440,6 +515,7 @@ impl World {
         let terrain = Arc::new(TerrainGen::new(seed, WorldType::Normal));
         let graph_hash = soils_worldgen::graph_hash(terrain.graph());
         classify_regions(data_dir, name, &regions_dir, &terrain, &registry, graph_hash);
+        let spawn = surface_spawn(&terrain, SPAWN_X, SPAWN_Z);
         Self {
             light_levels: registry.light_table(),
             registry,
@@ -453,9 +529,7 @@ impl World {
             persist,
             header_cache: HashMap::new(),
             navs: HashMap::new(),
-            // Surface near here sits around y=256; spawn a little above it so
-            // the player starts in the open air rather than buried in rock.
-            spawn: [282.0, 285.0, 268.0],
+            spawn,
             seed: seed as i64,
             graph_hash,
         }
@@ -468,6 +542,7 @@ impl World {
             Some(Instant::now())
         };
         self.light_queue.push(pos);
+        let faces = face_mask(&volume);
         ChunkEntry {
             volume,
             light: ChunkLight::dark(),
@@ -475,6 +550,7 @@ impl World {
             version: 0,
             dirty: false,
             edited,
+            faces,
             zero_since,
         }
     }
@@ -583,6 +659,10 @@ impl World {
         entry.dirty = true;
         entry.edited = true;
         entry.version = entry.version.wrapping_add(1);
+        // An edit can punch through a boundary layer, which un-seals whichever
+        // neighbour that layer was hiding. Cheaper to recompute the six masks
+        // than to reason about which one the voxel belonged to.
+        entry.faces = face_mask(&entry.volume);
         let mut lw = WorldLight {
             chunks: &mut self.chunks,
             levels: &self.light_levels,
@@ -594,6 +674,39 @@ impl World {
             self.rebuild_summary(c);
         }
         true
+    }
+
+    /// Is the boundary layer of the chunk at `pos` facing `dir` solid all the
+    /// way across? `None` when the chunk is not resident, which callers must
+    /// read as "not yet known", never as "no".
+    pub fn face_solid(&self, pos: IVec3, dir: IVec3) -> Option<bool> {
+        let entry = self.chunks.get(&pos)?;
+        let bit = face_index(dir)?;
+        Some(entry.faces & (1 << bit) != 0)
+    }
+
+    /// Whether every one of `pos`'s six neighbours presents a solid layer
+    /// towards it, i.e. the chunk is sealed off from the rest of the world.
+    ///
+    /// `None` if any neighbour that `visible` accepts is not resident yet:
+    /// the verdict is undecidable until it is, and guessing "not sealed" would
+    /// leak chunks while guessing "sealed" would hide visible ones. `visible`
+    /// answers whether a neighbour position is one the asking client would
+    /// ever be sent; a neighbour outside that set counts as exposed, which is
+    /// what terminates the question at the edge of a view radius.
+    pub fn sealed(&self, pos: IVec3, visible: impl Fn(IVec3) -> bool) -> Option<bool> {
+        for dir in FACE_DIRS {
+            let n = pos + dir;
+            if !visible(n) {
+                return Some(false);
+            }
+            match self.face_solid(n, -dir) {
+                None => return None,
+                Some(false) => return Some(false),
+                Some(true) => {}
+            }
+        }
+        Some(true)
     }
 
     /// Advance the async lighting pipeline: apply a finished job's results
@@ -900,9 +1013,96 @@ mod tests {
     use super::*;
     use crate::persist::Persister;
 
+    /// The lowest-corner voxel of a chunk.
+    fn chunk_origin_of(cpos: IVec3) -> IVec3 {
+        cpos * CHUNK_SIZE
+    }
+
     fn generate_one(world: &World, pos: IVec3) -> ChunkVolume {
         let (terrain, registry) = world.gen_ctx();
         terrain.generate_batch(&[pos], &registry).into_iter().next().unwrap()
+    }
+
+    /// The seal test and the edit that breaks it — the invariant the whole
+    /// occlusion cull rests on.
+    ///
+    /// A player can never trigger this by hand: `CULL_KEEP` keeps the chunks
+    /// around them subscribed, and edit reach is a handful of voxels, so the
+    /// nearest withheld chunk is always tens of voxels out of range. Scripts
+    /// edit at arbitrary coordinates though, and so would a teleport or an
+    /// explosion, which is why the exposure path exists and why it is pinned
+    /// here rather than through a client.
+    #[test]
+    fn breaking_a_boundary_layer_unseals_the_chunk_behind_it() {
+        let dir = std::env::temp_dir().join(format!("soils-world-seal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+
+        // A solid target with solid neighbours all round. Deep enough that the
+        // generator gives solid rock on every face.
+        let target = IVec3::new(4, 2, 4);
+        for dir_ in FACE_DIRS {
+            let n = target + dir_;
+            let vol = generate_one(&world, n);
+            world.adopt(n, vol);
+        }
+        let vol = generate_one(&world, target);
+        world.adopt(target, vol);
+
+        let all_visible = |_: IVec3| true;
+        assert_eq!(
+            world.sealed(target, all_visible),
+            Some(true),
+            "a deep chunk with solid neighbours on every face must be sealed"
+        );
+
+        // Punch one voxel out of the neighbour above's *bottom* layer — the
+        // layer that faces the target. That is the only thing between them.
+        let above = target + IVec3::Y;
+        let floor = chunk_origin_of(above);
+        assert!(world.edit(floor.x, floor.y, floor.z, soils_protocol::AIR), "edit applies");
+
+        assert_eq!(
+            world.sealed(target, all_visible),
+            Some(false),
+            "one hole in the layer above must unseal it"
+        );
+
+        // A neighbour that is not resident is not evidence of anything: the
+        // verdict has to be "unknown", never "sealed".
+        let lonely = IVec3::new(40, 2, 40);
+        assert_eq!(world.sealed(lonely, all_visible), None, "no neighbours, no verdict");
+
+        persister.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Neighbours outside what the client would ever be sent count as open, so
+    /// the outermost shell of a view radius resolves instead of waiting for a
+    /// chunk nobody will generate.
+    #[test]
+    fn a_neighbour_outside_the_view_counts_as_exposed() {
+        let dir = std::env::temp_dir().join(format!("soils-world-edge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+
+        let target = IVec3::new(4, 2, 4);
+        for dir_ in FACE_DIRS {
+            let n = target + dir_;
+            let vol = generate_one(&world, n);
+            world.adopt(n, vol);
+        }
+        let vol = generate_one(&world, target);
+        world.adopt(target, vol);
+
+        // Pretend the chunk above is past the view radius.
+        let above = target + IVec3::Y;
+        assert_eq!(world.sealed(target, |n| n != above), Some(false));
+
+        persister.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

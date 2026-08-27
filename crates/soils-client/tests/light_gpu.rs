@@ -122,6 +122,7 @@ impl Gpu {
                 entry(3, true),
                 entry(4, true),
                 entry(5, true),
+                entry(6, true),
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -157,6 +158,19 @@ impl Gpu {
         order: &[IVec3],
         core: &[IVec3],
         prior: Option<&HashMap<IVec3, Vec<u8>>>,
+    ) -> HashMap<IVec3, Vec<u8>> {
+        self.flood_with_points(world, order, core, prior, &[])
+    }
+
+    /// As [`Gpu::flood`], with non-block emitters (the player light) standing
+    /// in the given air voxels at the given levels.
+    fn flood_with_points(
+        &self,
+        world: &TestWorld,
+        order: &[IVec3],
+        core: &[IVec3],
+        prior: Option<&HashMap<IVec3, Vec<u8>>>,
+        points: &[(IVec3, u8)],
     ) -> HashMap<IVec3, Vec<u8>> {
         let mapped: Vec<IVec3> = order.to_vec();
         let slot_of = |c: IVec3| mapped.iter().position(|&m| m == c).map(|i| i as u32);
@@ -217,6 +231,16 @@ impl Gpu {
         let desc_buf = mk("desc", bytemuck::cast_slice(&desc), st);
         let table_buf = mk("table", bytemuck::cast_slice(&table), st);
         let emit_buf = mk("emitters", bytemuck::cast_slice(&emitters), st);
+        // Always at least one row: a zero-sized storage binding is invalid, and
+        // level 0 is the disabled row the shader skips.
+        let mut point_rows: Vec<i32> = Vec::new();
+        for (v, level) in points {
+            point_rows.extend_from_slice(&[v.x, v.y, v.z, i32::from(*level)]);
+        }
+        if point_rows.is_empty() {
+            point_rows.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        let points_buf = mk("point_lights", bytemuck::cast_slice(&point_rows), st);
         let core_buf = mk("core_jobs", &core_b, st);
         let relax_buf = mk("relax_jobs", &relax_b, st);
 
@@ -231,6 +255,7 @@ impl Gpu {
                     wgpu::BindGroupEntry { binding: 3, resource: table_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: emit_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: jobs.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: points_buf.as_entire_binding() },
                 ],
             })
         };
@@ -423,4 +448,93 @@ fn gpu_flood_matches_relight_full() {
         got2 = apply_edit(&mut world, v, 1, if got2.is_empty() { &got } else { &got2 });
     }
     assert_matches("doorway seal edits", &world, &got2);
+}
+/// The player is a light source: an emitter that is not a block, stamped into
+/// the grid by the reseed pass (see `PlayerLight`). It has to behave exactly
+/// like a placed emitter — full level in its own cell, one level lost per step,
+/// and stopped by geometry — because the whole point of doing it in the flood
+/// rather than in the terrain shader is that walls occlude it.
+#[test]
+fn a_point_light_lights_air_and_is_occluded() {
+    let Some(gpu) = Gpu::init() else {
+        eprintln!("no GPU adapter available; skipping a_point_light_lights_air_and_is_occluded");
+        return;
+    };
+
+    // A sealed room, so no skylight reaches in and every lit cell is the
+    // point light's doing. A wall splits it, with the light on one side.
+    let mut vol = ChunkVolume::empty();
+    for x in 4..28 {
+        for y in 4..28 {
+            for z in 4..28 {
+                vol.set(x, y, z, 1);
+            }
+        }
+    }
+    for x in 5..27 {
+        for y in 5..27 {
+            for z in 5..27 {
+                vol.set(x, y, z, 0);
+            }
+        }
+    }
+    for y in 5..27 {
+        for z in 5..27 {
+            vol.set(16, y, z, 1); // full-height partition at x = 16
+        }
+    }
+
+    let (world, order) = world_from(vec![(IVec3::ZERO, vol)]);
+    let level = 12u8;
+    let src = IVec3::new(10, 16, 16);
+    let got = gpu.flood_with_points(&world, &order, &order, None, &[(src, level)]);
+    let block_at = |v: IVec3| light::block(got[&IVec3::ZERO][light_index(v)]);
+
+    assert_eq!(block_at(src), level, "the emitter cell holds its own level");
+    for step in 1..=5i32 {
+        assert_eq!(
+            block_at(src + IVec3::new(0, 0, step)),
+            level - step as u8,
+            "one level lost per step, {step} away"
+        );
+    }
+    // Past the partition: the only path is through solid rock, so nothing.
+    assert_eq!(block_at(IVec3::new(20, 16, 16)), 0, "the wall must stop it");
+    // And the far side of the room it *is* in stays reachable, so the zero
+    // above is occlusion rather than the light simply not spreading.
+    assert!(block_at(IVec3::new(14, 16, 16)) > 0, "same side of the wall stays lit");
+}
+
+/// Level 0 is the disabled row the binding always carries. It must light
+/// nothing, or "player light off" would still glow.
+#[test]
+fn a_zero_level_point_light_lights_nothing() {
+    let Some(gpu) = Gpu::init() else {
+        eprintln!("no GPU adapter available; skipping a_zero_level_point_light_lights_nothing");
+        return;
+    };
+    let mut vol = ChunkVolume::empty();
+    for x in 4..28 {
+        for y in 4..28 {
+            for z in 4..28 {
+                vol.set(x, y, z, 1);
+            }
+        }
+    }
+    for x in 5..27 {
+        for y in 5..27 {
+            for z in 5..27 {
+                vol.set(x, y, z, 0);
+            }
+        }
+    }
+    let (world, order) = world_from(vec![(IVec3::ZERO, vol)]);
+    let src = IVec3::new(10, 16, 16);
+    let got = gpu.flood_with_points(&world, &order, &order, None, &[(src, 0)]);
+    assert_eq!(light::block(got[&IVec3::ZERO][light_index(src)]), 0);
+}
+
+/// Index of a chunk-local voxel in a flood readback volume.
+fn light_index(v: IVec3) -> usize {
+    (v.x + v.y * 32 + v.z * 1024) as usize
 }

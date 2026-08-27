@@ -8,7 +8,14 @@
 > [`crates/soils-terrainlab/TODO.md`](crates/soils-terrainlab/TODO.md).
 
 <!-- As you complete tasks, add descriptions of your implementation to CHANGELOG.md, and then reference them here, removing their descriptions from here. -->
-<!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. -->
+<!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. --> 
+
+## Devops
+
+### GitHub Actions
+
+- [ ] Create GitHub Actions workflow for creating builds released through the Releases section
+- [ ] GitHub Pages page created showing videos of all the test cases that can be shown via video. On the Pages site, have different tabs for different branches of the repository. Trigger this workflow whenever there are changes to the repository, including branches other than master.
 
 ## UI
 

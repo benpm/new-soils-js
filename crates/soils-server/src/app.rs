@@ -145,6 +145,15 @@ pub(crate) struct Client {
     center: Option<IVec3>,
     /// The chunks this client is subscribed to (holds a ref on each).
     subs: HashSet<IVec3>,
+    /// Subscribed, generated, and deliberately withheld: every neighbour
+    /// presents a solid layer towards it, so nothing of it can be seen or
+    /// walked into (see [`World::sealed`]). Held rather than forgotten so an
+    /// edit that breaks the seal can hand it over.
+    culled: HashSet<IVec3>,
+    /// Subscribed chunks whose seal verdict needs a neighbour that has not
+    /// been generated yet. Re-examined every tick until it resolves; nothing
+    /// reaches the client from here without a verdict.
+    deferred: VecDeque<IVec3>,
     /// Queued streaming jobs (subscription enters), served FIFO in waves.
     jobs: VecDeque<ChunkJob>,
     /// The authoritative inventory. The client mirrors it for the UI but never
@@ -592,6 +601,9 @@ pub(crate) fn run_app(
             // replication, so their edits/spawns replicate the same tick.
             run_scripts,
             pump_chunk_jobs,
+            // After the wave pump, so a chunk whose last missing neighbour
+            // just landed resolves in the same tick rather than the next.
+            pump_deferred,
             flush_inventory_updates,
             replicate_entities,
             tick_clock,
@@ -920,6 +932,8 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 full_streams: false,
                 center: None,
                 subs: HashSet::new(),
+                culled: HashSet::new(),
+                deferred: VecDeque::new(),
                 jobs: VecDeque::new(),
                 inventory: soils_sim::Inventory::default(),
                 inventory_dirty: false,
@@ -1291,6 +1305,11 @@ fn drain_inboxes(
                 let old = if valid { world.voxel(target) } else { 0 };
                 let applied = valid && world.edit(pos[0], pos[1], pos[2], value);
                 if applied {
+                    expose_neighbours(
+                        &mut clients,
+                        &world_name,
+                        soils_protocol::chunk_of(target),
+                    );
                     let c = clients.0.get_mut(&id).unwrap();
                     if placing {
                         let spent = c.inventory.remove(soils_sim::ItemKind::Block(value), 1);
@@ -1547,7 +1566,7 @@ fn run_scripts(
     mut rt: NonSendMut<ScriptRt>,
     mut events: ResMut<ScriptEvents>,
     mut worlds: ResMut<Worlds>,
-    clients: Res<Clients>,
+    mut clients: ResMut<Clients>,
     mut next_net: ResMut<NextNetId>,
     mut commands: Commands,
     mut sims: Query<(Entity, &NetId, &Kind, &mut SimState, &InWorld)>,
@@ -1583,6 +1602,11 @@ fn run_scripts(
                 let target = IVec3::new(x, y, z);
                 if world.ensure_resident(soils_protocol::chunk_of(target)) && world.edit(x, y, z, id)
                 {
+                    expose_neighbours(
+                        &mut clients,
+                        world_name,
+                        soils_protocol::chunk_of(target),
+                    );
                     // No `except` client: broadcast to everyone in the world.
                     send_world(&clients, world_name, u16::MAX, &ServerMsg::Edit {
                         pos: [x, y, z],
@@ -1657,8 +1681,14 @@ fn resubscribe(c: &mut Client, world: &mut World) {
         .collect();
     for pos in leaves {
         c.subs.remove(&pos);
+        // A withheld chunk was never sent, so it must not be unloaded either:
+        // `ChunkUnload` for a chunk the client never had is a protocol lie.
+        let withheld = c.culled.remove(&pos);
+        c.deferred.retain(|p| *p != pos);
         world.dec_ref(pos);
-        let _ = c.outbox.send(ServerMsg::ChunkUnload { pos: [pos.x, pos.y, pos.z] });
+        if !withheld {
+            let _ = c.outbox.send(ServerMsg::ChunkUnload { pos: [pos.x, pos.y, pos.z] });
+        }
     }
 
     let r = c.radius;
@@ -1764,7 +1794,16 @@ fn pump_chunk_jobs(mut clients: ResMut<Clients>, mut worlds: ResMut<Worlds>) {
                 // per-connection stream is FIFO).
                 let deliver: Vec<IVec3> =
                     wave.positions.into_iter().filter(|p| c.subs.contains(p)).collect();
-                send_wave(world, &deliver, &c.outbox, c.full_streams);
+                let (culled, deferred) = send_wave(
+                    &c.subs,
+                    c.center,
+                    &c.outbox,
+                    c.full_streams,
+                    world,
+                    &deliver,
+                );
+                c.culled.extend(culled);
+                c.deferred.extend(deferred);
             }
             if blocked {
                 break;
@@ -1780,15 +1819,77 @@ fn pump_chunk_jobs(mut clients: ResMut<Clients>, mut worlds: ResMut<Worlds>) {
     }
 }
 
-/// Stream one wave's chunks in request order, bundled `BUNDLE_SIZE` at a time.
-fn send_wave(
+/// What to do with a chunk whose generation has finished.
+enum Verdict {
+    /// Visible: put it on the wire.
+    Send,
+    /// Sealed off by its neighbours: withhold it.
+    Cull,
+    /// A neighbour has not been generated yet; ask again next tick.
+    Wait,
+}
+
+/// Chunks this close to the player are always sent, sealed or not.
+///
+/// Insurance, not optimization: a spawn, a warp or a teleport can drop a player
+/// inside terrain that the seal test would happily have hidden, and a player
+/// with no chunk under them falls through the world. One chunk of margin costs
+/// 27 chunks out of thousands.
+const CULL_KEEP: i32 = 1;
+
+/// Decide whether `pos` can be withheld from this client.
+///
+/// Takes the pieces rather than the `Client` so it can be called while the
+/// caller still holds a borrow on the client's job queue.
+fn cull_verdict(
+    subs: &HashSet<IVec3>,
+    center: Option<IVec3>,
     world: &World,
-    positions: &[IVec3],
+    pos: IVec3,
+) -> Verdict {
+    if let Some(center) = center {
+        let d = (pos - center).abs();
+        if d.x.max(d.y).max(d.z) <= CULL_KEEP {
+            return Verdict::Send;
+        }
+    }
+    // Only chunks this client would ever receive count as cover; anything
+    // past the subscription is treated as open, which is what stops the
+    // outermost shell from waiting forever on a neighbour nobody will generate.
+    match world.sealed(pos, |n| subs.contains(&n)) {
+        Some(true) => Verdict::Cull,
+        Some(false) => Verdict::Send,
+        None => Verdict::Wait,
+    }
+}
+
+/// Stream one wave's chunks in request order, bundled `BUNDLE_SIZE` at a time.
+///
+/// Sealed chunks are withheld and undecided ones deferred, so what reaches the
+/// client is only what it can actually see.
+fn send_wave(
+    subs: &HashSet<IVec3>,
+    center: Option<IVec3>,
     out: &UnboundedSender<ServerMsg>,
     full_streams: bool,
-) {
+    world: &World,
+    positions: &[IVec3],
+) -> (Vec<IVec3>, Vec<IVec3>) {
     let mut batch: Vec<ChunkInfo> = Vec::with_capacity(BUNDLE_SIZE);
+    let mut culled: Vec<IVec3> = Vec::new();
+    let mut deferred: Vec<IVec3> = Vec::new();
     for &pos in positions {
+        match cull_verdict(subs, center, world, pos) {
+            Verdict::Send => {}
+            Verdict::Cull => {
+                culled.push(pos);
+                continue;
+            }
+            Verdict::Wait => {
+                deferred.push(pos);
+                continue;
+            }
+        }
         // Every position is resident by now (cached at dispatch or adopted
         // above); a miss would mean a logic bug, not a recoverable state.
         let Some(edited) = world.chunk_edited(pos) else { continue };
@@ -1806,7 +1907,59 @@ fn send_wave(
     if !batch.is_empty() {
         let _ = out.send(ServerMsg::Manifest { chunks: batch });
     }
+    (culled, deferred)
 }
+
+/// Re-examine deferred chunks now that more neighbours exist. Bounded per tick
+/// so a huge radius cannot turn one tick into a full sweep; anything still
+/// undecided stays queued.
+fn pump_deferred(mut clients: ResMut<Clients>, mut worlds: ResMut<Worlds>) {
+    for c in clients.0.values_mut() {
+        let world = worlds.get_or_create(&c.world.clone());
+        let mut ready: Vec<IVec3> = Vec::new();
+        let budget = c.deferred.len().min(DEFERRED_PER_TICK);
+        for _ in 0..budget {
+            let Some(pos) = c.deferred.pop_front() else { break };
+            if !c.subs.contains(&pos) {
+                continue; // unsubscribed while it waited
+            }
+            match cull_verdict(&c.subs, c.center, world, pos) {
+                Verdict::Send => ready.push(pos),
+                Verdict::Cull => {
+                    c.culled.insert(pos);
+                }
+                Verdict::Wait => c.deferred.push_back(pos),
+            }
+        }
+        if !ready.is_empty() {
+            let (culled, deferred) =
+                send_wave(&c.subs, c.center, &c.outbox, c.full_streams, world, &ready);
+            c.culled.extend(culled);
+            c.deferred.extend(deferred);
+        }
+    }
+}
+
+/// Deferred chunks re-examined per client per tick.
+const DEFERRED_PER_TICK: usize = 256;
+
+/// An edit can break a seal: hand back any neighbour of the edited chunk that
+/// a client is withholding, so the newly exposed face has geometry behind it.
+fn expose_neighbours(clients: &mut Clients, world_name: &str, cpos: IVec3) {
+    for c in clients.0.values_mut() {
+        if c.world != world_name {
+            continue;
+        }
+        for dir in crate::world::FACE_DIRS {
+            let n = cpos + dir;
+            if c.culled.remove(&n) {
+                c.deferred.push_back(n);
+            }
+        }
+    }
+}
+
+
 
 /// How far critters notice players (voxels).
 const SEEK_RANGE: f32 = 48.0;

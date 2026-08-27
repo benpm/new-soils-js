@@ -727,6 +727,46 @@ impl Client {
         }
         out
     }
+    /// Drain pushed chunks until the manifest stream goes quiet for `quiet`,
+    /// keeping only positions in `want`.
+    ///
+    /// The counterpart to [`collect_chunks`](Self::collect_chunks) for anything
+    /// the server may legitimately never send: occlusion culling withholds
+    /// chunks sealed behind solid neighbours, so waiting for a fixed set hangs
+    /// forever. Quiet is measured on *manifests*, not on the socket — snapshots
+    /// go out every tick, so the connection is never idle.
+    pub async fn collect_available(
+        &mut self,
+        want: &[[i32; 3]],
+        quiet: Duration,
+    ) -> CollectedChunks {
+        let want: std::collections::HashSet<[i32; 3]> = want.iter().copied().collect();
+        let mut out = CollectedChunks::default();
+        let mut last = tokio::time::Instant::now();
+        while last.elapsed() < quiet {
+            if let Ok(ServerMsg::Manifest { chunks }) =
+                tokio::time::timeout(Duration::from_millis(150), self.next_msg()).await
+            {
+                last = tokio::time::Instant::now();
+                for info in chunks {
+                    let pos = info.pos();
+                    if !want.contains(&pos) {
+                        continue;
+                    }
+                    match &info {
+                        ChunkInfo::Edited { payload, .. } => {
+                            out.edited += 1;
+                            out.wire_bytes += payload.len() + 13;
+                        }
+                        ChunkInfo::Pristine { .. } => out.wire_bytes += 13,
+                    }
+                    let vol = self.materialize(&info);
+                    out.payloads.insert(pos, soils_protocol::encode_chunk(&vol));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Result of [`Client::collect_chunks`]: canonical payloads plus what the

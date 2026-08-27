@@ -17,6 +17,7 @@ Mostly agent-maintained documentation of the project. Start with
 |---|---|
 | [`concepts.md`](concepts.md) | Design philosophy and mechanics: what this is trying to be, and where it deliberately departs from Minecraft. |
 | [`conceptual_design.md`](conceptual_design.md) | Story and setting. |
+| [`future.md`](future.md) | Loose ideas, explicitly not ready for implementation. |
 
 ## Plans
 
@@ -29,6 +30,9 @@ implemented — `architecture.md` describes what actually shipped.
 | [`plan-game-systems.md`](plan-game-systems.md) | Entities, authoritative server, delta replication. **Implemented.** |
 | [`plan-rendering.md`](plan-rendering.md) | Renderer, lighting, GI. **Implemented.** |
 | [`plan-ui.md`](plan-ui.md) | Inventory, the item ring, and the `UiMode` refactor. **Phases 0–5 shipped**; remainder in `../Tasks.md`. |
+| [`plan-rgb-light-rework.md`](plan-rgb-light-rework.md) | RGB blocklight in a `u32` (5:5:5:5) with range 31, and the pool halving that pays for it. **Designed, not landed.** |
+| [`plan-sun.md`](plan-sun.md) | Semidirectional sunlight: a directional channel in the light word's spare bits. **Design only.** |
+| [`plan-better-lighting.md`](plan-better-lighting.md) | Coarse light stored with world data, fine light GPU-only. **Sketch.** |
 
 ## Working notes (`dev/`)
 

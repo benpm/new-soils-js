@@ -4,7 +4,7 @@
 use bevy::prelude::*;
 
 use crate::gi::GiSettings;
-use crate::player::Streaming;
+use crate::player::{LookSettings, Streaming};
 use crate::singleplayer::Singleplayer;
 
 /// Render settings toggled from the pause menu. New chunks read this; toggling
@@ -30,6 +30,8 @@ const RADIUS_MAX: i32 = 8;
 pub enum MenuButton {
     RadiusDown,
     RadiusUp,
+    SensDown,
+    SensUp,
     ToggleAo,
     ToggleFog,
     /// Toggle radiance-cascades global illumination.
@@ -46,6 +48,8 @@ pub(crate) struct PauseMenu;
 /// Markers for the dynamic value labels.
 #[derive(Component)]
 pub(crate) struct RadiusLabel;
+#[derive(Component)]
+pub(crate) struct SensLabel;
 #[derive(Component)]
 pub(crate) struct AoLabel;
 #[derive(Component)]
@@ -112,6 +116,25 @@ pub fn setup_pause_menu(mut commands: Commands) {
                             RadiusLabel,
                         ));
                         button(row, "+", MenuButton::RadiusUp);
+                    });
+
+                // Mouse sensitivity row: [-]  Mouse sensitivity: N.N  [+]
+                panel
+                    .spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(10.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        button(row, "-", MenuButton::SensDown);
+                        row.spawn((
+                            Text::new("Mouse sensitivity: 1.0"),
+                            TextFont { font_size: 18.0.into(), ..default() },
+                            TextColor(Color::WHITE),
+                            SensLabel,
+                        ));
+                        button(row, "+", MenuButton::SensUp);
                     });
 
                 labelled_button(panel, "Ambient occlusion: ON", MenuButton::ToggleAo, AoLabel);
@@ -224,6 +247,7 @@ pub fn pause_menu_visibility(
 pub fn pause_menu_buttons(
     buttons: Query<(&Interaction, &MenuButton), (Changed<Interaction>, With<Button>)>,
     mut streaming: ResMut<Streaming>,
+    mut look: ResMut<LookSettings>,
     mut toggles: ResMut<RenderToggles>,
     mut sp: ResMut<Singleplayer>,
     mut gi: ResMut<GiSettings>,
@@ -242,6 +266,8 @@ pub fn pause_menu_buttons(
                 streaming.load_radius = (streaming.load_radius + 1).min(RADIUS_MAX);
                 streaming.last_chunk = None;
             }
+            MenuButton::SensDown => look.nudge(-1),
+            MenuButton::SensUp => look.nudge(1),
             // Toggles flow into the terrain uniform every frame
             // (world_draw::update_terrain_params).
             MenuButton::ToggleAo => toggles.ao = !toggles.ao,
@@ -263,6 +289,7 @@ pub fn pause_menu_buttons(
 /// Keep the dynamic labels in sync with the current settings.
 pub fn update_pause_labels(
     streaming: Res<Streaming>,
+    look: Res<LookSettings>,
     toggles: Res<RenderToggles>,
     sp: Res<Singleplayer>,
     gi: Res<GiSettings>,
@@ -270,11 +297,16 @@ pub fn update_pause_labels(
         &mut Text,
         (
             With<RadiusLabel>,
+            Without<SensLabel>,
             Without<AoLabel>,
             Without<FogLabel>,
             Without<GiLabel>,
             Without<DiscoveryLabel>,
         ),
+    >,
+    mut sens: Query<
+        &mut Text,
+        (With<SensLabel>, Without<AoLabel>, Without<FogLabel>, Without<GiLabel>, Without<DiscoveryLabel>),
     >,
     mut ao: Query<
         &mut Text,
@@ -287,6 +319,9 @@ pub fn update_pause_labels(
 ) {
     if let Ok(mut t) = radius.single_mut() {
         t.0 = format!("Load radius: {}", streaming.load_radius);
+    }
+    if let Ok(mut t) = sens.single_mut() {
+        t.0 = format!("Mouse sensitivity: {:.1}", look.sensitivity);
     }
     if let Ok(mut t) = ao.single_mut() {
         t.0 = format!("Ambient occlusion: {}", if toggles.ao { "ON" } else { "OFF" });
@@ -342,6 +377,7 @@ mod tests {
         app.add_plugins(bevy::state::app::StatesPlugin);
         app.init_state::<crate::ui::UiMode>();
         app.insert_resource(Streaming::default());
+        app.insert_resource(LookSettings::default());
         app.insert_resource(RenderToggles::default());
         app.insert_resource(GiSettings::default());
         app.insert_resource(sp);

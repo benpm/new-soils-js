@@ -1,4 +1,6 @@
-# Story
+# Conceptual Design
+
+## Story
 
 - You are a Bulk Privateer: a wandering acolyte of the Bulk Seekers, tasked with seeking knowledge of the beings who populated an ancient city that contains an entire universe of connected worlds
 - Your task is to explore this Bulk (the universe the ancient people either discovered or created), and try to maintain a supply line leading back to your home world

@@ -35,7 +35,9 @@ intermittent `LNK1104`/`LNK1181` "cannot open file" failures under parallel
 test builds stopped. Those cost far more than 14% when they hit, because they
 look like corruption and invite a `cargo clean`.
 
-Requires LLVM on `PATH`. Delete the file and cargo falls back to `link.exe`.
+This applies to the MSVC target, which is no longer the default — the
+workspace builds under `x86_64-pc-windows-gnullvm` with llvm-mingw, which
+links with `lld` already. See [`toolchain.md`](toolchain.md).
 
 ### 2. Stop generating debug info nobody reads
 

@@ -1,11 +1,57 @@
-# Link with LLVM's lld instead of MSVC link.exe.
+# Build toolchain: LLVM only, no MSVC.
 #
-# Linking dominates an incremental rebuild of this workspace — the client links
-# ~450 rlibs — and link.exe is the slow part. lld-link is a drop-in for the MSVC
-# flavour and cuts that step by a large factor. It also stopped the intermittent
-# LNK1104/LNK1181 "cannot open file" failures we hit under parallel test builds.
+# The default toolchain for this repo is `stable-x86_64-pc-windows-gnullvm` —
+# the Windows target that links against mingw-w64/UCRT with lld, instead of the
+# MSVC CRT and link.exe. Nothing here needs Visual Studio or the Windows SDK.
 #
-# Requires LLVM on PATH (https://releases.llvm.org). If lld-link is missing,
-# delete this file and cargo falls back to link.exe.
+# rustup ships a *minimal* self-contained sysroot with that target (kernel32,
+# user32, ws2_32, ntdll, userenv, dbghelp and the CRT startup objects) — enough
+# for a hello-world, but not for this workspace. Linking real binaries also
+# wants libgcc/libgcc_eh/moldname and the wider Win32 import-library set
+# (advapi32, shell32, ...), and `cc`-driven build scripts such as `ring` need
+# mingw-w64 C headers. Both come from llvm-mingw:
+#
+#   https://github.com/mstorsjo/llvm-mingw/releases  (the ucrt-x86_64 zip)
+#
+# Extracted to C:\llvm-mingw here. If yours lives elsewhere, edit the paths
+# below — or drop this block entirely and put its `bin` directory on PATH,
+# which cargo and cc-rs both pick up on their own.
+#
+# Note this is a *different* LLVM from a stock C:\Program Files\LLVM install:
+# the stock one has clang and lld but no mingw-w64 sysroot, so it cannot link
+# this target on its own.
+[target.x86_64-pc-windows-gnullvm]
+linker = "C:/llvm-mingw/bin/x86_64-w64-mingw32-clang.exe"
+
+# Statically link the unwinder. Without this the binaries link fine but refuse
+# to *start* with 0xC0000135 (STATUS_DLL_NOT_FOUND): rustc emits `-lunwind` in
+# the linker's dynamic bracket, lld prefers `libunwind.dll.a` over
+# `libunwind.a`, and the resulting exe needs llvm-mingw's `libunwind.dll` at
+# run time. `+crt-static` resolves it against the static archive instead. The
+# UCRT stays dynamic (`api-ms-win-crt-*`), which is correct — it ships with
+# Windows.
+#
+# The `-Wno-unused-command-line-argument` silences a harmless
+# `argument unused during compilation: '-no-pie'` that clang prints on every
+# link under `+crt-static`.
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-Wno-unused-command-line-argument",
+]
+
+# `cc-rs` resolves the C compiler from PATH, not from the linker setting above,
+# and would otherwise find a stock `clang.exe` with no mingw-w64 headers
+# (`fatal error: 'assert.h' file not found` out of ring's build script).
+[env]
+CC_x86_64_pc_windows_gnullvm = "C:/llvm-mingw/bin/x86_64-w64-mingw32-clang.exe"
+CXX_x86_64_pc_windows_gnullvm = "C:/llvm-mingw/bin/x86_64-w64-mingw32-clang++.exe"
+AR_x86_64_pc_windows_gnullvm = "C:/llvm-mingw/bin/llvm-ar.exe"
+
+# Kept for anyone building the MSVC target explicitly (`cargo build
+# --target x86_64-pc-windows-msvc`). Linking dominates an incremental rebuild
+# of this workspace — the client links ~450 rlibs — and link.exe is the slow
+# part. lld-link is a drop-in for the MSVC flavour and cuts that step by a
+# large factor. It also stopped the intermittent LNK1104/LNK1181 "cannot open
+# file" failures we hit under parallel test builds.
 [target.x86_64-pc-windows-msvc]
 linker = "lld-link.exe"

@@ -146,6 +146,9 @@ pub struct Client {
     seen_items: std::collections::HashMap<u32, soils_sim::ItemStack>,
     /// Mirror of the server's authoritative inventory, from `InventoryUpdate`.
     inventory: Vec<Option<soils_sim::ItemStack>>,
+    /// Mirror of the open container, from `ContainerUpdate`. `None` once the
+    /// server says it is closed — a real client never decides that itself.
+    container: Option<([i32; 3], Vec<Option<soils_sim::ItemStack>>)>,
     /// Last position seen for each entity.
     ///
     /// Snapshots are deltas: an entity that has not moved is simply absent, so
@@ -188,6 +191,7 @@ impl Client {
             seen_spawns: std::collections::HashMap::new(),
             seen_items: std::collections::HashMap::new(),
             inventory: Vec::new(),
+            container: None,
             known: std::collections::HashMap::new(),
             id: 0,
             self_entity: 0,
@@ -283,6 +287,14 @@ impl Client {
                 self.known.remove(id);
             }
             ServerMsg::InventoryUpdate { slots } => self.inventory = slots.clone(),
+            ServerMsg::ContainerUpdate { pos, slots } => {
+                self.container = Some((*pos, slots.clone()))
+            }
+            ServerMsg::ContainerClosed { pos } => {
+                if self.container.as_ref().is_some_and(|(p, _)| p == pos) {
+                    self.container = None;
+                }
+            }
             _ => {}
         }
     }
@@ -297,6 +309,38 @@ impl Client {
     /// The last inventory the server pushed.
     pub fn inventory(&self) -> &[Option<soils_sim::ItemStack>] {
         &self.inventory
+    }
+
+    /// Contents of the container the server says we have open.
+    pub fn container(&self) -> Option<&[Option<soils_sim::ItemStack>]> {
+        self.container.as_ref().map(|(_, s)| s.as_slice())
+    }
+
+    /// How many of `kind` the open container holds.
+    pub fn container_count(&self, kind: soils_sim::ItemKind) -> u32 {
+        self.container()
+            .unwrap_or_default()
+            .iter()
+            .flatten()
+            .filter(|s| s.kind == kind)
+            .map(|s| s.count as u32)
+            .sum()
+    }
+
+    /// Index of the first container slot holding `kind`.
+    pub fn container_slot_of(&self, kind: soils_sim::ItemKind) -> Option<u16> {
+        self.container()?
+            .iter()
+            .position(|s| s.is_some_and(|s| s.kind == kind))
+            .map(|i| i as u16)
+    }
+
+    /// Index of the first pack slot holding `kind`.
+    pub fn pack_slot_of(&self, kind: soils_sim::ItemKind) -> Option<u16> {
+        self.inventory
+            .iter()
+            .position(|s| s.is_some_and(|s| s.kind == kind))
+            .map(|i| i as u16)
     }
 
     /// How many of `kind` the server says we hold.

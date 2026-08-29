@@ -46,6 +46,97 @@ impl ItemKind {
     }
 }
 
+/// What an item is *for*.
+///
+/// Two items are interchangeable when their whole [`ItemClass`] matches — that
+/// is what lets a hotbar slot heal itself when the stack it points at runs out,
+/// swapping in a like item rather than going dead. The three axes are
+/// deliberately separate: Cobblestone and a Healing Draught are both "one of a
+/// kind you have more of", but only the axes together say a Large Fruit may
+/// stand in for another fruit and never for a rock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ItemClass {
+    pub category: Category,
+    pub function: Function,
+    pub effect: Effect,
+}
+
+impl ItemClass {
+    /// What an unannotated block gets. Blocks are the only items with content
+    /// today, and they are overwhelmingly stone, so this is the value that
+    /// makes the fewest `blocks.yaml` entries need a `category:` line.
+    pub const BLOCK: Self =
+        Self { category: Category::Stone, function: Function::Place, effect: Effect::None };
+}
+
+/// Broad kind, and the row an item appears under in the inventory screen.
+///
+/// A closed enum rather than a free-form string so a typo in `blocks.yaml` is a
+/// startup parse error. The alternative fails much later and much quieter: an
+/// item whose category matches nothing is an item that can never substitute for
+/// anything, and no test would notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Category {
+    Earth,
+    Stone,
+    Ore,
+    Organic,
+    Crafted,
+    Tool,
+    Weapon,
+    Consumable,
+}
+
+impl Category {
+    /// Every category, in the order the inventory screen lists them.
+    pub const ALL: [Category; 8] = [
+        Category::Earth,
+        Category::Stone,
+        Category::Ore,
+        Category::Organic,
+        Category::Crafted,
+        Category::Tool,
+        Category::Weapon,
+        Category::Consumable,
+    ];
+
+    /// Title-case label for the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Category::Earth => "Earth",
+            Category::Stone => "Stone",
+            Category::Ore => "Ore",
+            Category::Organic => "Organic",
+            Category::Crafted => "Crafted",
+            Category::Tool => "Tools",
+            Category::Weapon => "Weapons",
+            Category::Consumable => "Consumables",
+        }
+    }
+}
+
+/// What using the item does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Function {
+    /// Right-click puts it in the world.
+    Place,
+    Mine,
+    Strike,
+    /// Consumed on use.
+    Eat,
+}
+
+/// What the item does to whoever uses it. Only meaningful alongside a
+/// [`Function`] that has an effect at all; [`Effect::None`] otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effect {
+    None,
+    Healing,
+}
+
 /// A non-empty run of one item kind. `count == 0` is not representable through
 /// the constructor; an inventory stores `None` for an empty slot instead.
 ///

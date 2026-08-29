@@ -20,10 +20,10 @@ pub use coords::{
     voxel_index,
 };
 pub use discovery::{DISCOVERY_PORT, PROBE_MAGIC, ServerInfo};
-pub use item::{ItemKind, ItemStack};
+pub use item::{Category, Effect, Function, ItemClass, ItemKind, ItemStack};
 pub use messages::{
-    ChunkInfo, ClientMsg, EntityState, GenParams, InputFrame, PROTOCOL_VERSION, ServerMsg, decode,
-    encode,
+    ChunkInfo, ClientMsg, EntityState, GenParams, InputFrame, PROTOCOL_VERSION, ServerMsg, SlotRef,
+    decode, encode,
 };
 pub use rng::{Rng, mix};
 pub use snapshot::{QuantState, SnapshotTracker, encode_snapshot};

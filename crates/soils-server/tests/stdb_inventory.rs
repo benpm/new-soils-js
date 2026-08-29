@@ -17,7 +17,6 @@ mod common;
 use std::time::Duration;
 
 use common::{Client, TestServer};
-use soils_protocol::ClientMsg;
 use soils_server::StdbConfig;
 
 const SETTLE: Duration = Duration::from_secs(10);

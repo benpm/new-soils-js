@@ -71,9 +71,10 @@ pub fn setup_crosshair(mut commands: Commands) {
 #[allow(clippy::too_many_arguments)]
 pub fn edit_blocks(
     buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
     net: Res<NetClient>,
     registry: Res<Blocks>,
-    inventory: Res<crate::inventory::PlayerInventory>,
+    hotbar: Res<crate::inventory::Hotbar>,
     map: Res<ChunkMap>,
     mut directory: ResMut<crate::demand::ChunkDirectory>,
     mut chunks: Query<&mut VoxelChunk>,
@@ -103,11 +104,28 @@ pub fn edit_blocks(
 
     let (target, value) = if break_block {
         (hit.voxel, 0u8)
+    } else if registry
+        .0
+        .get({
+            let ro = chunks.as_readonly();
+            voxel_at(&map, &ro, hit.voxel)
+        })
+        .is_some_and(|def| def.container.is_some())
+        && !keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight])
+    {
+        // Right-clicking a container opens it instead of placing against it.
+        // Shift is the override, so a chest is still something you can build
+        // on rather than a permanent hole in the placement grid.
+        net.send(ClientMsg::OpenContainer {
+            pos: [hit.voxel.x, hit.voxel.y, hit.voxel.z],
+        });
+        return;
     } else {
-        // Placement spends an item, so what is placeable is whatever the
-        // server says we hold. With nothing selected there is nothing to
-        // place; the server would refuse it anyway.
-        let Some(id) = inventory.selected_block() else { return };
+        // Placement spends an item, so what is placeable is whatever the live
+        // hotbar key points at — and a key only points at something the server
+        // says we hold. With an empty key there is nothing to place; the server
+        // would refuse it anyway.
+        let Some(id) = hotbar.selected_block() else { return };
         (hit.prev, id)
     };
 

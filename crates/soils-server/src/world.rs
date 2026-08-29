@@ -25,14 +25,32 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glam::IVec3;
-use soils_protocol::{AIR, CHUNK_BIT, CHUNK_CLIP, CHUNK_SIZE, ChunkVolume};
+use soils_protocol::{AIR, CHUNK_BIT, CHUNK_CLIP, CHUNK_SIZE, ChunkVolume, chunk_of};
 use soils_worldgen::{BlockRegistry, TerrainGen, WorldType, default_registry};
 
+use soils_sim::block_data::ChunkData;
 use soils_sim::light::{self, ChunkLight, LightWorld};
 use soils_sim::nav;
 
+/// Block data crosses the disk boundary as bincode, the same encoding the wire
+/// uses. `paged` compresses it, so this side stays a plain serialization.
+impl Codec for ChunkData {
+    fn encode(&self) -> Vec<u8> {
+        soils_protocol::encode(self)
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        soils_protocol::decode(bytes)
+    }
+
+    fn is_empty(&self) -> bool {
+        ChunkData::is_empty(self)
+    }
+}
+
 use crate::persist::PersistHandle;
 use crate::region;
+use crate::store::{Codec, Store};
 
 /// Cells with effective light below this count as "dark" for gameplay
 /// (spawn) queries.
@@ -326,6 +344,10 @@ pub struct World {
     /// Handle to the background writer: chunk saves are enqueued here instead
     /// of being written on the tick path.
     persist: PersistHandle,
+    /// Per-block state the voxel array cannot hold — chest contents, today.
+    /// Same write-back policy as `chunks`, one page per chunk, addressed at the
+    /// same slot index in a parallel file. See `store.rs`.
+    block_data: Store<ChunkData>,
     /// Chunks awaiting a light flood (made resident this session; processed
     /// top-of-column-first by [`pump_light`](World::pump_light)).
     light_queue: Vec<IVec3>,
@@ -524,6 +546,7 @@ impl World {
             refs: HashMap::new(),
             light_queue: Vec::new(),
             light_inflight: None,
+            block_data: Store::new(regions_dir.clone(), "b"),
             regions_dir,
             stdb_world_id: None,
             persist,
@@ -674,6 +697,95 @@ impl World {
             self.rebuild_summary(c);
         }
         true
+    }
+
+    /// One chunk's block data, faulting the page in. Absent data reads as an
+    /// empty `ChunkData` — a chunk nobody has put anything in is
+    /// indistinguishable from one that was never written, and neither needs a
+    /// caller to know the difference.
+    ///
+    /// The server reaches for individual blocks rather than whole pages
+    /// ([`container_at`](Self::container_at)); this is the whole-page view the
+    /// tests assert against and the shape a future "what is in this chunk"
+    /// query would use.
+    #[cfg(test)]
+    pub fn block_data(&mut self, cpos: IVec3) -> &ChunkData {
+        self.block_data.get(cpos)
+    }
+
+    /// The container at an absolute voxel position, or `None` if that block
+    /// holds nothing. Cheap on the common answer: the page probe is a memoised
+    /// pointer-table lookup, so asking about a block that has never held
+    /// anything costs no I/O.
+    pub fn container_at(&mut self, v: IVec3) -> Option<&soils_sim::Inventory> {
+        let key = soils_sim::local_key(v.x, v.y, v.z);
+        match self.block_data.get(chunk_of(v)).get(key) {
+            Some(soils_sim::BlockData::Container(inv)) => Some(inv),
+            None => None,
+        }
+    }
+
+    /// A container's contents for the wire, padded out to the block's slot
+    /// count. Read-only on purpose: opening a chest nobody has ever used must
+    /// not create a page for it, and every chest starts that way.
+    pub fn container_view(
+        &mut self,
+        v: IVec3,
+        slots: usize,
+    ) -> Vec<Option<soils_protocol::ItemStack>> {
+        match self.container_at(v) {
+            Some(inv) => inv.slots().to_vec(),
+            None => vec![None; slots],
+        }
+    }
+
+    /// The container at `v`, created with `slots` slots if this is the first
+    /// thing anyone has put in it. Marks the page dirty, so callers that only
+    /// want to *look* must use [`container_at`](Self::container_at).
+    pub fn container_mut(&mut self, v: IVec3, slots: usize) -> &mut soils_sim::Inventory {
+        let key = soils_sim::local_key(v.x, v.y, v.z);
+        self.block_data.get_mut(chunk_of(v)).container_mut(key, slots)
+    }
+
+    /// Drop the data attached to `v` and return it — what breaking a block
+    /// does. The caller owns what comes back; dropping it on the floor is how
+    /// a chest's contents silently vanish.
+    #[must_use = "the contents are lost unless they are spilled or re-stored"]
+    pub fn take_block_data(&mut self, v: IVec3) -> Option<soils_sim::BlockData> {
+        let key = soils_sim::local_key(v.x, v.y, v.z);
+        let cpos = chunk_of(v);
+        // Peek first: a break on an ordinary block must not dirty a page.
+        if self.block_data.get(cpos).get(key).is_none() {
+            return None;
+        }
+        let data = self.block_data.get_mut(cpos).remove(key);
+        self.block_data.get_mut(cpos).prune();
+        data
+    }
+
+    /// Tidy a page after a mutation and hold/release it against eviction.
+    /// A page with an open viewer must stay resident: the alternative is a
+    /// container that empties itself because its page left memory mid-session.
+    pub fn prune_block_data(&mut self, cpos: IVec3) {
+        self.block_data.get_mut(cpos).prune();
+    }
+
+    pub fn pin_block_data(&mut self, cpos: IVec3) {
+        self.block_data.pin(cpos);
+    }
+
+    pub fn unpin_block_data(&mut self, cpos: IVec3) {
+        self.block_data.unpin(cpos);
+    }
+
+    /// Cache counters, for the flush-interval log line and tests.
+    pub fn block_data_stats(&self) -> crate::store::StoreStats {
+        self.block_data.stats()
+    }
+
+    /// Block-data pages currently in memory.
+    pub fn block_data_pages(&self) -> usize {
+        self.block_data.len()
     }
 
     /// Is the boundary layer of the chunk at `pos` facing `dir` solid all the
@@ -945,6 +1057,9 @@ impl World {
                 );
             }
         }
+        // Block data rides the same writer and the same cadence: dirty in RAM
+        // until a flush, never written on the tick thread.
+        self.persist.enqueue_blobs(self.block_data.take_dirty());
     }
 
     /// Evict chunks whose unload timer exceeded `ttl` (save-if-dirty first).
@@ -973,7 +1088,16 @@ impl World {
             // the memoised copy is stale the moment the write lands.
             self.header_cache.remove(&region::region_path(&self.regions_dir, pos));
             self.navs.remove(&pos);
+            // Block data outliving its voxels is a leak with extra steps —
+            // unless something has it open, which `evict` respects.
+            let writes = self.block_data.evict(pos);
+            self.persist.enqueue_blobs(writes);
         }
+        // Pages whose chunk is still resident but that nobody has touched in a
+        // while: a chest read once during a walk past should not stay in RAM
+        // for as long as the terrain around it.
+        let writes = self.block_data.tick_lifecycle(ttl);
+        self.persist.enqueue_blobs(writes);
     }
 
     /// Refresh the cached pathfinding data for `cpos` if its version key
@@ -1400,6 +1524,94 @@ mod tests {
         assert_eq!(vol.get(0, 0, 0), 9, "edit survived eviction via save-if-dirty");
 
         persister2.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Block data rides the same cache policy as voxels: dirty in memory, out
+    /// on eviction, back off disk on demand. The failure this guards is the
+    /// interesting one — a chest that empties itself because its page left
+    /// memory before its bytes did.
+    #[test]
+    fn block_data_survives_eviction_and_comes_back_off_disk() {
+        let dir = std::env::temp_dir().join(format!("soils-world-blockdata-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let cpos = IVec3::new(8, 7, 8);
+        let v = cpos * 32 + IVec3::new(3, 4, 5);
+        let stack = soils_sim::ItemStack::new(soils_sim::ItemKind::Block(4), 17).unwrap();
+
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+        world.adopt(cpos, generate_one(&world, cpos));
+        assert!(world.container_mut(v, 27).insert(stack).is_none());
+        assert_eq!(world.block_data(cpos).len(), 1);
+
+        // Eviction is what writes it out; nothing has flushed yet.
+        world.tick_lifecycle(Duration::ZERO);
+        assert_eq!(world.resident(), 0);
+        drop(world);
+        persister.shutdown();
+
+        let persister2 = Persister::new();
+        let mut world2 = World::new(&dir, "default", 0, persister2.handle());
+        let inv = world2.container_at(v).expect("the chest came back");
+        assert_eq!(inv.count_of(soils_sim::ItemKind::Block(4)), 17);
+        assert_eq!(world2.block_data_stats().loads, 1, "and it came from the file, not from nowhere");
+
+        // A block with nothing in it costs no I/O: the pointer table says
+        // absent, and that answer is memoised for the whole region.
+        let before = world2.block_data_stats();
+        for i in 0..8 {
+            assert!(world2.container_at(cpos * 32 + IVec3::new(i, 0, 0)).is_none());
+        }
+        assert_eq!(world2.block_data_stats().loads, before.loads, "empty blocks must not inflate");
+
+        // Emptying it clears the slot rather than storing a row of `None`s.
+        assert_eq!(world2.container_mut(v, 27).remove(soils_sim::ItemKind::Block(4), 17), 17);
+        world2.prune_block_data(cpos);
+        world2.flush_dirty();
+        drop(world2);
+        persister2.shutdown();
+
+        let persister3 = Persister::new();
+        let mut world3 = World::new(&dir, "default", 0, persister3.handle());
+        assert!(world3.container_at(v).is_none(), "an emptied chest leaves nothing to reload");
+        assert_eq!(world3.block_data_stats().loads, 0);
+
+        persister3.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An open container pins its page: eviction must not pull the world out
+    /// from under a player who is looking at it.
+    #[test]
+    fn a_pinned_page_outlives_its_chunk() {
+        let dir = std::env::temp_dir().join(format!("soils-world-pinned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let cpos = IVec3::new(2, 2, 2);
+        let v = cpos * 32 + IVec3::splat(1);
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+        world.adopt(cpos, generate_one(&world, cpos));
+        let stack = soils_sim::ItemStack::new(soils_sim::ItemKind::Block(4), 3).unwrap();
+        assert!(world.container_mut(v, 27).insert(stack).is_none());
+        world.pin_block_data(cpos);
+
+        world.tick_lifecycle(Duration::ZERO);
+        assert_eq!(world.resident(), 0, "the chunk itself still evicts");
+        assert_eq!(
+            world.container_at(v).map(|i| i.count_of(soils_sim::ItemKind::Block(4))),
+            Some(3),
+            "but the pinned page is still in memory, unwritten and intact"
+        );
+        assert_eq!(world.block_data_stats().loads, 0, "it was never re-read");
+
+        world.unpin_block_data(cpos);
+        world.tick_lifecycle(Duration::ZERO);
+        assert_eq!(world.block_data_stats().evictions, 1);
+
+        persister.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

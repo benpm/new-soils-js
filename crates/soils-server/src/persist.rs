@@ -17,6 +17,7 @@ use soils_protocol::ChunkVolume;
 use soils_stdb::{StdbCmd, StdbLink};
 
 use crate::region;
+use crate::store;
 
 /// One chunk to persist, carrying its world's region directory so a single
 /// writer can serve every world.
@@ -36,6 +37,9 @@ pub struct SaveJob {
 
 enum Msg {
     Save(SaveJob),
+    /// Encoded pages from a [`store::Store`]. Already grouped by the caller;
+    /// the writer only coalesces them with whatever else is queued.
+    Blobs(Vec<store::Write>),
     /// Drain everything queued, then ack so the caller knows the flush is done.
     Shutdown(SyncSender<()>),
 }
@@ -63,6 +67,16 @@ impl PersistHandle {
         version: u32,
     ) {
         let _ = self.tx.send(Msg::Save(SaveJob { dir, pos, volume, edited, stdb_key, version }));
+    }
+
+    /// Queue encoded store pages. Same contract as [`enqueue`](Self::enqueue):
+    /// never blocks, and a dead writer drops the work rather than stalling the
+    /// tick.
+    pub fn enqueue_blobs(&self, writes: Vec<store::Write>) {
+        if writes.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(Msg::Blobs(writes));
     }
 }
 
@@ -118,20 +132,27 @@ fn writer_loop(rx: Receiver<Msg>, stdb: Option<Arc<StdbLink>>) {
     // fresh-world burst collapses into a few region-file writes.
     while let Ok(first) = rx.recv() {
         let mut batch: Vec<SaveJob> = Vec::new();
+        let mut blobs: Vec<store::Write> = Vec::new();
         let mut ack: Option<SyncSender<()>> = None;
-        match first {
-            Msg::Save(job) => batch.push(job),
-            Msg::Shutdown(a) => ack = Some(a),
-        }
-        loop {
-            match rx.try_recv() {
-                Ok(Msg::Save(job)) => batch.push(job),
-                Ok(Msg::Shutdown(a)) => ack = Some(a),
-                Err(_) => break,
+        let take = |msg: Msg, batch: &mut Vec<SaveJob>, blobs: &mut Vec<store::Write>| match msg
+        {
+            Msg::Save(job) => {
+                batch.push(job);
+                None
             }
+            Msg::Blobs(mut w) => {
+                blobs.append(&mut w);
+                None
+            }
+            Msg::Shutdown(a) => Some(a),
+        };
+        ack = take(first, &mut batch, &mut blobs).or(ack);
+        while let Ok(msg) = rx.try_recv() {
+            ack = take(msg, &mut batch, &mut blobs).or(ack);
         }
 
         flush_batch(batch, stdb.as_deref());
+        store::apply(&blobs);
 
         if let Some(a) = ack {
             let _ = a.send(());

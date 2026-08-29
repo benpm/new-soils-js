@@ -14,7 +14,17 @@ description into `CHANGELOG.md`, and leave only the one-line result behind.
 The loop works (break → drop → pick up → place). What it still lacks, in the
 order that hurts:
 
-- [ ] **Inventory does not survive logout.** It is session state on the server,
+- [x] **Items can be stored in blocks.** Closed 2026-08-28 (`ui-inventory`).
+      Wooden Crate (27 slots) and Clay Pot (9) hold items; contents live in a
+      per-chunk block-data page addressed at the same slot index as that chunk's
+      voxels, cached write-back and streamed off disk on demand. Protocol v5.
+      See [plan-storage.md](docs/plan-storage.md).
+- [ ] **Inventory does not survive logout.** The disk half of this is now
+      cheap — the write-back discipline exists and is tested — but a player key
+      is not spatial, so it wants a file per account rather than a `paged` slot;
+      see [plan-storage.md §6](docs/plan-storage.md#6-phase-2--the-remaining-tenants)
+      for why forcing it into the same file would be a second format wearing the
+      first one's name. It is session state on the server,
       so a reconnecting player is re-stocked with the starter kit — generous
       rather than correct, and the one gap that makes the feature feel unreal.
       Copy the `player_profile` shape: authoritative in `soils-server` during a
@@ -30,19 +40,47 @@ order that hurts:
       so they no longer accumulate forever, but strip mining still puts one
       replicated entity per block in the world until they expire. Merging drops
       within a voxel or two would cut that hard.
-- [ ] **The ring is a strip, not a ring.** It shows the right things — every
-      carried tool, weapon and consumable, never blocks — but laid out
-      horizontally, and it is not a *selector*: nothing in the game is a tool
-      yet, so there is nothing to select between. Do the radial layout and
-      hold-to-open selection when tools exist and it can be felt.
+- [x] **The ring is a strip, not a ring.** Closed 2026-08-28 (`ui-inventory`) by
+      deleting it. Working from the mockup in `scratch/`, the ring and the
+      one-slot held-item indicator were replaced by an eight-key hotbar that
+      holds *references* to item kinds: assigning moves nothing and sends
+      nothing, the item stays listed in the inventory (dimmed, badged with its
+      key), and a key whose item runs out rebinds itself to another of the same
+      category, function and effect — or goes empty and wiggles when pressed.
+      The screen groups by category instead of showing raw slots. See
+      [plan-ui.md §10](docs/plan-ui.md#10-phase-6--the-hotbar-2026-08-28).
 - [ ] **No crafting, durability, or drop tables.** `ItemStack::durability` is
       carried on the wire and never decremented; a broken block yields exactly
       itself. This is where item *identity* starts to matter and the
       `Tool`/`Weapon`/`Consumable` ids stop being reserved placeholders.
-- [ ] **`ItemKind::Tool`/`Weapon`/`Consumable` have no registry.** Blocks resolve
-      through `BlockRegistry`; the other three are bare ids with a placeholder
-      icon. They need the `entities.yaml`/`blocks.yaml` treatment — a data file,
-      stable ids, and a name.
+- [ ] **`ItemKind::Tool`/`Weapon`/`Consumable` have no content.** The registry
+      landed 2026-08-28 — `crates/soils-sim/items.yaml` plus `ItemRegistry`,
+      following the `entities.yaml` pattern, and blocks now carry a category,
+      function, effect and weight in `blocks.yaml`. All three lists are still
+      empty: what is missing is the items themselves. Authoring the first one is
+      a YAML edit, and the hotbar's substitution rule is already written against
+      it (a Large Fruit eaten to nothing is replaced by another
+      `Consumable, Healing`).
+- [ ] **A script edit that removes a container block does not spill it.**
+      `run_scripts` applies voxel edits straight through `World::edit`, so a
+      script that deletes a chest leaves its contents on the block-data page
+      with no block in front of them — invisible, unreachable, and inherited by
+      whatever is built on that voxel next. The player edit path handles this
+      (`take_block_data` + spill + close viewers); the script path needs the
+      same three lines, or both need to move behind one `break_block` helper.
+      Landed 2026-08-28 with containers; see
+      [plan-storage.md §5](docs/plan-storage.md).
+- [ ] **A grave is nobody's.** Any player can open any container, including one
+      that appears where someone died (planned in
+      [plan-death-chest.md](docs/plan-death-chest.md)). Ownership is a real
+      design question — timers, locks, owner-only tombstones — and guessing at
+      it is worse than leaving it open on a game this size. Decide it before
+      graves ship, not after.
+- [ ] **Hotbar assignments do not survive logout.** Same gap as the inventory
+      itself, and a smaller one: the bar is a client resource by design (it
+      stores no items, so it needs no authority), which means it is also not on
+      the wire. It rebuilds itself from the pack on login, so a returning player
+      gets a usable bar — just not the one they arranged.
 
 ## Next — lighting
 

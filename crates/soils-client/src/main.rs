@@ -33,6 +33,7 @@ mod record;
 mod world_draw;
 mod server_msg;
 mod singleplayer;
+mod theme;
 mod social;
 mod ui;
 
@@ -119,6 +120,11 @@ fn main() {
     .insert_resource(ActorMap::default())
     .init_state::<ui::UiMode>()
     .init_resource::<inventory::PlayerInventory>()
+    .init_resource::<inventory::Items>()
+    .init_resource::<inventory::Hotbar>()
+    .init_resource::<inventory::SelectedItem>()
+    .init_resource::<inventory::hotbar::DragItem>()
+    .init_resource::<inventory::container::OpenContainer>()
     .init_resource::<bot::BotActions>()
     .init_resource::<inventory::DroppedItemVisuals>()
     .init_resource::<ui::CursorFreed>()
@@ -158,7 +164,8 @@ fn main() {
             pause::setup_pause_menu,
             console::setup_console,
             inventory::setup_item_icons,
-            inventory::setup_inventory_ui,
+            inventory::screen::setup_inventory_ui,
+            inventory::hotbar::setup_hotbar,
             login::setup_login,
             selftest_login,
         ),
@@ -269,13 +276,38 @@ fn main() {
             console::console_input,
             console::update_console_text,
             hud::update_hud,
-            inventory::update_inventory_visibility,
-            inventory::rebuild_inventory_ui,
-            inventory::inventory_slot_clicks,
             pause::pause_menu_visibility,
             pause::pause_menu_buttons,
             pause::update_pause_labels,
         )
+            .run_if(login::logged_in),
+    )
+    // Inventory: the mirror changed, so settle the hotbar and redraw both
+    // views. Its own block rather than folded into the gameplay tuple above —
+    // `add_systems` takes at most twenty systems in one tuple, and that one was
+    // already close to the limit.
+    .add_systems(
+        Update,
+        (
+            inventory::screen::update_inventory_visibility,
+            inventory::hotbar::update_hotbar_visibility,
+            // Reconcile first: both rebuilds draw what it settles on, so the
+            // other order shows the bar one frame stale every time an item runs
+            // out.
+            inventory::hotbar::reconcile_hotbar,
+            inventory::hotbar::rebuild_hotbar,
+            inventory::screen::rebuild_inventory_ui,
+            inventory::screen::select_item,
+            inventory::screen::highlight_item_cells,
+            inventory::screen::forget_missing_selection,
+            inventory::screen::rebuild_detail_panel,
+            inventory::hotbar::animate_wiggle,
+            inventory::container::update_container_visibility,
+            inventory::container::rebuild_container_ui,
+            inventory::container::close_on_exit,
+            inventory::screen::update_footer_hint,
+        )
+            .chain()
             .run_if(login::logged_in),
     )
     // Direct player input: authenticated and console closed.
@@ -285,10 +317,20 @@ fn main() {
             player::mouse_look,
             edit::edit_blocks,
             edit::selection_highlight,
-            inventory::select_placeable,
-            inventory::drop_selected,
+            inventory::hotbar::select_hotbar_slot,
+            inventory::hotbar::drop_selected,
         )
             .run_if(ui::playing)
+            .run_if(console::console_closed)
+            .run_if(login::logged_in),
+    )
+    // With the screen open the number keys assign the picked item to a key
+    // instead of choosing between keys, so this deliberately does not share the
+    // `ui::playing` gate above.
+    .add_systems(
+        Update,
+        inventory::hotbar::bind_selected_to_hotbar
+            .run_if(in_state(ui::UiMode::Inventory))
             .run_if(console::console_closed)
             .run_if(login::logged_in),
     )

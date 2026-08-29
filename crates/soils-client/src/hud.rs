@@ -90,7 +90,7 @@ pub fn update_hud(
     slots: Res<crate::pool::ChunkSlots>,
     world_time: Res<WorldTime>,
     streaming: Res<Streaming>,
-    inventory: Res<crate::inventory::PlayerInventory>,
+    hotbar: Res<crate::inventory::Hotbar>,
     registry: Res<crate::chunk::Blocks>,
     player: Query<&Transform, With<Player>>,
     mut text: Query<&mut Text, With<DebugHud>>,
@@ -98,7 +98,7 @@ pub fn update_hud(
     let Ok(mut text) = text.single_mut() else { return };
     // What right-click would place, named. Empty-handed is a real state now
     // that placement spends the block.
-    let held = match inventory.selected_block() {
+    let held = match hotbar.selected_block() {
         Some(id) => registry.0.get(id).map_or("?".to_string(), |b| b.name.clone()),
         None => "(nothing)".to_string(),
     };

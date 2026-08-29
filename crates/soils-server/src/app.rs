@@ -31,7 +31,7 @@ use bevy_ecs::prelude::{
 use bevy_time::{Fixed, Time, TimePlugin};
 use glam::{IVec2, IVec3, Quat, Vec3};
 use soils_protocol::{
-    CHUNK_BIT, ChunkInfo, ClientMsg, ChunkVolume, QuantState, ServerMsg, encode_snapshot,
+    CHUNK_BIT, ChunkInfo, ClientMsg, ChunkVolume, QuantState, ServerMsg, SlotRef, encode_snapshot,
 };
 use soils_script::{ScriptCommand, ScriptEvent, ScriptRuntime, ScriptWorld};
 use soils_sim::{KIND_CRITTER, KIND_PHYSICS_CUBE, KIND_PLAYER, nav};
@@ -165,6 +165,14 @@ pub(crate) struct Client {
     /// `InventoryUpdate` at the end of the drain rather than one per change,
     /// so a single break/place cannot send several.
     inventory_dirty: bool,
+    /// The container block this client is viewing, as an absolute voxel
+    /// position — and nothing else. Whether it *may* still be viewed is
+    /// re-decided from the world on every use, so a client cannot keep a chest
+    /// open by not sending `CloseContainer`.
+    ///
+    /// Holds a pin on that chunk's block-data page, which is why every path
+    /// that clears this field goes through [`close_container`].
+    open_container: Option<IVec3>,
 }
 
 /// Server-allocated replication id; never reused within a session.
@@ -597,6 +605,7 @@ pub(crate) fn run_app(
             wander_critters,
             fall_dropped_items,
             pick_up_items,
+            close_unreachable_containers,
             // Scripts run after inputs/AI mutate state and before
             // replication, so their edits/spawns replicate the same tick.
             run_scripts,
@@ -899,8 +908,21 @@ fn world_lifecycle(time: Res<Time>, mut worlds: ResMut<Worlds>, mut acc: Local<(
     }
     if acc.1 >= FLUSH_SECS {
         acc.1 = 0.0;
-        for w in worlds.map.values_mut() {
+        for (name, w) in worlds.map.iter_mut() {
             w.flush_dirty();
+            // A cache nobody can see the hit rate of is a cache nobody can tell
+            // is broken. Logged on the flush interval, and only once anything
+            // has actually been stored, so an ordinary world stays silent.
+            let s = w.block_data_stats();
+            if s.writes > 0 {
+                println!(
+                    "world {name}: block data {} pages resident, {} loads, {} writes, {} evictions",
+                    w.block_data_pages(),
+                    s.loads,
+                    s.writes,
+                    s.evictions
+                );
+            }
         }
     }
 }
@@ -937,6 +959,7 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 jobs: VecDeque::new(),
                 inventory: soils_sim::Inventory::default(),
                 inventory_dirty: false,
+                open_container: None,
             },
         );
     }
@@ -1310,6 +1333,31 @@ fn drain_inboxes(
                         &world_name,
                         soils_protocol::chunk_of(target),
                     );
+                    // A broken block takes its state with it — and gives back
+                    // everything that state was holding. A chest that swallowed
+                    // its contents on break would be worse than one that never
+                    // opened.
+                    if !placing {
+                        let spilled = world
+                            .take_block_data(target)
+                            .map(|d| d.contents())
+                            .unwrap_or_default();
+                        for c in clients.0.values_mut() {
+                            if c.world == world_name && c.open_container == Some(target) {
+                                close_container(c, world);
+                            }
+                        }
+                        for stack in spilled {
+                            spawn_drop(
+                                &mut commands,
+                                &mut next_net,
+                                &world_name,
+                                target.as_vec3() + Vec3::splat(0.5),
+                                stack,
+                                ticks.0 + PICKUP_DELAY_TICKS,
+                            );
+                        }
+                    }
                     let c = clients.0.get_mut(&id).unwrap();
                     if placing {
                         let spent = c.inventory.remove(soils_sim::ItemKind::Block(value), 1);
@@ -1320,23 +1368,14 @@ fn drain_inboxes(
                         // stood rather than teleported into the inventory: the
                         // player may be out of room, and a drop the world can see
                         // is the honest outcome either way.
-                        let net = next_net.0;
-                        next_net.0 += 1;
-                        commands.spawn((
-                            NetId(net),
-                            Kind(soils_sim::KIND_DROPPED_ITEM),
-                            SimState(soils_sim::PlayerState {
-                                pos: target.as_vec3() + Vec3::splat(0.5),
-                                flying: false,
-                                ..Default::default()
-                            }),
-                            Yaw(0.0),
-                            InWorld(world_name.clone()),
-                            DroppedItem(soils_sim::ItemStack::one(soils_sim::ItemKind::Block(
-                                old,
-                            ))),
-                            PickupAfter(ticks.0 + PICKUP_DELAY_TICKS),
-                        ));
+                        spawn_drop(
+                            &mut commands,
+                            &mut next_net,
+                            &world_name,
+                            target.as_vec3() + Vec3::splat(0.5),
+                            soils_sim::ItemStack::one(soils_sim::ItemKind::Block(old)),
+                            ticks.0 + PICKUP_DELAY_TICKS,
+                        );
                     }
                 }
                 let c = &clients.0[&id];
@@ -1386,19 +1425,105 @@ fn drain_inboxes(
                 // inside them and read as "nothing happened".
                 let facing = Vec3::new(-yaw.0.sin(), 0.0, -yaw.0.cos());
                 let pos = sim.0.pos - Vec3::Y * (soils_sim::EYE_TO_FEET * 0.5) + facing;
-                let net = next_net.0;
-                next_net.0 += 1;
-                commands.spawn((
-                    NetId(net),
-                    Kind(soils_sim::KIND_DROPPED_ITEM),
-                    SimState(soils_sim::PlayerState { pos, flying: false, ..Default::default() }),
-                    Yaw(0.0),
-                    InWorld(world_name),
-                    DroppedItem(stack),
-                    // Long enough that the thrower walks clear before it is
-                    // collectable; otherwise dropping is a no-op.
-                    PickupAfter(ticks.0 + THROW_DELAY_TICKS),
-                ));
+                // Long enough that the thrower walks clear before it is
+                // collectable; otherwise dropping is a no-op.
+                spawn_drop(
+                    &mut commands,
+                    &mut next_net,
+                    &world_name,
+                    pos,
+                    stack,
+                    ticks.0 + THROW_DELAY_TICKS,
+                );
+            }
+            ClientMsg::OpenContainer { pos } => {
+                let c = clients.0.get_mut(&id).unwrap();
+                if !c.authenticated {
+                    continue;
+                }
+                let world_name = c.world.clone();
+                let target = IVec3::from_array(pos);
+                // Same reach rule as an edit: a chest you cannot touch is a
+                // chest you cannot loot, whatever the client believes.
+                let Some((sim, ..)) = c.entity.and_then(|e| sims.get(e).ok()) else { continue };
+                if !soils_sim::within_reach(sim.0.pos, target) {
+                    continue;
+                }
+                let world = worlds.get_or_create(&world_name);
+                if !world.ensure_resident(soils_protocol::chunk_of(target)) {
+                    continue;
+                }
+                // A block that is not a container is not an error — a stale UI
+                // can ask about one that was broken a tick ago — so it is
+                // simply not answered.
+                let Some(slots) = container_slots(world, target) else { continue };
+                let contents = world.container_view(target, slots);
+                let c = clients.0.get_mut(&id).unwrap();
+                // One open container per client, so `TransferItem` never has to
+                // say which. Re-opening replaces.
+                close_container(c, world);
+                c.open_container = Some(target);
+                world.pin_block_data(soils_protocol::chunk_of(target));
+                let _ = c
+                    .outbox
+                    .send(ServerMsg::ContainerUpdate { pos, slots: contents });
+            }
+            ClientMsg::CloseContainer => {
+                let world_name = clients.0[&id].world.clone();
+                let world = worlds.get_or_create(&world_name);
+                close_container(clients.0.get_mut(&id).unwrap(), world);
+            }
+            ClientMsg::TransferItem { from, count } => {
+                let c = clients.0.get_mut(&id).unwrap();
+                if !c.authenticated {
+                    continue;
+                }
+                let Some(target) = c.open_container else { continue };
+                let world_name = c.world.clone();
+                let eye = c.entity.and_then(|e| sims.get(e).ok()).map(|(s, ..)| s.0.pos);
+                let world = worlds.get_or_create(&world_name);
+                // Re-check on every transfer, not just on open: the alternative
+                // is a chest you keep looting as you walk away from it.
+                let ok = eye.is_some_and(|eye| soils_sim::within_reach(eye, target));
+                let Some(slots) = container_slots(world, target).filter(|_| ok) else {
+                    close_container(clients.0.get_mut(&id).unwrap(), world);
+                    continue;
+                };
+                let c = clients.0.get_mut(&id).unwrap();
+                // Take from the named side, insert into the other. Whatever
+                // does not fit goes straight back where it came from — the side
+                // it left had room for it a statement ago, so this cannot fail.
+                let (taken, refused) = match from {
+                    SlotRef::Pack(i) => {
+                        let Some(taken) = c.inventory.split(i as usize, count) else { continue };
+                        let refused = world.container_mut(target, slots).insert(taken);
+                        if let Some(rest) = refused {
+                            let lost = c.inventory.insert(rest);
+                            debug_assert!(lost.is_none(), "the pack just held this");
+                        }
+                        (taken, refused)
+                    }
+                    SlotRef::Container(i) => {
+                        let Some(taken) =
+                            world.container_mut(target, slots).split(i as usize, count)
+                        else {
+                            continue;
+                        };
+                        let refused = c.inventory.insert(taken);
+                        if let Some(rest) = refused {
+                            let lost = world.container_mut(target, slots).insert(rest);
+                            debug_assert!(lost.is_none(), "the container just held this");
+                        }
+                        (taken, refused)
+                    }
+                };
+                if refused == Some(taken) {
+                    continue; // nothing moved; no update to send
+                }
+                c.inventory_dirty = true;
+                world.prune_block_data(soils_protocol::chunk_of(target));
+                let contents = world.container_view(target, slots);
+                broadcast_container(&clients, &world_name, target, contents);
             }
             ClientMsg::Inputs { ack_tick, frames } => {
                 // Server authority: the client sends *inputs*, the server
@@ -1511,7 +1636,7 @@ fn drain_inboxes(
     // Phase 3: disconnects (any final messages above were already applied).
     // Peers learn via the interest diff once the entity despawns.
     for id in gone {
-        if let Some(c) = clients.0.remove(&id) {
+        if let Some(mut c) = clients.0.remove(&id) {
             if let Some(entity) = c.entity {
                 commands.entity(entity).despawn();
             }
@@ -1545,6 +1670,7 @@ fn drain_inboxes(
                 player_count.0.fetch_sub(1, Ordering::Relaxed);
                 script_events.0.push(ScriptEvent::PlayerLeave { netid: c.self_net as u32 });
                 let world = worlds.get_or_create(&c.world);
+                close_container(&mut c, world);
                 for pos in c.subs {
                     world.dec_ref(pos);
                 }
@@ -2219,6 +2345,90 @@ fn pick_up_items(
                 }
                 Some(_) => {}
             }
+        }
+    }
+}
+
+/// How many slots the block standing at `v` holds, or `None` if it holds
+/// nothing. Read from the world, never from what the client claims is there.
+fn container_slots(world: &World, v: IVec3) -> Option<usize> {
+    world.registry.get(world.voxel(v))?.container.map(|n| n as usize)
+}
+
+/// Push a container's contents to everyone viewing it. Two players may hold
+/// one chest open; neither may see a stale copy of it.
+fn broadcast_container(
+    clients: &Clients,
+    world_name: &str,
+    pos: IVec3,
+    slots: Vec<Option<soils_sim::ItemStack>>,
+) {
+    for c in clients.0.values() {
+        if c.world == world_name && c.open_container == Some(pos) {
+            let _ = c.outbox.send(ServerMsg::ContainerUpdate {
+                pos: pos.to_array(),
+                slots: slots.clone(),
+            });
+        }
+    }
+}
+
+/// Release whatever `c` had open and tell it so. A no-op when nothing is open,
+/// because the paths that call it (disconnect, warp, walked away, block broken)
+/// mostly do not know.
+fn close_container(c: &mut Client, world: &mut World) {
+    let Some(pos) = c.open_container.take() else { return };
+    world.unpin_block_data(soils_protocol::chunk_of(pos));
+    let _ = c.outbox.send(ServerMsg::ContainerClosed { pos: pos.to_array() });
+}
+
+/// Drop `stack` into the world at `pos`, collectable after `ready_at`.
+///
+/// One helper for all three sources — a broken block, a thrown item, and a
+/// container spilling its contents — because they differ only in where and
+/// when, and a fourth divergent copy is how one of them ends up unreplicated.
+#[allow(clippy::too_many_arguments)]
+fn spawn_drop(
+    commands: &mut Commands,
+    next_net: &mut NextNetId,
+    world_name: &str,
+    pos: Vec3,
+    stack: soils_sim::ItemStack,
+    ready_at: u64,
+) {
+    let net = next_net.0;
+    next_net.0 += 1;
+    commands.spawn((
+        NetId(net),
+        Kind(soils_sim::KIND_DROPPED_ITEM),
+        SimState(soils_sim::PlayerState { pos, flying: false, ..Default::default() }),
+        Yaw(0.0),
+        InWorld(world_name.to_string()),
+        DroppedItem(stack),
+        PickupAfter(ready_at),
+    ));
+}
+
+/// Close containers whose viewer walked out of reach, or whose block is no
+/// longer there.
+///
+/// Not a security boundary — reach is re-checked on every transfer — but the
+/// difference between a panel that closes when you step back and one that
+/// hangs around until you click it. It is also what releases the page pin when
+/// a player simply wanders off.
+fn close_unreachable_containers(
+    mut clients: ResMut<Clients>,
+    mut worlds: ResMut<Worlds>,
+    sims: Query<&SimState>,
+) {
+    for c in clients.0.values_mut() {
+        let Some(pos) = c.open_container else { continue };
+        let eye = c.entity.and_then(|e| sims.get(e).ok()).map(|s| s.0.pos);
+        let world = worlds.get_or_create(&c.world);
+        let reachable = eye.is_some_and(|eye| soils_sim::within_reach(eye, pos))
+            && container_slots(world, pos).is_some();
+        if !reachable {
+            close_container(c, world);
         }
     }
 }

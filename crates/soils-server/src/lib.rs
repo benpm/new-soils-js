@@ -10,8 +10,10 @@
 
 mod app;
 mod auth;
+mod paged;
 mod persist;
 mod region;
+mod store;
 mod world;
 
 use persist::{PersistHandle, Persister};

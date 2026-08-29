@@ -303,7 +303,24 @@ const INV_BEATS: &[(f32, InvAction)] = &[
     (15.5, InvAction::WalkOn),
     (18.5, InvAction::OpenScreen),
     (22.5, InvAction::CloseScreen),
+    // Then the container loop. `SelectKey` picks the crate off the hotbar, the
+    // first `Place` puts it down, and the second one lands on the crate that is
+    // now under the crosshair — which opens it rather than building on it.
+    // That is the real binding, not a shortcut: right-click on a container
+    // block is the open gesture.
+    (24.0, InvAction::SelectKey(CRATE_KEY)),
+    (25.0, InvAction::Place),
+    (27.5, InvAction::Place),
+    (32.0, InvAction::CloseScreen),
 ];
+
+/// Hotbar key the Wooden Crate lands on: an empty bar auto-fills in inventory
+/// order, and the crate is the sixth of the server's nine starter blocks.
+///
+/// Coupled to `STARTER_BLOCKS` in `soils-server`, which is why the demo test
+/// asserts on beats rather than on what appeared — a change there makes this
+/// place the wrong block, and the recording is what shows it.
+const CRATE_KEY: u8 = 5;
 
 #[derive(Clone, Copy, PartialEq)]
 enum InvAction {
@@ -312,6 +329,8 @@ enum InvAction {
     WalkOn,
     OpenScreen,
     CloseScreen,
+    /// Press a hotbar digit (0-based).
+    SelectKey(u8),
 }
 
 /// Held movement for the current beat, and any one-shot button presses.
@@ -321,6 +340,8 @@ pub struct BotActions {
     pub click_left: bool,
     pub click_right: bool,
     pub toggle_inventory: bool,
+    /// Hotbar digit to tap this frame (0-based).
+    pub select_key: Option<u8>,
 }
 
 fn drive_inventory(
@@ -399,6 +420,7 @@ pub fn inventory_actions(
             InvAction::Break => actions.click_left = true,
             InvAction::OpenScreen | InvAction::CloseScreen => actions.toggle_inventory = true,
             InvAction::WalkOn => bot.jumps = 0,
+            InvAction::SelectKey(k) => actions.select_key = Some(k),
         }
         bot.beat += 1;
     }
@@ -431,6 +453,12 @@ pub fn press_bot_buttons(
     if std::mem::take(&mut actions.toggle_inventory) {
         keys.reset(KeyCode::KeyE);
         keys.press(KeyCode::KeyE);
+    }
+    if let Some(k) = actions.select_key.take()
+        && let Some(&code) = crate::inventory::hotbar::HOTBAR_KEYS.get(k as usize)
+    {
+        keys.reset(code);
+        keys.press(code);
     }
 }
 

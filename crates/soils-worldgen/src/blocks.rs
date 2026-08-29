@@ -6,6 +6,7 @@
 
 use indexmap::IndexMap;
 use serde::Deserialize;
+use soils_protocol::{Category, Effect, Function, ItemClass};
 
 /// A single block type.
 #[derive(Debug, Clone)]
@@ -20,6 +21,16 @@ pub struct BlockDef {
     /// Emitted radiance (linear RGB), consumed by the radiance-cascades GI as a
     /// per-voxel light source. `[0.0; 3]` for ordinary (non-emitting) blocks.
     pub emission: [f32; 3],
+    /// What this block is as an *item*: which inventory row it lands in, and
+    /// what may stand in for it when a hotbar slot runs dry. Defaults to
+    /// [`ItemClass::BLOCK`] when the YAML says nothing.
+    pub class: ItemClass,
+    /// Item weight in kg, for the inventory screen's load readout.
+    pub weight: f32,
+    /// How many slots this block holds when placed, if it holds anything.
+    /// `None` — the overwhelming majority — is a block with no state beyond its
+    /// id, and never faults a block-data page in.
+    pub container: Option<u16>,
 }
 
 impl BlockDef {
@@ -49,6 +60,21 @@ struct YamlBlock {
     /// Optional linear-RGB emission; absent means non-emitting.
     #[serde(default)]
     emission: Option<[f32; 3]>,
+    /// Item taxonomy, all optional. An unknown value is a parse error rather
+    /// than a silent fallback: a block in no category can never substitute for
+    /// anything, and nothing downstream would notice.
+    #[serde(default)]
+    category: Option<Category>,
+    #[serde(default)]
+    function: Option<Function>,
+    #[serde(default)]
+    effect: Option<Effect>,
+    #[serde(default)]
+    weight: Option<f32>,
+    /// Slot count when placed. Presence is what makes a block a container;
+    /// there is no separate boolean to disagree with it.
+    #[serde(default)]
+    container: Option<u16>,
 }
 
 impl BlockRegistry {
@@ -70,7 +96,19 @@ impl BlockRegistry {
                 2 => [b.faces[1], b.faces[0], b.faces[0]],
                 _ => [b.faces[1], b.faces[0], b.faces[2]],
             };
-            reg.push(BlockDef { name, faces, emission: b.emission.unwrap_or([0.0; 3]) });
+            let class = ItemClass {
+                category: b.category.unwrap_or(ItemClass::BLOCK.category),
+                function: b.function.unwrap_or(ItemClass::BLOCK.function),
+                effect: b.effect.unwrap_or(ItemClass::BLOCK.effect),
+            };
+            reg.push(BlockDef {
+                name,
+                faces,
+                emission: b.emission.unwrap_or([0.0; 3]),
+                class,
+                weight: b.weight.unwrap_or(1.0),
+                container: b.container.filter(|&n| n > 0),
+            });
         }
         Ok(reg)
     }

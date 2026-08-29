@@ -1,4 +1,4 @@
-# Todo — implementation log
+# Tasks
 
 > **Open work lives in [`Tasks.md`](Tasks.md).** This file is the historical
 > record: what shipped in each phase, what was measured, and what was deferred
@@ -9,13 +9,6 @@
 
 <!-- As you complete tasks, add descriptions of your implementation to CHANGELOG.md, and then reference them here, removing their descriptions from here. -->
 <!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. --> 
-
-## Devops
-
-### GitHub Actions
-
-- [ ] Create GitHub Actions workflow for creating builds released through the Releases section
-- [ ] GitHub Pages page created showing videos of all the test cases that can be shown via video. On the Pages site, have different tabs for different branches of the repository. Trigger this workflow whenever there are changes to the repository, including branches other than master.
 
 ## UI
 
@@ -28,6 +21,19 @@ User interface is not like Minecraft's very much.
 - You can use various hotkeys to navigate the UI or pressing Alt to release the mouse cursor for UI interaction.
 - Inventory screen comes up by pressing E, I, Tab, or Escape.
 - A backpack icon with a cirled "E" on it is shown in the left corner of screen, indicating how to open inventory.
+
+**Revised 2026-08-28: there is a hotbar, and it is not Minecraft's.** The first
+bullet no longer holds. Working from the mockup in `scratch/`, the ring was
+replaced by an eight-key bar that holds **references** to item kinds rather than
+items: assigning costs no message and moves nothing, the item stays listed in
+the inventory (dimmed, badged with its key), and when the item runs out the key
+rebinds itself to another of the same category, function and effect — a spent
+Cobblestone becomes Moss Stone, an eaten fruit becomes another healing
+consumable. With no like item to hand the key goes empty and wiggles when
+pressed. That is the part Minecraft does not do, and it is why a bar is worth
+having here: it is a set of standing intentions, not eight more slots to
+micromanage. The ring and the one-slot held-item indicator are gone; the
+inventory screen groups by category instead of showing raw slots.
 
 Phasing, rationale and per-phase test gates: [plan-ui.md](docs/plan-ui.md).
 
@@ -299,3 +305,19 @@ and the cross-cutting notes that shape work elsewhere on the list.
 
 Moved to [`Tasks.md`](Tasks.md): Minecraft-parity block types, biomes, and
 neural tile/structure generation.
+
+---
+*After `ui-inventory` is merged and all tasks above are put into the changelog and removed from this file...*
+
+## Light Upgrade 2.0
+See `plan-better-lighting.md`
+
+## Draw Distance Upgrade 2.0
+WIP, but will involve these things:
+- Chunk compression over network and before copy to GPU mem
+- Chunk LOD, also over network and on GPU
+
+##  GitHub Actions
+
+- [ ] Create GitHub Actions workflow for creating builds released through the Releases section
+- [ ] GitHub Pages page created showing videos of all the test cases that can be shown via video. On the Pages site, have different tabs for different branches of the repository. Trigger this workflow whenever there are changes to the repository, including branches other than master.

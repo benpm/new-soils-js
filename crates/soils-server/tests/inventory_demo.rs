@@ -1,6 +1,7 @@
 //! Records one player working the inventory loop: place a block, mine it back,
-//! watch the item drop where it stood, walk onto it to collect it, and open the
-//! inventory screen to see it counted.
+//! watch the item drop where it stood, walk onto it to collect it, open the
+//! inventory screen to see it counted, and finally put down a Wooden Crate and
+//! right-click it open.
 //!
 //! Ignored by default: it drives a real GPU client and OBS Studio.
 //!
@@ -25,11 +26,11 @@ use std::time::Duration;
 
 /// Beats in the bot's inventory script (`INV_BEATS` in `soils-client::bot`).
 /// The take is only worth publishing if every one of them fired.
-const EXPECTED_BEATS: usize = 10;
+const EXPECTED_BEATS: usize = 14;
 
 /// Seconds of routine to record. The bot's script (`SOILS_BOT=inv`) runs about
-/// 24 s after landing, and landing from the spawn height costs ~5 s.
-const TAKE_SECS: &str = "30";
+/// 33 s after landing, and landing from the spawn height costs ~5 s.
+const TAKE_SECS: &str = "40";
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

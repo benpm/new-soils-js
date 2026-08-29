@@ -19,7 +19,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// v4: inventory. `EntitySpawn` carries an item payload for dropped items,
 /// and the server pushes the authoritative inventory with `InventoryUpdate`.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// v5: containers. Blocks may hold items (`OpenContainer`, `TransferItem`,
+/// `ContainerUpdate`), which the server stores per chunk and streams from disk
+/// on demand — see `soils-server`'s `store.rs`.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Bincode configuration used on both ends. Standard little-endian, variable
 /// int encoding.
@@ -103,6 +107,44 @@ pub enum ClientMsg {
     /// Throw `count` items out of `slot` into the world in front of the
     /// player. `count` is clamped to what the slot holds.
     DropItem { slot: u16, count: u16 },
+    /// Ask to open the container block at an absolute voxel position. The
+    /// server reach-checks it exactly as it does an edit, and answers with
+    /// `ContainerUpdate` — or with nothing at all, if the block is not one.
+    ///
+    /// Opening is not a lock: two players may hold the same chest open, and
+    /// both see every change. That is why a transfer names what to move rather
+    /// than a destination slot — two clients cannot both be right about where
+    /// the next stack lands.
+    OpenContainer { pos: [i32; 3] },
+    /// Stop viewing whatever container this client had open. Idempotent, and
+    /// the server also closes on its own (walked away, broken, disconnected).
+    CloseContainer,
+    /// Move up to `count` items from one side of the open container to the
+    /// other. The destination is whichever side `from` is not — there are only
+    /// two, and letting a client name a destination *slot* would make it model
+    /// the server's stacking rules and be wrong whenever another player is
+    /// touching the same chest.
+    ///
+    /// Ignored unless the client has a container open. Anything that does not
+    /// fit stays where it was.
+    TransferItem { from: SlotRef, count: u16 },
+}
+
+/// One end of an item move, while a container is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SlotRef {
+    /// A slot in the player's own inventory.
+    Pack(u16),
+    /// A slot in the open container.
+    Container(u16),
+}
+
+impl SlotRef {
+    pub fn index(self) -> usize {
+        match self {
+            SlotRef::Pack(i) | SlotRef::Container(i) => i as usize,
+        }
+    }
 }
 
 /// One fixed tick of movement input (see `soils_sim::pack_input`). `seq`
@@ -175,6 +217,15 @@ pub enum ServerMsg {
     /// desync the UI from the authority with no way to notice. Snapshot deltas
     /// exist because entity state is per-tick and large; this is neither.
     InventoryUpdate { slots: Vec<Option<crate::ItemStack>> },
+    /// The contents of a container the client has open — sent on open and
+    /// after every change, to every viewer. Whole rather than delta for the
+    /// same reason as `InventoryUpdate`, and more so: with two players in one
+    /// chest, a lost delta desyncs a shared object.
+    ContainerUpdate { pos: [i32; 3], slots: Vec<Option<crate::ItemStack>> },
+    /// The client no longer has that container open — it was broken, walked
+    /// away from, or its chunk left memory. The client drops the panel; it is
+    /// never the client's decision that a container is still open.
+    ContainerClosed { pos: [i32; 3] },
 }
 
 /// One chunk within a [`ServerMsg::Manifest`].

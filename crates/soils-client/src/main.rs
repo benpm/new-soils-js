@@ -139,7 +139,7 @@ fn main() {
     .init_resource::<actor::InterpClock>()
     .init_resource::<edit::PendingEdits>()
     .init_resource::<light::LightQueue>()
-    .init_resource::<light::PlayerLight>()
+    .insert_resource(light::configured_player_light())
     .init_resource::<light::SkyTerm>()
     .insert_resource(net::connect())
     .insert_resource(discovery::spawn());
@@ -215,7 +215,7 @@ fn main() {
                 .after(server_msg::apply_edits)
                 .after(edit::edit_blocks)
                 .after(light::track_player_light),
-            light::update_sky_term.after(server_msg::apply_time),
+            light::update_sky_term.after(server_msg::apply_time).after(PinnedTime),
         ),
     )
     // Always-on: login flow, day/night, camera interpolation, self-test.
@@ -232,7 +232,7 @@ fn main() {
             hud::toggle_hud,
             actor::interpolate_actors,
             player::sync_camera,
-            self_test_daytime.after(server_msg::apply_time).before(day_night),
+            self_test_daytime.after(server_msg::apply_time).before(day_night).in_set(PinnedTime),
             day_night,
             self_test,
             screenshot_once.after(player::sync_camera),
@@ -346,6 +346,7 @@ fn main() {
             // frame of latency before the fixed tick consumes it.
             bot::drive.run_if(bot::active),
             bot::inventory_actions.run_if(bot::active),
+            bot::light_actions.run_if(bot::active),
         )
             .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop)
             .run_if(login::logged_in),
@@ -458,6 +459,18 @@ fn spectator_camera(
 /// In self-test mode, pin the time of day so screenshots are deterministic
 /// (the server's clock drifts with wall-time). `SOILS_DAYTIME` overrides the
 /// default noon (0.0); e.g. 0.25 = dawn/dusk, 0.5 = midnight.
+/// The frame's authoritative time of day, once [`self_test_daytime`] has
+/// pinned it.
+///
+/// Everything that *reads* `WorldTime.daytime` must run after this, or on the
+/// frames a `ServerMsg::Time` lands it reads the server's drifting clock
+/// instead of the pin — and since that arrives once a second, the result is a
+/// 1 Hz two-value flicker in the sky term and the GI daylight factor, not a
+/// race that averages out. `update_sky_term` quantizes to 1/64, so the two
+/// values are visibly different steps rather than neighbouring ones.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PinnedTime;
+
 fn self_test_daytime(mut world_time: ResMut<WorldTime>) {
     // Honour SOILS_DAYTIME on its own, not only under SOILS_SELFTEST: a
     // recording session needs the light pinned too, or the take drifts into

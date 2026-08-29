@@ -27,6 +27,15 @@ use std::path::PathBuf;
 
 use bevy::prelude::*;
 
+/// How long the light backlog must sit at zero before the world counts as
+/// ready.
+///
+/// One frame is not enough. `record::cue` has no ordering against
+/// `demand::process_demands` or `gpu_light::plan_light_jobs`, so a single zero
+/// reading can be the gap between one frame's drain and the next frame's
+/// intake.
+const LIGHT_SETTLE_SECS: f32 = 1.0;
+
 #[derive(Resource)]
 pub struct CaptureCue {
     ready_file: PathBuf,
@@ -35,6 +44,8 @@ pub struct CaptureCue {
     secs: f32,
     /// When the cue fired.
     started: Option<f32>,
+    /// When the light backlog last became empty, or `None` if it is not.
+    light_quiet_since: Option<f32>,
     done: bool,
 }
 
@@ -59,6 +70,7 @@ pub fn configured() -> Option<CaptureCue> {
         wait: env_f32("SOILS_RECORD_WAIT", 120.0),
         secs: env_f32("SOILS_RECORD_SECS", 20.0),
         started: None,
+        light_quiet_since: None,
         done: false,
     })
 }
@@ -67,6 +79,8 @@ pub fn configured() -> Option<CaptureCue> {
 pub fn cue(
     time: Res<Time>,
     streaming: Res<crate::player::Streaming>,
+    light: Res<crate::light::LightQueue>,
+    light_ready: Option<Res<crate::gpu_light::LightReady>>,
     mut cue: ResMut<CaptureCue>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -78,18 +92,40 @@ pub fn cue(
         return;
     }
 
+    // Streaming being finished is not the same as the world being *lit*.
+    // `process_demands` drops a chunk from the pending set when it dispatches
+    // generation and pushes it onto the light queue, so `pending` reads zero
+    // while the flood for those chunks has not run — and an unflooded chunk is
+    // drawn on the optimistic open-sky assumption, i.e. as full daylight.
+    // Underground that is exactly the phantom-daylight window this demo exists
+    // to show is gone, so the cue waits for the flood to drain as well.
+    //
+    // `LightReady` matters too: `plan_light_jobs` returns early until the
+    // pipelines compile, so the queue can be non-empty *and* undrainable — an
+    // empty reading before then means nothing has started, not that everything
+    // finished.
+    let (queued_chunks, queued_edits, _) = light.backlog();
+    let flood_idle = light_ready.is_some() && queued_chunks == 0 && queued_edits == 0;
+    if !flood_idle {
+        cue.light_quiet_since = None;
+    } else if cue.light_quiet_since.is_none() {
+        cue.light_quiet_since = Some(now);
+    }
+    let lit = cue.light_quiet_since.is_some_and(|t| now - t >= LIGHT_SETTLE_SECS);
+
     let start = match cue.started {
         Some(t) => t,
         None => {
-            let ready = streaming.pending == 0;
+            let ready = streaming.pending == 0 && lit;
             if !ready && now < cue.after + cue.wait {
-                return; // still streaming; nothing worth filming yet
+                return; // still streaming, or still flooding
             }
             if !ready {
+                // Both halves, so a timed-out cue says which one never settled.
                 warn!(
-                    "SOILS_READY_FILE: cueing with {} chunks still streaming — the \
-                     take may open on an unfinished world",
-                    streaming.pending
+                    "SOILS_READY_FILE: cueing with {} chunks streaming and {}+{} light \
+                     jobs queued — the take may open on an unfinished or unlit world",
+                    streaming.pending, queued_chunks, queued_edits
                 );
             }
             if let Err(e) = std::fs::write(&cue.ready_file, format!("{now:.2}")) {

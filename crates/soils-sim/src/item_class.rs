@@ -171,6 +171,11 @@ mod tests {
         assert_eq!(class("Dirt"), class("Grass"));
         assert_eq!(class("Log"), class("Leaves"));
         assert_eq!(class("Wooden Crate"), class("Clay Pot"));
+        // There is no lighting category, so a lamp is a crafted block and a
+        // crate may stand in for a spent lamp key. Asserted so that stays a
+        // decision on the record rather than a surprise on the hotbar — if
+        // lamps ever want their own row, this is the line that fails first.
+        assert_eq!(class("Lamp Block"), class("Wooden Crate"));
         assert_ne!(class("Cobblestone"), class("Dirt"), "stone must not stand in for earth");
         assert_ne!(class("Log"), class("Wooden Crate"));
     }

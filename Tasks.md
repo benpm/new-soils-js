@@ -102,10 +102,19 @@ order that hurts:
       [plan-rgb-light-rework.md](docs/plan-rgb-light-rework.md). A sketch of
       step 1 is in a git stash (`wip: rgb light format`) — read the plan, not
       the stash.
-- [ ] **Author the lamp blocks.** `blocks.yaml` has exactly two emissive blocks
-      (Diamond Ore, Ruby Ore), which is not enough to see colour blending at
-      all. A hue-circle set plus atlas tiles, and a `SOILS_LIGHT_DEMO` room in
-      the shape of `gi_demo.rs` to look at them in.
+- [ ] **Author the lamp blocks** (partly done). The *room* landed 2026-08-29
+      (`lamp-demo`): `ServerConfig.chamber` carves a 49x24x49 hall under spawn,
+      and `light_demo.rs` films a player lighting it. One emissive block came
+      with it — Lamp Block, the first placeable light source, level 15 — plus
+      `scripts/paint_lamp_tile.py`, which makes a new atlas tile a reviewable
+      diff instead of a binary blob.
+      What is still open is the *hue circle*: there are now three emissive
+      blocks and they are all warm-to-cyan, so colour blending still cannot be
+      seen. That wants a set spanning the wheel, and it is worth doing after
+      [plan-rgb-light-rework.md](docs/plan-rgb-light-rework.md) rather than
+      before: the L0 grid is a single monochrome level today and `atlas.wgsl`
+      tints every block light with one hardcoded warm constant, so an authored
+      hue reaches the screen only through the GI bounce.
 - [ ] **Semidirectional sunlight.** Skylight has no direction, so overhangs are
       lit identically at dawn and noon and a wall lights the same on both sides.
       A second 5-bit channel in the light word's spare bits, flooded along a

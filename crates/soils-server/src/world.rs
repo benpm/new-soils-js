@@ -376,6 +376,11 @@ pub struct World {
     pub seed: i64,
     /// Cached `soils_worldgen::graph_hash` of the active generator.
     graph_hash: u64,
+    /// Precomputed inclusive shell box of the demo chamber, in absolute
+    /// voxels, with the ids it is built from: `(min, max, wall, floor)`.
+    /// Derived once in [`World::new`] from the terrain's own surface height,
+    /// so [`World::adopt`] only has to intersect an AABB.
+    chamber: Option<(IVec3, IVec3, u8, u8)>,
 }
 
 /// The six axis directions, in the order [`face_mask`] indexes its bits.
@@ -436,7 +441,7 @@ const SPAWN_Z: i32 = 268;
 /// ~256 surface. It is not cosmetic: players spawn flying, and the open air
 /// under them is where scripted tests build platforms and place blocks within
 /// reach. Shrinking it puts the spawn inside whatever the terrain does there.
-const SPAWN_CLEARANCE: f32 = 29.0;
+pub(crate) const SPAWN_CLEARANCE: f32 = 29.0;
 
 /// Spawn eye position for a world: the generator's own surface height at the
 /// spawn column, plus clearance.
@@ -528,7 +533,13 @@ impl World {
     /// Create (or open) a named world under `data_dir`. Each world persists to
     /// its own region directory and generates from its own `seed`, so different
     /// names yield different terrain.
-    pub fn new(data_dir: &Path, name: &str, seed: u32, persist: PersistHandle) -> Self {
+    pub fn new(
+        data_dir: &Path,
+        name: &str,
+        seed: u32,
+        persist: PersistHandle,
+        chamber: Option<crate::Chamber>,
+    ) -> Self {
         let regions_dir = data_dir.join("worlds").join(name).join("regions");
         // Reclaim space leaked by append-only chunk rewrites. Best-effort and
         // bounded by the leak thresholds; runs before any header is memoised.
@@ -538,7 +549,24 @@ impl World {
         let graph_hash = soils_worldgen::graph_hash(terrain.graph());
         classify_regions(data_dir, name, &regions_dir, &terrain, &registry, graph_hash);
         let spawn = surface_spawn(&terrain, SPAWN_X, SPAWN_Z);
+        // Anchored to the generator's own surface height rather than an
+        // absolute y: with the continental octave the surface at this column
+        // can sit anywhere across hundreds of voxels, so a fixed depth is the
+        // only thing that means the same everywhere.
+        let chamber = chamber.map(|c| {
+            let s = terrain.surface_height(SPAWN_X, SPAWN_Z);
+            let floor = s - c.depth;
+            let wall_id = registry.id_of("Stone").unwrap_or(3);
+            let floor_id = registry.id_of("Cobblestone").unwrap_or(wall_id);
+            (
+                IVec3::new(SPAWN_X - c.half - 1, floor, SPAWN_Z - c.half - 1),
+                IVec3::new(SPAWN_X + c.half + 1, floor + c.height + 1, SPAWN_Z + c.half + 1),
+                wall_id,
+                floor_id,
+            )
+        });
         Self {
+            chamber,
             light_levels: registry.light_table(),
             registry,
             terrain,
@@ -614,14 +642,83 @@ impl World {
     /// client's wave, or a generate-then-edit race), in which case the resident
     /// chunk wins. Enqueues background persistence for what was adopted (a
     /// generated chunk is written once; later rewrites only happen via edits).
-    pub fn adopt(&mut self, pos: IVec3, volume: ChunkVolume) {
+    pub fn adopt(&mut self, pos: IVec3, mut volume: ChunkVolume) {
         if !self.chunks.contains_key(&pos) {
+            // Carve *before* `entry`: it computes the face mask and seeds the
+            // light state from the volume it is handed.
+            let carved = self.carve_chamber(pos, &mut volume);
             // Pristine chunks are no longer persisted — they're reproducible
             // from the world identity (worldgen v2 is deterministic), so they
             // hit disk only once edited (the dirty flush).
-            let entry = self.entry(pos, volume, false);
+            //
+            // A carved chunk is marked edited, and that is load-bearing rather
+            // than bookkeeping. A pristine manifest entry tells the client to
+            // *regenerate* the chunk locally from `GenParams`, which would
+            // reproduce solid rock — the room would exist only on the server.
+            // It also keeps the chunk in the client's CPU mirror, which is
+            // what the placement raycast reads, so a pristine chamber is one
+            // you cannot put a block in either.
+            //
+            // Not marked dirty: the carve is a pure function of the config and
+            // the seed, so an evicted chamber chunk re-carves identically on
+            // its way back in and never needs to reach disk on its own.
+            let entry = self.entry(pos, volume, carved);
             self.chunks.insert(pos, entry);
         }
+    }
+
+    /// Stamp this chunk's slice of the configured chamber into `vol`.
+    /// Returns whether it touched anything.
+    ///
+    /// The room is a solid shell with an air interior: without the shell a
+    /// natural cave could open it to a lit column (skylight falls down a shaft
+    /// with no attenuation) or simply drop the player through the floor.
+    fn carve_chamber(&self, pos: IVec3, vol: &mut ChunkVolume) -> bool {
+        let Some((min, max, wall, floor)) = self.chamber else { return false };
+        let origin = soils_protocol::chunk_origin(pos);
+        let size = soils_protocol::CHUNK_SIZE as i32;
+        // Chunk-vs-box rejection first: all but a dozen chunks in a world
+        // leave here without touching a voxel.
+        if origin.x > max.x
+            || origin.y > max.y
+            || origin.z > max.z
+            || origin.x + size <= min.x
+            || origin.y + size <= min.y
+            || origin.z + size <= min.z
+        {
+            return false;
+        }
+        let lo = min.max(origin);
+        let hi = max.min(origin + IVec3::splat(size - 1));
+        for wy in lo.y..=hi.y {
+            for wz in lo.z..=hi.z {
+                for wx in lo.x..=hi.x {
+                    let inside = wx > min.x
+                        && wx < max.x
+                        && wy > min.y
+                        && wy < max.y
+                        && wz > min.z
+                        && wz < max.z;
+                    // Two 2x2 pillars left standing. A featureless box gives
+                    // the lamplight nothing to fall on, and the whole point of
+                    // the take is watching it land on something.
+                    let pillar = inside
+                        && (wx - SPAWN_X).abs().abs_diff(12) < 2
+                        && (wz - SPAWN_Z).abs().abs_diff(12) < 2;
+                    let id = if pillar {
+                        wall
+                    } else if inside {
+                        0
+                    } else if wy == min.y {
+                        floor
+                    } else {
+                        wall
+                    };
+                    vol.set(wx - origin.x, wy - origin.y, wz - origin.z, id);
+                }
+            }
+        }
+        true
     }
 
     /// Serialize a resident chunk for the wire as a `chunk_codec` payload
@@ -1161,7 +1258,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("soils-world-seal-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let persister = Persister::new();
-        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let mut world = World::new(&dir, "default", 0, persister.handle(), None);
 
         // A solid target with solid neighbours all round. Deep enough that the
         // generator gives solid rock on every face.
@@ -1210,7 +1307,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("soils-world-edge-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let persister = Persister::new();
-        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let mut world = World::new(&dir, "default", 0, persister.handle(), None);
 
         let target = IVec3::new(4, 2, 4);
         for dir_ in FACE_DIRS {
@@ -1239,7 +1336,7 @@ mod tests {
         let pos = IVec3::new(8, 7, 8);
         {
             let persister = Persister::new();
-            let mut world = World::new(&dir, "default", 0, persister.handle());
+            let mut world = World::new(&dir, "default", 0, persister.handle(), None);
             assert!(!world.ensure_resident(pos), "fresh world: nothing on disk yet");
             world.adopt(pos, generate_one(&world, pos));
             let payload = world.serve(pos).expect("adopted chunk is resident");
@@ -1257,7 +1354,7 @@ mod tests {
         // fresh world then loads it from disk instead of regenerating.
         let edited_payload = {
             let persister = Persister::new();
-            let mut world = World::new(&dir, "default", 0, persister.handle());
+            let mut world = World::new(&dir, "default", 0, persister.handle(), None);
             world.adopt(pos, generate_one(&world, pos));
             let v = pos * 32 + IVec3::new(1, 2, 3);
             assert!(world.edit(v.x, v.y, v.z, 3));
@@ -1267,12 +1364,62 @@ mod tests {
             payload
         };
         let persister2 = Persister::new();
-        let mut world2 = World::new(&dir, "default", 0, persister2.handle());
+        let mut world2 = World::new(&dir, "default", 0, persister2.handle(), None);
         assert!(world2.ensure_resident(pos), "edited chunk should load from disk");
         assert_eq!(world2.serve(pos).unwrap(), edited_payload);
         assert_eq!(world2.chunk_edited(pos), Some(true));
         persister2.shutdown();
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The chamber is carved on adoption, and the chunks it touches are
+    /// marked *edited*.
+    ///
+    /// That flag is the whole test. A pristine manifest entry tells the client
+    /// to regenerate the chunk locally from `GenParams`, which reproduces
+    /// solid rock — so an unmarked carve is a room that exists on the server
+    /// and nowhere else, and that the player cannot even place a block in
+    /// (placement raycasts the client's CPU mirror, which only retains chunks
+    /// the server sent as payloads).
+    #[test]
+    fn a_chamber_is_carved_on_adoption_and_marked_edited() {
+        let dir = std::env::temp_dir().join(format!("soils-world-chamber-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let persister = Persister::new();
+        let chamber = crate::Chamber::DEMO;
+        let mut world = World::new(&dir, "default", 0, persister.handle(), Some(chamber));
+
+        // Mid-room, and a voxel in the floor directly below it.
+        let surface = world.terrain.surface_height(SPAWN_X, SPAWN_Z);
+        let floor_y = surface - chamber.depth;
+        let air = IVec3::new(SPAWN_X, floor_y + chamber.height / 2, SPAWN_Z);
+        let cpos = soils_protocol::chunk_of(air);
+
+        world.adopt(cpos, generate_one(&world, cpos));
+        assert_eq!(
+            world.chunk_edited(cpos),
+            Some(true),
+            "a carved chunk must ship as a payload, not as a position the client regenerates"
+        );
+        assert_eq!(world.voxel(air), 0, "the interior must be hollow");
+
+        // The floor plane sits at the box minimum, one below the lowest air.
+        let floor = IVec3::new(SPAWN_X, floor_y, SPAWN_Z);
+        let fpos = soils_protocol::chunk_of(floor);
+        if fpos != cpos {
+            world.adopt(fpos, generate_one(&world, fpos));
+        }
+        assert_ne!(world.voxel(floor), 0, "the player must have something to stand on");
+
+        // Far from spawn is ordinary terrain: the carve is a box test, not a
+        // world-wide rewrite.
+        let away = cpos + IVec3::new(6, 0, 6);
+        world.adopt(away, generate_one(&world, away));
+        assert_eq!(world.chunk_edited(away), Some(false), "untouched chunks stay pristine");
+
+        persister.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1283,7 +1430,7 @@ mod tests {
 
         let pos = IVec3::new(8, 7, 8);
         let persister = Persister::new();
-        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let mut world = World::new(&dir, "default", 0, persister.handle(), None);
         let fresh = generate_one(&world, pos);
         world.adopt(pos, fresh.clone());
 
@@ -1303,7 +1450,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("soils-world-nav-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let persister = Persister::new();
-        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let mut world = World::new(&dir, "default", 0, persister.handle(), None);
 
         // A surface chunk plus its vertical neighbors (the grid samples them).
         // The surface height at this column depends on the worldgen tuning, so
@@ -1391,7 +1538,7 @@ mod tests {
 
         // Surface region around the spawn chunk: sky, terrain, and caves.
         let persister = Persister::new();
-        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let mut world = World::new(&dir, "default", 0, persister.handle(), None);
         let center = IVec3::new(8, 8, 8);
         let chunks = lit_region(&mut world, center);
 
@@ -1409,7 +1556,7 @@ mod tests {
 
         // Fresh oracle: same voxels, full relight from scratch.
         let persister2 = Persister::new();
-        let mut fresh = World::new(&dir, "oracle", 0, persister2.handle());
+        let mut fresh = World::new(&dir, "oracle", 0, persister2.handle(), None);
         for &pos in &chunks {
             let vol = ChunkVolume::from_bytes(
                 soils_protocol::decode_chunk(&world.serve(pos).unwrap()).unwrap().as_bytes(),
@@ -1442,7 +1589,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let persister = Persister::new();
-        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let mut world = World::new(&dir, "default", 0, persister.handle(), None);
         // Deep underground: solid rock threaded with generated caves — the
         // natural home of dark walkable cells, even at noon.
         let center = IVec3::new(8, 4, 8);
@@ -1475,7 +1622,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let persister = Persister::new();
-        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let mut world = World::new(&dir, "default", 0, persister.handle(), None);
         let center = IVec3::new(8, 8, 8);
         lit_region(&mut world, center);
 
@@ -1496,7 +1643,7 @@ mod tests {
 
         let pos = IVec3::new(8, 7, 8);
         let persister = Persister::new();
-        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let mut world = World::new(&dir, "default", 0, persister.handle(), None);
         world.inc_ref(pos);
         world.adopt(pos, generate_one(&world, pos));
         assert!(world.edit(pos.x * 32, pos.y * 32, pos.z * 32, 9), "edit marks dirty");
@@ -1518,7 +1665,7 @@ mod tests {
 
         // A fresh world sees the edited voxels: nothing was lost to eviction.
         let persister2 = Persister::new();
-        let mut world2 = World::new(&dir, "default", 0, persister2.handle());
+        let mut world2 = World::new(&dir, "default", 0, persister2.handle(), None);
         assert!(world2.ensure_resident(pos), "evicted chunk reloads from disk");
         let vol = soils_protocol::decode_chunk(&world2.serve(pos).unwrap()).unwrap();
         assert_eq!(vol.get(0, 0, 0), 9, "edit survived eviction via save-if-dirty");
@@ -1541,7 +1688,7 @@ mod tests {
         let stack = soils_sim::ItemStack::new(soils_sim::ItemKind::Block(4), 17).unwrap();
 
         let persister = Persister::new();
-        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let mut world = World::new(&dir, "default", 0, persister.handle(), None);
         world.adopt(cpos, generate_one(&world, cpos));
         assert!(world.container_mut(v, 27).insert(stack).is_none());
         assert_eq!(world.block_data(cpos).len(), 1);
@@ -1553,7 +1700,7 @@ mod tests {
         persister.shutdown();
 
         let persister2 = Persister::new();
-        let mut world2 = World::new(&dir, "default", 0, persister2.handle());
+        let mut world2 = World::new(&dir, "default", 0, persister2.handle(), None);
         let inv = world2.container_at(v).expect("the chest came back");
         assert_eq!(inv.count_of(soils_sim::ItemKind::Block(4)), 17);
         assert_eq!(world2.block_data_stats().loads, 1, "and it came from the file, not from nowhere");
@@ -1574,7 +1721,7 @@ mod tests {
         persister2.shutdown();
 
         let persister3 = Persister::new();
-        let mut world3 = World::new(&dir, "default", 0, persister3.handle());
+        let mut world3 = World::new(&dir, "default", 0, persister3.handle(), None);
         assert!(world3.container_at(v).is_none(), "an emptied chest leaves nothing to reload");
         assert_eq!(world3.block_data_stats().loads, 0);
 
@@ -1592,7 +1739,7 @@ mod tests {
         let cpos = IVec3::new(2, 2, 2);
         let v = cpos * 32 + IVec3::splat(1);
         let persister = Persister::new();
-        let mut world = World::new(&dir, "default", 0, persister.handle());
+        let mut world = World::new(&dir, "default", 0, persister.handle(), None);
         world.adopt(cpos, generate_one(&world, cpos));
         let stack = soils_sim::ItemStack::new(soils_sim::ItemKind::Block(4), 3).unwrap();
         assert!(world.container_mut(v, 27).insert(stack).is_none());

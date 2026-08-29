@@ -205,6 +205,19 @@ order that hurts:
       generated output of your structure as you edit it, with a tweakable
       ruleset derived from the source map.
 
+- [ ] **GPU pool sizes are compile-time and assert rather than adapt.**
+      `N_SLOTS`/`N_MESH` in `pool.rs` are `const`, and `probe_gpu_caps` panics
+      when the light pool exceeds the adapter's
+      `max_storage_buffer_binding_size` — "lower N_SLOTS/N_MESH for this
+      device", which is advice the program could take itself. Mesa lavapipe
+      offers 128 MiB against a 192 MiB default pool, so CI needs the
+      `small_pools` feature added 2026-08-29 to render at all, and any
+      integrated GPU with a low limit would hit the same wall. The right fix is
+      to clamp the pools to what the adapter reports and log the reduced
+      capacity; it was not done inline because the constants feed buffer sizes,
+      free-lists and slot arithmetic throughout the module, and sizing them
+      dynamically is a real change to the renderer rather than a build profile.
+
 ## Docs and hygiene
 
 - [ ] **Organize [`docs/concepts.md`](docs/concepts.md).** Much of it refers to

@@ -24,6 +24,13 @@ on:
     # recurse — but excluding it means a hand-push to the site does not queue a
     # 90-minute build of a branch with no source on it.
     branches-ignore: ["gh-pages"]
+    # A prose change cannot change a recording, and a run is a release build
+    # plus two takes under a software rasteriser. The TODO asked for "whenever
+    # there are changes"; this is the narrowest reading that still honours it.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".obsidianignore"
   workflow_dispatch:
 
 permissions:
@@ -69,7 +76,13 @@ jobs:
         # Release, not debug: a debug server cannot generate and light chunks
         # fast enough for the world to be on screen at all, and the take opens
         # on empty void. The demo tests say so in their own headers.
-        run: cargo build --release -p soils-client -p soils-server
+        # `small_pools` shrinks the GPU pools to fit lavapipe's 128 MiB
+        # storage-binding limit. Without it the client asserts on a 192 MiB
+        # light pool and dies before drawing anything. Off by default, so this
+        # is the only build that differs.
+        run: |
+          cargo build --release -p soils-server
+          cargo build --release -p soils-client --features small_pools
 
       - name: Start Xvfb
         run: |

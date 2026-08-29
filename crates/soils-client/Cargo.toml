@@ -52,6 +52,12 @@ bytemuck = "1"
 [target.'cfg(target_os = "linux")'.dependencies]
 bevy = { version = "0.19", default-features = false, features = ["x11", "wayland"] }
 
+[features]
+# Shrink the GPU pools to fit a software rasteriser's 128 MiB storage-binding
+# limit. CI only — see `pool.rs`. Off by default, so a normal build is
+# unaffected.
+small_pools = []
+
 [dev-dependencies]
 # Headless GPU test: run the radiance-cascades compute shader on a real device
 # (no window/surface) and compare its output against the CPU oracle.

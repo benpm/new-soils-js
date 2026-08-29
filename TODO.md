@@ -310,12 +310,57 @@ neural tile/structure generation.
 *After `ui-inventory` is merged and all tasks above are put into the changelog and removed from this file...*
 
 ## Light Upgrade 2.0
-See `plan-better-lighting.md`
+
+**Planned, not started.** The detailed plan is written:
+[plan-better-lighting.md](docs/plan-better-lighting.md). Four phases, each
+test-gated, with the payoff concentrated in the first.
+
+Two findings from writing it are worth having here, because they change what
+the section is asking for:
+
+- Three of the idea's five bullets already hold. Fine lighting is GPU-only and
+  never copied back, and it already runs only near the player — phase 12 did
+  that. What is left is shipping the *coarse* grid rather than recomputing it,
+  smoothing it, and ordering the queue.
+- That first item is not a micro-optimisation. The client re-floods every chunk
+  it receives, and the client frame is light-bound: a fresh join spends four to
+  five minutes at ~46 fps against a 116 fps steady state, redoing work the
+  server did moments earlier and discarded.
+
+The reference implementation the idea names, `~/projects/voxel_radiance_cascades`,
+turns out to be missing its cascade passes — all six shader files are
+byte-identical copies of `common.glsl` (md5-verified 2026-08-29, and its own
+`CLAUDE.md` warns of exactly this). The plan records the part that does
+survive, which is the probe layout, and explains why it is worth reading for
+ideas rather than porting: this repo already has a working, oracle-tested
+radiance-cascades implementation using a different direction encoding, and
+none of the five bullets is about direction encoding.
 
 ## Draw Distance Upgrade 2.0
-WIP, but will involve these things:
-- Chunk compression over network and before copy to GPU mem
-- Chunk LOD, also over network and on GPU
+
+**Deferred — not enough detail to build.** Self-labelled WIP, and the two
+bullets name outcomes rather than designs:
+
+- Chunk compression over the network and before the copy to GPU memory
+- Chunk LOD, also over the network and on the GPU
+
+Both need a plan doc before they need code. Notes toward one:
+
+- Chunks are *already* compressed on the wire — palette + LZ4, which took the
+  join burst from 23 MB to 498 KB and has a 2 MB regression gate. So the
+  network half of bullet one is done, and what is actually being asked for is
+  compression **of the GPU-side copy**, which is a different problem with a
+  different constraint: it has to be decompressible by the mesher, not by the
+  CPU.
+- The cheaper prerequisite is already listed in
+  [`Tasks.md`](Tasks.md): *cull all-air chunks*. Occlusion culling withholds
+  sealed chunks but still sends every empty chunk above the terrain, and
+  roughly half the cube is sky. That is the largest single win available here
+  and it needs no new format.
+- LOD interacts with the lighting plan: a downsampled chunk needs downsampled
+  light, and whether that is derived on the client or shipped is the same
+  question [plan-better-lighting.md](docs/plan-better-lighting.md) phase A
+  asks about full-resolution light. Decide them together.
 
 ##  GitHub Actions
 

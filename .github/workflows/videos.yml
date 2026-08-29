@@ -95,6 +95,42 @@ jobs:
           done
           xdpyinfo -display :99 | grep dimensions
 
+      # `screenshots.yml` renders four frames on this same runner, terrain
+      # included, so the client is not broken under lavapipe — yet the demo
+      # clients go silent straight after `gpu caps` and never signal readiness.
+      # The difference is the environment, not the renderer, so probe the two
+      # halves separately before spending an hour on a take. Never fails the
+      # job: this is evidence, not a gate.
+      - name: Probe the client in this environment
+        continue-on-error: true
+        env:
+          DISPLAY: ":99"
+          WGPU_BACKEND: vulkan
+          BEVY_ASSET_ROOT: crates/soils-client
+          RUST_LOG: "soils_client=debug,warn"
+        run: |
+          set -u
+          LVP="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1 || true)"
+          [ -n "$LVP" ] && export VK_ICD_FILENAMES="$LVP" VK_DRIVER_FILES="$LVP"
+
+          echo "=== A: does the shared :99 display work at all? ==="
+          # Exactly what screenshots.yml does, minus its private xvfb-run
+          # display. A PNG here means the display setup is fine and the demo
+          # environment is what differs.
+          rm -f /tmp/soils-selftest.png
+          timeout 150 env SOILS_SELFTEST=1 SOILS_GI_DEMO=1 SOILS_SHOT_SECS=22             SOILS_EXIT_SECS=28 ./target/release/soils-client 2>&1 | tail -25 || true
+          [ -f /tmp/soils-selftest.png ]             && echo "A: PNG produced — display OK"             || echo "A: NO PNG — the shared display is the problem"
+
+          echo "=== B: does a client with the demo's environment cue? ==="
+          ./target/release/soils-server & SRV=$!
+          sleep 5
+          READY=/tmp/probe-ready
+          rm -f "$READY"
+          # The demo env, but cueing early so 150s is enough to see it happen.
+          timeout 150 env             SOILS_AUTOLOGIN=127.0.0.1:9001 SOILS_NAME=probe             SOILS_READY_FILE="$READY" SOILS_RECORD_AFTER=10             SOILS_RECORD_WAIT=60 SOILS_RECORD_SECS=5 SOILS_RECORD_EXIT=1             SOILS_RADIUS=1 SOILS_DAYTIME=0.0 SOILS_VSYNC=1             ./target/release/soils-client 2>&1 | tail -30 || true
+          kill "$SRV" 2>/dev/null || true
+          [ -f "$READY" ]             && echo "B: ready file written — the cue works, timings are the issue"             || echo "B: NO ready file — the cue never fires in the demo environment"
+
       - name: Record the takes
         env:
           DISPLAY: ":99"

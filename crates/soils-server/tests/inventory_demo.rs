@@ -20,7 +20,7 @@
 
 mod common;
 
-use common::{recorder, workspace_root};
+use common::{demo_budget, demo_secs, demo_var, recorder, workspace_root};
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
@@ -61,19 +61,19 @@ fn spawn_bot(
         .env("SOILS_BOT", "inv")
         .env("SOILS_BOT_START", start_file)
         .env("SOILS_READY_FILE", ready_file)
-        .env("SOILS_RECORD_AFTER", "20")
+        .env("SOILS_RECORD_AFTER", demo_secs(20.0))
         // Wait for the world, do not time out into it. The first take of this
         // cued after 60s with 386 chunks still streaming: the player dropped out
         // of fly mode into terrain that did not exist yet and fell through the
         // world, so the whole recording was empty fog. A demo that opens on an
         // unfinished world is not a shorter demo, it is a broken one.
-        .env("SOILS_RECORD_WAIT", "600")
+        .env("SOILS_RECORD_WAIT", demo_secs(600.0))
         .env("SOILS_RECORD_SECS", TAKE_SECS)
         .env("SOILS_RECORD_EXIT", "1")
         // Matches props_demo. A wider radius is more to stream before the take
         // can start and buys nothing at this pitch — the camera is looking at
         // the ground a metre away.
-        .env("SOILS_RADIUS", "2")
+        .env("SOILS_RADIUS", demo_var("SOILS_DEMO_RADIUS", "2"))
         // Midday: the item on the ground has to be readable, and the drop is a
         // 0.3-unit cube.
         .env("SOILS_DAYTIME", "0.0")
@@ -95,7 +95,7 @@ fn await_ready(path: &std::path::Path, kid: &mut Child) {
     // Must exceed the client's own SOILS_RECORD_WAIT, or this gives up first
     // and the failure reads as "client never signalled" rather than "the world
     // took longer than expected to stream".
-    let deadline = std::time::Instant::now() + Duration::from_secs(660);
+    let deadline = std::time::Instant::now() + demo_budget(660.0);
     loop {
         if path.exists() {
             return;

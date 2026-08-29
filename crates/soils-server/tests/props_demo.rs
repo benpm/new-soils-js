@@ -24,7 +24,7 @@
 
 mod common;
 
-use common::{recorder, workspace_root};
+use common::{demo_budget, demo_secs, demo_var, recorder, workspace_root};
 
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -68,11 +68,11 @@ fn spawn_bot(
         .env("SOILS_BOT", role)
         .env("SOILS_BOT_START", start_file)
         .env("SOILS_READY_FILE", ready_file)
-        .env("SOILS_RECORD_AFTER", "20")
-        .env("SOILS_RECORD_WAIT", "60")
+        .env("SOILS_RECORD_AFTER", demo_secs(20.0))
+        .env("SOILS_RECORD_WAIT", demo_secs(60.0))
         .env("SOILS_RECORD_SECS", TAKE_SECS)
         .env("SOILS_RECORD_EXIT", "1")
-        .env("SOILS_RADIUS", "2")
+        .env("SOILS_RADIUS", demo_var("SOILS_DEMO_RADIUS", "2"))
         .env("SOILS_DAYTIME", "0.0")
         .env("SOILS_NOFOCUS", "1")
         .env("SOILS_VSYNC", "1")
@@ -81,7 +81,7 @@ fn spawn_bot(
 }
 
 fn await_ready(paths: &[std::path::PathBuf], kids: &mut [Child]) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let deadline = std::time::Instant::now() + demo_budget(300.0);
     loop {
         if paths.iter().all(|p| p.exists()) {
             return;

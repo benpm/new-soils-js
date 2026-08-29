@@ -50,7 +50,7 @@ env:
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
@@ -101,6 +101,16 @@ jobs:
           WGPU_BACKEND: vulkan
           SOILS_RECORDER: scripts/ffmpeg_record.py
           SOILS_CAPTURE_FPS: "24"
+          # Every timing in these tests is calibrated for a real GPU. There is
+          # none here — Mesa lavapipe rasterises on the CPU — so the budgets
+          # scale together rather than being re-tuned one at a time.
+          SOILS_DEMO_SCALE: "4"
+          # Chunk application on the client is time-boxed per frame, so at a
+          # couple of frames per second `streaming.pending` takes minutes to
+          # reach zero, and that is the cue the recorder waits for. Radius 1
+          # cuts the chunk count cubically; both demos film nose-to-the-ground
+          # and never see the horizon.
+          SOILS_DEMO_RADIUS: "1"
         run: |
           set -u
           # Resolve the lavapipe ICD by glob: an explicit-but-missing

@@ -111,6 +111,16 @@ jobs:
           # cuts the chunk count cubically; both demos film nose-to-the-ground
           # and never see the horizon.
           SOILS_DEMO_RADIUS: "1"
+          # The demos set SOILS_NOFOCUS=1 so a local recording does not steal
+          # the desktop. There is no desktop here, and an unfocused Bevy app is
+          # throttled by winit's default update mode — so on a headless display
+          # that setting only slows the thing down.
+          SOILS_DEMO_NOFOCUS: "0"
+          # The last run told us almost nothing: one `gpu caps` line and no
+          # further client output at all, which is why the cause is still a
+          # guess. Turn the client's own logging up so the next failure is
+          # readable, with the render/wgpu chatter left at warn.
+          RUST_LOG: "soils_client=debug,soils_sim=info,warn"
         run: |
           set -u
           # Resolve the lavapipe ICD by glob: an explicit-but-missing

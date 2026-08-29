@@ -74,7 +74,7 @@ fn spawn_bot(
         .env("SOILS_RECORD_EXIT", "1")
         .env("SOILS_RADIUS", demo_var("SOILS_DEMO_RADIUS", "2"))
         .env("SOILS_DAYTIME", "0.0")
-        .env("SOILS_NOFOCUS", "1")
+        .env("SOILS_NOFOCUS", demo_var("SOILS_DEMO_NOFOCUS", "1"))
         .env("SOILS_VSYNC", "1")
         .spawn()
         .expect("launch bot client")

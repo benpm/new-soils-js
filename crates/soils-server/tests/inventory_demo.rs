@@ -77,7 +77,7 @@ fn spawn_bot(
         // Midday: the item on the ground has to be readable, and the drop is a
         // 0.3-unit cube.
         .env("SOILS_DAYTIME", "0.0")
-        .env("SOILS_NOFOCUS", "1")
+        .env("SOILS_NOFOCUS", demo_var("SOILS_DEMO_NOFOCUS", "1"))
         .env("SOILS_VSYNC", "1")
         // The database is not part of what this films, and leaving it set would
         // make the take depend on a service being up.
@@ -103,7 +103,22 @@ fn await_ready(path: &std::path::Path, kid: &mut Child) {
         if let Ok(Some(status)) = kid.try_wait() {
             panic!("client exited before the world was ready ({status})");
         }
-        assert!(std::time::Instant::now() < deadline, "client never signalled readiness");
+        if std::time::Instant::now() >= deadline {
+            // stderr is piped, and on this path it was previously dropped —
+            // so a timeout said "never signalled readiness" and nothing about
+            // why. Kill the client first: the pipe only reaches EOF once the
+            // writer is gone, so reading it from a live child blocks forever.
+            let _ = kid.kill();
+            let mut log = String::new();
+            if let Some(mut err) = kid.stderr.take() {
+                let _ = err.read_to_string(&mut log);
+            }
+            let tail: Vec<&str> = log.lines().rev().take(40).collect();
+            for line in tail.into_iter().rev() {
+                println!("client| {line}");
+            }
+            panic!("client never signalled readiness (its last output is above)");
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
 }

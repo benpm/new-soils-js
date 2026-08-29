@@ -19,6 +19,8 @@ pub mod heartbeat_reducer;
 pub mod link_identity_reducer;
 pub mod mark_absent_reducer;
 pub mod mark_present_reducer;
+pub mod player_inventory_table;
+pub mod player_inventory_type;
 pub mod player_profile_table;
 pub mod player_profile_type;
 pub mod presence_table;
@@ -26,6 +28,7 @@ pub mod presence_type;
 pub mod put_chunk_blob_reducer;
 pub mod reap_timer_type;
 pub mod register_account_reducer;
+pub mod save_inventory_reducer;
 pub mod save_profile_reducer;
 pub mod send_chat_reducer;
 pub mod server_identity_type;
@@ -48,6 +51,8 @@ pub use heartbeat_reducer::heartbeat;
 pub use link_identity_reducer::link_identity;
 pub use mark_absent_reducer::mark_absent;
 pub use mark_present_reducer::mark_present;
+pub use player_inventory_table::*;
+pub use player_inventory_type::PlayerInventory;
 pub use player_profile_table::*;
 pub use player_profile_type::PlayerProfile;
 pub use presence_table::*;
@@ -55,6 +60,7 @@ pub use presence_type::Presence;
 pub use put_chunk_blob_reducer::put_chunk_blob;
 pub use reap_timer_type::ReapTimer;
 pub use register_account_reducer::register_account;
+pub use save_inventory_reducer::save_inventory;
 pub use save_profile_reducer::save_profile;
 pub use send_chat_reducer::send_chat;
 pub use server_identity_type::ServerIdentity;
@@ -108,6 +114,10 @@ pub enum Reducer {
         name: String,
         password: String,
     },
+    SaveInventory {
+        account: String,
+        items: Vec<u8>,
+    },
     SaveProfile {
         account: String,
         world_id: u16,
@@ -154,6 +164,7 @@ impl __sdk::Reducer for Reducer {
             Reducer::MarkPresent { .. } => "mark_present",
             Reducer::PutChunkBlob { .. } => "put_chunk_blob",
             Reducer::RegisterAccount { .. } => "register_account",
+            Reducer::SaveInventory { .. } => "save_inventory",
             Reducer::SaveProfile { .. } => "save_profile",
             Reducer::SendChat { .. } => "send_chat",
             Reducer::SetPassword { .. } => "set_password",
@@ -227,6 +238,12 @@ impl __sdk::Reducer for Reducer {
                     password: password.clone(),
                 })
             }
+            Reducer::SaveInventory { account, items } => {
+                __sats::bsatn::to_vec(&save_inventory_reducer::SaveInventoryArgs {
+                    account: account.clone(),
+                    items: items.clone(),
+                })
+            }
             Reducer::SaveProfile {
                 account,
                 world_id,
@@ -289,6 +306,7 @@ pub struct DbUpdate {
     chat_message: __sdk::TableUpdate<ChatMessage>,
     chunk_blob: __sdk::TableUpdate<ChunkBlob>,
     game_server: __sdk::TableUpdate<GameServer>,
+    player_inventory: __sdk::TableUpdate<PlayerInventory>,
     player_profile: __sdk::TableUpdate<PlayerProfile>,
     presence: __sdk::TableUpdate<Presence>,
     world: __sdk::TableUpdate<World>,
@@ -309,6 +327,9 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                 "game_server" => db_update
                     .game_server
                     .append(game_server_table::parse_table_update(table_update)?),
+                "player_inventory" => db_update
+                    .player_inventory
+                    .append(player_inventory_table::parse_table_update(table_update)?),
                 "player_profile" => db_update
                     .player_profile
                     .append(player_profile_table::parse_table_update(table_update)?),
@@ -353,6 +374,9 @@ impl __sdk::DbUpdate for DbUpdate {
         diff.game_server = cache
             .apply_diff_to_table::<GameServer>("game_server", &self.game_server)
             .with_updates_by_pk(|row| &row.server_id);
+        diff.player_inventory = cache
+            .apply_diff_to_table::<PlayerInventory>("player_inventory", &self.player_inventory)
+            .with_updates_by_pk(|row| &row.account);
         diff.player_profile = cache
             .apply_diff_to_table::<PlayerProfile>("player_profile", &self.player_profile)
             .with_updates_by_pk(|row| &row.account);
@@ -377,6 +401,9 @@ impl __sdk::DbUpdate for DbUpdate {
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "game_server" => db_update
                     .game_server
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "player_inventory" => db_update
+                    .player_inventory
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "player_profile" => db_update
                     .player_profile
@@ -409,6 +436,9 @@ impl __sdk::DbUpdate for DbUpdate {
                 "game_server" => db_update
                     .game_server
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "player_inventory" => db_update
+                    .player_inventory
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "player_profile" => db_update
                     .player_profile
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
@@ -436,6 +466,7 @@ pub struct AppliedDiff<'r> {
     chat_message: __sdk::TableAppliedDiff<'r, ChatMessage>,
     chunk_blob: __sdk::TableAppliedDiff<'r, ChunkBlob>,
     game_server: __sdk::TableAppliedDiff<'r, GameServer>,
+    player_inventory: __sdk::TableAppliedDiff<'r, PlayerInventory>,
     player_profile: __sdk::TableAppliedDiff<'r, PlayerProfile>,
     presence: __sdk::TableAppliedDiff<'r, Presence>,
     world: __sdk::TableAppliedDiff<'r, World>,
@@ -459,6 +490,11 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
         );
         callbacks.invoke_table_row_callbacks::<ChunkBlob>("chunk_blob", &self.chunk_blob, event);
         callbacks.invoke_table_row_callbacks::<GameServer>("game_server", &self.game_server, event);
+        callbacks.invoke_table_row_callbacks::<PlayerInventory>(
+            "player_inventory",
+            &self.player_inventory,
+            event,
+        );
         callbacks.invoke_table_row_callbacks::<PlayerProfile>(
             "player_profile",
             &self.player_profile,
@@ -1129,6 +1165,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
         chat_message_table::register_table(client_cache);
         chunk_blob_table::register_table(client_cache);
         game_server_table::register_table(client_cache);
+        player_inventory_table::register_table(client_cache);
         player_profile_table::register_table(client_cache);
         presence_table::register_table(client_cache);
         world_table::register_table(client_cache);
@@ -1137,6 +1174,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
         "chat_message",
         "chunk_blob",
         "game_server",
+        "player_inventory",
         "player_profile",
         "presence",
         "world",

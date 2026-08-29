@@ -11,9 +11,8 @@
 //! `Transform.rotation` stays owned by [`mouse_look`] (and ad-hoc `look_at`
 //! callers like the self-test framing).
 
-use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use std::collections::VecDeque;
 
 use soils_protocol::{CHUNK_BIT, ClientMsg, InputFrame};
@@ -22,7 +21,76 @@ use soils_sim::{PlayerInput, PlayerState};
 use crate::chunk::{ChunkMap, VoxelChunk, voxel_at};
 use crate::net::NetClient;
 
-const MOUSE_SENS: f32 = 0.0022;
+/// Radians of camera rotation per raw mouse count at sensitivity 1.0. Roughly
+/// Minecraft's default, which assumes an 800-DPI mouse; anything faster wants
+/// [`LookSettings::sensitivity`] below 1.
+const BASE_SENS: f32 = 0.0022;
+
+/// Sensitivity bounds. The low end has to stay usable on an 8000-DPI mouse and
+/// the high end on a 400-DPI one, which is most of two decades.
+pub const SENS_MIN: f32 = 0.1;
+pub const SENS_MAX: f32 = 5.0;
+/// One press of the pause menu's -/+ .
+pub const SENS_STEP: f32 = 0.1;
+
+/// Mouse-look tuning. A multiplier over [`BASE_SENS`], so 1.0 is the default
+/// feel and the number means the same thing whatever the base becomes.
+///
+/// Not persisted — like the load radius and the render toggles, it lasts the
+/// session. `SOILS_SENS` sets the starting value, which is also how a headless
+/// or scripted run pins it.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct LookSettings {
+    pub sensitivity: f32,
+}
+
+impl Default for LookSettings {
+    fn default() -> Self {
+        let from_env =
+            std::env::var("SOILS_SENS").ok().and_then(|v| v.parse::<f32>().ok());
+        Self { sensitivity: from_env.unwrap_or(1.0).clamp(SENS_MIN, SENS_MAX) }
+    }
+}
+
+impl LookSettings {
+    /// Set the multiplier, clamped to the supported range. Every writer (menu,
+    /// console) goes through this so none of them can park the camera on a
+    /// sensitivity of zero or a negative one that inverts both axes at once.
+    pub fn set(&mut self, sensitivity: f32) {
+        self.sensitivity = if sensitivity.is_finite() {
+            sensitivity.clamp(SENS_MIN, SENS_MAX)
+        } else {
+            self.sensitivity
+        };
+    }
+
+    /// Nudge by `steps` of [`SENS_STEP`], snapped to the step grid so repeated
+    /// presses can't accumulate float drift into "0.7000001".
+    pub fn nudge(&mut self, steps: i32) {
+        let raw = self.sensitivity / SENS_STEP + steps as f32;
+        self.set(raw.round() * SENS_STEP);
+    }
+
+    /// Radians per raw mouse count.
+    fn radians_per_count(self) -> f32 {
+        BASE_SENS * self.sensitivity
+    }
+}
+
+/// Largest per-report mouse delta that can be a real relative movement, in
+/// raw device counts. A 1000 Hz mouse would have to travel metres per second
+/// at 8000 DPI to exceed this; nothing reaches it by hand.
+///
+/// Reports *above* it are not fast movement, they are a different coordinate
+/// system. Some pointing devices — Wacom tablets, VM and remote-desktop
+/// pointers, a few KVMs — send raw mouse input in *absolute* mode, where the
+/// report carries a 0..65535 screen coordinate instead of a delta. winit's
+/// Windows backend does not filter those out (it tests `MOUSE_MOVE_RELATIVE`,
+/// which is zero, so the test always passes), so the coordinate arrives as a
+/// `MouseMotion` delta. Integrated as one it swings yaw by tens of radians and
+/// pins pitch to its clamp — the camera ends up stuck facing the ground while
+/// the smallest movement spins the view.
+const MAX_RAW_DELTA: f32 = 1500.0;
 
 #[derive(Component)]
 pub struct Player {
@@ -300,43 +368,40 @@ pub fn sync_camera(
     transform.translation = player.prev_pos.lerp(player.sim.pos, fixed_time.overstep_fraction());
 }
 
-/// Toggle pointer-lock with Escape; re-grab on click.
-pub fn cursor_toggle(
-    keys: Res<ButtonInput<KeyCode>>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
-) {
-    let Ok(mut cursor) = cursor.single_mut() else { return };
-    if keys.just_pressed(KeyCode::Escape) {
-        cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
-    } else if buttons.just_pressed(MouseButton::Left)
-        || buttons.just_pressed(MouseButton::Right)
-    {
-        cursor.grab_mode = CursorGrabMode::Locked;
-        cursor.visible = false;
-    }
-}
 
 /// Mouse-look: accumulate yaw/pitch and orient the camera.
+///
+/// Reads the individual reports rather than `AccumulatedMouseMotion` so a
+/// single absolute-mode report (see [`MAX_RAW_DELTA`]) can be dropped on its
+/// own; the accumulated resource has already folded it into the frame's sum by
+/// the time we could see it.
 pub fn mouse_look(
-    motion: Res<AccumulatedMouseMotion>,
-    cursor: Query<&CursorOptions, With<PrimaryWindow>>,
+    mut motion: MessageReader<MouseMotion>,
+    look: Res<LookSettings>,
     mut query: Query<(&mut Player, &mut Transform)>,
+    mut warned: Local<bool>,
 ) {
-    // Only look while the cursor is grabbed.
-    if let Ok(cursor) = cursor.single() {
-        if cursor.grab_mode == CursorGrabMode::None {
-            return;
+    let mut delta = Vec2::ZERO;
+    for report in motion.read() {
+        if report.delta.x.abs() > MAX_RAW_DELTA || report.delta.y.abs() > MAX_RAW_DELTA {
+            if !std::mem::replace(&mut *warned, true) {
+                warn!(
+                    "ignoring absolute-mode mouse reports (first {:?}): that device \
+                     sends screen coordinates, not deltas; look will not follow it",
+                    report.delta
+                );
+            }
+            continue;
         }
+        delta += report.delta;
     }
-    let delta = motion.delta;
     if delta == Vec2::ZERO {
         return;
     }
+    let sens = look.radians_per_count();
     for (mut player, mut transform) in &mut query {
-        player.yaw -= delta.x * MOUSE_SENS;
-        player.pitch = (player.pitch - delta.y * MOUSE_SENS)
+        player.yaw -= delta.x * sens;
+        player.pitch = (player.pitch - delta.y * sens)
             .clamp(-std::f32::consts::FRAC_PI_2 + 0.01, std::f32::consts::FRAC_PI_2 - 0.01);
         transform.rotation =
             Quat::from_axis_angle(Vec3::Y, player.yaw) * Quat::from_axis_angle(Vec3::X, player.pitch);
@@ -398,4 +463,110 @@ pub fn track_streaming(
         (p.z.floor() as i32) >> CHUNK_BIT,
     );
     streaming.last_chunk = Some(pc);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run [`mouse_look`] over the given reports and return the resulting
+    /// yaw/pitch. No window, no renderer — just the message queue.
+    fn look(reports: &[Vec2]) -> (f32, f32) {
+        look_at_sensitivity(1.0, reports)
+    }
+
+    /// As [`look`], but with an explicit sensitivity multiplier.
+    fn look_at_sensitivity(sensitivity: f32, reports: &[Vec2]) -> (f32, f32) {
+        let mut app = App::new();
+        app.add_message::<MouseMotion>();
+        app.insert_resource(LookSettings { sensitivity });
+        app.add_systems(Update, mouse_look);
+        let e = app.world_mut().spawn((Player::at(Vec3::ZERO), Transform::default())).id();
+        for &delta in reports {
+            app.world_mut().write_message(MouseMotion { delta });
+        }
+        app.update();
+        let p = app.world().entity(e).get::<Player>().unwrap();
+        (p.yaw, p.pitch)
+    }
+
+    #[test]
+    fn ordinary_reports_turn_the_camera() {
+        let (yaw, pitch) = look(&[Vec2::new(100.0, 0.0), Vec2::new(0.0, -50.0)]);
+        assert!((yaw - -100.0 * BASE_SENS).abs() < 1e-6, "yaw {yaw}");
+        assert!((pitch - (-0.5 + 50.0 * BASE_SENS)).abs() < 1e-6, "pitch {pitch}");
+    }
+
+    /// A Wacom tablet (or a VM/remote pointer) reports raw mouse motion in
+    /// absolute mode, and winit passes the 0..65535 screen coordinate through
+    /// as a delta. Integrating it pins pitch to the clamp and spins yaw — the
+    /// camera gets stuck facing the ground. Those reports must be dropped.
+    #[test]
+    fn absolute_mode_reports_are_dropped() {
+        let (yaw, pitch) = look(&[Vec2::new(30000.0, 30000.0), Vec2::new(32000.0, 31000.0)]);
+        assert_eq!((yaw, pitch), (0.0, -0.5), "absolute reports must not move the camera");
+    }
+
+    /// One bad report in a frame must not take the good ones with it: the
+    /// per-report filter exists precisely because the accumulated resource
+    /// would have summed them together.
+    #[test]
+    fn a_bad_report_does_not_poison_the_frame() {
+        let (yaw, _) = look(&[Vec2::new(10.0, 0.0), Vec2::new(40000.0, 0.0), Vec2::new(10.0, 0.0)]);
+        assert!((yaw - -20.0 * BASE_SENS).abs() < 1e-6, "yaw {yaw}");
+    }
+
+    /// The gate has to sit above the fastest real flick, or a high-DPI mouse
+    /// loses reports mid-swipe. 8000 DPI at 1000 Hz moving 3 m/s is ~950
+    /// counts per report.
+    #[test]
+    fn a_fast_flick_still_gets_through() {
+        let (yaw, _) = look(&[Vec2::new(950.0, 0.0)]);
+        assert!((yaw - -950.0 * BASE_SENS).abs() < 1e-6, "yaw {yaw}");
+    }
+
+    #[test]
+    fn sensitivity_scales_both_axes() {
+        let reports = [Vec2::new(100.0, -100.0)];
+        let (slow_yaw, slow_pitch) = look_at_sensitivity(0.5, &reports);
+        let (fast_yaw, fast_pitch) = look_at_sensitivity(2.0, &reports);
+        assert!((fast_yaw - slow_yaw * 4.0).abs() < 1e-6, "{slow_yaw} -> {fast_yaw}");
+        // Pitch starts at -0.5, so compare the travel rather than the value.
+        let (slow, fast) = (slow_pitch + 0.5, fast_pitch + 0.5);
+        assert!((fast - slow * 4.0).abs() < 1e-6, "{slow} -> {fast}");
+    }
+
+    /// Nothing may set a sensitivity of zero (look dies) or a negative one
+    /// (both axes invert at once), whichever writer asks.
+    #[test]
+    fn sensitivity_is_clamped_to_its_range() {
+        let mut s = LookSettings { sensitivity: 1.0 };
+        s.set(0.0);
+        assert_eq!(s.sensitivity, SENS_MIN);
+        s.set(-3.0);
+        assert_eq!(s.sensitivity, SENS_MIN);
+        s.set(1000.0);
+        assert_eq!(s.sensitivity, SENS_MAX);
+        s.set(f32::NAN);
+        assert_eq!(s.sensitivity, SENS_MAX, "NaN must leave the setting alone");
+    }
+
+    /// The menu's -/+ walk the step grid and stop at the ends rather than
+    /// drifting off it.
+    #[test]
+    fn nudging_stays_on_the_step_grid() {
+        let mut s = LookSettings { sensitivity: 1.0 };
+        for _ in 0..3 {
+            s.nudge(-1);
+        }
+        assert!((s.sensitivity - 0.7).abs() < 1e-6, "{}", s.sensitivity);
+        for _ in 0..100 {
+            s.nudge(-1);
+        }
+        assert_eq!(s.sensitivity, SENS_MIN, "must stop at the floor");
+        for _ in 0..1000 {
+            s.nudge(1);
+        }
+        assert_eq!(s.sensitivity, SENS_MAX, "must stop at the ceiling");
+    }
 }

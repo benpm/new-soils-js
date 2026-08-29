@@ -1,11 +1,21 @@
-//! Streaming-throughput scenario: a fresh world's full radius-4 burst (729
-//! chunks) must reach the client promptly. Guards the chunk pipeline's tick
-//! pacing (TODO phase 5) against serializing the burst.
+//! Streaming-throughput scenario: a fresh world's radius-4 burst must reach
+//! the client promptly. Guards the chunk pipeline's tick pacing (TODO phase 5)
+//! against serializing the burst.
+//!
+//! The burst is no longer the whole 729-chunk cube: occlusion culling withholds
+//! chunks sealed behind solid neighbours, so what must arrive promptly is the
+//! visible shell. The assertions that still mean something — promptness, all
+//! pristine, a manifest of a few KB — are unchanged.
 
 mod common;
 
+use std::time::Duration;
+
 use common::{Client, TestServer};
 use soils_protocol::{ChunkInfo, ClientMsg, ServerMsg};
+
+/// The cube the join burst subscribes: radius 4 around the spawn chunk.
+const CUBE: i32 = 729;
 
 #[tokio::test]
 async fn fresh_world_burst_streams_promptly() {
@@ -22,19 +32,32 @@ async fn fresh_world_burst_streams_promptly() {
             }
         }
     }
+    let quiet = Duration::from_millis(600);
     let t0 = std::time::Instant::now();
-    let got = c.collect_chunks(&wave).await;
-    let elapsed = t0.elapsed();
-    println!("729-chunk fresh burst streamed in {} ms", elapsed.as_millis());
-    assert_eq!(got.payloads.len(), 729);
+    let got = c.collect_available(&wave, quiet).await;
+    let elapsed = t0.elapsed().saturating_sub(quiet);
+    let sent = got.payloads.len();
+    println!(
+        "fresh burst: {sent} of {CUBE} chunks streamed in {} ms ({} withheld)",
+        elapsed.as_millis(),
+        CUBE as usize - sent
+    );
+    // The cull withholds the buried interior, so the delivered count is a band
+    // rather than a number. Both ends matter: nothing withheld would mean the
+    // cull stopped working, and a nearly-empty burst would mean it ate the
+    // visible world.
+    assert!(
+        (CUBE as usize / 3..CUBE as usize).contains(&sent),
+        "{sent} of {CUBE} chunks delivered — the cull is either inert or eating the shell"
+    );
     assert!(
         elapsed.as_secs_f32() < 3.0,
-        "fresh 729-chunk burst took {elapsed:?}; the chunk pipeline is pacing waves too slowly"
+        "fresh burst took {elapsed:?}; the chunk pipeline is pacing waves too slowly"
     );
 
     // Manifest streaming gates: a fresh world is all pristine — nothing ships
     // a payload, and the whole burst is a few KB of positions.
-    println!("729-chunk burst manifest cost {} KB", got.wire_bytes / 1024);
+    println!("burst manifest cost {} KB", got.wire_bytes / 1024);
     assert_eq!(got.edited, 0, "fresh world must classify every chunk pristine");
     assert!(
         got.wire_bytes < 100 * 1024,
@@ -53,15 +76,30 @@ async fn pristine_payloads_byte_equal_local_generation() {
 
     // Spread across the join subscription: surface, deep, sky.
     let probes: Vec<[i32; 3]> = vec![[8, 8, 8], [7, 5, 9], [9, 11, 8], [6, 8, 10]];
-    let _ = c.collect_chunks(&probes).await; // wait until they're all resident
-
-    c.send(&ClientMsg::ChunkFetch { positions: probes.clone() }).await;
+    // `[7, 5, 9]` is deep on purpose, and deep chunks are exactly what
+    // occlusion culling withholds — so there is no waiting for delivery here.
+    // `ChunkFetch` is the explicit escape hatch and serves any *subscribed and
+    // resident* position, culled or not; the retry covers the window where the
+    // join burst has not generated a probe yet.
     let mut got = std::collections::HashMap::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while got.len() < probes.len() {
-        if let ServerMsg::Manifest { chunks } = c.next_msg().await {
-            for info in chunks {
-                if let ChunkInfo::Edited { pos, payload } = info {
-                    got.insert(pos, payload);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} of {} probes came back from ChunkFetch",
+            got.len(),
+            probes.len()
+        );
+        c.send(&ClientMsg::ChunkFetch { positions: probes.clone() }).await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < until && got.len() < probes.len() {
+            if let Ok(ServerMsg::Manifest { chunks }) =
+                tokio::time::timeout(Duration::from_millis(200), c.next_msg()).await
+            {
+                for info in chunks {
+                    if let ChunkInfo::Edited { pos, payload } = info {
+                        got.insert(pos, payload);
+                    }
                 }
             }
         }

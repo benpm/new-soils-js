@@ -143,7 +143,14 @@ pub fn setup_actor_assets(
             });
             // Physics props replicate their body *center* (Avian Position), so
             // no eye→center drop; players/critters replicate the eye position.
-            let body_drop = if kind == soils_sim::KIND_PHYSICS_CUBE { 0.0 } else { hy };
+            // Physics props and dropped items replicate their body *centre*;
+            // players and critters replicate the eye position.
+            let body_drop =
+                if matches!(kind, soils_sim::KIND_PHYSICS_CUBE | soils_sim::KIND_DROPPED_ITEM) {
+                    0.0
+                } else {
+                    hy
+                };
             KindAssets { mesh, material, body_drop }
         })
         .collect();

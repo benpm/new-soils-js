@@ -1,24 +1,77 @@
-# Todo - main
-Commit each task. Test before commit. Each header is a different project, likely needing its own branch. After completing tasks, move them to CHANGELOG.md
+# Tasks
 
-Other todo files:
-- [`crates/soils-terrainlab/TODO.md`](crates/soils-terrainlab/TODO.md)
+> **Open work lives in [`Tasks.md`](Tasks.md).** This file is the historical
+> record: what shipped in each phase, what was measured, and what was deferred
+> with the reasoning. Checkoffs here are not re-litigated; they are evidence.
+>
+> `soils-terrainlab` keeps its own:
+> [`crates/soils-terrainlab/TODO.md`](crates/soils-terrainlab/TODO.md).
 
 <!-- As you complete tasks, add descriptions of your implementation to CHANGELOG.md, and then reference them here, removing their descriptions from here. -->
-<!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. -->
-
-## Design
-- [ ] Organize the information in [concepts.md](concepts.md). Some of it refers to Minecraft, so you should research Minecraft and take extensive notes on its mechanics before interpreting and rewriting concepts.md
-- [ ] Clean up this file, moving the finished tasks into [[CHANGELOG]]
+<!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. --> 
 
 ## UI
 
 ### Inventory
+
+Design intent (the source of truth for the plan below):
+
 User interface is not like Minecraft's very much.
 - No hotbar, just a ring indicating all tools and weapons and consumables in your inventory.
 - You can use various hotkeys to navigate the UI or pressing Alt to release the mouse cursor for UI interaction.
 - Inventory screen comes up by pressing E, I, Tab, or Escape.
 - A backpack icon with a cirled "E" on it is shown in the left corner of screen, indicating how to open inventory.
+
+**Revised 2026-08-28: there is a hotbar, and it is not Minecraft's.** The first
+bullet no longer holds. Working from the mockup in `scratch/`, the ring was
+replaced by an eight-key bar that holds **references** to item kinds rather than
+items: assigning costs no message and moves nothing, the item stays listed in
+the inventory (dimmed, badged with its key), and when the item runs out the key
+rebinds itself to another of the same category, function and effect — a spent
+Cobblestone becomes Moss Stone, an eaten fruit becomes another healing
+consumable. With no like item to hand the key goes empty and wiggles when
+pressed. That is the part Minecraft does not do, and it is why a bar is worth
+having here: it is a set of standing intentions, not eight more slots to
+micromanage. The ring and the one-slot held-item indicator are gone; the
+inventory screen groups by category instead of showing raw slots.
+
+Phasing, rationale and per-phase test gates: [plan-ui.md](docs/plan-ui.md).
+
+**Shipped 2026-08-25 (`ui-inventory`).** The loop works: breaking a block drops
+it as a world entity, walking into the drop collects it, placing spends it, and
+the server owns the inventory (protocol v4). What is left is listed under
+[plan-ui.md §9](docs/plan-ui.md#9-what-is-left) — persistence across logout, the
+radial *shape* of the ring, and a TTL for uncollected drops.
+
+- [x] **Decide the Escape binding.** The intent above lists Escape as an
+      inventory key, but Escape is currently the cursor release and therefore
+      the pause menu; both cannot hold. Recommendation and the alternative:
+      [plan-ui.md §6](docs/plan-ui.md#6-open-decisions). Blocks phase 0.
+- [x] **Phase 0 — `UiMode` state.** The client has no UI state machine: the
+      pause menu is shown whenever the cursor is released (`pause.rs:211`), and
+      any click re-grabs it (`player.rs:313`), so an inventory screen cannot be
+      clicked without dismissing itself. Replace the inferred state with a real
+      one, give cursor grab a single owner, and add Alt as a modifier over it.
+      Ships alone with no new UI. Gate: transitions both ways, plus a test that
+      a click in `Inventory` does not re-grab.
+- [x] **Phase 1 — item model in `soils-sim`.** `ItemKind` / `ItemStack` /
+      `Inventory` as plain data, so the server can reuse it unchanged when
+      inventory becomes authoritative. Gate: stacking and count-conservation
+      tests, including insert-into-full returning the remainder.
+- [x] **Phase 2 — item icons.** `blocks.png` is an 8x8 grid of 16x16 tiles and
+      `BlockDef.faces[1]` is the top face, so block icons need no new art.
+      Placeholder tiles for tools/weapons/consumables. Gate: every block in
+      `blocks.yaml` resolves to an in-range tile.
+- [x] **Phase 3 — the ring** (partial). `Hotbar` retired; the strip shows the
+      carried tools/weapons/consumables. Radial layout and hold-to-open
+      selection deferred until tools exist — tracked in `Tasks.md`.
+- [x] **Phase 4 — inventory screen.** E/I/Tab into `UiMode::Inventory`, slot
+      grid, click-to-pick/click-to-place, and the backpack affordance with the
+      circled "E". Gate: open/close per binding; moving a stack conserves it;
+      closing with a stack in hand returns it rather than voiding it.
+- [x] **Phase 5 — authority** (persistence deferred). Protocol v4, server-owned
+      inventory, client mirrors only. Persistence across logout is tracked in
+      `Tasks.md`.
 
 ## BigRefactor
 
@@ -171,7 +224,10 @@ what was measured, and what was deferred with rationale. Current-state documenta
 - [x] Client local Avian world: predicts props, rebases to server snapshots past an epsilon; client terrain colliders from `ChunkMap`. Rendered from the predicted transform. (In-game validated.)
 - [x] Kinematic player proxy (server + client) so props are shoved by the player, movement feel unchanged.
 - [x] `spawn`/`cube` console command → `ClientMsg::SpawnCube` (reach-checked, rate-limited); test.
-- [ ] Optional follow-ups: replicate angular velocity (smoother predicted spin); full two-way player via an Avian character controller (ride on / be pushed by props); interpolation plugin for sub-tick smoothing.
+- [x] Angular velocity replicated (`MASK_ANGVEL` / `BodyAngVel`), so the client
+      predicts a prop's spin between snapshots. Remaining follow-ups (two-way
+      player via an Avian character controller, sub-tick interpolation) are in
+      `Tasks.md`.
 
 ## SpacetimeDB (`stdb/soils-module`, `soils-stdb`) — behind `SOILS_STDB_URI`
 
@@ -240,60 +296,28 @@ as it was, region files only. Setup and schema notes in
 
 ### Remaining
 
-- [ ] **`player_profile` is world-readable**, and it holds every player's last
-      known position. It has to be public: the game server reads it from the
-      SDK cache on login, and a private table has no client accessor at all.
-      Row-level security is the fix and is unimplemented in 2.7.1 — revisit
-      when upstream lands it, rather than declaring a filter that does nothing.
-      The same applies to `chunk_blob`, where the exposure is the stored world
-      rather than player locations.
-- [ ] **`send_chat` trusts the caller's `world_id`.** A client can post into
-      any world's channel. The check wants a presence row for the sender's
-      account in that world, which needs the client to know its real
-      `world_id_for(name)` first — today `Social::chat_world` defaults to 0.
-      Worth doing together with per-world chat channels rather than alone.
-- [ ] **Opening a *new* world on login blocks the tick** for up to 5 s while
-      the restore runs. Correct as written — pristine terrain must not be
-      generated over chunks being recovered — but it is a stall a joining
-      player imposes on everyone. Wants world creation to become asynchronous
-      with joins held until it completes, not a shorter timeout.
-- [ ] **A database-only account cannot log in while the database is down.**
-      The local account file is a cache written when *this* server registers or
-      migrates an account, so a player who signed up against another server has
-      no local record here and `local_auth` answers "no such account". Keeping
-      a local verifier for every successful database login would fix it, at the
-      cost of scattering verifiers across every server a player touches —
-      a deliberate trade, not an oversight.
-- [ ] **`grant_server` is trust-on-first-use.** Whoever claims an empty
-      allowlist first becomes a server. Fine for a local database, a race on a
-      public one; seed the first identity from a trusted console instead.
-- [ ] Decision gate: re-evaluate whether the hybrid split still earns its keep,
-      or whether more should move across.
-
-### Considerations for other work on this list
-
-These are not SpacetimeDB tasks, but they interact with it and will be cheaper
-to get right if the interaction is settled first.
-
-- **Biomes / structures** (Content Expansion below): structure "seeds" placed by
-  blue noise across chunk boundaries are exactly the kind of sparse relational
-  state SpacetimeDB is good at, and a structure spanning chunks needs a claim
-  that survives a server restart. Worth deciding before the generator is written
-  whether seed ownership lives in region files or the database.
-- **Inventory / UI** (above): item stacks are cold relational state and a natural
-  fit for a table, but inventory is also latency-sensitive during play. The
-  likely split is authoritative in `soils-server` during a session, persisted to
-  SpacetimeDB on logout — the same shape as `player_profile`.
-- **Blocks with data-parity to Minecraft**: a larger block registry changes the
-  chunk payload size, and `chunk_blob` payloads above 992 bytes land in
-  SpacetimeDB's content-addressed blob store. Worth re-measuring dedupe rates
-  once palettes get wider.
-- **Networked physics follow-ups**: prop state is hot and per-tick; it should
-  stay out of the database entirely. Anything persisted should be the *resting*
-  state at unload, if at all.
+Moved to [`Tasks.md`](Tasks.md) — the known limits of the hybrid split
+(world-readable `player_profile`/`chunk_blob`, `send_chat` world trust, the
+new-world join stall, database-down logins, `grant_server` trust-on-first-use)
+and the cross-cutting notes that shape work elsewhere on the list.
 
 ## The First Content Expansion
-- [ ] Robust, neural texture gen techniques for tile gen with constraints to create complex 3d structures based on inferred structural relationships and probabilies from example. Ingest minecraft builds from the internet, parsing them, converting them to a compressed structure format. These should be editable in a new mode in game: structure design. Structure design should allow the instant output of applying the structure generation algorithm to your structure as input. You should be aple to tweak the ruleset that gets generated from your source map. Use techniques from the internet
-- [ ] Create block types (even with no real properties yet) to match all blocks in this Minecraft texture pack: (https://github.com/Unity-Resource-Pack/Unity-Modded). Use data files from the texture pack to help understand which tiles are what. Also, start creating some amount of data parity with minecraft files. Replace existing textures with these.
-- [ ] Biomes. Biomes should blend into each other oranically. The color of grass should able to shift in a subtle gradient stored a individual block data. Some biomes have tall trees, some short, some none. Some have rain, clouds, storms. Others, a barren moon-like landscape. Biome transitions might be able to have unique structures, such as small, sparse ponds between wetlands and a desert, or a desert and a tundra. Some biomes are more unique and have more extreme boundaries, such as the Crater Forest, where the boundary is a sheer cliff straight into the dense cannopy of massive trees. Make sure structures can be generated at great quantity along chunk boundaries use blue noise to place structure "seeds", which can fully generate as structures and thus "completing" the chunks it resides, only if all chunks it intersects are otherwise fully generated. Generate chunks in 2x2 blocks of chunks to mitigate large structures being incomplete.
-- [ ] Upgrade to Bevy 0.19
+
+Moved to [`Tasks.md`](Tasks.md): Minecraft-parity block types, biomes, and
+neural tile/structure generation.
+
+---
+*After `ui-inventory` is merged and all tasks above are put into the changelog and removed from this file...*
+
+## Light Upgrade 2.0
+See `plan-better-lighting.md`
+
+## Draw Distance Upgrade 2.0
+WIP, but will involve these things:
+- Chunk compression over network and before copy to GPU mem
+- Chunk LOD, also over network and on GPU
+
+##  GitHub Actions
+
+- [ ] Create GitHub Actions workflow for creating builds released through the Releases section
+- [ ] GitHub Pages page created showing videos of all the test cases that can be shown via video. On the Pages site, have different tabs for different branches of the repository. Trigger this workflow whenever there are changes to the repository, including branches other than master.

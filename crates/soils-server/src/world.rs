@@ -25,14 +25,32 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glam::IVec3;
-use soils_protocol::{CHUNK_BIT, CHUNK_CLIP, ChunkVolume};
+use soils_protocol::{AIR, CHUNK_BIT, CHUNK_CLIP, CHUNK_SIZE, ChunkVolume, chunk_of};
 use soils_worldgen::{BlockRegistry, TerrainGen, WorldType, default_registry};
 
+use soils_sim::block_data::ChunkData;
 use soils_sim::light::{self, ChunkLight, LightWorld};
 use soils_sim::nav;
 
+/// Block data crosses the disk boundary as bincode, the same encoding the wire
+/// uses. `paged` compresses it, so this side stays a plain serialization.
+impl Codec for ChunkData {
+    fn encode(&self) -> Vec<u8> {
+        soils_protocol::encode(self)
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        soils_protocol::decode(bytes)
+    }
+
+    fn is_empty(&self) -> bool {
+        ChunkData::is_empty(self)
+    }
+}
+
 use crate::persist::PersistHandle;
 use crate::region;
+use crate::store::{Codec, Store};
 
 /// Cells with effective light below this count as "dark" for gameplay
 /// (spawn) queries.
@@ -53,6 +71,9 @@ struct ChunkEntry {
     /// Ever edited (from the region header's EDITED_FLAG, set by `edit`).
     /// Pristine chunks stream as manifest positions; edited ones as payloads.
     edited: bool,
+    /// Which of the chunk's six boundary layers are solid all the way across
+    /// (see [`face_mask`]). Drives occlusion culling; recomputed on edit.
+    faces: u8,
     zero_since: Option<Instant>,
 }
 
@@ -323,6 +344,10 @@ pub struct World {
     /// Handle to the background writer: chunk saves are enqueued here instead
     /// of being written on the tick path.
     persist: PersistHandle,
+    /// Per-block state the voxel array cannot hold — chest contents, today.
+    /// Same write-back policy as `chunks`, one page per chunk, addressed at the
+    /// same slot index in a parallel file. See `store.rs`.
+    block_data: Store<ChunkData>,
     /// Chunks awaiting a light flood (made resident this session; processed
     /// top-of-column-first by [`pump_light`](World::pump_light)).
     light_queue: Vec<IVec3>,
@@ -351,6 +376,78 @@ pub struct World {
     pub seed: i64,
     /// Cached `soils_worldgen::graph_hash` of the active generator.
     graph_hash: u64,
+}
+
+/// The six axis directions, in the order [`face_mask`] indexes its bits.
+pub const FACE_DIRS: [IVec3; 6] = [
+    IVec3::new(1, 0, 0),
+    IVec3::new(-1, 0, 0),
+    IVec3::new(0, 1, 0),
+    IVec3::new(0, -1, 0),
+    IVec3::new(0, 0, 1),
+    IVec3::new(0, 0, -1),
+];
+
+/// Index of `dir` in [`FACE_DIRS`], or `None` if it is not an axis step.
+fn face_index(dir: IVec3) -> Option<usize> {
+    FACE_DIRS.iter().position(|d| *d == dir)
+}
+
+/// One bit per direction in [`FACE_DIRS`]: set when that boundary layer of the
+/// chunk is solid across all 32x32 of it.
+///
+/// This is what occlusion culling is built on. A chunk whose neighbours all
+/// present a solid layer towards it cannot be seen into and cannot be walked
+/// into, whatever it contains — so the client never needs it, caves and all.
+/// Testing the *neighbours'* layers rather than the chunk's own contents is
+/// what makes the test useful: at depth almost every chunk has some cave air
+/// in it, but the layer between two of them is usually still solid.
+fn face_mask(vol: &ChunkVolume) -> u8 {
+    let n = CHUNK_SIZE - 1;
+    let mut mask = 0u8;
+    for (bit, dir) in FACE_DIRS.iter().enumerate() {
+        let solid = (0..CHUNK_SIZE).all(|a| {
+            (0..CHUNK_SIZE).all(|b| {
+                let (x, y, z) = match (dir.x, dir.y, dir.z) {
+                    (1, 0, 0) => (n, a, b),
+                    (-1, 0, 0) => (0, a, b),
+                    (0, 1, 0) => (a, n, b),
+                    (0, -1, 0) => (a, 0, b),
+                    (0, 0, 1) => (a, b, n),
+                    _ => (a, b, 0),
+                };
+                vol.get(x, y, z) != AIR
+            })
+        });
+        if solid {
+            mask |= 1 << bit;
+        }
+    }
+    mask
+}
+
+/// The traditional spawn column. Only x/z are fixed; the height follows the
+/// terrain.
+const SPAWN_X: i32 = 282;
+const SPAWN_Z: i32 = 268;
+/// Eye height above the surface voxel at spawn.
+///
+/// 29 preserves the drop the fixed `[282, 285, 268]` spawn used to have over a
+/// ~256 surface. It is not cosmetic: players spawn flying, and the open air
+/// under them is where scripted tests build platforms and place blocks within
+/// reach. Shrinking it puts the spawn inside whatever the terrain does there.
+const SPAWN_CLEARANCE: f32 = 29.0;
+
+/// Spawn eye position for a world: the generator's own surface height at the
+/// spawn column, plus clearance.
+///
+/// Hardcoding the height stopped being viable when the continental octave
+/// landed — the surface at this column can now sit anywhere across hundreds of
+/// voxels, so a fixed y is either buried in rock or hundreds of blocks up in
+/// the air.
+fn surface_spawn(terrain: &TerrainGen, x: i32, z: i32) -> [f32; 3] {
+    let h = terrain.surface_height(x, z) as f32;
+    [x as f32, h + SPAWN_CLEARANCE, z as f32]
 }
 
 impl World {
@@ -440,6 +537,7 @@ impl World {
         let terrain = Arc::new(TerrainGen::new(seed, WorldType::Normal));
         let graph_hash = soils_worldgen::graph_hash(terrain.graph());
         classify_regions(data_dir, name, &regions_dir, &terrain, &registry, graph_hash);
+        let spawn = surface_spawn(&terrain, SPAWN_X, SPAWN_Z);
         Self {
             light_levels: registry.light_table(),
             registry,
@@ -448,14 +546,13 @@ impl World {
             refs: HashMap::new(),
             light_queue: Vec::new(),
             light_inflight: None,
+            block_data: Store::new(regions_dir.clone(), "b"),
             regions_dir,
             stdb_world_id: None,
             persist,
             header_cache: HashMap::new(),
             navs: HashMap::new(),
-            // Surface near here sits around y=256; spawn a little above it so
-            // the player starts in the open air rather than buried in rock.
-            spawn: [282.0, 285.0, 268.0],
+            spawn,
             seed: seed as i64,
             graph_hash,
         }
@@ -468,6 +565,7 @@ impl World {
             Some(Instant::now())
         };
         self.light_queue.push(pos);
+        let faces = face_mask(&volume);
         ChunkEntry {
             volume,
             light: ChunkLight::dark(),
@@ -475,6 +573,7 @@ impl World {
             version: 0,
             dirty: false,
             edited,
+            faces,
             zero_since,
         }
     }
@@ -583,6 +682,10 @@ impl World {
         entry.dirty = true;
         entry.edited = true;
         entry.version = entry.version.wrapping_add(1);
+        // An edit can punch through a boundary layer, which un-seals whichever
+        // neighbour that layer was hiding. Cheaper to recompute the six masks
+        // than to reason about which one the voxel belonged to.
+        entry.faces = face_mask(&entry.volume);
         let mut lw = WorldLight {
             chunks: &mut self.chunks,
             levels: &self.light_levels,
@@ -594,6 +697,128 @@ impl World {
             self.rebuild_summary(c);
         }
         true
+    }
+
+    /// One chunk's block data, faulting the page in. Absent data reads as an
+    /// empty `ChunkData` — a chunk nobody has put anything in is
+    /// indistinguishable from one that was never written, and neither needs a
+    /// caller to know the difference.
+    ///
+    /// The server reaches for individual blocks rather than whole pages
+    /// ([`container_at`](Self::container_at)); this is the whole-page view the
+    /// tests assert against and the shape a future "what is in this chunk"
+    /// query would use.
+    #[cfg(test)]
+    pub fn block_data(&mut self, cpos: IVec3) -> &ChunkData {
+        self.block_data.get(cpos)
+    }
+
+    /// The container at an absolute voxel position, or `None` if that block
+    /// holds nothing. Cheap on the common answer: the page probe is a memoised
+    /// pointer-table lookup, so asking about a block that has never held
+    /// anything costs no I/O.
+    pub fn container_at(&mut self, v: IVec3) -> Option<&soils_sim::Inventory> {
+        let key = soils_sim::local_key(v.x, v.y, v.z);
+        match self.block_data.get(chunk_of(v)).get(key) {
+            Some(soils_sim::BlockData::Container(inv)) => Some(inv),
+            None => None,
+        }
+    }
+
+    /// A container's contents for the wire, padded out to the block's slot
+    /// count. Read-only on purpose: opening a chest nobody has ever used must
+    /// not create a page for it, and every chest starts that way.
+    pub fn container_view(
+        &mut self,
+        v: IVec3,
+        slots: usize,
+    ) -> Vec<Option<soils_protocol::ItemStack>> {
+        match self.container_at(v) {
+            Some(inv) => inv.slots().to_vec(),
+            None => vec![None; slots],
+        }
+    }
+
+    /// The container at `v`, created with `slots` slots if this is the first
+    /// thing anyone has put in it. Marks the page dirty, so callers that only
+    /// want to *look* must use [`container_at`](Self::container_at).
+    pub fn container_mut(&mut self, v: IVec3, slots: usize) -> &mut soils_sim::Inventory {
+        let key = soils_sim::local_key(v.x, v.y, v.z);
+        self.block_data.get_mut(chunk_of(v)).container_mut(key, slots)
+    }
+
+    /// Drop the data attached to `v` and return it — what breaking a block
+    /// does. The caller owns what comes back; dropping it on the floor is how
+    /// a chest's contents silently vanish.
+    #[must_use = "the contents are lost unless they are spilled or re-stored"]
+    pub fn take_block_data(&mut self, v: IVec3) -> Option<soils_sim::BlockData> {
+        let key = soils_sim::local_key(v.x, v.y, v.z);
+        let cpos = chunk_of(v);
+        // Peek first: a break on an ordinary block must not dirty a page.
+        if self.block_data.get(cpos).get(key).is_none() {
+            return None;
+        }
+        let data = self.block_data.get_mut(cpos).remove(key);
+        self.block_data.get_mut(cpos).prune();
+        data
+    }
+
+    /// Tidy a page after a mutation and hold/release it against eviction.
+    /// A page with an open viewer must stay resident: the alternative is a
+    /// container that empties itself because its page left memory mid-session.
+    pub fn prune_block_data(&mut self, cpos: IVec3) {
+        self.block_data.get_mut(cpos).prune();
+    }
+
+    pub fn pin_block_data(&mut self, cpos: IVec3) {
+        self.block_data.pin(cpos);
+    }
+
+    pub fn unpin_block_data(&mut self, cpos: IVec3) {
+        self.block_data.unpin(cpos);
+    }
+
+    /// Cache counters, for the flush-interval log line and tests.
+    pub fn block_data_stats(&self) -> crate::store::StoreStats {
+        self.block_data.stats()
+    }
+
+    /// Block-data pages currently in memory.
+    pub fn block_data_pages(&self) -> usize {
+        self.block_data.len()
+    }
+
+    /// Is the boundary layer of the chunk at `pos` facing `dir` solid all the
+    /// way across? `None` when the chunk is not resident, which callers must
+    /// read as "not yet known", never as "no".
+    pub fn face_solid(&self, pos: IVec3, dir: IVec3) -> Option<bool> {
+        let entry = self.chunks.get(&pos)?;
+        let bit = face_index(dir)?;
+        Some(entry.faces & (1 << bit) != 0)
+    }
+
+    /// Whether every one of `pos`'s six neighbours presents a solid layer
+    /// towards it, i.e. the chunk is sealed off from the rest of the world.
+    ///
+    /// `None` if any neighbour that `visible` accepts is not resident yet:
+    /// the verdict is undecidable until it is, and guessing "not sealed" would
+    /// leak chunks while guessing "sealed" would hide visible ones. `visible`
+    /// answers whether a neighbour position is one the asking client would
+    /// ever be sent; a neighbour outside that set counts as exposed, which is
+    /// what terminates the question at the edge of a view radius.
+    pub fn sealed(&self, pos: IVec3, visible: impl Fn(IVec3) -> bool) -> Option<bool> {
+        for dir in FACE_DIRS {
+            let n = pos + dir;
+            if !visible(n) {
+                return Some(false);
+            }
+            match self.face_solid(n, -dir) {
+                None => return None,
+                Some(false) => return Some(false),
+                Some(true) => {}
+            }
+        }
+        Some(true)
     }
 
     /// Advance the async lighting pipeline: apply a finished job's results
@@ -832,6 +1057,9 @@ impl World {
                 );
             }
         }
+        // Block data rides the same writer and the same cadence: dirty in RAM
+        // until a flush, never written on the tick thread.
+        self.persist.enqueue_blobs(self.block_data.take_dirty());
     }
 
     /// Evict chunks whose unload timer exceeded `ttl` (save-if-dirty first).
@@ -860,7 +1088,16 @@ impl World {
             // the memoised copy is stale the moment the write lands.
             self.header_cache.remove(&region::region_path(&self.regions_dir, pos));
             self.navs.remove(&pos);
+            // Block data outliving its voxels is a leak with extra steps —
+            // unless something has it open, which `evict` respects.
+            let writes = self.block_data.evict(pos);
+            self.persist.enqueue_blobs(writes);
         }
+        // Pages whose chunk is still resident but that nobody has touched in a
+        // while: a chest read once during a walk past should not stay in RAM
+        // for as long as the terrain around it.
+        let writes = self.block_data.tick_lifecycle(ttl);
+        self.persist.enqueue_blobs(writes);
     }
 
     /// Refresh the cached pathfinding data for `cpos` if its version key
@@ -900,9 +1137,96 @@ mod tests {
     use super::*;
     use crate::persist::Persister;
 
+    /// The lowest-corner voxel of a chunk.
+    fn chunk_origin_of(cpos: IVec3) -> IVec3 {
+        cpos * CHUNK_SIZE
+    }
+
     fn generate_one(world: &World, pos: IVec3) -> ChunkVolume {
         let (terrain, registry) = world.gen_ctx();
         terrain.generate_batch(&[pos], &registry).into_iter().next().unwrap()
+    }
+
+    /// The seal test and the edit that breaks it — the invariant the whole
+    /// occlusion cull rests on.
+    ///
+    /// A player can never trigger this by hand: `CULL_KEEP` keeps the chunks
+    /// around them subscribed, and edit reach is a handful of voxels, so the
+    /// nearest withheld chunk is always tens of voxels out of range. Scripts
+    /// edit at arbitrary coordinates though, and so would a teleport or an
+    /// explosion, which is why the exposure path exists and why it is pinned
+    /// here rather than through a client.
+    #[test]
+    fn breaking_a_boundary_layer_unseals_the_chunk_behind_it() {
+        let dir = std::env::temp_dir().join(format!("soils-world-seal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+
+        // A solid target with solid neighbours all round. Deep enough that the
+        // generator gives solid rock on every face.
+        let target = IVec3::new(4, 2, 4);
+        for dir_ in FACE_DIRS {
+            let n = target + dir_;
+            let vol = generate_one(&world, n);
+            world.adopt(n, vol);
+        }
+        let vol = generate_one(&world, target);
+        world.adopt(target, vol);
+
+        let all_visible = |_: IVec3| true;
+        assert_eq!(
+            world.sealed(target, all_visible),
+            Some(true),
+            "a deep chunk with solid neighbours on every face must be sealed"
+        );
+
+        // Punch one voxel out of the neighbour above's *bottom* layer — the
+        // layer that faces the target. That is the only thing between them.
+        let above = target + IVec3::Y;
+        let floor = chunk_origin_of(above);
+        assert!(world.edit(floor.x, floor.y, floor.z, soils_protocol::AIR), "edit applies");
+
+        assert_eq!(
+            world.sealed(target, all_visible),
+            Some(false),
+            "one hole in the layer above must unseal it"
+        );
+
+        // A neighbour that is not resident is not evidence of anything: the
+        // verdict has to be "unknown", never "sealed".
+        let lonely = IVec3::new(40, 2, 40);
+        assert_eq!(world.sealed(lonely, all_visible), None, "no neighbours, no verdict");
+
+        persister.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Neighbours outside what the client would ever be sent count as open, so
+    /// the outermost shell of a view radius resolves instead of waiting for a
+    /// chunk nobody will generate.
+    #[test]
+    fn a_neighbour_outside_the_view_counts_as_exposed() {
+        let dir = std::env::temp_dir().join(format!("soils-world-edge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+
+        let target = IVec3::new(4, 2, 4);
+        for dir_ in FACE_DIRS {
+            let n = target + dir_;
+            let vol = generate_one(&world, n);
+            world.adopt(n, vol);
+        }
+        let vol = generate_one(&world, target);
+        world.adopt(target, vol);
+
+        // Pretend the chunk above is past the view radius.
+        let above = target + IVec3::Y;
+        assert_eq!(world.sealed(target, |n| n != above), Some(false));
+
+        persister.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1200,6 +1524,94 @@ mod tests {
         assert_eq!(vol.get(0, 0, 0), 9, "edit survived eviction via save-if-dirty");
 
         persister2.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Block data rides the same cache policy as voxels: dirty in memory, out
+    /// on eviction, back off disk on demand. The failure this guards is the
+    /// interesting one — a chest that empties itself because its page left
+    /// memory before its bytes did.
+    #[test]
+    fn block_data_survives_eviction_and_comes_back_off_disk() {
+        let dir = std::env::temp_dir().join(format!("soils-world-blockdata-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let cpos = IVec3::new(8, 7, 8);
+        let v = cpos * 32 + IVec3::new(3, 4, 5);
+        let stack = soils_sim::ItemStack::new(soils_sim::ItemKind::Block(4), 17).unwrap();
+
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+        world.adopt(cpos, generate_one(&world, cpos));
+        assert!(world.container_mut(v, 27).insert(stack).is_none());
+        assert_eq!(world.block_data(cpos).len(), 1);
+
+        // Eviction is what writes it out; nothing has flushed yet.
+        world.tick_lifecycle(Duration::ZERO);
+        assert_eq!(world.resident(), 0);
+        drop(world);
+        persister.shutdown();
+
+        let persister2 = Persister::new();
+        let mut world2 = World::new(&dir, "default", 0, persister2.handle());
+        let inv = world2.container_at(v).expect("the chest came back");
+        assert_eq!(inv.count_of(soils_sim::ItemKind::Block(4)), 17);
+        assert_eq!(world2.block_data_stats().loads, 1, "and it came from the file, not from nowhere");
+
+        // A block with nothing in it costs no I/O: the pointer table says
+        // absent, and that answer is memoised for the whole region.
+        let before = world2.block_data_stats();
+        for i in 0..8 {
+            assert!(world2.container_at(cpos * 32 + IVec3::new(i, 0, 0)).is_none());
+        }
+        assert_eq!(world2.block_data_stats().loads, before.loads, "empty blocks must not inflate");
+
+        // Emptying it clears the slot rather than storing a row of `None`s.
+        assert_eq!(world2.container_mut(v, 27).remove(soils_sim::ItemKind::Block(4), 17), 17);
+        world2.prune_block_data(cpos);
+        world2.flush_dirty();
+        drop(world2);
+        persister2.shutdown();
+
+        let persister3 = Persister::new();
+        let mut world3 = World::new(&dir, "default", 0, persister3.handle());
+        assert!(world3.container_at(v).is_none(), "an emptied chest leaves nothing to reload");
+        assert_eq!(world3.block_data_stats().loads, 0);
+
+        persister3.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An open container pins its page: eviction must not pull the world out
+    /// from under a player who is looking at it.
+    #[test]
+    fn a_pinned_page_outlives_its_chunk() {
+        let dir = std::env::temp_dir().join(format!("soils-world-pinned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let cpos = IVec3::new(2, 2, 2);
+        let v = cpos * 32 + IVec3::splat(1);
+        let persister = Persister::new();
+        let mut world = World::new(&dir, "default", 0, persister.handle());
+        world.adopt(cpos, generate_one(&world, cpos));
+        let stack = soils_sim::ItemStack::new(soils_sim::ItemKind::Block(4), 3).unwrap();
+        assert!(world.container_mut(v, 27).insert(stack).is_none());
+        world.pin_block_data(cpos);
+
+        world.tick_lifecycle(Duration::ZERO);
+        assert_eq!(world.resident(), 0, "the chunk itself still evicts");
+        assert_eq!(
+            world.container_at(v).map(|i| i.count_of(soils_sim::ItemKind::Block(4))),
+            Some(3),
+            "but the pinned page is still in memory, unwritten and intact"
+        );
+        assert_eq!(world.block_data_stats().loads, 0, "it was never re-read");
+
+        world.unpin_block_data(cpos);
+        world.tick_lifecycle(Duration::ZERO);
+        assert_eq!(world.block_data_stats().evictions, 1);
+
+        persister.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

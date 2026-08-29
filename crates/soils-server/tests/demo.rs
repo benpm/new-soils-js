@@ -232,6 +232,11 @@ fn record_two_player_demo() {
                         soils_protocol::ServerMsg::EditAccepted { seq: s, .. } if s == seq => {
                             Some(())
                         }
+                        // Placement spends the block. Without this arm a stock
+                        // shortfall hangs here rather than failing.
+                        soils_protocol::ServerMsg::EditRejected { seq: s } if s == seq => {
+                            panic!("stage block at {x},{z} rejected — out of reach or out of stock")
+                        }
                         _ => None,
                     })
                     .await;

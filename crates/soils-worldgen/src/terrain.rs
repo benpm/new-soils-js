@@ -61,11 +61,15 @@ const CAVE_STEP: i32 = 4;
 const CAVE_N: usize = (CHUNK_SIZE / CAVE_STEP) as usize + 1;
 
 /// Conservative ceiling on the highest solid voxel the height + outcrop math
-/// can produce (256 + summed octave amplitudes 115 scaled by the noise
-/// envelope 0.75 ≈ 87, + max rock 5, with margin). Chunks whose origin is
+/// can produce: the base 256, plus every heightmap amplitude summed
+/// (`CONTINENT_AMPLITUDE` 300 + the five original octaves' 115), plus max rock
+/// 5, with margin. The noise envelope means the real maximum is well under
+/// this; the ceiling only has to be an upper bound, and
+/// `height_envelope_under_max_surface` keeps it honest. Chunks whose origin is
 /// above this are all air. Assumes the default-flavoured graph. Shared with
 /// the GPU gen kernel codegen (`crate::wgsl`).
-pub(crate) const MAX_SURFACE: i32 = 256 + 115 + 5 + 24;
+pub(crate) const MAX_SURFACE: i32 =
+    256 + crate::graph::TerrainGraph::CONTINENT_AMPLITUDE as i32 + 115 + MAX_ROCK + 24;
 /// Max positive contribution of the rock-outcrop term (the other two terms
 /// only subtract).
 pub(crate) const MAX_ROCK: i32 = 5;
@@ -107,6 +111,20 @@ impl TerrainGen {
             .deterministic()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(Self::from_graph(graph, seed, world_type))
+    }
+
+    /// Highest solid voxel of a column, outcrops included — what
+    /// [`Self::generate`] would put the surface at. Cheap: one graph
+    /// evaluation, no chunk.
+    pub fn surface_height(&self, x: i32, z: i32) -> i32 {
+        match self.world_type {
+            WorldType::Flat => 256,
+            WorldType::Normal => {
+                let (h, r, _) =
+                    self.compiled.columns_fx(self.seed, x.wrapping_shl(16), z.wrapping_shl(16));
+                fx::floor(h) + fx::floor(r).max(0)
+            }
+        }
     }
 
     /// The graph this generator evaluates.
@@ -375,6 +393,7 @@ mod tests {
     /// Golden chunk hashes: pins generation output across platforms and
     /// releases. A deliberate algorithm change re-pins these AND bumps
     /// WORLDGEN_ALGO_VERSION.
+
     #[test]
     fn golden_chunk_hashes() {
         let reg = registry();
@@ -387,11 +406,17 @@ mod tests {
             }
             h
         };
+        // Every position straddles its own column's surface (heights here run
+        // 222..342 once the continental octave is in play), so each hash
+        // covers the soil gradient, outcrops and caves. Hashing chunks that
+        // happen to be all-air or all-slate would pin almost nothing.
         let got: Vec<u64> = [
             glam::IVec3::new(0, 8, 0),
-            glam::IVec3::new(2, 8, -3),
-            glam::IVec3::new(6, 4, 7),
-            glam::IVec3::new(-5, 7, 12),
+            glam::IVec3::new(2, 7, -3),
+            glam::IVec3::new(6, 8, 7),
+            glam::IVec3::new(-5, 10, 12),
+            glam::IVec3::new(-20, 6, -18),
+            glam::IVec3::new(24, 9, 30),
         ]
         .iter()
         .map(|&p| hash(&tg.generate(p, &reg)))
@@ -400,10 +425,12 @@ mod tests {
     }
 
     // Captured from the first correct run with the final tuning constants.
-    const GOLDEN_HASHES: [u64; 4] = [
-        4649143715739076006,
-        10333885101303931685,
-        8965844200867111717,
-        322037544446518887,
+    const GOLDEN_HASHES: [u64; 6] = [
+        3014140618640698796,
+        2286582673895210938,
+        16249842187429991510,
+        13760555350052704581,
+        9831198623544717505,
+        2735751282263063509,
     ];
 }

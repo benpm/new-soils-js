@@ -6,7 +6,6 @@ use bevy::prelude::*;
 use soils_protocol::CHUNK_BIT;
 
 use crate::chunk::WorldTime;
-use crate::edit::Hotbar;
 use crate::player::{Player, Streaming};
 
 /// Marker for the debug overlay text node.
@@ -91,11 +90,18 @@ pub fn update_hud(
     slots: Res<crate::pool::ChunkSlots>,
     world_time: Res<WorldTime>,
     streaming: Res<Streaming>,
-    hotbar: Res<Hotbar>,
+    hotbar: Res<crate::inventory::Hotbar>,
+    registry: Res<crate::chunk::Blocks>,
     player: Query<&Transform, With<Player>>,
     mut text: Query<&mut Text, With<DebugHud>>,
 ) {
     let Ok(mut text) = text.single_mut() else { return };
+    // What right-click would place, named. Empty-handed is a real state now
+    // that placement spends the block.
+    let held = match hotbar.selected_block() {
+        Some(id) => registry.0.get(id).map_or("?".to_string(), |b| b.name.clone()),
+        None => "(nothing)".to_string(),
+    };
     let fps = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FPS)
         .and_then(|d| d.smoothed())
@@ -115,12 +121,12 @@ pub fn update_hud(
          chunks loaded {}  radius {}\n\
          generating {pending}  ({progress:.0}%)\n\
          daytime {:.2}\n\
-         block [{}] {}",
+         block {}",
         pos.x, pos.y, pos.z,
         vox.x, vox.y, vox.z,
         chunk.x, chunk.y, chunk.z,
         loaded, streaming.load_radius,
         world_time.daytime,
-        hotbar.selected + 1, hotbar.block_name(),
+        held,
     );
 }

@@ -114,6 +114,8 @@ pub struct EntitySpawned {
     pub id: u32,
     pub kind: u16,
     pub pos: [f32; 3],
+    /// What a dropped item carries; `None` for every other kind.
+    pub item: Option<soils_protocol::ItemStack>,
 }
 
 #[derive(Message)]
@@ -204,31 +206,46 @@ pub fn register(app: &mut App) {
 /// per-chunk [`ChunkReceived`]s. (One writer param per message type — the
 /// param count is the point of this system.)
 #[allow(clippy::too_many_arguments)]
+/// Everything [`route_server_messages`] forwards, bundled.
+///
+/// A Bevy system takes at most sixteen parameters, and the router had exactly
+/// sixteen — so the next message the protocol grew would not have fitted. One
+/// `SystemParam` for the whole fan-out puts the ceiling somewhere far away and
+/// keeps the router's signature about what it *reads* rather than what it
+/// happens to forward.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct Routed<'w> {
+    dir: MessageWriter<'w, DirMsg>,
+    edits: MessageWriter<'w, EditReceived>,
+    spawns: MessageWriter<'w, EntitySpawned>,
+    entities: MessageWriter<'w, EntitiesUpdated>,
+    despawns: MessageWriter<'w, EntityDespawned>,
+    times: MessageWriter<'w, TimeReceived>,
+    inits: MessageWriter<'w, InitReceived>,
+    warps: MessageWriter<'w, WarpReceived>,
+    edit_acks: MessageWriter<'w, EditAck>,
+    login_fails: MessageWriter<'w, LoginFailed>,
+    statuses: MessageWriter<'w, NetStatus>,
+}
+
 pub fn route_server_messages(
     net: Res<NetClient>,
     mut epoch: ResMut<WorldEpoch>,
     mut tracker: ResMut<SnapTracker>,
+    mut inventory: ResMut<crate::inventory::PlayerInventory>,
+    mut container: ResMut<crate::inventory::container::OpenContainer>,
+    mut ui_mode: ResMut<NextState<crate::ui::UiMode>>,
     mut cgen: ResMut<ClientGen>,
-    mut dir_msgs: MessageWriter<DirMsg>,
-    mut edits: MessageWriter<EditReceived>,
-    mut spawns: MessageWriter<EntitySpawned>,
-    mut entities: MessageWriter<EntitiesUpdated>,
-    mut despawns: MessageWriter<EntityDespawned>,
-    mut times: MessageWriter<TimeReceived>,
-    mut inits: MessageWriter<InitReceived>,
-    mut warps: MessageWriter<WarpReceived>,
-    mut edit_acks: MessageWriter<EditAck>,
-    mut login_fails: MessageWriter<LoginFailed>,
-    mut statuses: MessageWriter<NetStatus>,
+    mut out: Routed,
 ) {
     for ev in net.drain() {
         let msg = match ev {
             NetEvent::Connected => {
-                statuses.write(NetStatus("connected".into()));
+                out.statuses.write(NetStatus("connected".into()));
                 continue;
             }
             NetEvent::ConnectFailed(e) => {
-                statuses.write(NetStatus(format!("could not reach server: {e}")));
+                out.statuses.write(NetStatus(format!("could not reach server: {e}")));
                 continue;
             }
             NetEvent::Msg(msg) => msg,
@@ -236,46 +253,69 @@ pub fn route_server_messages(
         match msg {
             ServerMsg::Init { id, self_entity, spawn, worldgen, daytime } => {
                 cgen.configure(worldgen);
-                inits.write(InitReceived { id, self_entity, spawn, daytime });
+                out.inits.write(InitReceived { id, self_entity, spawn, daytime });
             }
             ServerMsg::LoginError { message } => {
-                login_fails.write(LoginFailed(message));
+                out.login_fails.write(LoginFailed(message));
             }
             ServerMsg::Manifest { chunks: infos } => {
-                dir_msgs.write(DirMsg::Manifest { infos, epoch: epoch.0 });
+                out.dir.write(DirMsg::Manifest { infos, epoch: epoch.0 });
             }
             ServerMsg::ChunkUnload { pos } => {
-                dir_msgs.write(DirMsg::Unload { pos, epoch: epoch.0 });
+                out.dir.write(DirMsg::Unload { pos, epoch: epoch.0 });
             }
             ServerMsg::Edit { pos, value } => {
-                edits.write(EditReceived { pos, value, epoch: epoch.0 });
+                out.edits.write(EditReceived { pos, value, epoch: epoch.0 });
             }
             ServerMsg::Time { daytime } => {
-                times.write(TimeReceived(daytime));
+                out.times.write(TimeReceived(daytime));
             }
             ServerMsg::Warp { spawn, worldgen, daytime } => {
                 epoch.0 += 1;
                 tracker.0.clear();
                 cgen.configure(worldgen);
-                warps.write(WarpReceived { spawn, daytime });
+                out.warps.write(WarpReceived { spawn, daytime });
             }
             ServerMsg::EditAccepted { seq, .. } => {
-                edit_acks.write(EditAck { seq, accepted: true });
+                out.edit_acks.write(EditAck { seq, accepted: true });
             }
             ServerMsg::EditRejected { seq } => {
-                edit_acks.write(EditAck { seq, accepted: false });
+                out.edit_acks.write(EditAck { seq, accepted: false });
             }
-            ServerMsg::EntitySpawn { id, kind, pos } => {
-                spawns.write(EntitySpawned { id, kind, pos });
+            ServerMsg::EntitySpawn { id, kind, pos, item } => {
+                out.spawns.write(EntitySpawned { id, kind, pos, item });
+            }
+            ServerMsg::InventoryUpdate { slots } => {
+                // Wholesale replacement: this message *is* the authority, so a
+                // merge would only be a way to keep stale slots alive.
+                inventory.slots = slots;
+            }
+            ServerMsg::ContainerUpdate { pos, slots } => {
+                // The server opening a container is what puts the screen up:
+                // the client asked, but only this says it happened.
+                let pos = IVec3::from_array(pos);
+                if container.pos != Some(pos) {
+                    container.pos = Some(pos);
+                    ui_mode.set(crate::ui::UiMode::Inventory);
+                }
+                container.slots = slots;
+            }
+            ServerMsg::ContainerClosed { pos } => {
+                // Only if it is the one we are showing — a stale close for a
+                // container we already replaced must not blank the panel.
+                if container.pos == Some(IVec3::from_array(pos)) {
+                    container.pos = None;
+                    container.slots.clear();
+                }
             }
             ServerMsg::Snapshot { tick, baseline_tick, last_input_seq, payload } => {
                 if let Some(updated) = tracker.0.apply(tick, baseline_tick, &payload) {
-                    entities.write(EntitiesUpdated { states: updated, tick, last_input_seq });
+                    out.entities.write(EntitiesUpdated { states: updated, tick, last_input_seq });
                 }
             }
             ServerMsg::EntityDespawn { id } => {
                 tracker.0.forget(id);
-                despawns.write(EntityDespawned(id));
+                out.despawns.write(EntityDespawned(id));
             }
         }
     }
@@ -419,6 +459,12 @@ pub fn apply_entity_spawns(
     mut map: ResMut<ActorMap>,
     assets: Res<ActorAssets>,
     physics: Res<crate::physics::ClientPhysics>,
+    icons: Option<Res<crate::inventory::ItemIcons>>,
+    items: Res<crate::inventory::Items>,
+    registry: Res<crate::chunk::Blocks>,
+    mut drops: ResMut<crate::inventory::DroppedItemVisuals>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     for msg in reader.read() {
         if msg.id == local.self_entity || map.map.contains_key(&msg.id) {
@@ -430,13 +476,30 @@ pub fn apply_entity_spawns(
             continue;
         }
         let target = Vec3::from_array(msg.pos);
-        let Some(kind) = assets.kinds.get(msg.kind as usize) else { continue };
+        // A dropped item wears the texture of the block it came from. Its
+        // position is the item's centre, not an eye, so it takes no body drop.
+        let visual = match (msg.kind == soils_sim::KIND_DROPPED_ITEM, msg.item, &icons) {
+            (true, Some(stack), Some(icons)) => {
+                let tile = items.0.view(stack.kind, &registry.0).map_or(0, |v| v.tile);
+                let (mesh, material) =
+                    drops.get(tile, &icons.atlas, &mut meshes, &mut materials);
+                Some((mesh, material, 0.0))
+            }
+            _ => None,
+        };
+        let (mesh, material, drop) = match visual {
+            Some(v) => v,
+            None => {
+                let Some(kind) = assets.kinds.get(msg.kind as usize) else { continue };
+                (kind.mesh.clone(), kind.material.clone(), kind.body_drop)
+            }
+        };
         let entity = commands
             .spawn((
                 Actor::new(msg.kind, 0, target),
-                Mesh3d(kind.mesh.clone()),
-                MeshMaterial3d(kind.material.clone()),
-                Transform::from_translation(target - Vec3::Y * kind.body_drop),
+                Mesh3d(mesh),
+                MeshMaterial3d(material),
+                Transform::from_translation(target - Vec3::Y * drop),
             ))
             .id();
         map.map.insert(msg.id, entity);

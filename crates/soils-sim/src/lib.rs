@@ -7,14 +7,21 @@
 //! per-frame systems (`player.rs`, `edit.rs`) so behavior is unchanged; only
 //! the voxel lookup is abstracted.
 
+pub mod block_data;
 pub mod entities;
+pub mod item;
+pub mod item_class;
 pub mod light;
 pub mod nav;
 
+pub use block_data::{BlockData, ChunkData, LocalPos, local_key};
 pub use entities::{
-    ENTITIES_YAML, EntityDef, EntityRegistry, KIND_CRITTER, KIND_PHYSICS_CUBE, KIND_PLAYER,
+    ENTITIES_YAML, EntityDef, EntityRegistry, KIND_CRITTER, KIND_DROPPED_ITEM,
+    KIND_PHYSICS_CUBE, KIND_PLAYER,
     default_entity_registry,
 };
+pub use item::{ITEM_HALF, Inventory, ItemKind, ItemStack, PICKUP_RADIUS, fall_item};
+pub use item_class::{ITEMS_YAML, ItemDef, ItemRegistry, ItemView, default_item_registry};
 
 use glam::{IVec3, Quat, Vec2, Vec3};
 use soils_worldgen::BlockRegistry;
@@ -357,8 +364,17 @@ pub fn raycast_voxel(origin: Vec3, dir: Vec3, world: &impl VoxelSampler) -> Opti
 /// within [`REACH`] (Chebyshev, matching the raycast metric) of the eye, and
 /// `value` must be a known block id (Air = break is id 0 and always known).
 pub fn validate_edit(eye: Vec3, target: IVec3, value: u8, registry: &BlockRegistry) -> bool {
-    let within = (target - eye.floor().as_ivec3()).abs().max_element() <= REACH;
-    within && registry.get(value).is_some()
+    within_reach(eye, target) && registry.get(value).is_some()
+}
+
+/// Whether `target` is close enough to an eye at `eye` to interact with.
+///
+/// Split out of [`validate_edit`] because opening a container is the same
+/// question minus the block-id check, and two copies of a reach rule is one
+/// copy too many — a server that reach-checks placing but not opening is a
+/// server you can loot a chest through a wall with.
+pub fn within_reach(eye: Vec3, target: IVec3) -> bool {
+    (target - eye.floor().as_ivec3()).abs().max_element() <= REACH
 }
 
 /// Day-length easing ported from the JS `ease10`: a steep ease-in/out that

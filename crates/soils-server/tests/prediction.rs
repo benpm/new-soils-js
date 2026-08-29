@@ -416,7 +416,9 @@ async fn forced_misprediction_reconciles_behind_the_wall() {
     let eye = pred.sim.pos;
     let (feet_y, x0) = ((eye.y - 1.6).floor() as i32, eye.x.floor() as i32);
     let mut edits = 0u32;
-    for value in [3u8, 0] {
+    // Cobblestone: the wall must be a block the player is actually stocked
+    // with, or every placement is refused and the obstacle never exists.
+    for value in [common::HELD_BLOCK, 0] {
         for dz in 1..=3i32 {
             for dx in -1..=1i32 {
                 for dy in 0..3i32 {
@@ -430,7 +432,11 @@ async fn forced_misprediction_reconciles_behind_the_wall() {
             }
         }
         drain(&mut a, &mut pred, self_net).await;
-        if value == 3 {
+        // The build pass, whatever block it used. Comparing against a literal
+        // id silently stops matching the moment the block changes, and the
+        // predictor then never goes stale — the test still runs and proves
+        // nothing.
+        if value != 0 {
             // Let the wall reach the predictor's map, then stop applying
             // edits — the deterministic form of "the world changed
             // server-side inside my staleness window".

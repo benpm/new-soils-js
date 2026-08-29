@@ -1,5 +1,5 @@
 # New Soils
-[CHANGELOG](CHANGELOG.md) - [TODO](TODO.md) - [docs](docs/README.md)
+[CHANGELOG](CHANGELOG.md) - [Tasks](Tasks.md) - [TODO](TODO.md) - [docs](docs/README.md)
 
 A Rust/[Bevy](https://bevyengine.org) port of the original Node.js + Three.js
 `new-soils` voxel sandbox — now a **client/server multiplayer game** with a
@@ -77,11 +77,23 @@ that made it. Rebuilt with `python scripts/deploy_dashboard.py`.
   pathfind to them: per-chunk walkability grids, budgeted A* with jump/fall
   moves, an HPA* region-portal fallback for long routes, and flow fields
   ready for crowds — all invalidated by chunk edit versions.
-- **Worldgen** — multi-octave simplex heightmap, soil gradient, rock
-  outcrops, and 3D-noise caves (lattice-interpolated; a 48-chunk wave
-  generates in ~3.5 ms), persisted to zlib region files.
+- **Worldgen** — multi-octave simplex heightmap over a long-wavelength
+  continental octave (amplitude 300 against 115 for the rest combined, so
+  surfaces run roughly 60-430), soil gradient, rock outcrops, and 3D-noise
+  caves (lattice-interpolated; a 48-chunk wave generates in ~3.5 ms), persisted
+  to zlib region files. Spawn follows the generator's own surface height.
 - **Editing** — raycast break/place with optimistic application and rollback:
   the server validates reach/rate/residency and acks or rejects each edit.
+- **Occlusion-culled streaming** — the server withholds chunks that are sealed
+  behind solid neighbours on all six faces: nothing can see into them or walk
+  into them, so the client never generates, meshes or holds them. 26% of a
+  radius-8 subscription (4913 chunks) at the default terrain. Breaking a seal
+  hands the chunk over.
+- **Inventory and dropped items** — breaking a block yields it as an entity
+  lying in the world; walking into it collects it. Placing spends the block and
+  is refused when the stack is empty. The server owns the inventory and pushes
+  it whole; the client mirrors it and never decides it. Inventory screen on
+  E/I/Tab, with icons drawn from the block atlas.
 - **Player-vs-player collision** — players block, stand and jump on each other.
   Peers are resolved from a tick-boundary snapshot so the client can predict
   the same thing the server will, and a peer already interpenetrating at the
@@ -100,7 +112,8 @@ that made it. Rebuilt with `python scripts/deploy_dashboard.py`.
   variable unset the server behaves exactly as before. A returning player
   resumes where they logged out. See [`stdb/README.md`](stdb/README.md).
 - **The rest** — login/signup accounts, multiple named worlds (`/warp`),
-  LAN discovery, day/night cycle, HUD/console/pause menu.
+  LAN discovery, a 30-minute day/night cycle, a player who is himself a light
+  source, HUD/console/pause menu.
 
 ## Workspace layout
 
@@ -145,7 +158,9 @@ break/place, **1-9** pick a block, **F3** debug overlay, **/** command
 console, **Esc** pause/settings.
 
 Console commands: `tp x y z`, `warp <world>`, `daytime t`, `loadradius n`,
-`fog on|off`, `ao on|off`, `light on|off`, `gi on|off`.
+`sens n` (mouse sensitivity, 0.1-5.0, also in the pause menu), `playerlight n`
+(the player's own emission, 0-15; 0 turns it off), `fog on|off`, `ao on|off`,
+`light on|off`, `gi on|off`.
 
 ### Linux build dependencies
 
@@ -189,9 +204,12 @@ CI renders release screenshots headlessly under Mesa lavapipe
 
 ## Documentation
 
+- [`docs/README.md`](docs/README.md) — index of every doc and what it is for.
+- [`Tasks.md`](Tasks.md) — **open work**, one list: what is left and why it
+  matters, from inventory persistence through biomes.
 - [`docs/architecture.md`](docs/architecture.md) — how every system works
-  today: protocol, transports, server tick, chunk lifecycle, rendering, GI,
-  prediction, pathfinding, testing.
+  today: protocol, transports, server tick, chunk lifecycle, inventory,
+  rendering, GI, prediction, pathfinding, testing.
 - [`docs/perf-report.md`](docs/perf-report.md) — the optimization arc with
   measurements (23 MB → 498 KB joins, 849 → 187 ms bursts, the GI rework),
   methodology, and the ranked list of what to optimize next.
@@ -203,11 +221,16 @@ CI renders release screenshots headlessly under Mesa lavapipe
   guide: the traps this codebase actually produced (the asset-path void, delta
   snapshots that omit unchanged entities, barrier deadlocks that hide the real
   failure), and how to tell them apart quickly.
-- [`TODO.md`](TODO.md) — the 14-phase implementation log; each checkoff
-  records what shipped, what was measured, and what was deferred and why.
+- [`TODO.md`](TODO.md) — the implementation *log*: each checkoff records what
+  shipped, what was measured, and what was deferred and why. Historical —
+  open work lives in [`Tasks.md`](Tasks.md).
 - [`docs/plan-rendering.md`](docs/plan-rendering.md) /
   [`docs/plan-game-systems.md`](docs/plan-game-systems.md) — the original
   plans the phases implement.
+- [`docs/plan-ui.md`](docs/plan-ui.md) — the inventory/UI plan: the item ring,
+  the inventory screen, and the `UiMode` refactor they depend on.
+- [`docs/dev/server-tick.md`](docs/dev/server-tick.md) — tick phase ordering,
+  the determinism rules, and why login runs off the tick thread.
 
 ## Deliberate simplifications vs. the JS original
 

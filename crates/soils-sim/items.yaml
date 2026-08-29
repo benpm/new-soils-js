@@ -1,0 +1,26 @@
+# Tools, weapons and consumables. Ids are the declaration index *within each
+# list*, matching `ItemKind::Tool(0)`, `ItemKind::Weapon(0)`, and so on — the
+# same "id is the index" rule as `entities.yaml` and `blocks.yaml`, so never
+# reorder a list without re-pinning whatever stores a raw id.
+#
+# Blocks are not listed here: they carry their own name, icon tile and item
+# class in `blocks.yaml`, resolved through `BlockRegistry`.
+#
+# All three lists are empty because nothing in the game is a tool, weapon or
+# consumable yet (see `Tasks.md`). The registry exists anyway so the inventory,
+# the hotbar and its substitution rule are written against real data instead of
+# a special case, and so authoring the first fruit is a YAML edit:
+#
+#   tools:
+#     - name: Iron Pickaxe
+#       tile: 0
+#       function: mine
+#       weight: 2.5
+#   consumables:
+#     - name: Large Fruit
+#       tile: 0
+#       effect: healing
+#       weight: 0.4
+tools: []
+weapons: []
+consumables: []

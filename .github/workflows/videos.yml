@@ -140,23 +140,18 @@ jobs:
           # Every timing in these tests is calibrated for a real GPU. There is
           # none here — Mesa lavapipe rasterises on the CPU — so the budgets
           # scale together rather than being re-tuned one at a time.
-          SOILS_DEMO_SCALE: "4"
+          SOILS_DEMO_SCALE: "2"
           # Chunk application on the client is time-boxed per frame, so at a
           # couple of frames per second `streaming.pending` takes minutes to
           # reach zero, and that is the cue the recorder waits for. Radius 1
           # cuts the chunk count cubically; both demos film nose-to-the-ground
           # and never see the horizon.
           SOILS_DEMO_RADIUS: "1"
-          # The demos set SOILS_NOFOCUS=1 so a local recording does not steal
-          # the desktop. There is no desktop here, and an unfocused Bevy app is
-          # throttled by winit's default update mode — so on a headless display
-          # that setting only slows the thing down.
-          SOILS_DEMO_NOFOCUS: "0"
-          # The last run told us almost nothing: one `gpu caps` line and no
-          # further client output at all, which is why the cause is still a
-          # guess. Turn the client's own logging up so the next failure is
-          # readable, with the render/wgpu chatter left at warn.
-          RUST_LOG: "soils_client=debug,soils_sim=info,warn"
+          # Deliberately NOT raising RUST_LOG or forcing focus here. Both were
+          # tried against the "software rendering is too slow" theory, which the
+          # probe below disproved — and more log volume actively worsens the
+          # real bug, which was a stderr pipe nobody was draining.
+          RUST_LOG: "info"
         run: |
           set -u
           # Resolve the lavapipe ICD by glob: an explicit-but-missing

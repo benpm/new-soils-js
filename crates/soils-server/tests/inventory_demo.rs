@@ -22,7 +22,8 @@ mod common;
 
 use common::{demo_budget, demo_secs, demo_var, recorder, workspace_root};
 
-use std::io::Read;
+use std::io::{BufRead, BufReader};
+use std::sync::{Arc, Mutex};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -83,15 +84,43 @@ fn spawn_bot(
         // make the take depend on a service being up.
         .env_remove("SOILS_STDB_URI")
         .env_remove("SOILS_STDB_TOKEN")
-        // Captured so the test can prove the routine ran. Reading it is
-        // deferred until after the client exits, which is safe only because
-        // the pipe is drained in one go at the end — see the wait below.
+        // Captured so the test can prove the routine ran. Drained by a
+        // thread from the moment of spawn — see `drain_stderr`.
         .stderr(Stdio::piped())
         .spawn()
         .expect("launch bot client")
 }
 
-fn await_ready(path: &std::path::Path, kid: &mut Child) {
+/// Read the client's stderr on a thread, into a buffer the test can inspect.
+///
+/// A piped stderr that nobody reads is a 64 KB buffer that fills and then
+/// blocks the writer forever. This client fills it easily — winit repeats
+/// "Cursor could not be confined" every frame on a display with no window
+/// manager, and Bevy adds a `CommandQueue` warning per dropped command — so
+/// the client would log a few lines, wedge on a write, and never reach the
+/// point of signalling readiness. That is precisely what happened on CI: five
+/// runs where the client printed `gpu caps` and then nothing at all for
+/// three quarters of an hour.
+///
+/// The exit path below already knew this ("drain stderr *before* waiting"),
+/// but `await_ready` runs first and nothing was reading during it. Draining
+/// from spawn covers both waits and keeps the log for the beat assertions.
+fn drain_stderr(kid: &mut Child) -> (Arc<Mutex<String>>, Option<std::thread::JoinHandle<()>>) {
+    let buf = Arc::new(Mutex::new(String::new()));
+    let handle = kid.stderr.take().map(|err| {
+        let sink = Arc::clone(&buf);
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                let mut g = sink.lock().unwrap();
+                g.push_str(&line);
+                g.push_str("\n");
+            }
+        })
+    });
+    (buf, handle)
+}
+
+fn await_ready(path: &std::path::Path, kid: &mut Child, log: &Arc<Mutex<String>>) {
     // Must exceed the client's own SOILS_RECORD_WAIT, or this gives up first
     // and the failure reads as "client never signalled" rather than "the world
     // took longer than expected to stream".
@@ -104,16 +133,10 @@ fn await_ready(path: &std::path::Path, kid: &mut Child) {
             panic!("client exited before the world was ready ({status})");
         }
         if std::time::Instant::now() >= deadline {
-            // stderr is piped, and on this path it was previously dropped —
-            // so a timeout said "never signalled readiness" and nothing about
-            // why. Kill the client first: the pipe only reaches EOF once the
-            // writer is gone, so reading it from a live child blocks forever.
+            // Show what the client was doing rather than only that it stopped.
             let _ = kid.kill();
-            let mut log = String::new();
-            if let Some(mut err) = kid.stderr.take() {
-                let _ = err.read_to_string(&mut log);
-            }
-            let tail: Vec<&str> = log.lines().rev().take(40).collect();
+            let captured = log.lock().unwrap().clone();
+            let tail: Vec<&str> = captured.lines().rev().take(40).collect();
             for line in tail.into_iter().rev() {
                 println!("client| {line}");
             }
@@ -142,21 +165,22 @@ fn record_the_inventory_loop() {
     println!("demo server on {addr}");
 
     let mut kid = spawn_bot(addr, "miner", &ready, &start);
+    let (log, drain) = drain_stderr(&mut kid);
 
     // Roll only once the world is on screen. Starting earlier films the join
     // burst, which is a different demo.
-    await_ready(&ready, &mut kid);
+    await_ready(&ready, &mut kid, &log);
     recorder("start");
     std::fs::write(&start, "go").expect("write bot start file");
     println!("client ready; bot released");
 
-    // Drain stderr *before* waiting: a client that fills the pipe buffer would
-    // block forever on a write while we block forever on the exit.
-    let mut log = String::new();
-    if let Some(mut err) = kid.stderr.take() {
-        let _ = err.read_to_string(&mut log);
-    }
     let status = kid.wait().expect("client");
+    // The pipe EOFs when the client exits; join so the buffer is complete
+    // before anything is asserted about it.
+    if let Some(d) = drain {
+        let _ = d.join();
+    }
+    let log = log.lock().unwrap().clone();
     println!("client exited: {status}");
     let recorded = recorder("stop");
 

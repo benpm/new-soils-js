@@ -190,7 +190,7 @@ pub fn apply_directory(
                 if let Some(entity) = map.map.remove(&cpos) {
                     commands.entity(entity).despawn();
                 }
-                slots.unmap_chunk(&mut pool_ops, cpos);
+                slots.unmap_chunk(&mut pool_ops, &mut dirty_mesh, cpos);
                 light_queue.unload(cpos);
             }
             _ => {} // stale epoch

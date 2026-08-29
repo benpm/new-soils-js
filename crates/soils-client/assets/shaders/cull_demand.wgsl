@@ -76,8 +76,23 @@ fn cull(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let info = mesh_info[slot];
-    // Unallocated / freed mesh slots have their light-slot word poisoned.
+    // Freed mesh slots have their light-slot word poisoned (`retire_mesh` in
+    // pool.rs), which also beats the mesher: finalize_mesh runs earlier in the
+    // frame and may have republished draw args from the freed slot's voxels.
+    // Never-allocated slots keep a zeroed row instead and fall through — they
+    // describe chunk (0,0,0) and draw nothing, their vertex_count being 0.
     if (u32(info.w) == TABLE_EMPTY) {
+        indirect[slot * 4u + 1u] = 0u;
+        return;
+    }
+    // Outside the load window: keep the chunk cached, just stop drawing it.
+    // The same Chebyshev box `demand_scan` walks below, so the drawn set and
+    // the demanded set agree. Without this the only render gate is the
+    // frustum, so anything still holding a mesh slot draws at any distance —
+    // and the server unloads at > radius + 1 while loading at <= radius, so
+    // that one-chunk shell would never be demanded and never go away.
+    let d = abs(info.xyz - params.camera_chunk);
+    if (max(d.x, max(d.y, d.z)) > params.radius) {
         indirect[slot * 4u + 1u] = 0u;
         return;
     }

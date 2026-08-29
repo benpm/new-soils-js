@@ -1,5 +1,78 @@
 # Changelog
 ****
+## Five fixes from the PR #8 review
+
+**Branch `ui-inventory`, 2026-08-29.** An independent review of the container
+and hotbar work (gemini CLI over the diff, every finding then verified against
+the code). Nine of its eighteen findings did not survive that check; five that
+did are fixed here, and one is recorded in `Tasks.md` because it is a design
+decision rather than a bug.
+
+### Warping with a chest open unpinned the wrong world
+
+`ClientMsg::Warp` replaced `c.world`, drained the subscription and re-spawned
+the player, but never closed an open container. Two consequences, neither
+visible from a client, which is how it survived being written:
+
+* The old world's block-data page stayed pinned forever, and pinned pages are
+  never evicted.
+* On the next tick `close_unreachable_containers` resolved the *new* world and
+  unpinned there — so if another player had that same chunk's page open in the
+  destination world, their pin was decremented and their live chest's page
+  became evictable underneath them.
+
+One line, before `c.world` is replaced.
+
+### Building over a chest orphaned its contents
+
+Nothing on the server requires the target voxel to be air before a place, so a
+client can send one straight onto a container block. The spill was keyed on
+"this was a break" rather than "the old block is gone", so the page entry
+stayed behind with no container in front of it — invisible, unreachable, and
+inherited by whatever was built on that voxel next.
+
+`if !placing` became `if old != 0`. That whether placement should require air
+at all is a separate question — a gameplay decision about which blocks are
+replaceable in place, not just a missing check — is now in `Tasks.md`.
+
+### A page whose write was still in flight could be evicted and re-read stale
+
+`take_dirty` clears `dirty` and hands the bytes to a channel, so eviction saw
+a clean page and dropped it *and* its header memo while the write was still
+queued. The next `get` re-read the pre-write file and was now resident, stale
+and clean — and the next mutation wrote that stale version back over the good
+one. Pages now carry `in_flight`, set at `take_dirty` and cleared at the next
+one (a whole flush interval later, and the writer is one thread draining an
+mpsc in order), and neither `tick_lifecycle` nor `evict` will drop one.
+
+Found alongside it: `idle_since` was set at fault-in and never moved, so the
+TTL measured *age*, not idleness — a page read every tick was evicted exactly
+`ttl` after it loaded. `get`/`get_mut` now restart the timer.
+
+### Inventory and container messages spent no rate tokens
+
+`Edit` and `Inputs` were bucketed; the five inventory messages were not, and
+`drain_inboxes` pulls the inbox in an unbounded loop. `TransferItem` in
+particular does a fresh `container_view` allocation and sends a
+`ContainerUpdate` to *every* viewer, immediately — so shuffling one item back
+and forth forced unbounded per-tick work and outbound traffic to everyone else
+in the chest. New `UI_RATE` bucket at 64/s, spent by `MoveItem`, `DropItem`,
+`OpenContainer`, `CloseContainer` and `TransferItem`.
+
+### Two smaller ones
+
+`paged::read_block` allocated `vec![0u8; len]` straight from a `u32` read off
+disk, so a truncated region file could ask for 4 GB before the `read_exact`
+that would have failed anyway. It now bounds the length against the file
+first; `compact` already checked the same field.
+
+And the put-back after a refused transfer was guarded by `debug_assert!`,
+which compiles out — so a failure would have silently voided items rather than
+panicking. It now spills the remainder into the world and says so. Currently
+unreachable (it needs a durability item with `max_stack > 1`, and there is
+none), which is exactly why it was worth fixing before the first one exists.
+
+****
 ## Items go in chests, and one cache serves every world structure
 
 **Branch `ui-inventory`, 2026-08-28.** Design and reasoning in

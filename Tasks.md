@@ -70,6 +70,17 @@ order that hurts:
       same three lines, or both need to move behind one `break_block` helper.
       Landed 2026-08-28 with containers; see
       [plan-storage.md §5](docs/plan-storage.md).
+- [ ] **Placing does not require the target to be air.** `validate_edit`
+      checks reach and a known block id, nothing else, and `World::edit`
+      unconditionally `set`s — so a modified client can overwrite any block
+      without breaking it, taking no drop and spending one item. The container
+      feature made this visible (building over a chest used to orphan its
+      contents; that half is fixed — the spill is now keyed on "the old block
+      is gone" rather than "this was a break"), but the gap itself predates it
+      and is a gameplay decision, not just a check: some blocks *should* be
+      replaceable in place, and which ones is a `blocks.yaml` key nobody has
+      designed yet. Found in the PR #8 review, 2026-08-29.
+
 - [ ] **A grave is nobody's.** Any player can open any container, including one
       that appears where someone died (planned in
       [plan-death-chest.md](docs/plan-death-chest.md)). Ownership is a real

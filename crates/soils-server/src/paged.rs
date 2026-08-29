@@ -94,7 +94,21 @@ pub fn read_block(path: &Path, entry: u32) -> io::Result<Option<Vec<u8>>> {
             file.seek(SeekFrom::Start(offset as u64))?;
             let mut len = [0u8; 4];
             file.read_exact(&mut len)?;
-            let mut compressed = vec![0u8; u32::from_le_bytes(len) as usize];
+            let len = u32::from_le_bytes(len) as u64;
+            // Bound the length against the file before allocating for it.
+            // `compact` already checks the same field against the mapped
+            // length; this path did not, so a truncated or corrupt region
+            // could ask for a 4 GB `vec![0u8; ...]` before the `read_exact`
+            // that would have failed. `read_exact` reports the corruption
+            // either way — the point is to report it without the allocation.
+            let avail = file.metadata()?.len().saturating_sub(offset as u64 + 4);
+            if len > avail {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("block at {offset} claims {len} bytes, {avail} remain"),
+                ));
+            }
+            let mut compressed = vec![0u8; len as usize];
             file.read_exact(&mut compressed)?;
             let mut out = Vec::new();
             ZlibDecoder::new(&compressed[..]).read_to_end(&mut out)?;

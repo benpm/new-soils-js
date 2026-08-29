@@ -94,6 +94,21 @@ const SNAPSHOT_BUDGET: usize = 410;
 const BASELINE_RING: usize = 64;
 /// Per-client edit rate cap (edits per second, bucketed like inputs).
 const EDIT_RATE: f32 = 32.0;
+/// Per-client cap on inventory and container messages (per second, bucketed
+/// like edits).
+///
+/// These were the only client-driven messages that spent nothing. `Edit` and
+/// `Inputs` have always been bucketed, and `InventoryUpdate` is coalesced to
+/// one per client per tick via `inventory_dirty` — but `TransferItem` does a
+/// fresh `container_view` allocation and sends a `ContainerUpdate` to *every*
+/// viewer, immediately, and `drain_inboxes` pulls the inbox in an unbounded
+/// loop. So a client shuffling one item back and forth forced unbounded
+/// per-tick work and outbound traffic to everyone else in the chest.
+///
+/// Higher than `EDIT_RATE` because these are cheap and a person really does
+/// click fast when moving a pack around; the point is a ceiling, not a
+/// throttle anyone reaches by hand.
+const UI_RATE: f32 = 64.0;
 
 pub(crate) struct Client {
     inbox: UnboundedReceiver<ClientMsg>,
@@ -136,6 +151,8 @@ pub(crate) struct Client {
     input_tokens: f32,
     /// Remaining edits allowed (token bucket, see [`EDIT_RATE`]).
     edit_tokens: f32,
+    /// Remaining inventory/container messages allowed (see [`UI_RATE`]).
+    ui_tokens: f32,
     /// View radius in chunks (client-requested via `ViewRadius`, clamped).
     radius: i32,
     /// Client opted out of local generation (graph-hash mismatch / gen
@@ -950,6 +967,7 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 last_seq: 0,
                 input_tokens: INPUT_BURST,
                 edit_tokens: EDIT_RATE,
+                ui_tokens: UI_RATE,
                 radius: DEFAULT_RADIUS,
                 full_streams: false,
                 center: None,
@@ -1047,6 +1065,7 @@ fn drain_inboxes(
     for (&id, c) in clients.0.iter_mut() {
         c.input_tokens = (c.input_tokens + dt * soils_sim::TICK_HZ as f32).min(INPUT_BURST);
         c.edit_tokens = (c.edit_tokens + dt * EDIT_RATE).min(EDIT_RATE);
+        c.ui_tokens = (c.ui_tokens + dt * UI_RATE).min(UI_RATE);
         loop {
             match c.inbox.try_recv() {
                 Ok(m) => msgs.push((id, m)),
@@ -1333,11 +1352,20 @@ fn drain_inboxes(
                         &world_name,
                         soils_protocol::chunk_of(target),
                     );
-                    // A broken block takes its state with it — and gives back
-                    // everything that state was holding. A chest that swallowed
-                    // its contents on break would be worse than one that never
-                    // opened.
-                    if !placing {
+                    // A block that stops existing takes its state with it — and
+                    // gives back everything that state was holding. A chest
+                    // that swallowed its contents on break would be worse than
+                    // one that never opened.
+                    //
+                    // The condition is "the old block is gone", not "this was a
+                    // break". Nothing here requires the target to be air before
+                    // placing, so a client can send a place *onto* a container
+                    // voxel; keyed on `!placing` that left the page entry with
+                    // no container in front of it — invisible, unreachable, and
+                    // inherited by whatever is built on that voxel next. Whether
+                    // placement should require air at all is a separate
+                    // authority question, tracked in `Tasks.md`.
+                    if old != 0 {
                         let spilled = world
                             .take_block_data(target)
                             .map(|d| d.contents())
@@ -1407,6 +1435,10 @@ fn drain_inboxes(
                 if !c.authenticated {
                     continue;
                 }
+                if c.ui_tokens < 1.0 {
+                    continue;
+                }
+                c.ui_tokens -= 1.0;
                 if c.inventory.move_slot(from as usize, to as usize) {
                     c.inventory_dirty = true;
                 }
@@ -1416,6 +1448,10 @@ fn drain_inboxes(
                 if !c.authenticated {
                     continue;
                 }
+                if c.ui_tokens < 1.0 {
+                    continue;
+                }
+                c.ui_tokens -= 1.0;
                 let world_name = c.world.clone();
                 let Some(stack) = c.inventory.split(slot as usize, count) else { continue };
                 c.inventory_dirty = true;
@@ -1441,6 +1477,10 @@ fn drain_inboxes(
                 if !c.authenticated {
                     continue;
                 }
+                if c.ui_tokens < 1.0 {
+                    continue;
+                }
+                c.ui_tokens -= 1.0;
                 let world_name = c.world.clone();
                 let target = IVec3::from_array(pos);
                 // Same reach rule as an edit: a chest you cannot touch is a
@@ -1469,7 +1509,12 @@ fn drain_inboxes(
                     .send(ServerMsg::ContainerUpdate { pos, slots: contents });
             }
             ClientMsg::CloseContainer => {
-                let world_name = clients.0[&id].world.clone();
+                let c = clients.0.get_mut(&id).unwrap();
+                if c.ui_tokens < 1.0 {
+                    continue;
+                }
+                c.ui_tokens -= 1.0;
+                let world_name = c.world.clone();
                 let world = worlds.get_or_create(&world_name);
                 close_container(clients.0.get_mut(&id).unwrap(), world);
             }
@@ -1478,6 +1523,10 @@ fn drain_inboxes(
                 if !c.authenticated {
                     continue;
                 }
+                if c.ui_tokens < 1.0 {
+                    continue;
+                }
+                c.ui_tokens -= 1.0;
                 let Some(target) = c.open_container else { continue };
                 let world_name = c.world.clone();
                 let eye = c.entity.and_then(|e| sims.get(e).ok()).map(|(s, ..)| s.0.pos);
@@ -1493,13 +1542,36 @@ fn drain_inboxes(
                 // Take from the named side, insert into the other. Whatever
                 // does not fit goes straight back where it came from — the side
                 // it left had room for it a statement ago, so this cannot fail.
+                // The side it left had room for it a statement ago, so the
+                // put-back cannot fail — but `debug_assert` compiles out, and
+                // what it was guarding is items ceasing to exist. So the
+                // remainder is spilled into the world instead: loud in the log,
+                // and still collectable. Reachable only if a partial split of a
+                // non-mergeable stack ever meets a full pack, which needs a
+                // durability item with `max_stack > 1`; there is none today,
+                // and this is what stops the first one from being a dupe bug.
+                let mut orphan = |stack: Option<soils_sim::ItemStack>, side: &str| {
+                    if let Some(stack) = stack {
+                        eprintln!(
+                            "transfer at {target:?}: {side} would not take {stack:?} back — \
+                             spilling it into the world"
+                        );
+                        spawn_drop(
+                            &mut commands,
+                            &mut next_net,
+                            &world_name,
+                            target.as_vec3() + Vec3::splat(0.5),
+                            stack,
+                            ticks.0 + PICKUP_DELAY_TICKS,
+                        );
+                    }
+                };
                 let (taken, refused) = match from {
                     SlotRef::Pack(i) => {
                         let Some(taken) = c.inventory.split(i as usize, count) else { continue };
                         let refused = world.container_mut(target, slots).insert(taken);
                         if let Some(rest) = refused {
-                            let lost = c.inventory.insert(rest);
-                            debug_assert!(lost.is_none(), "the pack just held this");
+                            orphan(c.inventory.insert(rest), "the pack");
                         }
                         (taken, refused)
                     }
@@ -1511,8 +1583,7 @@ fn drain_inboxes(
                         };
                         let refused = c.inventory.insert(taken);
                         if let Some(rest) = refused {
-                            let lost = world.container_mut(target, slots).insert(rest);
-                            debug_assert!(lost.is_none(), "the container just held this");
+                            orphan(world.container_mut(target, slots).insert(rest), "the container");
                         }
                         (taken, refused)
                     }
@@ -1608,6 +1679,15 @@ fn drain_inboxes(
                 c.jobs.clear();
                 c.known.clear();
                 let old_world = worlds.get_or_create(&old);
+                // Before anything else: an open container pins a block-data
+                // page in the world it lives in. Closing it after `c.world` has
+                // been replaced unpins the *new* world's store instead — which
+                // both leaks the old page (pinned pages are never evicted) and
+                // decrements a pin another player may be holding on the same
+                // chunk over there, letting a live chest's page be evicted
+                // underneath them. `close_unreachable_containers` would do
+                // exactly that on the next tick if this were left to it.
+                close_container(c, old_world);
                 for pos in c.subs.drain() {
                     old_world.dec_ref(pos);
                 }

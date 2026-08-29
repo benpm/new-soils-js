@@ -287,3 +287,59 @@ async fn crate_contents_survive_a_server_restart() {
 
     let _ = std::fs::remove_dir_all(&data_dir);
 }
+
+#[tokio::test]
+async fn placing_over_a_crate_does_not_orphan_its_contents() {
+    // Nothing on the server requires the target voxel to be air before a
+    // place, so a client can send one straight onto a container block. Keyed
+    // on "this was a break" rather than "the old block is gone", the spill
+    // never ran: the page entry stayed behind with no container in front of
+    // it — invisible, unreachable, and inherited by whatever was built on
+    // that voxel next.
+    let server = TestServer::start("chest-overbuild");
+    let mut a = Client::join(server.addr(), "alice").await;
+    let (at, crate_id) = open_a_crate(&mut a).await;
+
+    let kind = ItemKind::Block(block_id(&mut a, "Grass"));
+    let slot = a.pack_slot_of(kind).expect("a pack slot holds it");
+    a.send(&ClientMsg::TransferItem { from: SlotRef::Pack(slot), count: 12 }).await;
+    assert!(a.await_inventory(|c| c.container_count(kind) == 12, SETTLE).await);
+
+    let dropped_before = a.items_seen().len();
+    // Place a *different* block onto the crate's own voxel.
+    let stone = block_id(&mut a, "Cobblestone");
+    edit_paced(&mut a, at, stone).await;
+
+    assert!(
+        a.await_inventory(|c| c.container().is_none(), SETTLE).await,
+        "building over the block must close the panel, as breaking it does"
+    );
+    // The spill is a set of entity spawns; wait for them rather than reading
+    // the moment the panel closes.
+    assert!(
+        a.await_inventory(|c| c.items_seen().len() > dropped_before, SETTLE).await,
+        "the contents must be spawned as world items"
+    );
+    let spilled: u32 = a
+        .items_seen()
+        .into_iter()
+        .filter(|(_, s)| s.kind == kind)
+        .map(|(_, s)| s.count as u32)
+        .sum();
+    assert_eq!(spilled, 12, "the contents must come back out, not be orphaned");
+
+    // And the voxel must no longer answer as a container: if the page entry
+    // had survived, a crate rebuilt here would inherit the old contents.
+    edit_paced(&mut a, at, 0).await;
+    edit_paced(&mut a, at, crate_id).await;
+    a.send(&ClientMsg::OpenContainer { pos: at }).await;
+    assert!(
+        a.await_inventory(|c| c.container().is_some(), SETTLE).await,
+        "a fresh crate here must open"
+    );
+    assert_eq!(
+        a.container_count(kind),
+        0,
+        "a crate built where one was overbuilt must be empty, not inherit the old contents"
+    );
+}

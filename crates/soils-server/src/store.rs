@@ -64,6 +64,17 @@ struct Page<V> {
     pins: u32,
     /// Set while unpinned; the eviction timer runs from it.
     idle_since: Option<Instant>,
+    /// A write for this page has been handed to the background writer and may
+    /// not have reached disk yet.
+    ///
+    /// Without this the page is `dirty = false` the instant `take_dirty` runs,
+    /// so eviction drops it — and its header memo — while the bytes are still
+    /// in the channel. The next `get` re-reads the file, gets the *pre-write*
+    /// contents, and is now resident, stale and clean; the next mutation
+    /// writes that stale version back over the good one. Holding the page
+    /// until the write has certainly drained is what keeps "in memory" and
+    /// "on disk" from disagreeing.
+    in_flight: bool,
 }
 
 /// Counters, for tests and the `/stats` debug line. A cache with no visible
@@ -156,7 +167,8 @@ impl<V: Codec + Default> Store<V> {
             },
             None => V::default(),
         };
-        self.pages.insert(pos, Page { value, dirty: false, pins: 0, idle_since: Some(Instant::now()) });
+        self.pages
+            .insert(pos, Page { value, dirty: false, pins: 0, idle_since: Some(Instant::now()), in_flight: false });
     }
 
     /// The page at `pos`, loading it if necessary. An unwritten page reads as
@@ -164,7 +176,19 @@ impl<V: Codec + Default> Store<V> {
     /// a reader.
     pub fn get(&mut self, pos: IVec3) -> &V {
         self.fault_in(pos);
+        self.touch(pos);
         &self.pages[&pos].value
+    }
+
+    /// Restart the eviction timer. `idle_since` was set once at fault-in and
+    /// never moved, so the TTL measured age rather than idleness and a page
+    /// read every tick was evicted exactly `ttl` after it loaded.
+    fn touch(&mut self, pos: IVec3) {
+        if let Some(page) = self.pages.get_mut(&pos)
+            && page.pins == 0
+        {
+            page.idle_since = Some(Instant::now());
+        }
     }
 
     /// As [`get`](Self::get), but marks the page dirty. Taking this handle is
@@ -172,6 +196,7 @@ impl<V: Codec + Default> Store<V> {
     /// should check with `get` first.
     pub fn get_mut(&mut self, pos: IVec3) -> &mut V {
         self.fault_in(pos);
+        self.touch(pos);
         let page = self.pages.get_mut(&pos).expect("faulted in above");
         page.dirty = true;
         &mut page.value
@@ -199,10 +224,17 @@ impl<V: Codec + Default> Store<V> {
     pub fn take_dirty(&mut self) -> Vec<Write> {
         let mut out = Vec::new();
         for (&pos, page) in self.pages.iter_mut() {
+            // Anything handed over on the *previous* call has drained: the
+            // writer is one thread pulling an mpsc channel in order, and a
+            // whole flush interval has passed since. Clearing here rather than
+            // on an ack keeps the writer free of a back-channel it would
+            // otherwise need only for this.
+            page.in_flight = false;
             if !page.dirty {
                 continue;
             }
             page.dirty = false;
+            page.in_flight = true;
             out.push(Write {
                 path: region::paged_path(&self.dir, self.prefix, pos),
                 slot: region::header_index(pos),
@@ -220,7 +252,9 @@ impl<V: Codec + Default> Store<V> {
         let expired: Vec<IVec3> = self
             .pages
             .iter()
-            .filter(|(_, p)| p.pins == 0 && p.idle_since.is_some_and(|t| t.elapsed() >= ttl))
+            .filter(|(_, p)| {
+                p.pins == 0 && !p.in_flight && p.idle_since.is_some_and(|t| t.elapsed() >= ttl)
+            })
             .map(|(&pos, _)| pos)
             .collect();
         let mut out = Vec::new();
@@ -236,7 +270,10 @@ impl<V: Codec + Default> Store<V> {
     /// voxels is just a leak with extra steps.
     pub fn evict(&mut self, pos: IVec3) -> Vec<Write> {
         let mut out = Vec::new();
-        if self.pages.get(&pos).is_some_and(|p| p.pins == 0) {
+        // An in-flight page is left for a later `tick_lifecycle`: its
+        // `idle_since` is already running, so this defers the eviction rather
+        // than leaking the page.
+        if self.pages.get(&pos).is_some_and(|p| p.pins == 0 && !p.in_flight) {
             self.evict_into(pos, &mut out);
             self.stats.writes += out.len() as u64;
         }
@@ -378,6 +415,70 @@ mod tests {
 
         s.unpin(pos);
         assert_eq!(s.tick_lifecycle(Duration::ZERO).len(), 1);
+        assert_eq!(s.resident(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `take_dirty` clears `dirty` but the bytes are still in the writer's
+    /// channel. Evicting the page then drops it *and* its header memo, so the
+    /// next `get` re-reads the pre-write file: resident, stale, and clean — and
+    /// the next mutation writes that stale version back over the good one.
+    #[test]
+    fn a_page_whose_write_is_still_in_flight_is_not_evicted() {
+        let d = dir("inflight");
+        let pos = IVec3::new(3, 1, 4);
+        let mut s = store(&d);
+        s.get_mut(pos).0 = "chest contents".into();
+
+        // Handed to the writer, but deliberately not applied — this is the
+        // window where the bytes exist only in the channel.
+        let pending = s.take_dirty();
+        assert_eq!(pending.len(), 1);
+
+        assert!(
+            s.tick_lifecycle(Duration::ZERO).is_empty(),
+            "a page with a write in flight must not be evicted"
+        );
+        assert_eq!(s.resident(), 1);
+        assert!(s.evict(pos).is_empty(), "nor by an explicit evict");
+        assert_eq!(s.resident(), 1);
+        assert_eq!(s.get(pos).0, "chest contents", "and it still reads correctly");
+
+        // Once the write has landed and a later flush has cleared the flag,
+        // the page evicts normally and reads back what was written.
+        apply(&pending);
+        let _ = s.take_dirty();
+        assert_eq!(s.tick_lifecycle(Duration::ZERO).len(), 0, "already clean, nothing to write");
+        assert_eq!(s.resident(), 0);
+        assert_eq!(store(&d).get(pos).0, "chest contents");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `idle_since` was set at fault-in and never moved, so the TTL measured
+    /// age rather than idleness: a page read every tick was evicted exactly
+    /// `ttl` after it loaded, whatever was using it.
+    #[test]
+    fn reading_a_page_restarts_its_eviction_timer() {
+        let d = dir("touch");
+        let pos = IVec3::new(5, 0, 5);
+        let mut s = store(&d);
+        s.get_mut(pos).0 = "hot".into();
+        apply(&s.take_dirty());
+        let _ = s.take_dirty();
+
+        // A generous TTL that a just-touched page cannot have exceeded.
+        let ttl = Duration::from_secs(60);
+        assert!(s.tick_lifecycle(ttl).is_empty());
+        assert_eq!(s.resident(), 1);
+
+        s.get(pos);
+        assert!(s.tick_lifecycle(ttl).is_empty(), "the read must have restarted the timer");
+        assert_eq!(s.resident(), 1);
+
+        // Zero TTL evicts it, proving the page was evictable all along and the
+        // assertions above were the timer, not a pin.
+        assert_eq!(s.resident(), 1);
+        s.tick_lifecycle(Duration::ZERO);
         assert_eq!(s.resident(), 0);
         let _ = std::fs::remove_dir_all(&d);
     }

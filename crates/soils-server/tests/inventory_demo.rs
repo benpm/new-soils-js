@@ -34,6 +34,11 @@ const EXPECTED_BEATS: usize = 14;
 /// Seconds of routine to record. The bot's script (`SOILS_BOT=inv`) runs about
 /// 33 s after landing, and landing from the spawn height costs ~5 s.
 const TAKE_SECS: &str = "40";
+/// Earliest the client may cue the recorder, and how long it waits for the
+/// world to finish streaming before cueing anyway. `await_ready`'s deadline is
+/// derived from both, so the two cannot drift apart.
+const RECORD_AFTER: f32 = 20.0;
+const RECORD_WAIT: f32 = 600.0;
 
 fn client_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("SOILS_CLIENT_BIN") {
@@ -62,13 +67,13 @@ fn spawn_bot(
         .env("SOILS_BOT", "inv")
         .env("SOILS_BOT_START", start_file)
         .env("SOILS_READY_FILE", ready_file)
-        .env("SOILS_RECORD_AFTER", demo_secs(20.0))
+        .env("SOILS_RECORD_AFTER", demo_secs(RECORD_AFTER))
         // Wait for the world, do not time out into it. The first take of this
         // cued after 60s with 386 chunks still streaming: the player dropped out
         // of fly mode into terrain that did not exist yet and fell through the
         // world, so the whole recording was empty fog. A demo that opens on an
         // unfinished world is not a shorter demo, it is a broken one.
-        .env("SOILS_RECORD_WAIT", demo_secs(600.0))
+        .env("SOILS_RECORD_WAIT", demo_secs(RECORD_WAIT))
         .env("SOILS_RECORD_SECS", TAKE_SECS)
         .env("SOILS_RECORD_EXIT", "1")
         // Matches props_demo. A wider radius is more to stream before the take
@@ -121,10 +126,14 @@ fn drain_stderr(kid: &mut Child) -> (Arc<Mutex<String>>, Option<std::thread::Joi
 }
 
 fn await_ready(path: &std::path::Path, kid: &mut Child, log: &Arc<Mutex<String>>) {
-    // Must exceed the client's own SOILS_RECORD_WAIT, or this gives up first
-    // and the failure reads as "client never signalled" rather than "the world
-    // took longer than expected to stream".
-    let deadline = std::time::Instant::now() + demo_budget(660.0);
+    // Derived from the client's own budget rather than picked: it cues
+    // unconditionally at RECORD_AFTER + RECORD_WAIT, so anything less than that
+    // plus real slack is a race this side loses — and the failure then reads as
+    // "client never signalled" rather than "we gave up first". It was 660
+    // against a 620 cue: forty seconds, most of which the client spends
+    // starting up. On CI that lost every time, for six runs.
+    let deadline =
+        std::time::Instant::now() + demo_budget((RECORD_AFTER + RECORD_WAIT) * 1.4);
     loop {
         if path.exists() {
             return;

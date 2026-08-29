@@ -234,7 +234,11 @@ def cmd_stop() -> None:
         log = Path(st.get("log", ""))
         detail = log.read_text() if log.exists() else "(no log)"
         die(f"no video at {path}:\n{detail}")
-    print(path)
+    # The `recorded: ` prefix is part of the contract, not decoration: the demo
+    # tests parse it out of stdout (`strip_prefix("recorded: ")`) to find the
+    # file they then assert on. Printing a bare path made `props_demo` fail
+    # *after* it had successfully recorded a video.
+    print(f"recorded: {path}")
 
 
 def main() -> None:

@@ -137,10 +137,10 @@ jobs:
           WGPU_BACKEND: vulkan
           SOILS_RECORDER: scripts/ffmpeg_record.py
           SOILS_CAPTURE_FPS: "24"
-          # Every timing in these tests is calibrated for a real GPU. There is
-          # none here — Mesa lavapipe rasterises on the CPU — so the budgets
-          # scale together rather than being re-tuned one at a time.
-          SOILS_DEMO_SCALE: "2"
+          # A little headroom over a real GPU, not the 4x that six runs were
+          # wrongly spent on: the probe below cues in ~70s, and `props_demo`
+          # recorded a full take here. The budgets were never the problem.
+          SOILS_DEMO_SCALE: "1.5"
           # Chunk application on the client is time-boxed per frame, so at a
           # couple of frames per second `streaming.pending` takes minutes to
           # reach zero, and that is the cue the recorder waits for. Radius 1

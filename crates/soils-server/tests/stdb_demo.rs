@@ -16,6 +16,8 @@
 
 mod common;
 
+use common::{recorder, workspace_root};
+
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -23,14 +25,6 @@ use soils_server::StdbConfig;
 
 /// Seconds of routine to record once both clients report the world is up.
 const TAKE_SECS: &str = "30";
-
-fn workspace_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/<pkg> lives two levels below the workspace root")
-        .to_path_buf()
-}
 
 fn client_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("SOILS_CLIENT_BIN") {
@@ -42,24 +36,6 @@ fn client_binary() -> Option<std::path::PathBuf> {
         .iter()
         .map(|d| root.join(d).join(exe))
         .find(|p| p.exists())
-}
-
-fn obs(action: &str) -> String {
-    let script = workspace_root().join("scripts/obs_record.py");
-    let out = Command::new("python")
-        .arg(&script)
-        .arg(action)
-        .current_dir(workspace_root())
-        .output()
-        .unwrap_or_else(|e| panic!("could not run {}: {e}", script.display()));
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(
-        out.status.success(),
-        "obs_record.py {action} failed:\n{text}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    println!("obs {action}: {text}");
-    text
 }
 
 /// Launch one client, pointed at both the game server and the database.
@@ -146,7 +122,7 @@ fn record_spacetimedb_lobby_and_chat() {
     ];
 
     await_ready(&ready, &mut kids);
-    obs("start");
+    recorder("start");
     std::fs::write(&start, "go").expect("write bot start file");
     println!("both clients ready; recording");
 
@@ -154,7 +130,7 @@ fn record_spacetimedb_lobby_and_chat() {
         let status = k.wait().expect("client");
         println!("client {i} exited: {status}");
     }
-    let recorded = obs("stop");
+    let recorded = recorder("stop");
 
     let path = recorded
         .lines()

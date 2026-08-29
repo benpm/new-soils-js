@@ -317,7 +317,23 @@ WIP, but will involve these things:
 - Chunk compression over network and before copy to GPU mem
 - Chunk LOD, also over network and on GPU
 
-##  GitHub Actions
+## GitHub Actions
 
-- [ ] Create GitHub Actions workflow for creating builds released through the Releases section
-- [ ] GitHub Pages page created showing videos of all the test cases that can be shown via video. On the Pages site, have different tabs for different branches of the repository. Trigger this workflow whenever there are changes to the repository, including branches other than master.
+- [x] **Release builds through the Releases section.**
+      `.github/workflows/release.yml` — pushing a `v*` tag builds the client
+      and server for Linux and Windows, packages each with `assets/` beside the
+      binaries, and publishes a Release with both archives attached. The
+      existing `screenshots.yml` listens for `release: published`, so the
+      rendered screenshots land in the notes underneath the downloads with no
+      coupling between the two. 2026-08-29, `ci-pipelines`.
+- [x] **GitHub Pages site of recorded test cases, tabbed by branch.**
+      `.github/workflows/videos.yml` runs the `#[ignore]`d recording tests on
+      every push to every branch and publishes their videos to `gh-pages`.
+      What made this possible was making the recorder pluggable rather than
+      writing a second CI-only driver: `SOILS_RECORDER` selects
+      `scripts/obs_record.py` (OBS, local, Windows) or the new
+      `scripts/ffmpeg_record.py` (X11 grab, CI), and the tests are otherwise
+      unchanged — so a published video is a take the test *passed*, assertions
+      on scripted beats included. `scripts/build_pages.py` folds one branch's
+      videos into the site without disturbing the others. 2026-08-29,
+      `ci-pipelines`. See [CHANGELOG.md](CHANGELOG.md).

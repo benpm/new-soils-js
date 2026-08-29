@@ -23,3 +23,4 @@ artifact/
 .obsidian
 *.stackdump
 scratch/
+__pycache__/

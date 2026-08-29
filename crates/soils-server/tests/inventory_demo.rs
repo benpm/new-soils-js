@@ -20,6 +20,8 @@
 
 mod common;
 
+use common::{recorder, workspace_root};
+
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -32,14 +34,6 @@ const EXPECTED_BEATS: usize = 14;
 /// 33 s after landing, and landing from the spawn height costs ~5 s.
 const TAKE_SECS: &str = "40";
 
-fn workspace_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/<pkg> lives two levels below the workspace root")
-        .to_path_buf()
-}
-
 fn client_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("SOILS_CLIENT_BIN") {
         return Some(p.into());
@@ -50,24 +44,6 @@ fn client_binary() -> Option<std::path::PathBuf> {
         .iter()
         .map(|d| root.join(d).join(exe))
         .find(|p| p.exists())
-}
-
-fn obs(action: &str) -> String {
-    let script = workspace_root().join("scripts/obs_record.py");
-    let out = Command::new("python")
-        .arg(&script)
-        .arg(action)
-        .current_dir(workspace_root())
-        .output()
-        .unwrap_or_else(|e| panic!("could not run {}: {e}", script.display()));
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(
-        out.status.success(),
-        "obs_record.py {action} failed:\n{text}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    println!("obs {action}: {text}");
-    text
 }
 
 fn spawn_bot(
@@ -144,7 +120,7 @@ fn record_the_inventory_loop() {
     // Check OBS *before* anything expensive. Streaming the world takes minutes,
     // and discovering a dead recorder after that wastes the whole run — which is
     // exactly how the fourth take was lost.
-    obs("status");
+    recorder("status");
 
     let server = common::TestServer::start("invdemo");
     let addr = server.addr();
@@ -155,7 +131,7 @@ fn record_the_inventory_loop() {
     // Roll only once the world is on screen. Starting earlier films the join
     // burst, which is a different demo.
     await_ready(&ready, &mut kid);
-    obs("start");
+    recorder("start");
     std::fs::write(&start, "go").expect("write bot start file");
     println!("client ready; bot released");
 
@@ -167,7 +143,7 @@ fn record_the_inventory_loop() {
     }
     let status = kid.wait().expect("client");
     println!("client exited: {status}");
-    let recorded = obs("stop");
+    let recorded = recorder("stop");
 
     // A stalled routine produces a file of the right length full of nothing
     // happening. That is indistinguishable from a good take by size alone —

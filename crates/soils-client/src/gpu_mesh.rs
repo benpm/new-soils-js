@@ -291,4 +291,23 @@ mod tests {
         }
         assert_eq!(hits.len(), 1, "load the atlas via `load_atlas`, not by path; found {hits:?}");
     }
+
+    /// The global default backs up [`load_atlas`] for anything loaded without
+    /// settings. Losing it is silent — nothing fails, textures just go blurry —
+    /// so pin it here.
+    #[test]
+    fn the_app_sets_the_global_nearest_default() {
+        let main = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let text = std::fs::read_to_string(main).unwrap();
+        assert!(
+            text.contains("ImagePlugin::default_nearest()"),
+            "DefaultPlugins must .set(ImagePlugin::default_nearest())"
+        );
+        // The plugin default is linear, so the call above is the only thing
+        // standing between a settings-less load and bilinear filtering.
+        assert_eq!(
+            ImagePlugin::default_nearest().default_sampler.mag_filter,
+            ImageFilterMode::Nearest
+        );
+    }
 }

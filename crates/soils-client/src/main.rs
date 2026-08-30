@@ -71,7 +71,10 @@ const PROVISIONAL_SPAWN: Vec3 = Vec3::new(282.0, 285.0, 268.0);
 
 fn main() {
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+    // Everything this client draws is 16x16 pixel art magnified hard, so the
+    // linear default is never what's wanted. `load_atlas` pins the block atlas
+    // itself; this is the backstop for anything loaded without settings.
+    app.add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()).set(WindowPlugin {
         primary_window: Some(Window {
             // The player name is in the title so two clients of the same
             // executable are separable — OBS matches capture sources by

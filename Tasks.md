@@ -61,15 +61,12 @@ order that hurts:
       a YAML edit, and the hotbar's substitution rule is already written against
       it (a Large Fruit eaten to nothing is replaced by another
       `Consumable, Healing`).
-- [ ] **A script edit that removes a container block does not spill it.**
-      `run_scripts` applies voxel edits straight through `World::edit`, so a
-      script that deletes a chest leaves its contents on the block-data page
-      with no block in front of them — invisible, unreachable, and inherited by
-      whatever is built on that voxel next. The player edit path handles this
-      (`take_block_data` + spill + close viewers); the script path needs the
-      same three lines, or both need to move behind one `break_block` helper.
-      Landed 2026-08-28 with containers; see
-      [plan-storage.md §5](docs/plan-storage.md).
+- [x] **A script edit that removes a container block does not spill it.**
+      Closed 2026-08-30 (`light-falloff`). Both paths now go through one
+      `release_block_data` helper — the second option in the original note, and
+      the right one: two copies of this is exactly how they drifted apart in the
+      first place. Pinned by `a_script_that_deletes_a_container_spills_it`,
+      verified to fail with the fix disabled.
 - [ ] **Placing does not require the target to be air.** `validate_edit`
       checks reach and a known block id, nothing else, and `World::edit`
       unconditionally `set`s — so a modified client can overwrite any block
@@ -140,12 +137,34 @@ order that hurts:
       ~90 s; its settle budget was doubled to 120 x 700 ms to compensate. The
       comparison was also unsound — each peer decided "settled" from its own
       delta stream and the two readings could describe different instants — and
-      now samples from a common barrier. Both are treatments, not a diagnosis:
-      worth finding out whether the pile is genuinely creeping on a slope or
-      whether the snapshot budget is starving prop updates under load.
+      now samples from a common barrier. Both are treatments, not a diagnosis.
 
-- [ ] **`forced_misprediction_reconciles_behind_the_wall` is load-sensitive.**
-      It asserts `max_divergence > 0.5` after walking a stale predictor into a
+      **Diagnosis, 2026-08-30:** it is the second one. Observed failing under a
+      full `--workspace` run with "clients disagree on a prop by 0.904 units",
+      then passing in isolation immediately afterwards, on the same build. A
+      pile genuinely creeping down a slope would creep whether or not other
+      tests were running; one that only disagrees under contention is being
+      starved. That points at the per-client snapshot byte budget
+      (`SNAPSHOT_BUDGET`, 410 B/tick) and the priority accumulator: with 300
+      bodies moving, two clients draining at different rates reconstruct
+      different instants, and the barrier only makes them *sample* together —
+      it cannot conjure updates that were never sent. Next step is to record
+      per-client snapshot backlog during the settle and see whether the two
+      diverge, rather than to raise the tolerance.
+
+- [x] **`forced_misprediction_reconciles_behind_the_wall` is load-sensitive.**
+      Closed 2026-08-30 (`light-falloff`) by the first of the two candidate
+      fixes: the walk phase now runs until the *server* has actually travelled
+      two voxels, with a tick cap, instead of for a fixed 150 ticks. The ticker
+      is wall-clock, so under contention ticks were missed, the server walked
+      less far, and the divergence shrank with it — which is how a fixed count
+      landed on exactly the 0.5 threshold. The assertion is unchanged; what is
+      new is that the scenario now *establishes* its precondition and fails
+      with a clear message if it cannot ("the server only walked X of 2 voxels
+      … the scenario never set up the misprediction it is about to assert on")
+      rather than failing on the consequence.
+
+      For the record, what it used to say: it asserts `max_divergence > 0.5` after walking a stale predictor into a
       carved tunnel. Under full-suite contention it has landed on exactly 0.5
       and failed; run alone it passes every time. The misprediction *does*
       happen — the threshold is what is marginal, and 0.5 is an arbitrary
@@ -234,13 +253,29 @@ order that hurts:
       interpreting and rewriting it. Note there are now two design docs —
       `concepts.md` (philosophy, mechanics) and `conceptual_design.md` (story,
       setting) — and it is worth deciding whether that split is intended.
-- [ ] **Prune `TODO.md`.** Its 14-phase checkoffs are the historical record and
-      worth keeping, but the finished descriptions belong in `CHANGELOG.md` with
-      only the result left behind.
-- [ ] **Stale worktree.** `.claude/worktrees/light-pad-cache` is a 7.8 GB second
-      checkout of the repo on the unmerged `worktree-light-pad-cache` branch,
-      with uncommitted `Cargo.toml` edits. It doubles every repo-wide search.
-      Land it or remove it.
+- [x] **Prune `TODO.md`** — narrowed and mostly declined, 2026-08-30
+      (`light-falloff`). It was titled `# Tasks`, the same as this file, which
+      is the part that was actually wrong; it is now `# Implementation log`.
+      The prune itself is a bad trade and should not be done: the file's own
+      header says the detail *is* the point ("what shipped in each phase, what
+      was measured, and what was deferred with the reasoning"), and the
+      descriptions carry measurements that exist nowhere else — 11.4 to 10.4 ms
+      on the renderer, 23 MB to 498 KB on the join burst, 9.05 to 3.46 ms on a
+      worldgen wave. `CHANGELOG.md` is organised by release, not by phase, so
+      moving them there would scatter a single narrative and drop the numbers.
+      Reopen only with a specific thing to delete.
+- [x] **Stale worktrees.** Closed 2026-08-30 (`light-falloff`). There were
+      *three*, not one — `light-pad-cache` (7.8 GB), `texture-nearest` (9.3 GB)
+      and `docs-server-commands` — all on unmerged branches, and all three are
+      now deregistered.
+      Nothing was lost. The 17 GB was entirely `target/`, which regenerates,
+      and the only irreplaceable content was three uncommitted criterion
+      benches in `light-pad-cache`; those were committed to their own branch
+      first (`5fa6133`) precisely because a worktree's untracked files are the
+      one thing removal actually destroys. Every branch still exists, so
+      `git worktree add .claude/worktrees/<name> <branch>` restores any of them.
+      One directory refused to delete (a file held open) and can be removed by
+      hand; git no longer tracks it either way.
 
 ---
 

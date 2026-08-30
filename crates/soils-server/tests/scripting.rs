@@ -7,8 +7,10 @@
 mod common;
 
 use common::{Client, TestServer};
-use soils_protocol::ServerMsg;
+use soils_protocol::{ClientMsg, ServerMsg, SlotRef};
+use soils_sim::ItemKind;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// The chunk containing the spawn point (mirrors `scenarios.rs`).
 const SPAWN_CHUNK: [i32; 3] = [8, 8, 8];
@@ -28,13 +30,27 @@ const FIXTURE_WAT: &str = r#"(module
   (func (export "on_edit") (param i32 i32 i32 i32 i32 i32)
     (call $edit (local.get 0) (i32.add (local.get 1) (i32.const 1)) (local.get 2) (i32.const 3))))"#;
 
-/// Write the fixture into a fresh temp scripts dir; returns the dir path.
-fn scripts_dir(tag: &str) -> PathBuf {
+/// Fixture that deletes whatever a player edits, one voxel below their edit.
+///
+/// Deliberately a *script* edit: script commands go straight through
+/// `World::edit`, bypassing reach, rate and inventory checks, which is why the
+/// container spill was missing on this path for so long.
+const ERASER_WAT: &str = r#"(module
+  (import "soils" "edit_voxel" (func $edit (param i32 i32 i32 i32)))
+  (func (export "on_edit") (param i32 i32 i32 i32 i32 i32)
+    (call $edit (local.get 0) (i32.sub (local.get 1) (i32.const 1)) (local.get 2) (i32.const 0))))"#;
+
+/// Write a fixture into a fresh temp scripts dir; returns the dir path.
+fn scripts_dir_with(tag: &str, wat: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("soils-scripts-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scripts dir");
-    std::fs::write(dir.join("fixture.wat"), FIXTURE_WAT).expect("write fixture");
+    std::fs::write(dir.join("fixture.wat"), wat).expect("write fixture");
     dir
+}
+
+fn scripts_dir(tag: &str) -> PathBuf {
+    scripts_dir_with(tag, FIXTURE_WAT)
 }
 
 #[tokio::test]
@@ -84,6 +100,74 @@ async fn script_on_tick_spawns_a_replicated_entity() {
         })
         .await;
     assert_eq!(kind, soils_sim::KIND_CRITTER, "script-spawned entity replicates as a critter");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A script that deletes a container block must give its contents back, exactly
+/// as a player breaking it does.
+///
+/// Script edits bypass reach, rate and inventory checks and go straight to
+/// `World::edit`, and for a long time they bypassed the spill too — so a script
+/// that removed a chest left its contents on the block-data page with no block
+/// in front of them: invisible, unreachable, and inherited by whatever was
+/// built on that voxel next. Both paths now share `release_block_data`.
+#[tokio::test]
+async fn a_script_that_deletes_a_container_spills_it() {
+    let dir = scripts_dir_with("eraser", ERASER_WAT);
+    let server = TestServer::start_with("script-spill", |c| c.scripts_dir = Some(dir.clone()));
+    let mut a = Client::join(server.addr(), "alice").await;
+
+    assert!(
+        a.await_inventory(|c| !c.inventory().is_empty(), Duration::from_secs(10)).await,
+        "the server must stock a new player before anything can be stored"
+    );
+    let crate_id = a
+        .generator()
+        .1
+        .id_of("Wooden Crate")
+        .expect("Wooden Crate must exist in blocks.yaml");
+    let grass = a.generator().1.id_of("Grass").expect("Grass must exist");
+
+    // Put a crate down and fill it, one voxel *above* where the script will
+    // strike, so the player's own edit is what triggers `on_edit`.
+    let spawn = a.spawn;
+    let at = [spawn[0].floor() as i32, spawn[1].floor() as i32 - 3, spawn[2].floor() as i32];
+    let trigger = [at[0], at[1] + 1, at[2]];
+    let _ = a.await_chunk([at[0] >> 5, at[1] >> 5, at[2] >> 5]).await;
+    a.place(at, crate_id).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    a.send(&ClientMsg::OpenContainer { pos: at }).await;
+    assert!(
+        a.await_inventory(|c| c.container().is_some(), Duration::from_secs(10)).await,
+        "the crate must open"
+    );
+    let kind = ItemKind::Block(grass);
+    let slot = a.pack_slot_of(kind).expect("a pack slot holds grass");
+    a.send(&ClientMsg::TransferItem { from: SlotRef::Pack(slot), count: 9 }).await;
+    assert!(a.await_inventory(|c| c.container_count(kind) == 9, Duration::from_secs(10)).await);
+
+    // Editing `trigger` fires `on_edit`, and the script erases the voxel below
+    // it — the crate.
+    let dropped_before = a.items_seen().len();
+    a.edit(trigger, grass).await;
+
+    assert!(
+        a.await_inventory(|c| c.container().is_none(), Duration::from_secs(10)).await,
+        "the script deleting the block must close the panel, as a break does"
+    );
+    assert!(
+        a.await_inventory(|c| c.items_seen().len() > dropped_before, Duration::from_secs(10)).await,
+        "the contents must be spawned as world items"
+    );
+    let spilled: u32 = a
+        .items_seen()
+        .into_iter()
+        .filter(|(_, s)| s.kind == kind)
+        .map(|(_, s)| s.count as u32)
+        .sum();
+    assert_eq!(spilled, 9, "every stored item must come back, exactly once");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

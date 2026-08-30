@@ -1,4 +1,4 @@
-# Tasks
+# Implementation log
 
 > **Open work lives in [`Tasks.md`](Tasks.md).** This file is the historical
 > record: what shipped in each phase, what was measured, and what was deferred
@@ -383,5 +383,11 @@ Both need a plan doc before they need code. Notes toward one:
       videos into the site without disturbing the others. 2026-08-29,
       `ci-pipelines`. See [CHANGELOG.md](CHANGELOG.md).
 
-## Minor problems
+## `optimization`
+This branch should focus on making performance improvements to chunk generation, disk i/o, network i/o, etc.
+
+- [ ] Add instrumentation to critical functions such as chunk gen, then create some benchmark tests
+- [ ] ADd
+- [ ] 
+- [ ] 
 - [ ] 

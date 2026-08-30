@@ -1371,25 +1371,15 @@ fn drain_inboxes(
                     // placement should require air at all is a separate
                     // authority question, tracked in `Tasks.md`.
                     if old != 0 {
-                        let spilled = world
-                            .take_block_data(target)
-                            .map(|d| d.contents())
-                            .unwrap_or_default();
-                        for c in clients.0.values_mut() {
-                            if c.world == world_name && c.open_container == Some(target) {
-                                close_container(c, world);
-                            }
-                        }
-                        for stack in spilled {
-                            spawn_drop(
-                                &mut commands,
-                                &mut next_net,
-                                &world_name,
-                                target.as_vec3() + Vec3::splat(0.5),
-                                stack,
-                                ticks.0 + PICKUP_DELAY_TICKS,
-                            );
-                        }
+                        release_block_data(
+                            &mut commands,
+                            &mut next_net,
+                            &mut clients,
+                            world,
+                            &world_name,
+                            target,
+                            ticks.0 + PICKUP_DELAY_TICKS,
+                        );
                     }
                     let c = clients.0.get_mut(&id).unwrap();
                     if placing {
@@ -1811,8 +1801,22 @@ fn run_scripts(
             ScriptCommand::Edit { x, y, z, id } => {
                 let world = worlds.get_or_create(world_name);
                 let target = IVec3::new(x, y, z);
-                if world.ensure_resident(soils_protocol::chunk_of(target)) && world.edit(x, y, z, id)
-                {
+                let resident = world.ensure_resident(soils_protocol::chunk_of(target));
+                // Read before the write, so the block being replaced can give
+                // back what it was holding.
+                let old = if resident { world.voxel(target) } else { 0 };
+                if resident && world.edit(x, y, z, id) {
+                    if old != 0 {
+                        release_block_data(
+                            &mut commands,
+                            &mut next_net,
+                            &mut clients,
+                            world,
+                            world_name,
+                            target,
+                            tick.0 + PICKUP_DELAY_TICKS,
+                        );
+                    }
                     expose_neighbours(
                         &mut clients,
                         world_name,
@@ -2471,6 +2475,41 @@ fn close_container(c: &mut Client, world: &mut World) {
     let Some(pos) = c.open_container.take() else { return };
     world.unpin_block_data(soils_protocol::chunk_of(pos));
     let _ = c.outbox.send(ServerMsg::ContainerClosed { pos: pos.to_array() });
+}
+
+/// Give back what a vanishing block was holding: spill its contents as world
+/// items and close the panel for everyone looking at it.
+///
+/// One function because there are two places a block stops existing — a player
+/// edit and a script edit — and they had drifted. The script path did not do
+/// this at all, so a script that deleted a chest left its contents on the
+/// block-data page with no block in front of them: invisible, unreachable, and
+/// inherited by whatever was built on that voxel next.
+fn release_block_data(
+    commands: &mut Commands,
+    next_net: &mut NextNetId,
+    clients: &mut Clients,
+    world: &mut World,
+    world_name: &str,
+    target: IVec3,
+    ready_at: u64,
+) {
+    let spilled = world.take_block_data(target).map(|d| d.contents()).unwrap_or_default();
+    for c in clients.0.values_mut() {
+        if c.world == world_name && c.open_container == Some(target) {
+            close_container(c, world);
+        }
+    }
+    for stack in spilled {
+        spawn_drop(
+            commands,
+            next_net,
+            world_name,
+            target.as_vec3() + Vec3::splat(0.5),
+            stack,
+            ready_at,
+        );
+    }
 }
 
 /// Drop `stack` into the world at `pos`, collectable after `ready_at`.

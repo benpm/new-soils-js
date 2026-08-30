@@ -82,3 +82,23 @@ artifact pages, and are never loaded by the server.
 
 The recordings themselves are produced by the `#[ignore]`d tests
 `soils-server/tests/demo.rs` and `soils-server/tests/props_demo.rs`.
+
+## Block textures (`gen_textures.mjs`)
+
+Unrelated to server scripts, but it lives here because it is Node tooling:
+
+```sh
+npm install                         # @resvg/resvg-js + pngjs (devDependencies)
+node scripts/gen_textures.mjs       # regenerate every block texture
+node scripts/gen_textures.mjs --only 2,3   # a subset, for iterating on a tile
+```
+
+Every atlas tile index in `crates/soils-client/assets/blocks.yaml` is authored
+as SVG in that script (one builder per tile; `scripts/textures/svg/` holds the
+emitted sources) and rendered to a 1024×1024 mega-tile that repeats over 16×16
+blocks (64 px per block). The tiles are stacked into
+`crates/soils-client/assets/blocks_mega.png`, which the client loads as a
+24-layer texture array (`gpu_mesh.rs`) and samples at `face_uv / 16`
+(`atlas.wgsl`). `scripts/textures/contact_sheet.png` shows all tiles at a
+glance. Row 0 of each 64 px band is the top of a block on side faces — that is
+where the grass cap sits in `grass_side`.

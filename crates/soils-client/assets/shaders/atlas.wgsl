@@ -44,9 +44,15 @@ struct ChunkSlot {
 @group(2) @binding(3) var<storage, read> light_pool: array<u32>;      // N_SLOTS × 8192 words
 @group(2) @binding(4) var<storage, read> slot_table: array<u32>;      // 32³ wrap-window map
 @group(2) @binding(5) var<storage, read> gi_probes: array<vec4<f32>>;
-@group(2) @binding(6) var atlas_tex: texture_2d<f32>;
+// Block textures: one 1024² layer per tile index (assets/blocks_mega.png via
+// scripts/gen_textures.mjs), each repeating over TILE_PERIOD blocks. Linear +
+// repeat sampler, so no fract() is needed on the face coordinate.
+@group(2) @binding(6) var atlas_tex: texture_2d_array<f32>;
 @group(2) @binding(7) var atlas_sampler: sampler;
 @group(2) @binding(8) var<uniform> params: WorldParams;
+
+// Blocks per texture repeat (1024 px / 64 px per block).
+const TILE_PERIOD: f32 = 16.0;
 
 // Must match pool::QUADS_PER_SLOT / voxel_mesh.wgsl.
 const QUADS_PER_SLOT: u32 = 4096u;
@@ -187,8 +193,6 @@ fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
-const ATLAS_COLS: f32 = 8.0;
-
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let n = in.normal;
@@ -210,13 +214,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         tile_uv.y = r;
     }
 
-    // Map into the atlas: pick the tile cell, repeat within it via fract().
-    let col = f32(in.tile % 8u);
-    let row = f32(in.tile / 8u);
-    let within = fract(tile_uv);
-    let atlas_uv = (vec2<f32>(col, row) + within) / ATLAS_COLS;
-
-    var color = textureSample(atlas_tex, atlas_sampler, atlas_uv);
+    // Sample the tile's layer over a TILE_PERIOD-block repeat. The face
+    // coordinate is chunk-local (0..32) and 16 divides 32, so the pattern is
+    // continuous across chunk borders; the orientation fix-ups above keep
+    // each 64 px band's row 0 at the top of its block on side faces.
+    var color = textureSample(atlas_tex, atlas_sampler, tile_uv / TILE_PERIOD, i32(in.tile));
 
     if (params.ambient_occlusion > 0.5) {
         color = vec4<f32>(color.rgb * in.ao, color.a);

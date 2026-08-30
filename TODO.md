@@ -1,5 +1,27 @@
 # Todo - main
-Commit each task. Test before commit. Each header is a different project, likely needing its own branch. After completing tasks, move them to CHANGELOG.md
+Commit 
+each task. Test before commit. Each header is a different project, likely needing its own branch. After completing tasks, move them to CHANGELOG.md
+
+## Staging
+Move these tasks into their respective categories (you can make more categories if needed). If it lacks detail or is too vague, add "??" to the item right before the description
+- [ ] Compress world data
+- [ ] Portals
+- [ ] NPCs with pathfinding
+- [ ] Server only sends chunk DELTAs, client uses world's seed (from server)
+      - Make sure to separate just the voxel generation from other parts of world gen
+- [ ] Structure generation - implementation must be able to be done 100% independently. You must be able to only generate one chunk from inside a structure, and be able to generate the rest later. 
+      - Bounding box has an origin which represents the internal voxel location it is translated relative to - for example a tree's origin is at its base, where the trunk should meet the ground
+      - Structures have unique identifiers (32-bit uint). 
+      - Output from terrain gen also a table
+- [ ] Client will generate a chunk while waiting for real chunk data from server. Server
+- [ ] NPCs have inventories, make armor for NPCs, 
+- [ ] NPC crafting - make houses and NPCs move in. Their inventories are accessible by interacting with them. They have roles, like Blacksmith, which allows them to craft. They are not created with these roles, but they train and specialize in whatever item is requested by the player. They need equipment to craft. Blacksmith needs 
+- [ ] Stars are vertices
+- [ ] Bow and arrows
+- [ ] Blocks should be shaped by their neighbors - block with exposed edge is sloped, exposed corner is also sloped
+- [ ] Breaking blocks should drop soil, sometimes grass seeds
+- [ ] Grass seeds can be crafted into Organic Brick
+- [ ] Throwable knife
 
 Other todo files:
 - [`crates/soils-terrainlab/TODO.md`](crates/soils-terrainlab/TODO.md)

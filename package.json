@@ -3,6 +3,8 @@
   "private": true,
   "description": "AssemblyScript toolchain for server-side scripts. `npm install` puts `asc` in node_modules/.bin so soils-script can compile scripts/*.ts at runtime (SOILS_SCRIPTS=1). Not needed for .wasm/.wat scripts.",
   "devDependencies": {
-    "assemblyscript": "^0.28.19"
+    "@resvg/resvg-js": "^2.6.2",
+    "assemblyscript": "^0.28.19",
+    "pngjs": "^7.0.0"
   }
 }

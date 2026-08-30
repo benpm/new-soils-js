@@ -24,7 +24,7 @@ use bevy::render::render_phase::{
     ViewBinnedRenderPhases,
 };
 use bevy::render::render_resource::binding_types::{
-    sampler, storage_buffer_read_only_sized, texture_2d, uniform_buffer_sized,
+    sampler, storage_buffer_read_only_sized, texture_2d_array, uniform_buffer_sized,
 };
 use bevy::render::render_resource::{
     BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
@@ -237,7 +237,7 @@ fn init_terrain_pipeline(
                     storage_buffer_read_only_sized(false, None), // 3 light pool
                     storage_buffer_read_only_sized(false, None), // 4 slot table
                     storage_buffer_read_only_sized(false, None), // 5 gi probes
-                    texture_2d(TextureSampleType::Float { filterable: true }), // 6 atlas
+                    texture_2d_array(TextureSampleType::Float { filterable: true }), // 6 block textures
                     sampler(SamplerBindingType::Filtering),      // 7
                     uniform_buffer_sized(false, None),           // 8 world params
                 ),
@@ -316,7 +316,15 @@ fn prepare_world_bind_group(
     else {
         return;
     };
+    // Built once, so the block texture array must be resident — and actually
+    // an array: `ExtractedAtlas` only appears after gpu_mesh promotes the
+    // stacked image, but guard against a stale 2D upload anyway, since a 2D
+    // view bound to a texture_2d_array layout is a validation panic. A
+    // missing/unloadable blocks_mega.png means no terrain draws at all.
     let Some(atlas_gpu) = images.get(&atlas.0) else { return };
+    if atlas_gpu.texture.depth_or_array_layers() != crate::gpu_mesh::MEGA_LAYERS {
+        return;
+    }
     let Some(gi_probes) = ssbos.get(&gi.irradiance()) else { return };
 
     let uniform = device.create_buffer(&BufferDescriptor {
@@ -346,8 +354,9 @@ fn prepare_world_bind_group(
     commands.insert_resource(WorldBindGroup { bind_group, uniform });
 }
 
-/// The atlas texture handle, extracted so the render world can resolve its
-/// GpuImage. Inserted by `gpu_mesh::setup_gpu_assets`.
+/// The block texture array handle, extracted so the render world can resolve
+/// its GpuImage. Inserted by `gpu_mesh::promote_block_textures` once the
+/// image is an array.
 #[derive(Resource, Clone, ExtractResource)]
 pub struct ExtractedAtlas(pub Handle<Image>);
 

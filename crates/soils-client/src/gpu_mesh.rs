@@ -4,6 +4,7 @@
 //! args — no CPU meshing, no Bevy meshes, no per-chunk buffers or bind groups
 //! (see `pool.rs` for the buffers and `world_draw.rs` for the draw).
 
+use bevy::image::{ImageLoaderSettings, ImageSampler};
 use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::render_asset::RenderAssets;
@@ -61,6 +62,27 @@ impl Plugin for GpuMeshPlugin {
     }
 }
 
+/// The block atlas. Load it only through [`load_atlas`].
+pub const ATLAS_PATH: &str = "blocks.png";
+
+/// Nearest in every direction: the atlas is 16x16 pixel-art tiles, magnified
+/// hard on a voxel face, and linear filtering both blurs it and bleeds the
+/// neighbouring tile across the cell edge.
+fn atlas_settings(s: &mut ImageLoaderSettings) {
+    s.sampler = ImageSampler::nearest();
+}
+
+/// Load the block atlas, sampled nearest.
+///
+/// Every caller must come through here. `AssetServer` keys by path, so the
+/// *first* load of a path fixes its settings and later ones quietly inherit
+/// them — two unordered `Startup` systems loading this with different samplers
+/// is a race, and the losing outcome is bilinear-blurred voxels for the
+/// session. One loader means there is nothing to win.
+pub fn load_atlas(asset_server: &AssetServer) -> Handle<Image> {
+    asset_server.load_builder().with_settings(atlas_settings).load(ATLAS_PATH)
+}
+
 /// Build the atlas texture and the faces-table buffer.
 fn setup_gpu_assets(
     mut commands: Commands,
@@ -68,10 +90,7 @@ fn setup_gpu_assets(
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     blocks: Res<Blocks>,
 ) {
-    // Nearest filtering comes from `ImagePlugin::default_nearest()` in `main`,
-    // not from settings here: the UI loads this same path too, and per-load
-    // settings only apply to whichever `load` happens to run first.
-    let texture = asset_server.load("blocks.png");
+    let texture = load_atlas(&asset_server);
 
     let faces: Vec<UVec4> = blocks.0.faces_table().into_iter().map(UVec4::from_array).collect();
     let faces_buf = buffers.add(ShaderBuffer::from(faces));
@@ -220,4 +239,75 @@ pub(crate) fn voxel_mesh_pass(
     pass.dispatch_workgroups(3, 33, jobs.count);
     pass.set_pipeline(finalize);
     pass.dispatch_workgroups(jobs.count, 1, 1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::image::ImageFilterMode;
+
+    /// The atlas must pin its own sampler rather than inherit the `ImagePlugin`
+    /// default, which is linear and blurs every voxel face.
+    #[test]
+    fn atlas_samples_nearest() {
+        let mut s = ImageLoaderSettings::default();
+        atlas_settings(&mut s);
+        let ImageSampler::Descriptor(d) = s.sampler else {
+            panic!("atlas inherits the ImagePlugin default sampler");
+        };
+        assert_eq!(d.mag_filter, ImageFilterMode::Nearest, "magnification");
+        assert_eq!(d.min_filter, ImageFilterMode::Nearest, "minification");
+        assert_eq!(d.mipmap_filter, ImageFilterMode::Nearest, "mipmap");
+    }
+
+    /// A second load of the atlas by literal path would race [`load_atlas`] and
+    /// could win with the default sampler, so the path belongs in exactly one
+    /// place. This is the test that catches the bug coming back: the symptom is
+    /// a startup-order race, so a normal run may reproduce it only sometimes.
+    ///
+    /// The needle is built from [`ATLAS_PATH`] rather than written out, so this
+    /// test does not count itself.
+    #[test]
+    fn the_atlas_path_is_written_once() {
+        let needle = format!("{ATLAS_PATH:?}");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension() == Some(std::ffi::OsStr::new("rs")) {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for (n, line) in text.lines().enumerate() {
+                        if line.contains(&needle) && !line.trim_start().starts_with("//") {
+                            let rel = path.strip_prefix(&src).unwrap();
+                            hits.push(format!("{}:{}", rel.display(), n + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(hits.len(), 1, "load the atlas via `load_atlas`, not by path; found {hits:?}");
+    }
+
+    /// The global default backs up [`load_atlas`] for anything loaded without
+    /// settings. Losing it is silent — nothing fails, textures just go blurry —
+    /// so pin it here.
+    #[test]
+    fn the_app_sets_the_global_nearest_default() {
+        let main = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let text = std::fs::read_to_string(main).unwrap();
+        assert!(
+            text.contains("ImagePlugin::default_nearest()"),
+            "DefaultPlugins must .set(ImagePlugin::default_nearest())"
+        );
+        // The plugin default is linear, so the call above is the only thing
+        // standing between a settings-less load and bilinear filtering.
+        assert_eq!(
+            ImagePlugin::default_nearest().default_sampler.mag_filter,
+            ImageFilterMode::Nearest
+        );
+    }
 }

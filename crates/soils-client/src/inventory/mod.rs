@@ -133,7 +133,8 @@ pub fn setup_item_icons(
         None,
         None,
     ));
-    commands.insert_resource(ItemIcons { atlas: assets.load("blocks.png"), layout });
+    let atlas = crate::gpu_mesh::load_atlas(&assets);
+    commands.insert_resource(ItemIcons { atlas, layout });
 }
 
 /// Meshes and materials for items lying in the world, cached per atlas tile.

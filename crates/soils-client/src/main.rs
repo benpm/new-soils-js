@@ -72,7 +72,10 @@ const PROVISIONAL_SPAWN: Vec3 = Vec3::new(282.0, 285.0, 268.0);
 
 fn main() {
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+    // Everything this client draws is 16x16 pixel art magnified hard, so the
+    // linear default is never what's wanted. `load_atlas` pins the block atlas
+    // itself; this is the backstop for anything loaded without settings.
+    app.add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()).set(WindowPlugin {
         primary_window: Some(Window {
             // The player name is in the title so two clients of the same
             // executable are separable — OBS matches capture sources by
@@ -102,13 +105,7 @@ fn main() {
             ..default()
         }),
         ..default()
-    })
-    // Blocks are pixel art: bilinear filtering smears tile edges, and with the
-    // in-shader `fract` tiling in atlas.wgsl it bleeds the neighbouring tile in
-    // at the seams. `blocks.png` is the only image the client loads, so set the
-    // default here instead of per-load: two `load`s of one path with different
-    // settings is a race, and the first one to run wins.
-    .set(ImagePlugin::default_nearest()))
+    }))
     .add_plugins(GpuMeshPlugin)
     .add_plugins(pool::PoolPlugin)
     .add_plugins(world_draw::WorldDrawPlugin)

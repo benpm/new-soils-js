@@ -126,7 +126,7 @@ pub fn cue(
     let start = match cue.started {
         Some(t) => t,
         None => {
-            let ready = streaming.pending == 0 && lit;
+            let ready = streaming.wanted == 0 && lit;
             if !ready && now < cue.after + cue.wait {
                 return; // still streaming, or still flooding
             }

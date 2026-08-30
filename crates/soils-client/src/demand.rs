@@ -495,8 +495,19 @@ pub fn process_demands(
         cgen.dispatch(epoch.0, gen_batch);
     }
 
-    // HUD estimate: subscribed-but-unmapped plus in-flight gen.
+    // HUD estimate: subscribed-but-unmapped plus in-flight gen. Includes
+    // chunks nothing has demanded, which is why it does not reach zero when
+    // the player is enclosed.
     streaming.pending = dir.entries.len() + proc.generating.len();
+    // What the renderer is actually still waiting for. Only demanded chunks
+    // are ever materialized (see the `take` loop above), so this is the count
+    // that goes to zero once the visible world is present.
+    streaming.wanted = demanded
+        .positions
+        .iter()
+        .filter(|c| dir.entries.contains_key(*c))
+        .count()
+        + proc.generating.len();
 }
 
 /// Buffer a remote edit whose chunk has no CPU bytes yet: overlay it and (if
@@ -536,6 +547,7 @@ mod tests {
                 load_radius: 3,
                 sent_radius: Some(3),
                 pending: 0,
+                wanted: 0,
             })
             .init_resource::<ChunkSlots>()
             .init_resource::<PoolOpQueue>()

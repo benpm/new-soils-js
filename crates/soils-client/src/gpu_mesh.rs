@@ -4,7 +4,6 @@
 //! args — no CPU meshing, no Bevy meshes, no per-chunk buffers or bind groups
 //! (see `pool.rs` for the buffers and `world_draw.rs` for the draw).
 
-use bevy::image::{ImageLoaderSettings, ImageSampler};
 use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::render_asset::RenderAssets;
@@ -69,12 +68,10 @@ fn setup_gpu_assets(
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     blocks: Res<Blocks>,
 ) {
-    let texture = asset_server
-        .load_builder()
-        .with_settings(|s: &mut ImageLoaderSettings| {
-            s.sampler = ImageSampler::nearest();
-        })
-        .load("blocks.png");
+    // Nearest filtering comes from `ImagePlugin::default_nearest()` in `main`,
+    // not from settings here: the UI loads this same path too, and per-load
+    // settings only apply to whichever `load` happens to run first.
+    let texture = asset_server.load("blocks.png");
 
     let faces: Vec<UVec4> = blocks.0.faces_table().into_iter().map(UVec4::from_array).collect();
     let faces_buf = buffers.add(ShaderBuffer::from(faces));

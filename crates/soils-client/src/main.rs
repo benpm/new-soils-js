@@ -40,6 +40,7 @@ mod ui;
 use bevy::app::{RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::camera::{Exposure, Hdr};
 use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::image::ImagePlugin;
 // Bevy 0.19 moved the atmosphere *description* types into `bevy_light`; the
 // render-side `AtmosphereSettings` stayed in `bevy_pbr`.
 use bevy::light::{
@@ -101,7 +102,13 @@ fn main() {
             ..default()
         }),
         ..default()
-    }))
+    })
+    // Blocks are pixel art: bilinear filtering smears tile edges, and with the
+    // in-shader `fract` tiling in atlas.wgsl it bleeds the neighbouring tile in
+    // at the seams. `blocks.png` is the only image the client loads, so set the
+    // default here instead of per-load: two `load`s of one path with different
+    // settings is a race, and the first one to run wins.
+    .set(ImagePlugin::default_nearest()))
     .add_plugins(GpuMeshPlugin)
     .add_plugins(pool::PoolPlugin)
     .add_plugins(world_draw::WorldDrawPlugin)

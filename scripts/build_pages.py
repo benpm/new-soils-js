@@ -46,6 +46,14 @@ CAPTIONS = {
         "fired — a take of nothing happening fails the test rather than "
         "publishing.",
     ),
+    "light": (
+        "Lighting a dark room",
+        "A player flies down into a sealed chamber under the spawn and rings "
+        "himself with Lamp Blocks, each one taking another sector of the floor "
+        "out of the dark. His own lantern is switched off for the take, so "
+        "every photon on screen comes from a block he placed. Recorded from "
+        "<code>light_demo.rs</code>.",
+    ),
     "props": (
         "Two clients, one prop pile",
         "Two bots walk mirrored routines into a pile of physics props and meet "

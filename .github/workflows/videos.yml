@@ -193,6 +193,11 @@ jobs:
           # no window placement.
           take inventory inventory_demo || true
 
+          # Underground, one client, in a room carved by the server. The one
+          # take whose subject *is* the lighting, so it is also the one that
+          # would show a regression in the flood.
+          take light light_demo || true
+
           # Two clients side by side. Without a window manager both map at the
           # origin and the second hides the first, so the recorder is told to
           # tile them by title before it rolls.

@@ -438,13 +438,17 @@ struct Worlds {
     /// SpacetimeDB mirror, when enabled. Each world registers itself here on
     /// first open and then keys its chunk saves by `world_id_for(name)`.
     stdb: Option<Arc<soils_stdb::StdbLink>>,
+    /// Carved into every world this server opens, on generation. `None` in
+    /// normal play.
+    chamber: Option<crate::Chamber>,
 }
 
 impl Worlds {
     /// Fetch a world by name, creating (opening) it on first request.
     fn get_or_create(&mut self, name: &str) -> &mut World {
         if !self.map.contains_key(name) {
-            let mut world = World::new(&self.data_dir, name, world_seed(name), self.persist.clone());
+            let mut world =
+                World::new(&self.data_dir, name, world_seed(name), self.persist.clone(), self.chamber);
             if let Some(stdb) = &self.stdb {
                 // The id is a stable hash of the name, so this needs no
                 // round-trip and survives restarts; the module rejects a
@@ -541,6 +545,7 @@ pub(crate) fn run_app(
     scripts_dir: Option<PathBuf>,
     physics_enabled: bool,
     props: u16,
+    chamber: Option<crate::Chamber>,
     stdb: Option<Arc<soils_stdb::StdbLink>>,
     server_name: String,
     bind_addr: String,
@@ -560,7 +565,7 @@ pub(crate) fn run_app(
         name: server_name,
         addr: bind_addr,
     });
-    let mut worlds = Worlds { map: HashMap::new(), data_dir, persist, stdb };
+    let mut worlds = Worlds { map: HashMap::new(), data_dir, persist, stdb, chamber };
     // Pre-create the default world so it's ready before the first client.
     worlds.get_or_create(DEFAULT_WORLD);
 
@@ -2308,8 +2313,14 @@ fn wander_critters(
 /// Blocks a new player starts with, by name. This keeps building available
 /// from the first second, as it was before placement cost anything; mining
 /// refills it. Names that a world's registry does not define are skipped.
-const STARTER_BLOCKS: [&str; 9] = [
+const STARTER_BLOCKS: [&str; 10] = [
     "Cobblestone", "Moss Stone", "Stone Bricks", "Dirt", "Grass", "Wooden Crate", "Clay Pot",
+    // Index 7 is deliberate. The bar auto-fills in inventory order and has
+    // eight keys, so this index *is* the hotbar key a bot selects — see
+    // `LAMP_KEY` in `soils-client::bot`. Inserting anywhere below index 6
+    // would also shift `CRATE_KEY` and silently make the container demo place
+    // the wrong block.
+    "Lamp Block",
     "Log", "Leaves",
 ];
 /// How many of each. Two full stacks apiece — one stack is 64, and a single

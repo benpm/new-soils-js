@@ -149,7 +149,14 @@ impl Plugin for GiPlugin {
         app.init_resource::<GiSettings>()
             .add_plugins(ExtractResourcePlugin::<GiAssets>::default())
             .add_systems(Startup, setup_gi_assets)
-            .add_systems(Update, (selftest_disable_gi, update_gi_volume).chain());
+            // `update_gi_volume` reads `WorldTime.daytime` for its daylight
+            // factor and had no ordering at all — not even after
+            // `apply_time` — so it sampled the pinned clock or the server's
+            // drifting one depending on the scheduler.
+            .add_systems(
+                Update,
+                (selftest_disable_gi, update_gi_volume).chain().after(crate::PinnedTime),
+            );
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;

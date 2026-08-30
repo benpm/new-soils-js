@@ -1,5 +1,145 @@
 # Changelog
 ****
+## The lamp demo filmed cobblestone, and demo worlds are playable
+
+**Branch `lamp-demo`, 2026-08-30.** The published lighting take was dark from
+start to finish. Three candidates — the test not working, the recording not
+capturing it, or lighting being broken — and it was the first, by way of a
+scheduling bug that had nothing to do with lighting at all.
+
+### The bot was placing the wrong block
+
+`bot::press_bot_buttons` synthesizes the keypresses a script asks for, and
+declared `.before(ui_hotkeys)` and `.before(edit_blocks)` — but **not** before
+`inventory::hotbar::select_hotbar_slot`. `ButtonInput` clears `just_pressed` at
+the start of the next frame, so a consumer scheduled *before* the synthesizer
+never sees the press. With no ordering that is a per-frame coin flip, and it
+lost.
+
+So `SelectKey(LAMP_KEY)` was dropped while the following `Place` still fired —
+`edit_blocks` *was* ordered. The bot placed whatever key 0 held, which is
+Cobblestone, which emits nothing. Six cobblestones in a sealed room is a video
+of a dark room.
+
+The same latent bug applies to the inventory demo's `SelectKey(CRATE_KEY)`;
+that take got the block it wanted by luck of scheduling.
+
+Verified by screenshot rather than by reasoning: the frame after the script
+finishes now shows lamps glowing on a lit floor, the HUD reading `block Lamp
+Block`, and the hotbar down to 122 from 128 — six placed.
+
+### Screenshots of a bot run keep the bot's framing
+
+`screenshot_once` parked the camera high over spawn looking down, which for a
+bot run photographs somewhere other than the place being filmed. A bot's
+framing *is* the subject, so it is now preserved like the GI demo's. Without
+this a "verify the demo works" screenshot proves nothing.
+
+`LIGHT_PITCH` went to -0.25 and back to -0.40 on the evidence: the obvious
+model says a shallower angle puts the lamp further away and shows more room,
+and the frame says otherwise. The constant now carries that warning.
+
+### Demo worlds in single-player
+
+The scenes the recording tests build only existed inside `#[ignore]`d tests, so
+the only way to see one was to film it. `singleplayer::DEMOS` is a table of
+`ServerConfig` tweaks — lamp room, prop pile, critters — with a button each on
+the login screen and `SOILS_DEMO=<id>` for scripted runs. Each gets its own
+`data/demo-<id>` directory: a demo must not scribble on the real save, and the
+chamber in particular is carved only as chunks are *generated*, so pointed at a
+directory that already has terrain the room would silently not be there.
+
+Smoke-tested: `prop-pile` reports 300 actors, `critters` 8, and the lamp room
+lights up under the bot.
+
+### Also
+
+Deleted `crates/soils-client/assets/blocks.yaml`. It was a stale copy of the
+block registry — no `emission`, no categories, and now no Lamp Block — that
+nothing loads (the client uses the compiled-in `soils-worldgen` one). It cost
+an investigation on the theory that the client was reading it, which is what an
+unused duplicate of a source of truth is for.
+
+****
+## A lamp to place, a room to place it in, and the flicker fixed
+
+**Branch `lamp-demo`, 2026-08-29.** Prompted by sunlight flickering in the
+published recordings. Investigating that turned up two causes, neither of which
+is avoided by filming underground — one of them is *worst* underground — so
+this fixes both and adds the demo that would show either coming back.
+
+### The flicker
+
+**Optimistic open sky.** A chunk whose column above has not streamed yet is lit
+as full daylight (`light_flood.wgsl`: "above means optimistic open sky") and
+snaps dark when the column arrives and re-floods. At 64 chunks/frame that
+correction rolls through the view for seconds. The recorder used to cue on
+`streaming.pending == 0`, which is not the same question: `process_demands`
+drops a chunk from the pending set when it *dispatches* generation and pushes
+it onto the light queue, so `pending` reads zero while the flood has not run.
+`record::cue` now also waits for `LightQueue::backlog()` to be empty — and to
+have *stayed* empty for a settle window, because the cue has no ordering
+against the planner, so one zero reading can be the gap between a drain and the
+next intake. It also waits for `LightReady`: before the pipelines compile the
+queue is undrainable, and an empty reading means nothing has started rather
+than that everything finished.
+
+**An ordering race on the pinned clock.** `light::update_sky_term` and
+`gi::update_gi_volume` read `WorldTime.daytime` with no ordering against
+`self_test_daytime`, which pins it — so on each frame a `ServerMsg::Time`
+landed, at 1 Hz, they saw the pin or the server's drifting clock depending on
+the scheduler. `update_sky_term` quantizes to 1/64, so those are visibly
+different steps. GI was worse: no ordering at all, not even after `apply_time`.
+Both now run after a named `PinnedTime` set, so the dependency is declared once
+instead of by function reference from three modules.
+
+### Lamp Block
+
+Appended to `blocks.yaml` as id 19 — safe, because ids are declaration order
+and the block registry does not feed `graph_hash`. Emission `[5.0, 3.4, 1.4]`,
+which `light_table` maps to level 15, a 15-voxel reach. It is the first
+*placeable* light source: the only two emissive blocks were ores that worldgen
+never places.
+
+Atlas tile 24 is painted by `scripts/paint_lamp_tile.py` rather than by hand.
+The atlas had no tooling, so a new block normally meant an image editor and a
+binary diff nobody can review; this makes the art code. Verified that exactly
+one tile changed — the file shrank only because Pillow re-compresses.
+
+`STARTER_BLOCKS` takes it at **index 7**, and that index is load-bearing: the
+bar auto-fills in inventory order and has eight keys, so the index *is* the
+key a bot selects, and inserting below 6 would have shifted `CRATE_KEY` and
+made the container demo place the wrong block.
+
+### A room to light
+
+`ServerConfig.chamber` carves a 49x24x49 hall with a solid shell under the
+spawn column, anchored to the generator's surface height because the
+continental octave means no absolute y is safe. Natural caves are 8-20 voxel
+tubes at 1-2% density — nothing like a hall — so there was nowhere to film.
+
+Carved in `World::adopt`, and the carved chunks are marked **edited**. That is
+not bookkeeping: a pristine manifest entry tells the client to *regenerate* the
+chunk locally from `GenParams`, which reproduces solid rock, so the room would
+have existed only on the server. It also keeps the chunk in the client's CPU
+mirror, which is what the placement raycast reads — a pristine chamber is one
+you cannot put a block in either. Not marked dirty, because the carve is a pure
+function of config and seed and re-carves identically on the way back in.
+
+### The take
+
+`SOILS_BOT=light` flies ~113 voxels down, lands, and rings itself with six
+lamps 60 degrees apart, panning between placements so the light is seen
+arriving rather than cutting. `SOILS_PLAYER_LIGHT=0` switches off the level-12
+lantern that otherwise rides the camera and would have kept the room lit
+whatever was placed in it.
+
+The descent deliberately runs *before* the recorder is cued. Streaming the
+chamber is most of what readiness waits for, and a bot that flew after the cue
+would film its own room arriving — which is the phantom-daylight artefact this
+demo exists to show is gone.
+
+****
 ## CI builds releases, and publishes the recordings per branch
 
 **Branch `ci-pipelines`, 2026-08-29.** Closes the two GitHub Actions items in

@@ -27,6 +27,10 @@ Environment:
                             the last one mapped hides the rest, so they have to
                             be moved explicitly. Needs `xdotool`.
     SOILS_CAPTURE_DIR       output directory (default: <repo>/recordings/ci)
+    SOILS_CAPTURE_SPEED     playback speed of the finished file (default 2.0,
+                            1.0 disables). Halves the duration and drops every
+                            other frame, so the published file is roughly half
+                            the size.
 
 Usage:
     python scripts/ffmpeg_record.py ensure
@@ -128,6 +132,44 @@ def tile_windows(titles: list[str], screen_w: int, screen_h: int) -> None:
     # Give the server a moment to actually restack and redraw before the first
     # captured frame, or the take opens on the pre-move layout.
     time.sleep(1.0)
+
+
+def speed_up(src: Path, fps: str, speed: float) -> Path:
+    """Re-encode `src` at `speed`x, keeping the same frame rate.
+
+    `setpts=PTS/speed` halves the presentation times, and pinning the output
+    rate back to `fps` makes ffmpeg *drop* the frames that no longer fit rather
+    than doubling the rate — so the result is half the duration and half the
+    frames. Measured on a 10 s 24 fps clip: 240 frames to 122.
+
+    Size falls by less than half, and by how much depends entirely on the
+    content: dropping every other frame also makes the surviving ones less
+    similar to their neighbours, so each costs more to encode. A high-entropy
+    test pattern only shrank 21%; a bot walking a fixed script under a software
+    rasteriser, which is mostly the same frame repeated, does much better.
+    """
+    dst = src.with_name(src.stem + "-x" + str(speed).replace(".", "_") + src.suffix)
+    args = [
+        ffmpeg(), "-hide_banner", "-loglevel", "warning", "-y",
+        "-i", str(src),
+        "-vf", f"setpts=PTS/{speed}",
+        "-r", fps,
+        "-an",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        str(dst),
+    ]
+    out = subprocess.run(args, capture_output=True, text=True)
+    if out.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+        # Not fatal: a take at 1x is still a take. Say so and keep the original
+        # rather than losing a recording to a post-process.
+        msg = f"{speed}x pass failed, keeping the original"
+        print(f"warning: {msg}\n{out.stderr}", file=sys.stderr)
+        return src
+    before, after = src.stat().st_size, dst.stat().st_size
+    print(f"sped up {speed}x: {before // 1024} KiB -> {after // 1024} KiB")
+    src.unlink(missing_ok=True)
+    return dst
 
 
 def read_state() -> dict | None:
@@ -234,6 +276,10 @@ def cmd_stop() -> None:
         log = Path(st.get("log", ""))
         detail = log.read_text() if log.exists() else "(no log)"
         die(f"no video at {path}:\n{detail}")
+    speed = float(os.environ.get("SOILS_CAPTURE_SPEED", "2.0"))
+    if speed > 1.0:
+        path = speed_up(path, os.environ.get("SOILS_CAPTURE_FPS", "30"), speed)
+
     # The `recorded: ` prefix is part of the contract, not decoration: the demo
     # tests parse it out of stdout (`strip_prefix("recorded: ")`) to find the
     # file they then assert on. Printing a bare path made `props_demo` fail

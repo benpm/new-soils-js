@@ -1,5 +1,85 @@
 # Changelog
 ****
+## CI builds releases, and publishes the recordings per branch
+
+**Branch `ci-pipelines`, 2026-08-29.** Closes the two GitHub Actions items in
+`TODO.md`. Two workflows and two scripts; no game code changed.
+
+### Releases
+
+`.github/workflows/release.yml`. Pushing a `v*` tag builds `soils-client` and
+`soils-server` in release for Linux and Windows, packages each with the
+`assets/` directory beside the binaries — that is where Bevy's asset server
+looks when the executable is not run through cargo, since there is no
+`CARGO_MANIFEST_DIR` outside the workspace — and publishes a Release with both
+archives attached. `workflow_dispatch` builds the same archives and leaves them
+as workflow artifacts, so the packaging can be exercised without cutting a
+release.
+
+Symbols are stripped through `CARGO_PROFILE_RELEASE_STRIP` in the workflow
+rather than a `[profile.release]` key, so a local `cargo build --release` is
+unchanged. `fail-fast` is off: a release with a Linux archive and no Windows
+one is still useful, and the gap is obvious from the assets list.
+
+There is no coupling to `screenshots.yml` — it already listens for
+`release: published`, which is what creating the release fires, so the rendered
+screenshots append themselves under the downloads.
+
+### The recorder became pluggable
+
+The four recording tests were already well-orchestrated: they host a server,
+script the bots, wait on `SOILS_READY_FILE` before rolling, and assert on which
+beats actually fired. The only thing OBS-specific about them was a `fn obs()`
+duplicated four times, so the change was to make *that* the seam rather than to
+write a second CI-only driver.
+
+`SOILS_RECORDER` names a script relative to the workspace root, defaulting to
+`scripts/obs_record.py`. Both implementations answer `ensure` / `start` / `stop`
+/ `status`, and `common::recorder()` replaces the four copies.
+
+`scripts/ffmpeg_record.py` is the CI one: an `x11grab` of the Xvfb display.
+`obs_record.py` cannot be it — it reads the websocket password out of
+`%APPDATA%` and launches OBS from a hardcoded `C:\Program Files` path — and
+OBS on a headless runner would need a compositor to capture from, which an Xvfb
+display already is. Capturing from inside the client was not an option either,
+for the reason `record.rs` already gives: a PNG per frame perturbs the frame
+clock the recording exists to judge.
+
+Two details that are not incidental. `stop` sends **SIGINT**, not SIGKILL,
+because ffmpeg finalises the container on interrupt and a killed encode leaves
+a file with no moov atom — the right length, and unplayable. And
+`SOILS_CAPTURE_TITLES` tiles named windows with `xdotool` before rolling:
+without a window manager every X client maps at the origin and the last one
+mapped hides the rest, so a two-client take would otherwise record one client
+twice. OBS does the equivalent with one scene pane per window.
+
+### The site
+
+`.github/workflows/videos.yml` runs on every push to every branch (bar
+`gh-pages`) and publishes to `gh-pages`, one tab per branch.
+`scripts/build_pages.py` mutates the existing site rather than replacing it: a
+Pages deploy overwrites everything, so a run on one branch has to carry the
+other branches' entries forward as data. `index.html` is rewritten every run
+and reads `branches.json` at load, so a change to the shell reaches the live
+site from whichever branch pushes next. Branches deleted from the remote are
+pruned — but an *empty* remote listing prunes nothing, since that means the
+listing failed rather than that every branch is gone.
+
+The publish job is force-pushed as an orphan commit. Every push to any branch
+produces tens of megabytes of video, and keeping that history would grow the
+repository without bound; the site is derived state.
+
+The takes are Mesa lavapipe on a four-core runner, so they are slow and ugly
+next to a local capture. They are evidence that the loop works on this commit,
+not a showcase — and because the recorder is the only thing that changed, a
+published video is one whose test passed, beat assertions included. A stalled
+routine records the right number of seconds of nothing happening, which is
+indistinguishable from a good take by file size alone; the assertions are what
+tell them apart, and they still run.
+
+Two of the four demos ship in CI: `inventory_demo` (one client, no window
+placement needed) and `props_demo` (two clients, tiled). `demo` and
+`stdb_demo` need a third client and a live database respectively.
 ## Five fixes from the PR #8 review
 
 **Branch `ui-inventory`, 2026-08-29.** An independent review of the container

@@ -15,11 +15,40 @@ use soils_protocol::{CHUNK_CUBED, ChunkVolume};
 
 /// Unified slots (light + descriptor). Covers a full r8 window (17³ = 4913)
 /// with headroom for hysteresis and in-flight loads.
+///
+/// `N_SLOTS × SLOT_BYTES` is the light pool, and it has to fit the adapter's
+/// `max_storage_buffer_binding_size` — 192 MiB at the default, which a real
+/// GPU has and Mesa lavapipe (128 MiB) does not. See `small_pools`.
+#[cfg(not(feature = "small_pools"))]
 pub const N_SLOTS: u32 = 6144;
 /// Mesh slots (voxels + quads + indirect). Only non-air chunks need one
 /// (~2.5k at r8). Slot 0 is a permanently-zero sentinel so air chunks' voxel
 /// reads resolve to air without branching; it is never handed out.
+#[cfg(not(feature = "small_pools"))]
 pub const N_MESH: u32 = 4096;
+
+/// Pool sizes for a software rasteriser: light 96 MiB, voxels 64 MiB, quads
+/// 64 MiB, all inside lavapipe's 128 MiB storage-binding limit.
+///
+/// CI renders headlessly under lavapipe, where the default pools trip the
+/// assert in `probe_gpu_caps` and the client dies before it can draw anything.
+/// A feature rather than a runtime clamp because these are `const` and feed
+/// buffer sizes, free-lists and slot arithmetic all over this module; sizing
+/// them dynamically is a real change to the renderer, and this is a build
+/// profile. Tracked in `Tasks.md` as the thing to do properly.
+///
+/// The ratio is preserved (`N_SLOTS > N_MESH`): light slots cover padded
+/// neighbours, so there must be more of them than mesh slots. Nothing needs
+/// to change in the shaders — `N_SLOTS` appears there only in comments, and
+/// `cull_demand.wgsl`'s hardcoded `N_MESH = 4096u` is an upper bound check,
+/// so a smaller Rust-side pool merely never reaches it.
+///
+/// Capacity is the cost: this covers a radius-4 window, not radius-8. The
+/// recordings set `SOILS_RADIUS=2`, so it is not the binding constraint there.
+#[cfg(feature = "small_pools")]
+pub const N_SLOTS: u32 = 3072;
+#[cfg(feature = "small_pools")]
+pub const N_MESH: u32 = 2048;
 /// `Slot::mesh` value for air chunks (no mesh slot).
 pub const NO_MESH: u32 = u32::MAX;
 /// Slot-table axis size: chunk coord masked to `& 31` per axis. Collision-free

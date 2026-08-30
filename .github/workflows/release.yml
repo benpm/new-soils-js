@@ -1,0 +1,154 @@
+name: Release builds
+
+# Builds the client and the dedicated server for Linux and Windows and attaches
+# the archives to a GitHub Release.
+#
+# Triggered by pushing a `v*` tag. The release is created as *published*, which
+# is what `screenshots.yml` listens for — so the screenshots land in the notes
+# underneath these downloads without any coupling between the two workflows.
+#
+# `workflow_dispatch` builds the same archives and leaves them as workflow
+# artifacts instead, so the packaging can be exercised without cutting a
+# release. This workflow must live on the default branch for the dispatch entry
+# to appear in the Actions tab.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Release archives are for running, not debugging: symbols roughly double the
+  # size of a Bevy binary and a crash report from a stripped build still names
+  # the crate from the symbol table. Set here rather than in Cargo.toml so a
+  # local `cargo build --release` is unchanged.
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not withhold the other's archive: a
+      # release with a Linux build and no Windows build is still useful, and
+      # the missing one is obvious from the assets list.
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            ext: ""
+            archive: tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            ext: ".exe"
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      # Bevy's windowing and audio backends link against these; the Windows
+      # runner needs nothing equivalent.
+      - name: Install Bevy system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libasound2-dev libudev-dev
+
+      - name: Build client + server (release)
+        run: cargo build --release -p soils-client -p soils-server
+
+      # `assets/` sits beside the executables because that is where Bevy's
+      # asset server looks when the binary is not run through cargo: there is
+      # no CARGO_MANIFEST_DIR outside the workspace, so it falls back to the
+      # executable's directory. Running the client from anywhere else needs
+      # BEVY_ASSET_ROOT, which the README note in the archive says.
+      - name: Stage the archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          STAGE="soils-${VERSION}-${{ matrix.name }}"
+          mkdir -p "$STAGE"
+          cp "target/release/soils-client${{ matrix.ext }}" "$STAGE/"
+          cp "target/release/soils-server${{ matrix.ext }}" "$STAGE/"
+          cp -r crates/soils-client/assets "$STAGE/assets"
+          cp README.md "$STAGE/" 2>/dev/null || true
+          cat > "$STAGE/RUNNING.txt" <<'TXT'
+          soils — client and dedicated server
+
+          Start a server:   ./soils-server
+          Start the client: ./soils-client
+
+          The client connects to 127.0.0.1:9001 by default; the server browser
+          also finds servers on the LAN. `assets/` must stay beside the
+          executables — if you move the binaries, set BEVY_ASSET_ROOT to the
+          directory that contains `assets`.
+
+          Both binaries read the environment variables documented in README.md.
+          TXT
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+
+      - name: Archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: tar -czf "${STAGE}.tar.gz" "$STAGE"
+
+      - name: Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path "$env:STAGE" -DestinationPath "$env:STAGE.zip"
+
+      # Uploaded unconditionally so a dispatch run is useful on its own and a
+      # failed release step does not throw away a good build.
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ env.STAGE }}.tar.gz
+            ${{ env.STAGE }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List assets
+        run: find dist -type f | sort
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.zip
+          body: |
+            ### Downloads
+
+            | Platform | Archive |
+            |---|---|
+            | Linux x86_64 | `soils-${{ github.ref_name }}-linux-x86_64.tar.gz` |
+            | Windows x86_64 | `soils-${{ github.ref_name }}-windows-x86_64.zip` |
+
+            Each archive holds `soils-client`, `soils-server` and the `assets/`
+            directory they need. See `RUNNING.txt` inside.

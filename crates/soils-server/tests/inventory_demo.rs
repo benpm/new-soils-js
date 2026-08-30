@@ -20,7 +20,10 @@
 
 mod common;
 
-use std::io::Read;
+use common::{demo_budget, demo_secs, demo_var, recorder, workspace_root};
+
+use std::io::{BufRead, BufReader};
+use std::sync::{Arc, Mutex};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -31,14 +34,11 @@ const EXPECTED_BEATS: usize = 14;
 /// Seconds of routine to record. The bot's script (`SOILS_BOT=inv`) runs about
 /// 33 s after landing, and landing from the spawn height costs ~5 s.
 const TAKE_SECS: &str = "40";
-
-fn workspace_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/<pkg> lives two levels below the workspace root")
-        .to_path_buf()
-}
+/// Earliest the client may cue the recorder, and how long it waits for the
+/// world to finish streaming before cueing anyway. `await_ready`'s deadline is
+/// derived from both, so the two cannot drift apart.
+const RECORD_AFTER: f32 = 20.0;
+const RECORD_WAIT: f32 = 600.0;
 
 fn client_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("SOILS_CLIENT_BIN") {
@@ -50,24 +50,6 @@ fn client_binary() -> Option<std::path::PathBuf> {
         .iter()
         .map(|d| root.join(d).join(exe))
         .find(|p| p.exists())
-}
-
-fn obs(action: &str) -> String {
-    let script = workspace_root().join("scripts/obs_record.py");
-    let out = Command::new("python")
-        .arg(&script)
-        .arg(action)
-        .current_dir(workspace_root())
-        .output()
-        .unwrap_or_else(|e| panic!("could not run {}: {e}", script.display()));
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(
-        out.status.success(),
-        "obs_record.py {action} failed:\n{text}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    println!("obs {action}: {text}");
-    text
 }
 
 fn spawn_bot(
@@ -85,41 +67,73 @@ fn spawn_bot(
         .env("SOILS_BOT", "inv")
         .env("SOILS_BOT_START", start_file)
         .env("SOILS_READY_FILE", ready_file)
-        .env("SOILS_RECORD_AFTER", "20")
+        .env("SOILS_RECORD_AFTER", demo_secs(RECORD_AFTER))
         // Wait for the world, do not time out into it. The first take of this
         // cued after 60s with 386 chunks still streaming: the player dropped out
         // of fly mode into terrain that did not exist yet and fell through the
         // world, so the whole recording was empty fog. A demo that opens on an
         // unfinished world is not a shorter demo, it is a broken one.
-        .env("SOILS_RECORD_WAIT", "600")
+        .env("SOILS_RECORD_WAIT", demo_secs(RECORD_WAIT))
         .env("SOILS_RECORD_SECS", TAKE_SECS)
         .env("SOILS_RECORD_EXIT", "1")
         // Matches props_demo. A wider radius is more to stream before the take
         // can start and buys nothing at this pitch — the camera is looking at
         // the ground a metre away.
-        .env("SOILS_RADIUS", "2")
+        .env("SOILS_RADIUS", demo_var("SOILS_DEMO_RADIUS", "2"))
         // Midday: the item on the ground has to be readable, and the drop is a
         // 0.3-unit cube.
         .env("SOILS_DAYTIME", "0.0")
-        .env("SOILS_NOFOCUS", "1")
+        .env("SOILS_NOFOCUS", demo_var("SOILS_DEMO_NOFOCUS", "1"))
         .env("SOILS_VSYNC", "1")
         // The database is not part of what this films, and leaving it set would
         // make the take depend on a service being up.
         .env_remove("SOILS_STDB_URI")
         .env_remove("SOILS_STDB_TOKEN")
-        // Captured so the test can prove the routine ran. Reading it is
-        // deferred until after the client exits, which is safe only because
-        // the pipe is drained in one go at the end — see the wait below.
+        // Captured so the test can prove the routine ran. Drained by a
+        // thread from the moment of spawn — see `drain_stderr`.
         .stderr(Stdio::piped())
         .spawn()
         .expect("launch bot client")
 }
 
-fn await_ready(path: &std::path::Path, kid: &mut Child) {
-    // Must exceed the client's own SOILS_RECORD_WAIT, or this gives up first
-    // and the failure reads as "client never signalled" rather than "the world
-    // took longer than expected to stream".
-    let deadline = std::time::Instant::now() + Duration::from_secs(660);
+/// Read the client's stderr on a thread, into a buffer the test can inspect.
+///
+/// A piped stderr that nobody reads is a 64 KB buffer that fills and then
+/// blocks the writer forever. This client fills it easily — winit repeats
+/// "Cursor could not be confined" every frame on a display with no window
+/// manager, and Bevy adds a `CommandQueue` warning per dropped command — so
+/// the client would log a few lines, wedge on a write, and never reach the
+/// point of signalling readiness. That is precisely what happened on CI: five
+/// runs where the client printed `gpu caps` and then nothing at all for
+/// three quarters of an hour.
+///
+/// The exit path below already knew this ("drain stderr *before* waiting"),
+/// but `await_ready` runs first and nothing was reading during it. Draining
+/// from spawn covers both waits and keeps the log for the beat assertions.
+fn drain_stderr(kid: &mut Child) -> (Arc<Mutex<String>>, Option<std::thread::JoinHandle<()>>) {
+    let buf = Arc::new(Mutex::new(String::new()));
+    let handle = kid.stderr.take().map(|err| {
+        let sink = Arc::clone(&buf);
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                let mut g = sink.lock().unwrap();
+                g.push_str(&line);
+                g.push_str("\n");
+            }
+        })
+    });
+    (buf, handle)
+}
+
+fn await_ready(path: &std::path::Path, kid: &mut Child, log: &Arc<Mutex<String>>) {
+    // Derived from the client's own budget rather than picked: it cues
+    // unconditionally at RECORD_AFTER + RECORD_WAIT, so anything less than that
+    // plus real slack is a race this side loses — and the failure then reads as
+    // "client never signalled" rather than "we gave up first". It was 660
+    // against a 620 cue: forty seconds, most of which the client spends
+    // starting up. On CI that lost every time, for six runs.
+    let deadline =
+        std::time::Instant::now() + demo_budget((RECORD_AFTER + RECORD_WAIT) * 1.4);
     loop {
         if path.exists() {
             return;
@@ -127,7 +141,16 @@ fn await_ready(path: &std::path::Path, kid: &mut Child) {
         if let Ok(Some(status)) = kid.try_wait() {
             panic!("client exited before the world was ready ({status})");
         }
-        assert!(std::time::Instant::now() < deadline, "client never signalled readiness");
+        if std::time::Instant::now() >= deadline {
+            // Show what the client was doing rather than only that it stopped.
+            let _ = kid.kill();
+            let captured = log.lock().unwrap().clone();
+            let tail: Vec<&str> = captured.lines().rev().take(40).collect();
+            for line in tail.into_iter().rev() {
+                println!("client| {line}");
+            }
+            panic!("client never signalled readiness (its last output is above)");
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
 }
@@ -144,30 +167,31 @@ fn record_the_inventory_loop() {
     // Check OBS *before* anything expensive. Streaming the world takes minutes,
     // and discovering a dead recorder after that wastes the whole run — which is
     // exactly how the fourth take was lost.
-    obs("status");
+    recorder("status");
 
     let server = common::TestServer::start("invdemo");
     let addr = server.addr();
     println!("demo server on {addr}");
 
     let mut kid = spawn_bot(addr, "miner", &ready, &start);
+    let (log, drain) = drain_stderr(&mut kid);
 
     // Roll only once the world is on screen. Starting earlier films the join
     // burst, which is a different demo.
-    await_ready(&ready, &mut kid);
-    obs("start");
+    await_ready(&ready, &mut kid, &log);
+    recorder("start");
     std::fs::write(&start, "go").expect("write bot start file");
     println!("client ready; bot released");
 
-    // Drain stderr *before* waiting: a client that fills the pipe buffer would
-    // block forever on a write while we block forever on the exit.
-    let mut log = String::new();
-    if let Some(mut err) = kid.stderr.take() {
-        let _ = err.read_to_string(&mut log);
-    }
     let status = kid.wait().expect("client");
+    // The pipe EOFs when the client exits; join so the buffer is complete
+    // before anything is asserted about it.
+    if let Some(d) = drain {
+        let _ = d.join();
+    }
+    let log = log.lock().unwrap().clone();
     println!("client exited: {status}");
-    let recorded = obs("stop");
+    let recorded = recorder("stop");
 
     // A stalled routine produces a file of the right length full of nothing
     // happening. That is indistinguishable from a good take by size alone —

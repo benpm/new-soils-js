@@ -1,4 +1,4 @@
-# Tasks
+# Implementation log
 
 > **Open work lives in [`Tasks.md`](Tasks.md).** This file is the historical
 > record: what shipped in each phase, what was measured, and what was deferred

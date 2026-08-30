@@ -32,8 +32,17 @@ use std::time::Duration;
 const EXPECTED_BEATS: usize = 14;
 
 /// Seconds of routine to record. The bot's script (`SOILS_BOT=inv`) runs about
-/// 33 s after landing, and landing from the spawn height costs ~5 s.
-const TAKE_SECS: &str = "40";
+/// 33 s after landing, and landing costs a variable amount on top.
+///
+/// 40 used to be enough by three seconds, and stopped being enough once the
+/// recorder started cueing on a *ready* world instead of timing out. The take
+/// now opens at ~30 s rather than ~930 s, so the bot flies outward from spawn
+/// into chunks that are still arriving, and the fall to `grounded` takes
+/// longer than it did when the world had fifteen minutes to settle first. The
+/// budget has to cover the script plus a landing whose length is a property of
+/// the machine, not of the script — hence real headroom rather than three
+/// seconds of it.
+const TAKE_SECS: &str = "55";
 /// Earliest the client may cue the recorder, and how long it waits for the
 /// world to finish streaming before cueing anyway. `await_ready`'s deadline is
 /// derived from both, so the two cannot drift apart.

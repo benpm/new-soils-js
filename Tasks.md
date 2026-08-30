@@ -61,15 +61,12 @@ order that hurts:
       a YAML edit, and the hotbar's substitution rule is already written against
       it (a Large Fruit eaten to nothing is replaced by another
       `Consumable, Healing`).
-- [ ] **A script edit that removes a container block does not spill it.**
-      `run_scripts` applies voxel edits straight through `World::edit`, so a
-      script that deletes a chest leaves its contents on the block-data page
-      with no block in front of them — invisible, unreachable, and inherited by
-      whatever is built on that voxel next. The player edit path handles this
-      (`take_block_data` + spill + close viewers); the script path needs the
-      same three lines, or both need to move behind one `break_block` helper.
-      Landed 2026-08-28 with containers; see
-      [plan-storage.md §5](docs/plan-storage.md).
+- [x] **A script edit that removes a container block does not spill it.**
+      Closed 2026-08-30 (`light-falloff`). Both paths now go through one
+      `release_block_data` helper — the second option in the original note, and
+      the right one: two copies of this is exactly how they drifted apart in the
+      first place. Pinned by `a_script_that_deletes_a_container_spills_it`,
+      verified to fail with the fix disabled.
 - [ ] **Placing does not require the target to be air.** `validate_edit`
       checks reach and a known block id, nothing else, and `World::edit`
       unconditionally `set`s — so a modified client can overwrite any block

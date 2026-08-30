@@ -23,6 +23,12 @@ async fn main() {
             config.physics = true;
         }
     }
+    // The lighting demo's room, for looking at by hand. Off by default, so
+    // ordinary worlds are untouched terrain.
+    if std::env::var("SOILS_CHAMBER").is_ok_and(|v| v != "0") {
+        config.chamber = Some(soils_server::Chamber::DEMO);
+    }
+
     // Scripting: SOILS_SCRIPTS_DIR wins; else SOILS_SCRIPTS=1 loads ./scripts.
     if let Ok(dir) = std::env::var("SOILS_SCRIPTS_DIR") {
         config.scripts_dir = Some(dir.into());

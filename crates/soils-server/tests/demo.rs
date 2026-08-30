@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use common::{TestServer, spawn_peer};
+use common::{TestServer, recorder, spawn_peer, workspace_root};
 use tokio::sync::Barrier;
 
 const WEST: f32 = std::f32::consts::FRAC_PI_2;
@@ -48,16 +48,6 @@ const SPAWN_CHUNK: [i32; 3] = [8, 8, 8];
 const MAX_TAKE_SECS: u64 = 400;
 /// Length of the recorded take, handed to the spectator.
 const TAKE_SECS_STR: &str = "40";
-
-/// The workspace root. A test's working directory is its *package* directory,
-/// so `target/` is two levels up, not relative to the cwd.
-fn workspace_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/<pkg> lives two levels below the workspace root")
-        .to_path_buf()
-}
 
 /// The client binary: release if it has been built (much smoother capture, and
 /// a debug Bevy client is too slow to judge motion by), debug otherwise.
@@ -127,31 +117,6 @@ fn spawn_spectator(
         .spawn()
         .map_err(|e| eprintln!("could not launch client: {e}"))
         .ok()
-}
-
-/// Run `scripts/obs_record.py <action>`; returns its stdout.
-///
-/// OBS is driven through obs-websocket rather than recorded frame-by-frame in
-/// the client. `muesli/obs-cli` cannot be used for this: it is pinned to
-/// obs-websocket protocol 4 and OBS 28+ serves protocol 5 only, so it fails
-/// the handshake. `scripts/obs_record.py` wraps `obs-cmd`, which speaks 5.
-fn obs(action: &str) -> String {
-    let script = workspace_root().join("scripts/obs_record.py");
-    let out = Command::new("python")
-        .arg(&script)
-        .arg(action)
-        .current_dir(workspace_root())
-        .output()
-        .unwrap_or_else(|e| panic!("could not run {}: {e}", script.display()));
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !out.status.success() {
-        panic!(
-            "obs_record.py {action} failed:\n{text}\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    println!("obs {action}: {text}");
-    text
 }
 
 /// Block until the spectator reports the world is on screen.
@@ -307,12 +272,12 @@ fn record_two_player_demo() {
     // Roll only once the world is actually on screen, so the take never opens
     // on empty sky.
     await_ready(&ready_file, &mut spectator);
-    obs("start");
+    recorder("start");
 
     // The spectator ends the take (SOILS_RECORD_SECS then exit); the
     // participants keep performing until it does.
     let status = spectator.wait().expect("spectator client");
-    let recorded = obs("stop");
+    let recorded = recorder("stop");
     println!("spectator exited: {status}");
     stop.store(true, Ordering::Relaxed);
     let _ = alice.join();

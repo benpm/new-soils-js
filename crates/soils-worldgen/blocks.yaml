@@ -82,3 +82,14 @@ Leaves:
   faces: [22, 22, 22]
   category: organic
   weight: 0.1
+Lamp Block:
+  faces: [24, 24, 24]
+  # `light_table` maps max(rgb) -> a 0-15 level as round(max * 3), so 5.0 is
+  # level 15: a 15-voxel blocklight reach, a room light rather than an ore
+  # glint. The RGB itself only reaches the screen through the radiance-cascade
+  # GI — the L0 grid is one monochrome level per voxel and `atlas.wgsl` tints
+  # it with a fixed warm `BLOCK_TINT` — so the hue here is what the *bounce*
+  # is coloured with, not the direct glow.
+  emission: [5.0, 3.4, 1.4]
+  category: crafted
+  weight: 1.6

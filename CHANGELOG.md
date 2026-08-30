@@ -1,5 +1,225 @@
 # Changelog
 ****
+## The lamp demo filmed cobblestone, and demo worlds are playable
+
+**Branch `lamp-demo`, 2026-08-30.** The published lighting take was dark from
+start to finish. Three candidates — the test not working, the recording not
+capturing it, or lighting being broken — and it was the first, by way of a
+scheduling bug that had nothing to do with lighting at all.
+
+### The bot was placing the wrong block
+
+`bot::press_bot_buttons` synthesizes the keypresses a script asks for, and
+declared `.before(ui_hotkeys)` and `.before(edit_blocks)` — but **not** before
+`inventory::hotbar::select_hotbar_slot`. `ButtonInput` clears `just_pressed` at
+the start of the next frame, so a consumer scheduled *before* the synthesizer
+never sees the press. With no ordering that is a per-frame coin flip, and it
+lost.
+
+So `SelectKey(LAMP_KEY)` was dropped while the following `Place` still fired —
+`edit_blocks` *was* ordered. The bot placed whatever key 0 held, which is
+Cobblestone, which emits nothing. Six cobblestones in a sealed room is a video
+of a dark room.
+
+The same latent bug applies to the inventory demo's `SelectKey(CRATE_KEY)`;
+that take got the block it wanted by luck of scheduling.
+
+Verified by screenshot rather than by reasoning: the frame after the script
+finishes now shows lamps glowing on a lit floor, the HUD reading `block Lamp
+Block`, and the hotbar down to 122 from 128 — six placed.
+
+### Screenshots of a bot run keep the bot's framing
+
+`screenshot_once` parked the camera high over spawn looking down, which for a
+bot run photographs somewhere other than the place being filmed. A bot's
+framing *is* the subject, so it is now preserved like the GI demo's. Without
+this a "verify the demo works" screenshot proves nothing.
+
+`LIGHT_PITCH` went to -0.25 and back to -0.40 on the evidence: the obvious
+model says a shallower angle puts the lamp further away and shows more room,
+and the frame says otherwise. The constant now carries that warning.
+
+### Demo worlds in single-player
+
+The scenes the recording tests build only existed inside `#[ignore]`d tests, so
+the only way to see one was to film it. `singleplayer::DEMOS` is a table of
+`ServerConfig` tweaks — lamp room, prop pile, critters — with a button each on
+the login screen and `SOILS_DEMO=<id>` for scripted runs. Each gets its own
+`data/demo-<id>` directory: a demo must not scribble on the real save, and the
+chamber in particular is carved only as chunks are *generated*, so pointed at a
+directory that already has terrain the room would silently not be there.
+
+Smoke-tested: `prop-pile` reports 300 actors, `critters` 8, and the lamp room
+lights up under the bot.
+
+### Also
+
+Deleted `crates/soils-client/assets/blocks.yaml`. It was a stale copy of the
+block registry — no `emission`, no categories, and now no Lamp Block — that
+nothing loads (the client uses the compiled-in `soils-worldgen` one). It cost
+an investigation on the theory that the client was reading it, which is what an
+unused duplicate of a source of truth is for.
+
+****
+## A lamp to place, a room to place it in, and the flicker fixed
+
+**Branch `lamp-demo`, 2026-08-29.** Prompted by sunlight flickering in the
+published recordings. Investigating that turned up two causes, neither of which
+is avoided by filming underground — one of them is *worst* underground — so
+this fixes both and adds the demo that would show either coming back.
+
+### The flicker
+
+**Optimistic open sky.** A chunk whose column above has not streamed yet is lit
+as full daylight (`light_flood.wgsl`: "above means optimistic open sky") and
+snaps dark when the column arrives and re-floods. At 64 chunks/frame that
+correction rolls through the view for seconds. The recorder used to cue on
+`streaming.pending == 0`, which is not the same question: `process_demands`
+drops a chunk from the pending set when it *dispatches* generation and pushes
+it onto the light queue, so `pending` reads zero while the flood has not run.
+`record::cue` now also waits for `LightQueue::backlog()` to be empty — and to
+have *stayed* empty for a settle window, because the cue has no ordering
+against the planner, so one zero reading can be the gap between a drain and the
+next intake. It also waits for `LightReady`: before the pipelines compile the
+queue is undrainable, and an empty reading means nothing has started rather
+than that everything finished.
+
+**An ordering race on the pinned clock.** `light::update_sky_term` and
+`gi::update_gi_volume` read `WorldTime.daytime` with no ordering against
+`self_test_daytime`, which pins it — so on each frame a `ServerMsg::Time`
+landed, at 1 Hz, they saw the pin or the server's drifting clock depending on
+the scheduler. `update_sky_term` quantizes to 1/64, so those are visibly
+different steps. GI was worse: no ordering at all, not even after `apply_time`.
+Both now run after a named `PinnedTime` set, so the dependency is declared once
+instead of by function reference from three modules.
+
+### Lamp Block
+
+Appended to `blocks.yaml` as id 19 — safe, because ids are declaration order
+and the block registry does not feed `graph_hash`. Emission `[5.0, 3.4, 1.4]`,
+which `light_table` maps to level 15, a 15-voxel reach. It is the first
+*placeable* light source: the only two emissive blocks were ores that worldgen
+never places.
+
+Atlas tile 24 is painted by `scripts/paint_lamp_tile.py` rather than by hand.
+The atlas had no tooling, so a new block normally meant an image editor and a
+binary diff nobody can review; this makes the art code. Verified that exactly
+one tile changed — the file shrank only because Pillow re-compresses.
+
+`STARTER_BLOCKS` takes it at **index 7**, and that index is load-bearing: the
+bar auto-fills in inventory order and has eight keys, so the index *is* the
+key a bot selects, and inserting below 6 would have shifted `CRATE_KEY` and
+made the container demo place the wrong block.
+
+### A room to light
+
+`ServerConfig.chamber` carves a 49x24x49 hall with a solid shell under the
+spawn column, anchored to the generator's surface height because the
+continental octave means no absolute y is safe. Natural caves are 8-20 voxel
+tubes at 1-2% density — nothing like a hall — so there was nowhere to film.
+
+Carved in `World::adopt`, and the carved chunks are marked **edited**. That is
+not bookkeeping: a pristine manifest entry tells the client to *regenerate* the
+chunk locally from `GenParams`, which reproduces solid rock, so the room would
+have existed only on the server. It also keeps the chunk in the client's CPU
+mirror, which is what the placement raycast reads — a pristine chamber is one
+you cannot put a block in either. Not marked dirty, because the carve is a pure
+function of config and seed and re-carves identically on the way back in.
+
+### The take
+
+`SOILS_BOT=light` flies ~113 voxels down, lands, and rings itself with six
+lamps 60 degrees apart, panning between placements so the light is seen
+arriving rather than cutting. `SOILS_PLAYER_LIGHT=0` switches off the level-12
+lantern that otherwise rides the camera and would have kept the room lit
+whatever was placed in it.
+
+The descent deliberately runs *before* the recorder is cued. Streaming the
+chamber is most of what readiness waits for, and a bot that flew after the cue
+would film its own room arriving — which is the phantom-daylight artefact this
+demo exists to show is gone.
+
+****
+## CI builds releases, and publishes the recordings per branch
+
+**Branch `ci-pipelines`, 2026-08-29.** Closes the two GitHub Actions items in
+`TODO.md`. Two workflows and two scripts; no game code changed.
+
+### Releases
+
+`.github/workflows/release.yml`. Pushing a `v*` tag builds `soils-client` and
+`soils-server` in release for Linux and Windows, packages each with the
+`assets/` directory beside the binaries — that is where Bevy's asset server
+looks when the executable is not run through cargo, since there is no
+`CARGO_MANIFEST_DIR` outside the workspace — and publishes a Release with both
+archives attached. `workflow_dispatch` builds the same archives and leaves them
+as workflow artifacts, so the packaging can be exercised without cutting a
+release.
+
+Symbols are stripped through `CARGO_PROFILE_RELEASE_STRIP` in the workflow
+rather than a `[profile.release]` key, so a local `cargo build --release` is
+unchanged. `fail-fast` is off: a release with a Linux archive and no Windows
+one is still useful, and the gap is obvious from the assets list.
+
+There is no coupling to `screenshots.yml` — it already listens for
+`release: published`, which is what creating the release fires, so the rendered
+screenshots append themselves under the downloads.
+
+### The recorder became pluggable
+
+The four recording tests were already well-orchestrated: they host a server,
+script the bots, wait on `SOILS_READY_FILE` before rolling, and assert on which
+beats actually fired. The only thing OBS-specific about them was a `fn obs()`
+duplicated four times, so the change was to make *that* the seam rather than to
+write a second CI-only driver.
+
+`SOILS_RECORDER` names a script relative to the workspace root, defaulting to
+`scripts/obs_record.py`. Both implementations answer `ensure` / `start` / `stop`
+/ `status`, and `common::recorder()` replaces the four copies.
+
+`scripts/ffmpeg_record.py` is the CI one: an `x11grab` of the Xvfb display.
+`obs_record.py` cannot be it — it reads the websocket password out of
+`%APPDATA%` and launches OBS from a hardcoded `C:\Program Files` path — and
+OBS on a headless runner would need a compositor to capture from, which an Xvfb
+display already is. Capturing from inside the client was not an option either,
+for the reason `record.rs` already gives: a PNG per frame perturbs the frame
+clock the recording exists to judge.
+
+Two details that are not incidental. `stop` sends **SIGINT**, not SIGKILL,
+because ffmpeg finalises the container on interrupt and a killed encode leaves
+a file with no moov atom — the right length, and unplayable. And
+`SOILS_CAPTURE_TITLES` tiles named windows with `xdotool` before rolling:
+without a window manager every X client maps at the origin and the last one
+mapped hides the rest, so a two-client take would otherwise record one client
+twice. OBS does the equivalent with one scene pane per window.
+
+### The site
+
+`.github/workflows/videos.yml` runs on every push to every branch (bar
+`gh-pages`) and publishes to `gh-pages`, one tab per branch.
+`scripts/build_pages.py` mutates the existing site rather than replacing it: a
+Pages deploy overwrites everything, so a run on one branch has to carry the
+other branches' entries forward as data. `index.html` is rewritten every run
+and reads `branches.json` at load, so a change to the shell reaches the live
+site from whichever branch pushes next. Branches deleted from the remote are
+pruned — but an *empty* remote listing prunes nothing, since that means the
+listing failed rather than that every branch is gone.
+
+The publish job is force-pushed as an orphan commit. Every push to any branch
+produces tens of megabytes of video, and keeping that history would grow the
+repository without bound; the site is derived state.
+
+The takes are Mesa lavapipe on a four-core runner, so they are slow and ugly
+next to a local capture. They are evidence that the loop works on this commit,
+not a showcase — and because the recorder is the only thing that changed, a
+published video is one whose test passed, beat assertions included. A stalled
+routine records the right number of seconds of nothing happening, which is
+indistinguishable from a good take by file size alone; the assertions are what
+tell them apart, and they still run.
+
+Two of the four demos ship in CI: `inventory_demo` (one client, no window
+placement needed) and `props_demo` (two clients, tiled). `demo` and
+`stdb_demo` need a third client and a live database respectively.
 ## Five fixes from the PR #8 review
 
 **Branch `ui-inventory`, 2026-08-29.** An independent review of the container

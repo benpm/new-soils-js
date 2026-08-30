@@ -117,6 +117,10 @@ struct Predictor {
     /// reconciles that had a matching history entry.
     max_divergence: f32,
     reconciles: u32,
+    /// Where the server last said we were. The walk phase below drives until
+    /// *this* has travelled far enough, rather than for a fixed tick count —
+    /// see `forced_misprediction_reconciles_behind_the_wall`.
+    server_pos: Option<Vec3>,
     /// Diagnostics: snapshots seen / snapshots containing self / mismatched.
     snapshots: u32,
     self_seen: u32,
@@ -145,6 +149,7 @@ impl Predictor {
             ignore_edits: false,
             max_divergence: 0.0,
             reconciles: 0,
+            server_pos: None,
             snapshots: 0,
             self_seen: 0,
             unmatched: 0,
@@ -269,6 +274,7 @@ impl Predictor {
             );
         }
         self.max_divergence = self.max_divergence.max(divergence);
+        self.server_pos = Some(server_pos);
         if divergence <= EPSILON {
             return;
         }
@@ -448,12 +454,32 @@ async fn forced_misprediction_reconciles_behind_the_wall() {
 
     // Phase 2: walk north. The server strolls down the carved tunnel; the
     // local sim bumps into phantom rock; reconciliation must drag us forward.
-    for _ in 0u32..150 {
+    //
+    // Driven by how far the *server* has actually walked, not by a fixed tick
+    // count. The ticker is wall-clock, so under full-suite contention ticks are
+    // missed, the server walks less far, and the divergence this test exists to
+    // observe shrinks with it — which is how a fixed 150 ticks landed on
+    // exactly the 0.5 threshold and failed. The bar is not lowered; the
+    // precondition for reaching it is now established rather than assumed.
+    const WALK_TARGET: f32 = 2.0;
+    const WALK_TICK_CAP: u32 = 900;
+    let start_z = eye.z;
+    let mut walked = 0u32;
+    while walked < WALK_TICK_CAP {
         ticker.tick().await;
         let msg = pred.tick(fly_input(0.0, false), a.tracker.latest_tick);
         a.send(&msg).await;
         drain(&mut a, &mut pred, self_net).await;
+        walked += 1;
+        if pred.server_pos.is_some_and(|p| start_z - p.z >= WALK_TARGET) {
+            break;
+        }
     }
+    let server_walk = pred.server_pos.map(|p| start_z - p.z).unwrap_or(0.0);
+    assert!(
+        server_walk >= WALK_TARGET,
+        "the server only walked {server_walk} of {WALK_TARGET} voxels in {walked} ticks —          the scenario never set up the misprediction it is about to assert on"
+    );
 
     // Let everything settle through the delayed link (no further inputs, so
     // the pending-replay window shrinks to nothing).

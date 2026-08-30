@@ -643,16 +643,20 @@ mod tests {
                 ("Grass", 128),
                 ("Wooden Crate", 128),
                 ("Clay Pot", 128),
+                ("Lamp Block", 128),
                 ("Log", 128),
                 ("Leaves", 128),
             ],
         );
         let (hotbar, ..) = settled(&inv);
         assert_eq!(named(&hotbar, &blocks, 0).as_deref(), Some("Cobblestone"));
-        assert_eq!(named(&hotbar, &blocks, 7).as_deref(), Some("Log"));
+        // Key 7 is the last one, and the lamp sits at index 7 of the real
+        // starter kit precisely so a bot can select it. `bot::LAMP_KEY`
+        // depends on this holding.
+        assert_eq!(named(&hotbar, &blocks, 7).as_deref(), Some("Lamp Block"));
         assert!(
             hotbar.slots.iter().all(|s| s.bound.is_some()),
-            "nine kinds and eight keys: every key gets one"
+            "ten kinds and eight keys: every key gets one"
         );
         assert!(
             hotbar.slots.iter().all(|s| s.want.is_none()),
@@ -784,9 +788,11 @@ mod tests {
         );
     }
 
-    /// A pack the shape of the real starter kit: nine kinds, eight keys, so one
-    /// stone is left over and unassigned.
-    const NINE_KINDS: [(&str, u16); 9] = [
+    /// A pack the shape of the real starter kit: ten kinds, eight keys, so two
+    /// are left over and unassigned. Appended to rather than reordered, so
+    /// keys 0-7 still hold what they did and the healing test below still
+    /// exercises Cobblestone -> Slate.
+    const TEN_KINDS: [(&str, u16); 10] = [
         ("Cobblestone", 1),
         ("Dirt", 128),
         ("Grass", 128),
@@ -796,13 +802,14 @@ mod tests {
         ("Clay Pot", 128),
         ("Iron Ore", 128),
         ("Slate", 128),
+        ("Lamp Block", 128),
     ];
 
     /// End to end through the real systems: place the last Cobblestone and key
     /// 1 comes back holding the spare stone, untouched by anything else.
     #[test]
     fn the_bar_heals_itself_through_the_running_systems() {
-        let mut app = ui_app(&NINE_KINDS);
+        let mut app = ui_app(&TEN_KINDS);
         let cobble = block(&app, "Cobblestone");
         let slate = block(&app, "Slate");
         {

@@ -1,22 +1,27 @@
-//! Records one player working the inventory loop: place a block, mine it back,
-//! watch the item drop where it stood, walk onto it to collect it, open the
-//! inventory screen to see it counted, and finally put down a Wooden Crate and
-//! right-click it open.
+//! Records one player lighting a dark room: fly down into the carved chamber
+//! ~100 voxels under spawn, then ring yourself with Lamp Blocks and watch each
+//! one take another sector of the floor out of the dark.
 //!
 //! Ignored by default: it drives a real GPU client and OBS Studio.
 //!
 //! ```sh
 //! cargo build --release -p soils-client
-//! python scripts/obs_scene.py --pane "new-soils [miner]"
+//! python scripts/obs_scene.py --pane "new-soils [lamplighter]"
 //! python scripts/obs_record.py ensure
-//! cargo test --release -p soils-server --test inventory_demo -- --ignored --nocapture
+//! cargo test --release -p soils-server --test light_demo -- --ignored --nocapture
 //! ```
 //!
-//! One client, not two: the inventory is a first-person, single-player concern,
-//! and the interesting frames are what *this* player's HUD and screen show. The
-//! bot drives the same `ButtonInput` the keyboard and mouse write to, so what is
-//! filmed is the path a person exercises — a bot with its own private edit path
-//! would prove nothing about the one people use.
+//! This is the take whose subject *is* the lighting, which makes it the one
+//! that would show a regression in the flood. Two things are deliberately
+//! switched off for it: the player's own lantern (`SOILS_PLAYER_LIGHT=0`, or a
+//! level-12 emitter rides the camera and the room is never dark), and any
+//! reliance on the sun (the chamber is sealed, so every photon on screen comes
+//! from a block the player put there).
+//!
+//! The bot flies down *before* the recorder is cued, not after. Streaming the
+//! chamber is most of what readiness waits for, and a take that opened on it
+//! arriving would film the optimistic-open-sky correction rolling through —
+//! the exact flicker `record::cue`'s light gate exists to keep off film.
 
 mod common;
 
@@ -27,27 +32,25 @@ use std::sync::{Arc, Mutex};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-/// Beats in the bot's inventory script (`INV_BEATS` in `soils-client::bot`).
+/// Beats in the bot's light script (`LIGHT_BEATS` in `soils-client::bot`).
 /// The take is only worth publishing if every one of them fired.
-const EXPECTED_BEATS: usize = 14;
+const EXPECTED_BEATS: usize = 16;
 
-/// Seconds of routine to record. The bot's script (`SOILS_BOT=inv`) runs about
-/// 33 s after landing, and landing costs a variable amount on top.
-///
-/// 40 used to be enough by three seconds, and stopped being enough once the
-/// recorder started cueing on a *ready* world instead of timing out. The take
-/// now opens at ~30 s rather than ~930 s, so the bot flies outward from spawn
-/// into chunks that are still arriving, and the fall to `grounded` takes
-/// longer than it did when the world had fifteen minutes to settle first. The
-/// budget has to cover the script plus a landing whose length is a property of
-/// the machine, not of the script — hence real headroom rather than three
-/// seconds of it.
-const TAKE_SECS: &str = "55";
+/// Seconds of routine to record. The script runs 31.5 s from the start signal;
+/// the flight down is pre-roll, so unlike the inventory demo no landing budget
+/// is needed inside the take itself.
+const TAKE_SECS: &str = "35";
 /// Earliest the client may cue the recorder, and how long it waits for the
 /// world to finish streaming before cueing anyway. `await_ready`'s deadline is
 /// derived from both, so the two cannot drift apart.
 const RECORD_AFTER: f32 = 20.0;
-const RECORD_WAIT: f32 = 600.0;
+// Longer than the other demos on purpose. On a software rasteriser the chunk
+// pipeline drains slowly enough that `streaming.pending` does not reach zero
+// inside 600s, and the cue then times out into an unfinished world — which
+// underground means the phantom daylight this take exists to disprove. The
+// budget is honest now that the recorder reads `Time<Real>`, so this is 900
+// actual seconds rather than 900 of a clock that runs at half speed.
+const RECORD_WAIT: f32 = 900.0;
 
 fn client_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("SOILS_CLIENT_BIN") {
@@ -73,7 +76,7 @@ fn spawn_bot(
         .env("BEVY_ASSET_ROOT", workspace_root().join("crates/soils-client"))
         .env("SOILS_AUTOLOGIN", addr.to_string())
         .env("SOILS_NAME", name)
-        .env("SOILS_BOT", "inv")
+        .env("SOILS_BOT", "light")
         .env("SOILS_BOT_START", start_file)
         .env("SOILS_READY_FILE", ready_file)
         .env("SOILS_RECORD_AFTER", demo_secs(RECORD_AFTER))
@@ -91,7 +94,20 @@ fn spawn_bot(
         .env("SOILS_RADIUS", demo_var("SOILS_DEMO_RADIUS", "2"))
         // Midday: the item on the ground has to be readable, and the drop is a
         // 0.3-unit cube.
+        // Noon: exposure is `EV100_DAY` rather than the much darker
+        // `EV100_NIGHT`, so the lamps read at the brightness they were tuned
+        // for. Underground the sun contributes nothing either way — this only
+        // sets the camera.
         .env("SOILS_DAYTIME", "0.0")
+        // The whole point: no lantern on the camera, so the room is dark until
+        // a lamp is placed in it.
+        .env("SOILS_PLAYER_LIGHT", "0")
+        // Derived from the same numbers that carve the room, because the spawn
+        // height follows the terrain and only a delta means anything here.
+        .env("SOILS_BOT_DESCENT", format!("{:.0}", soils_server::Chamber::DEMO.descent_from_spawn()))
+        // GI is what gives the lamps their colour; the L0 glow is monochrome.
+        // Overridable because it is expensive on a software rasteriser.
+        .env("SOILS_GI", demo_var("SOILS_DEMO_GI", "1"))
         .env("SOILS_NOFOCUS", demo_var("SOILS_DEMO_NOFOCUS", "1"))
         .env("SOILS_VSYNC", "1")
         // The database is not part of what this films, and leaving it set would
@@ -166,10 +182,10 @@ fn await_ready(path: &std::path::Path, kid: &mut Child, log: &Arc<Mutex<String>>
 
 #[test]
 #[ignore = "drives a GPU client and OBS; run deliberately to record"]
-fn record_the_inventory_loop() {
+fn record_the_lit_room() {
     let root = workspace_root();
-    let ready = root.join("target/soils-ready-miner");
-    let start = root.join("target/soils-bot-start");
+    let ready = root.join("target/soils-ready-lamplighter");
+    let start = root.join("target/soils-bot-start-light");
     let _ = std::fs::remove_file(&ready);
     let _ = std::fs::remove_file(&start);
 
@@ -178,11 +194,13 @@ fn record_the_inventory_loop() {
     // exactly how the fourth take was lost.
     recorder("status");
 
-    let server = common::TestServer::start("invdemo");
+    let server = common::TestServer::start_with("lightdemo", |c| {
+        c.chamber = Some(soils_server::Chamber::DEMO)
+    });
     let addr = server.addr();
     println!("demo server on {addr}");
 
-    let mut kid = spawn_bot(addr, "miner", &ready, &start);
+    let mut kid = spawn_bot(addr, "lamplighter", &ready, &start);
     let (log, drain) = drain_stderr(&mut kid);
 
     // Roll only once the world is on screen. Starting earlier films the join
@@ -206,8 +224,10 @@ fn record_the_inventory_loop() {
     // happening. That is indistinguishable from a good take by size alone —
     // the first attempt at this recorded 34s of empty fog and passed.
     let beats = log.matches("bot: beat ").count();
-    assert!(log.contains("inventory routine starts"), "the bot never landed:
-{log}");
+    assert!(
+        log.contains("light routine starts"),
+        "the bot never reached the chamber:\n{log}"
+    );
     assert_eq!(
         beats, EXPECTED_BEATS,
         "only {beats} of {EXPECTED_BEATS} script beats fired — the take shows a \

@@ -40,6 +40,7 @@ mod ui;
 use bevy::app::{RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::camera::{Exposure, Hdr};
 use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::image::ImagePlugin;
 // Bevy 0.19 moved the atmosphere *description* types into `bevy_light`; the
 // render-side `AtmosphereSettings` stayed in `bevy_pbr`.
 use bevy::light::{
@@ -142,7 +143,7 @@ fn main() {
     .init_resource::<actor::InterpClock>()
     .init_resource::<edit::PendingEdits>()
     .init_resource::<light::LightQueue>()
-    .init_resource::<light::PlayerLight>()
+    .insert_resource(light::configured_player_light())
     .init_resource::<light::SkyTerm>()
     .insert_resource(net::connect())
     .insert_resource(discovery::spawn());
@@ -218,7 +219,7 @@ fn main() {
                 .after(server_msg::apply_edits)
                 .after(edit::edit_blocks)
                 .after(light::track_player_light),
-            light::update_sky_term.after(server_msg::apply_time),
+            light::update_sky_term.after(server_msg::apply_time).after(PinnedTime),
         ),
     )
     // Always-on: login flow, day/night, camera interpolation, self-test.
@@ -235,7 +236,7 @@ fn main() {
             hud::toggle_hud,
             actor::interpolate_actors,
             player::sync_camera,
-            self_test_daytime.after(server_msg::apply_time).before(day_night),
+            self_test_daytime.after(server_msg::apply_time).before(day_night).in_set(PinnedTime),
             day_night,
             self_test,
             screenshot_once.after(player::sync_camera),
@@ -271,6 +272,15 @@ fn main() {
             bot::press_bot_buttons
                 .run_if(bot::active)
                 .before(ui::ui_hotkeys)
+                // Every consumer of `just_pressed` this synthesizes must run
+                // after it. `ButtonInput` clears the flag at the start of the
+                // next frame, so a consumer scheduled *before* this simply
+                // never sees the press — and with no ordering that is a
+                // per-frame coin flip. `select_hotbar_slot` was missing here
+                // while `edit_blocks` was not, so a bot's `SelectKey` was
+                // usually dropped and the following `Place` put down whatever
+                // key 0 held instead of the block the script asked for.
+                .before(inventory::hotbar::select_hotbar_slot)
                 .before(edit::edit_blocks),
             ui::track_alt,
             ui::ui_hotkeys.run_if(console::console_closed),
@@ -349,6 +359,7 @@ fn main() {
             // frame of latency before the fixed tick consumes it.
             bot::drive.run_if(bot::active),
             bot::inventory_actions.run_if(bot::active),
+            bot::light_actions.run_if(bot::active),
         )
             .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop)
             .run_if(login::logged_in),
@@ -380,10 +391,17 @@ fn screenshot_once(
     mut hold: ResMut<player::CameraHold>,
     slots: Res<pool::ChunkSlots>,
     remote_actors: Query<&Transform, (With<Actor>, Without<Player>)>,
+    bot: Option<Res<bot::Bot>>,
 ) {
     if *taken || std::env::var("SOILS_SELFTEST").is_err() {
         return;
     }
+    // A bot's framing *is* the subject: it flew somewhere and aimed at
+    // something on purpose, and the whole reason to shoot a bot run is to see
+    // what the take will show. Parking the camera over spawn would photograph
+    // a different place than the one being filmed — which is exactly how a
+    // "verify the demo works" screenshot ends up proving nothing.
+    let keep_framing = gi_demo::demo_enabled() || bot.is_some();
     // Configurable so slow software-GPU CI (lavapipe) can allow more time to
     // stream/mesh/trace before the shot; defaults preserve local behaviour.
     if time.elapsed_secs() > env_secs("SOILS_SHOT_SECS", 9.0) {
@@ -391,7 +409,7 @@ fn screenshot_once(
         // In GI-demo mode keep the scene's own framing (see gi_demo.rs).
         // The hold stops the server position echo from dragging the framed
         // camera back toward the player's authoritative position mid-capture.
-        if !gi_demo::demo_enabled() {
+        if !keep_framing {
             hold.0 = true;
             if let Ok((mut p, mut t)) = camera.single_mut() {
                 if let Some(actor) = remote_actors.iter().next() {
@@ -461,6 +479,18 @@ fn spectator_camera(
 /// In self-test mode, pin the time of day so screenshots are deterministic
 /// (the server's clock drifts with wall-time). `SOILS_DAYTIME` overrides the
 /// default noon (0.0); e.g. 0.25 = dawn/dusk, 0.5 = midnight.
+/// The frame's authoritative time of day, once [`self_test_daytime`] has
+/// pinned it.
+///
+/// Everything that *reads* `WorldTime.daytime` must run after this, or on the
+/// frames a `ServerMsg::Time` lands it reads the server's drifting clock
+/// instead of the pin — and since that arrives once a second, the result is a
+/// 1 Hz two-value flicker in the sky term and the GI daylight factor, not a
+/// race that averages out. `update_sky_term` quantizes to 1/64, so the two
+/// values are visibly different steps rather than neighbouring ones.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PinnedTime;
+
 fn self_test_daytime(mut world_time: ResMut<WorldTime>) {
     // Honour SOILS_DAYTIME on its own, not only under SOILS_SELFTEST: a
     // recording session needs the light pinned too, or the take drifts into
@@ -600,9 +630,31 @@ fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) 
 /// `SOILS_AUTOLOGIN=<host:port>` with an optional `SOILS_NAME`. The latter
 /// exists so a recording session can point a spectating client at a server on
 /// an ephemeral port without anyone typing into a dialog.
-fn selftest_login(net: Res<NetClient>) {
+fn selftest_login(net: Res<NetClient>, mut sp: ResMut<singleplayer::Singleplayer>) {
     if gi_demo::demo_enabled() {
         return; // demo builds a local scene; no server/login
+    }
+    // `SOILS_DEMO=<id>` starts one of the demo worlds embedded and dials it,
+    // so a scene the recording tests build can be opened — or screenshotted —
+    // without a separate server or any clicking.
+    if let Some(demo) = singleplayer::from_env() {
+        match sp.ensure_started_demo(demo) {
+            Ok(port) => {
+                let name = std::env::var("SOILS_NAME")
+                    .unwrap_or_else(|_| singleplayer::LOCAL_NAME.into());
+                let url = format!("{}://127.0.0.1:{port}", net::default_scheme());
+                info!("demo world '{}': {url} as {name}", demo.id);
+                net.connect(url);
+                net.send(soils_protocol::ClientMsg::Login {
+                    name,
+                    password: String::new(),
+                    signup: true,
+                    protocol: soils_protocol::PROTOCOL_VERSION,
+                });
+            }
+            Err(e) => error!("SOILS_DEMO: could not start {}: {e}", demo.id),
+        }
+        return;
     }
     let addr = match std::env::var("SOILS_AUTOLOGIN") {
         Ok(a) if !a.is_empty() => a,

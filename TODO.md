@@ -1,4 +1,4 @@
-# Tasks
+# Implementation log
 
 > **Open work lives in [`Tasks.md`](Tasks.md).** This file is the historical
 > record: what shipped in each phase, what was measured, and what was deferred
@@ -310,14 +310,84 @@ neural tile/structure generation.
 *After `ui-inventory` is merged and all tasks above are put into the changelog and removed from this file...*
 
 ## Light Upgrade 2.0
-See `plan-better-lighting.md`
+
+**Planned, not started.** The detailed plan is written:
+[plan-better-lighting.md](docs/plan-better-lighting.md). Four phases, each
+test-gated, with the payoff concentrated in the first.
+
+Two findings from writing it are worth having here, because they change what
+the section is asking for:
+
+- Three of the idea's five bullets already hold. Fine lighting is GPU-only and
+  never copied back, and it already runs only near the player — phase 12 did
+  that. What is left is shipping the *coarse* grid rather than recomputing it,
+  smoothing it, and ordering the queue.
+- That first item is not a micro-optimisation. The client re-floods every chunk
+  it receives, and the client frame is light-bound: a fresh join spends four to
+  five minutes at ~46 fps against a 116 fps steady state, redoing work the
+  server did moments earlier and discarded.
+
+The reference implementation the idea names, `~/projects/voxel_radiance_cascades`,
+turns out to be missing its cascade passes — all six shader files are
+byte-identical copies of `common.glsl` (md5-verified 2026-08-29, and its own
+`CLAUDE.md` warns of exactly this). The plan records the part that does
+survive, which is the probe layout, and explains why it is worth reading for
+ideas rather than porting: this repo already has a working, oracle-tested
+radiance-cascades implementation using a different direction encoding, and
+none of the five bullets is about direction encoding.
 
 ## Draw Distance Upgrade 2.0
-WIP, but will involve these things:
-- Chunk compression over network and before copy to GPU mem
-- Chunk LOD, also over network and on GPU
 
-##  GitHub Actions
+**Deferred — not enough detail to build.** Self-labelled WIP, and the two
+bullets name outcomes rather than designs:
 
-- [ ] Create GitHub Actions workflow for creating builds released through the Releases section
-- [ ] GitHub Pages page created showing videos of all the test cases that can be shown via video. On the Pages site, have different tabs for different branches of the repository. Trigger this workflow whenever there are changes to the repository, including branches other than master.
+- Chunk compression over the network and before the copy to GPU memory
+- Chunk LOD, also over the network and on the GPU
+
+Both need a plan doc before they need code. Notes toward one:
+
+- Chunks are *already* compressed on the wire — palette + LZ4, which took the
+  join burst from 23 MB to 498 KB and has a 2 MB regression gate. So the
+  network half of bullet one is done, and what is actually being asked for is
+  compression **of the GPU-side copy**, which is a different problem with a
+  different constraint: it has to be decompressible by the mesher, not by the
+  CPU.
+- The cheaper prerequisite is already listed in
+  [`Tasks.md`](Tasks.md): *cull all-air chunks*. Occlusion culling withholds
+  sealed chunks but still sends every empty chunk above the terrain, and
+  roughly half the cube is sky. That is the largest single win available here
+  and it needs no new format.
+- LOD interacts with the lighting plan: a downsampled chunk needs downsampled
+  light, and whether that is derived on the client or shipped is the same
+  question [plan-better-lighting.md](docs/plan-better-lighting.md) phase A
+  asks about full-resolution light. Decide them together.
+
+## GitHub Actions
+
+- [x] **Release builds through the Releases section.**
+      `.github/workflows/release.yml` — pushing a `v*` tag builds the client
+      and server for Linux and Windows, packages each with `assets/` beside the
+      binaries, and publishes a Release with both archives attached. The
+      existing `screenshots.yml` listens for `release: published`, so the
+      rendered screenshots land in the notes underneath the downloads with no
+      coupling between the two. 2026-08-29, `ci-pipelines`.
+- [x] **GitHub Pages site of recorded test cases, tabbed by branch.**
+      `.github/workflows/videos.yml` runs the `#[ignore]`d recording tests on
+      every push to every branch and publishes their videos to `gh-pages`.
+      What made this possible was making the recorder pluggable rather than
+      writing a second CI-only driver: `SOILS_RECORDER` selects
+      `scripts/obs_record.py` (OBS, local, Windows) or the new
+      `scripts/ffmpeg_record.py` (X11 grab, CI), and the tests are otherwise
+      unchanged — so a published video is a take the test *passed*, assertions
+      on scripted beats included. `scripts/build_pages.py` folds one branch's
+      videos into the site without disturbing the others. 2026-08-29,
+      `ci-pipelines`. See [CHANGELOG.md](CHANGELOG.md).
+
+## `optimization`
+This branch should focus on making performance improvements to chunk generation, disk i/o, network i/o, etc.
+
+- [ ] Add instrumentation to critical functions such as chunk gen, then create some benchmark tests
+- [ ] ADd
+- [ ] 
+- [ ] 
+- [ ] 

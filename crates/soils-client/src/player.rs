@@ -420,7 +420,20 @@ pub struct Streaming {
     pub sent_radius: Option<i32>,
     /// Chunks inside the local view box not yet applied — a live estimate of
     /// how much of the surrounding world is still streaming in (HUD).
+    ///
+    /// Deliberately *not* a readiness signal: it counts everything subscribed
+    /// but unmapped, and a chunk is only ever materialized once something
+    /// demands it. Chunks the renderer never asks for — most of the
+    /// subscription when the player is enclosed — sit here forever, so this
+    /// never reaches zero underground. Use [`wanted`](Self::wanted) for
+    /// "is the world I can see actually here".
     pub pending: usize,
+    /// Outstanding work the *renderer* is waiting on: demanded chunks not yet
+    /// materialized, plus generation in flight.
+    ///
+    /// This is the honest "the visible world has arrived" signal, and it does
+    /// reach zero. `record::cue` waits on it before starting a take.
+    pub wanted: usize,
 }
 
 impl Default for Streaming {
@@ -432,7 +445,7 @@ impl Default for Streaming {
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .map_or(4, |r| r.clamp(2, 8));
-        Self { last_chunk: None, load_radius, sent_radius: None, pending: 0 }
+        Self { last_chunk: None, load_radius, sent_radius: None, pending: 0, wanted: 0 }
     }
 }
 

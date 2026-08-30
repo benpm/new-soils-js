@@ -958,3 +958,87 @@ pub fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
     }
     cond()
 }
+
+/// The workspace root, from this crate's manifest directory.
+pub fn workspace_root() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/<pkg> lives two levels below the workspace root")
+        .to_path_buf()
+}
+
+/// Run the recorder script's `<action>` and return its stdout.
+///
+/// Which script is `SOILS_RECORDER`, relative to the workspace root, defaulting
+/// to `scripts/obs_record.py`. The demo tests are the same either way — the
+/// only OBS-specific thing about them was this function, and the `ensure /
+/// start / stop / status` shape is a contract both recorders implement:
+///
+/// * `scripts/obs_record.py` drives OBS Studio over obs-websocket, which is
+///   what a local Windows recording session uses. `muesli/obs-cli` cannot be
+///   used for it: it is pinned to obs-websocket protocol 4 and OBS 28+ serves
+///   protocol 5 only, so it fails the handshake.
+/// * `scripts/ffmpeg_record.py` grabs the X display, which is what CI uses —
+///   OBS needs a compositor to capture from, and an Xvfb display already is
+///   one.
+///
+/// `stop` prints the file that was written, so a caller can assert on it.
+pub fn recorder(action: &str) -> String {
+    let script = workspace_root().join(
+        std::env::var("SOILS_RECORDER").unwrap_or_else(|_| "scripts/obs_record.py".into()),
+    );
+    let out = std::process::Command::new("python")
+        .arg(&script)
+        .arg(action)
+        .current_dir(workspace_root())
+        .output()
+        .unwrap_or_else(|e| panic!("could not run {}: {e}", script.display()));
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        out.status.success(),
+        "{} {action} failed:\n{text}\n{}",
+        script.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    println!("recorder {action}: {text}");
+    text
+}
+
+/// Multiplier for the demo tests' wall-clock budgets, from `SOILS_DEMO_SCALE`.
+///
+/// Every timing in a recording test is calibrated for a real GPU: how long to
+/// wait for the world to stream, when to cue the recorder, how long to let the
+/// take run. Under a software rasteriser (Mesa lavapipe on a CI runner, no GPU
+/// at all) the same work takes an order of magnitude longer, and every one of
+/// those budgets is wrong by the same factor — so they scale together rather
+/// than being re-tuned one at a time.
+///
+/// Defaults to 1.0, which is exactly the numbers that were there before.
+pub fn demo_scale() -> f32 {
+    std::env::var("SOILS_DEMO_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0)
+}
+
+/// `secs` scaled by [`demo_scale`], as a string for a child's environment.
+pub fn demo_secs(secs: f32) -> String {
+    format!("{:.0}", secs * demo_scale())
+}
+
+/// `secs` scaled by [`demo_scale`], as a [`Duration`] for a test-side deadline.
+pub fn demo_budget(secs: f32) -> Duration {
+    Duration::from_secs_f32(secs * demo_scale())
+}
+
+/// A demo-test knob overridable from the environment, so CI can trade fidelity
+/// for wall-clock without editing the tests.
+///
+/// The one that matters is `SOILS_DEMO_RADIUS`. Chunk *application* on the
+/// client is time-boxed per frame, so at one or two frames per second a
+/// software rasteriser applies chunks at a crawl and `streaming.pending` takes
+/// minutes to reach zero — which is the cue the recorder waits for. Shrinking
+/// the view radius cuts the chunk count cubically and is the difference
+/// between a take that starts and one that times out. The demos are filmed
+/// nose-to-the-ground anyway.
+pub fn demo_var(key: &str, default: &str) -> String {
+    std::env::var(key).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.into())
+}

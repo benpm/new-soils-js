@@ -375,14 +375,13 @@ pub fn apply_warp(
     mut gen_queue: ResMut<crate::gpu_gen::GpuGenQueue>,
     mut pending_edits: ResMut<crate::edit::PendingEdits>,
     mut ring: ResMut<player::InputRing>,
-    mut slots: ResMut<ChunkSlots>,
-    mut pool_ops: ResMut<PoolOpQueue>,
+    mut pool: crate::pool::PoolWrite,
     mut query: Query<(&mut Player, &mut Transform)>,
 ) {
     for msg in reader.read() {
         pending_edits.clear(); // old-world verdicts are moot
         ring.reset(); // prediction history describes the old world
-        slots.clear_all(&mut pool_ops);
+        pool.slots.clear_all(&mut pool.ops, &mut pool.dirty);
         for (_, entity) in map.map.drain() {
             commands.entity(entity).despawn();
         }

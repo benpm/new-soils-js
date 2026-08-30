@@ -101,6 +101,21 @@ impl Default for PlayerLight {
     }
 }
 
+/// The player's lantern as configured for this run: `SOILS_PLAYER_LIGHT`
+/// (0-15, 0 = off) overriding [`DEFAULT_PLAYER_LIGHT`].
+///
+/// Exists for the lighting demo. A level-12 emitter riding the camera lights a
+/// 12-voxel sphere around the player, so a dark room is not dark and the first
+/// lamp placed in it adds nothing you can see. The `playerlight` console
+/// command is the interactive equivalent — and a bot cannot type.
+pub fn configured_player_light() -> PlayerLight {
+    let mut light = PlayerLight::default();
+    if let Some(level) = std::env::var("SOILS_PLAYER_LIGHT").ok().and_then(|v| v.parse().ok()) {
+        light.set_level(level);
+    }
+    light
+}
+
 impl PlayerLight {
     /// Clamped to the 4-bit block channel; anything above [`MAX_LIGHT`] would
     /// wrap into the sky nibble.

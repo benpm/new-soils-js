@@ -47,7 +47,15 @@ jobs:
           xvfb-run -a vulkaninfo --summary 2>&1 | head -50 || echo "vulkaninfo failed"
 
       - name: Build client + server (release)
-        run: cargo build --release -p soils-client -p soils-server
+        # `small_pools` is required on lavapipe: its 128 MiB storage-binding
+        # limit cannot hold the default 192 MiB light pool, and the client
+        # asserts at render startup rather than drawing anything. The Linux
+        # window backends are target-gated in the client's Cargo.toml — without
+        # them winit does not compile here at all, which is why this workflow
+        # last succeeded in July.
+        run: |
+          cargo build --release -p soils-server
+          cargo build --release -p soils-client --features small_pools
 
       - name: Render screenshots
         env:

@@ -15,11 +15,40 @@ use soils_protocol::{CHUNK_CUBED, ChunkVolume};
 
 /// Unified slots (light + descriptor). Covers a full r8 window (17³ = 4913)
 /// with headroom for hysteresis and in-flight loads.
+///
+/// `N_SLOTS × SLOT_BYTES` is the light pool, and it has to fit the adapter's
+/// `max_storage_buffer_binding_size` — 192 MiB at the default, which a real
+/// GPU has and Mesa lavapipe (128 MiB) does not. See `small_pools`.
+#[cfg(not(feature = "small_pools"))]
 pub const N_SLOTS: u32 = 6144;
 /// Mesh slots (voxels + quads + indirect). Only non-air chunks need one
 /// (~2.5k at r8). Slot 0 is a permanently-zero sentinel so air chunks' voxel
 /// reads resolve to air without branching; it is never handed out.
+#[cfg(not(feature = "small_pools"))]
 pub const N_MESH: u32 = 4096;
+
+/// Pool sizes for a software rasteriser: light 96 MiB, voxels 64 MiB, quads
+/// 64 MiB, all inside lavapipe's 128 MiB storage-binding limit.
+///
+/// CI renders headlessly under lavapipe, where the default pools trip the
+/// assert in `probe_gpu_caps` and the client dies before it can draw anything.
+/// A feature rather than a runtime clamp because these are `const` and feed
+/// buffer sizes, free-lists and slot arithmetic all over this module; sizing
+/// them dynamically is a real change to the renderer, and this is a build
+/// profile. Tracked in `Tasks.md` as the thing to do properly.
+///
+/// The ratio is preserved (`N_SLOTS > N_MESH`): light slots cover padded
+/// neighbours, so there must be more of them than mesh slots. Nothing needs
+/// to change in the shaders — `N_SLOTS` appears there only in comments, and
+/// `cull_demand.wgsl`'s hardcoded `N_MESH = 4096u` is an upper bound check,
+/// so a smaller Rust-side pool merely never reaches it.
+///
+/// Capacity is the cost: this covers a radius-4 window, not radius-8. The
+/// recordings set `SOILS_RADIUS=2`, so it is not the binding constraint there.
+#[cfg(feature = "small_pools")]
+pub const N_SLOTS: u32 = 3072;
+#[cfg(feature = "small_pools")]
+pub const N_MESH: u32 = 2048;
 /// `Slot::mesh` value for air chunks (no mesh slot).
 pub const NO_MESH: u32 = u32::MAX;
 /// Slot-table axis size: chunk coord masked to `& 31` per axis. Collision-free
@@ -175,7 +204,7 @@ impl ChunkSlots {
     /// Downgrade a resident chunk to an air slot (a GPU-genned chunk whose
     /// occupancy readback came back all-air): free the mesh slot, stop its
     /// draws. The light slot and descriptor stay (air still carries light).
-    pub fn demote_mesh(&mut self, ops: &mut PoolOpQueue, cpos: IVec3) {
+    pub fn demote_mesh(&mut self, ops: &mut PoolOpQueue, dirty: &mut DirtyMesh, cpos: IVec3) {
         let Some(s) = self.map.get_mut(&cpos) else { return };
         if s.mesh == NO_MESH {
             return;
@@ -185,13 +214,14 @@ impl ChunkSlots {
         let slot = s.slot;
         self.free_mesh.push(mesh);
         ops.push(PoolOp::ClearIndirect { mesh });
+        retire_mesh(ops, dirty, mesh);
         ops.push(PoolOp::WriteDesc { slot, cpos, mesh: NO_MESH });
     }
 
     /// Unmap a chunk (unload): free its slots, vacate its table cell (only if
     /// still owned), stop its draws, and poison its descriptor so stale table
     /// cells elsewhere fail validation.
-    pub fn unmap_chunk(&mut self, ops: &mut PoolOpQueue, cpos: IVec3) {
+    pub fn unmap_chunk(&mut self, ops: &mut PoolOpQueue, dirty: &mut DirtyMesh, cpos: IVec3) {
         let Some(s) = self.free(cpos) else { return };
         let idx = table_index(cpos);
         if self.table[idx] == s.slot {
@@ -200,17 +230,19 @@ impl ChunkSlots {
         }
         if s.mesh != NO_MESH {
             ops.push(PoolOp::ClearIndirect { mesh: s.mesh });
+            retire_mesh(ops, dirty, s.mesh);
         }
         ops.push(PoolOp::WriteDesc { slot: s.slot, cpos: IVec3::MAX, mesh: NO_MESH });
     }
 
     /// Drop everything (warp: the whole world went away), vacating the GPU
     /// side too.
-    pub fn clear_all(&mut self, ops: &mut PoolOpQueue) {
+    pub fn clear_all(&mut self, ops: &mut PoolOpQueue, dirty: &mut DirtyMesh) {
         let positions: Vec<IVec3> = self.map.keys().copied().collect();
         for cpos in positions {
-            self.unmap_chunk(ops, cpos);
+            self.unmap_chunk(ops, dirty, cpos);
         }
+        dirty.0.clear();
         *self = Self::default();
     }
 
@@ -309,6 +341,16 @@ pub enum PoolOp {
     ClearIndirect { mesh: u32 },
 }
 
+/// The three main-world resources a pool mutation needs, bundled because Bevy
+/// systems cap out at 16 params (same reason as `demand::MaterializeParams`)
+/// and `apply_warp` was already sitting on the limit.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct PoolWrite<'w> {
+    pub slots: ResMut<'w, ChunkSlots>,
+    pub ops: ResMut<'w, PoolOpQueue>,
+    pub dirty: ResMut<'w, DirtyMesh>,
+}
+
 /// Main-world queue of pool writes, drained into the render world each frame.
 #[derive(Resource, Default)]
 pub struct PoolOpQueue(pub Vec<PoolOp>);
@@ -322,6 +364,22 @@ impl PoolOpQueue {
 /// Mesh slots whose voxels changed this frame → remesh dispatch list.
 #[derive(Resource, Default)]
 pub struct DirtyMesh(pub Vec<u32>);
+
+/// Retire a freed mesh slot: poison its info row and drop any remesh still
+/// queued against it.
+///
+/// The poison is what `cull` in `cull_demand.wgsl` tests to skip freed slots —
+/// without it that branch is dead and the slot keeps drawing the old chunk.
+/// Dropping the dirty entry closes the matching race: `finalize_mesh` runs
+/// before `cull` and would otherwise republish real draw args from the freed
+/// slot's stale voxels. Scrubbing here rather than at extract time is
+/// deliberate — a mesh id freed and handed straight back out by `alloc` in the
+/// same frame has a *legitimate* new dirty entry, and a blanket "freed this
+/// frame" filter would drop it and leave the new chunk invisible.
+fn retire_mesh(ops: &mut PoolOpQueue, dirty: &mut DirtyMesh, mesh: u32) {
+    ops.push(PoolOp::WriteMeshInfo { mesh, cpos: IVec3::MAX, slot: TABLE_EMPTY });
+    dirty.0.retain(|m| *m != mesh);
+}
 
 fn extract_pool_ops(mut main: ResMut<MainWorld>, mut ops: ResMut<ExtractedPoolOps>) {
     if let Some(mut q) = main.get_resource_mut::<PoolOpQueue>() {
@@ -580,5 +638,65 @@ mod tests {
         s.clear();
         assert_eq!(s.len(), 0);
         assert_eq!(s.get(IVec3::ONE), None);
+    }
+
+    /// Poisoning the info row is what makes the `cull` shader's freed-slot
+    /// branch reachable at all; scrubbing `DirtyMesh` stops `finalize_mesh`
+    /// from republishing draw args for the chunk that just went away.
+    #[test]
+    fn unmap_retires_the_mesh_slot() {
+        let mut s = ChunkSlots::default();
+        let cpos = IVec3::new(1, 2, 3);
+        let a = s.alloc(cpos, true).unwrap();
+        let (mut ops, mut dirty) = (PoolOpQueue::default(), DirtyMesh(vec![a.mesh, 4242]));
+        s.unmap_chunk(&mut ops, &mut dirty, cpos);
+        assert!(ops.0.iter().any(|op| matches!(
+            op,
+            PoolOp::WriteMeshInfo { mesh, slot, .. } if *mesh == a.mesh && *slot == TABLE_EMPTY
+        )));
+        assert_eq!(dirty.0, vec![4242], "only the freed slot's remesh is dropped");
+    }
+
+    #[test]
+    fn demote_retires_the_mesh_slot() {
+        let mut s = ChunkSlots::default();
+        let cpos = IVec3::new(4, 5, 6);
+        let a = s.alloc(cpos, true).unwrap();
+        let (mut ops, mut dirty) = (PoolOpQueue::default(), DirtyMesh(vec![a.mesh]));
+        s.demote_mesh(&mut ops, &mut dirty, cpos);
+        assert_eq!(s.get(cpos).unwrap().mesh, NO_MESH, "chunk stays resident as air");
+        assert!(ops.0.iter().any(|op| matches!(
+            op,
+            PoolOp::WriteMeshInfo { mesh, slot, .. } if *mesh == a.mesh && *slot == TABLE_EMPTY
+        )));
+        assert!(dirty.0.is_empty());
+    }
+
+    /// Why the scrub lives at free time and not at extract time: `free_mesh` is
+    /// a LIFO, so a mesh id can be freed and handed straight back out in the
+    /// same frame. The new owner's remesh is legitimate — a blanket "freed this
+    /// frame" filter would drop it and leave the new chunk invisible.
+    #[test]
+    fn same_frame_realloc_keeps_its_remesh() {
+        let mut s = ChunkSlots::default();
+        let old = IVec3::new(1, 0, 0);
+        let a = s.alloc(old, true).unwrap();
+        let (mut ops, mut dirty) = (PoolOpQueue::default(), DirtyMesh(vec![a.mesh]));
+        s.unmap_chunk(&mut ops, &mut dirty, old);
+        assert!(dirty.0.is_empty());
+        let b = s.alloc(IVec3::new(9, 9, 9), true).unwrap();
+        assert_eq!(b.mesh, a.mesh, "same mesh id comes straight back around");
+        dirty.0.push(b.mesh);
+        assert_eq!(dirty.0, vec![b.mesh], "the new owner's remesh survives");
+    }
+
+    #[test]
+    fn clear_all_drops_every_queued_remesh() {
+        let mut s = ChunkSlots::default();
+        let a = s.alloc(IVec3::new(1, 1, 1), true).unwrap();
+        let (mut ops, mut dirty) = (PoolOpQueue::default(), DirtyMesh(vec![a.mesh, 7]));
+        s.clear_all(&mut ops, &mut dirty);
+        assert_eq!(s.len(), 0);
+        assert!(dirty.0.is_empty(), "the whole world went away");
     }
 }

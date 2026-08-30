@@ -42,6 +42,45 @@ markdown, so the still links to it instead.*
 every recording the test suite produces, newest first, each naming the test
 that made it. Rebuilt with `python scripts/deploy_dashboard.py`.
 
+## Recorded demos
+
+Every one of these is a **test**, not a screen capture. CI runs the
+`#[ignore]`d recording tests on each push, and a take is only published if the
+test that produced it passed — `inventory_demo.rs` asserts all fourteen of its
+scripted beats fired, so a routine that stalled halfway fails the build instead
+of shipping a video of nothing happening. They render under Mesa lavapipe (a
+CPU rasteriser, no GPU on the runner), which is why they look rough; they are
+evidence, not a showreel. Played at 2x — half the frames, so the files stay
+small.
+
+**Browse them all, one tab per branch: [the Pages
+site](https://benpm.github.io/new-soils-js/).** Or run any of them yourself
+from the login screen — see [Demo worlds](#demo-worlds) below.
+
+| | |
+|---|---|
+| [![Lighting a dark room](docs/media/light.jpg)](https://benpm.github.io/new-soils-js/#light-falloff) | **Lighting a dark room** — a player flies ~100 voxels down into a sealed chamber the server carves under spawn, and rings himself with Lamp Blocks. His own lantern is switched off for the take, so every photon on screen comes from a block he placed. From `light_demo.rs`. |
+| [![The inventory loop](docs/media/inventory.jpg)](https://benpm.github.io/new-soils-js/#light-falloff) | **The inventory loop** — place a block, mine it, watch it drop, walk onto it to collect. Then the container loop: a Wooden Crate comes off the hotbar, goes down, and is opened by right-clicking it. From `inventory_demo.rs`. |
+| [![Two clients, one prop pile](docs/media/props.jpg)](https://benpm.github.io/new-soils-js/#light-falloff) | **Two clients, one prop pile** — two bots walk mirrored routines into 300 server-simulated rigid bodies and meet in the middle. Each pane is a real first-person view rebuilt from delta snapshots, not a replicated body. From `props_demo.rs`. |
+
+Two of the recent merges have nothing to film and are named here rather than
+faked: the CI pipeline itself is what *produces* these takes (release builds,
+the recorder, the per-branch site), and the lighting plan is a design document.
+
+## Demo worlds
+
+The scenes those tests build are also playable. Pick one from the login screen,
+or start it directly:
+
+```sh
+SOILS_DEMO=lamp-room  cargo run --release -p soils-client   # the sealed chamber
+SOILS_DEMO=prop-pile  cargo run --release -p soils-client   # 300 rigid bodies
+SOILS_DEMO=critters   cargo run --release -p soils-client   # wandering AI
+```
+
+Each runs an embedded server in its own `data/demo-<id>` directory, so a demo
+never touches the real single-player save.
+
 ## What works today
 
 - **Server authority + prediction** — clients send *inputs*, not positions;

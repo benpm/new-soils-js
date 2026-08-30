@@ -531,23 +531,37 @@ never from the server (`player.rs:327-328`, with a comment explaining that
 taking it from the prediction would double-apply fly toggles). The server has
 no way to tell the client it is flying. Do not open that.
 
-Instead, a one-shot settle:
+Instead, pin them at the destination until it exists:
 
 ```rust
-/// A teleport whose destination was not resident yet. Held for at most
-/// `SETTLE_TICKS`; the moment the destination chunk exists, a player standing
-/// inside solid rock is lifted to the first free space above it.
+/// A teleport whose destination was not resident yet.
 ///
-/// The alternative looks more honest — move them and let physics sort it out —
-/// but it cannot: unloaded space reads as air on *both* ends, so they fall
-/// through a world that has not arrived and wake up embedded in a hillside.
+/// The destination is held here, not just a deadline, and that is the whole
+/// point. Letting physics run while the chunk loads and *then* lifting the
+/// player clear of rock does not work: they have been falling through air the
+/// whole time, so the lift starts from wherever they fell to — the first free
+/// space above a point 60 blocks down is a cave ceiling, not the surface they
+/// asked for. They arrive somewhere they never chose, underground, and the
+/// command looks broken rather than slow.
+///
+/// So each tick until the chunk is resident, rewrite `sim.pos` back to `dest`
+/// and zero `vel`: authoritatively suspended, not falling. Once it is
+/// resident, lift clear of rock once and drop the entry.
 #[derive(Resource, Default)]
-struct PendingSettles(Vec<(u16, u64)>); // (client, deadline tick)
+struct PendingSettles(Vec<Settle>);
+
+struct Settle { client: u16, dest: Vec3, deadline: u64 }
 ```
 
 Move them immediately so the camera and streaming go, register a settle, and
-let a system after `pump_chunk_jobs` lift them once the chunk exists. The
-ordinary reconcile then corrects the client. Past the deadline, drop it.
+let a system after `pump_chunk_jobs` re-pin them each tick and lift them once
+the chunk exists. The ordinary reconcile then corrects the client — the
+re-pinning is server state, so each snapshot simply repeats the same position
+and the client stops predicting a fall.
+
+Past `SETTLE_TICKS` the entry is dropped and normal physics resumes wherever
+they are; a destination that never loads is a bug worth seeing rather than a
+player held in the void forever.
 
 ---
 
@@ -645,10 +659,40 @@ Minimal correct mechanism: a `ServerMsg::Disconnect { reason }` on the reliable
 lane, **recognised by the writer task**. `pump_connection`'s writer already
 breaks when its channel ends (`lib.rs:487`, beside an arm commented "app
 despawned the client"); teach it that seeing `Disconnect` means "send this,
-then send a Close frame and stop", and have the read loop end when the writer
-does. Then `in_tx` drops at function exit, phase 1 sees
-`TryRecvError::Disconnected`, and the *existing* cleanup runs unchanged —
+then send a Close frame and stop". Then `in_tx` drops at function exit, phase 1
+sees `TryRecvError::Disconnected`, and the *existing* cleanup runs unchanged —
 inventory save, profile save, `MarkAbsent`, entity despawn, refs released.
+
+**But the read loop will not end on its own, and that is the actual work.**
+The two halves are separate tasks: `ws.split()` (`lib.rs:472`) hands the
+`SplitSink` to a spawned writer (`lib.rs:481`) while the reader *is*
+`pump_connection` itself — a bare `while let Some(frame) = ws_rx.next().await`
+(`lib.rs:509`) with no `select!` and no cancellation. Every way out of it
+requires the **peer** to act: a frame whose `in_tx.send` fails, a `Close`, a
+transport error, or end of stream. The app dropping a `Client` reaches only the
+writer. And the sink's drop does not rescue this — both halves share one
+`WebSocketStream` behind a `BiLock`, so while `ws_rx` lives the socket stays
+open. `writer.abort()` at `lib.rs:527` looks like the answer but runs *after*
+the read loop, so it can only ever fire once the reader has already left.
+
+Two changes, and they fix different failures:
+
+* **Select the read loop on the writer's `JoinHandle`.** `pump_connection`
+  already owns it. `select!` on `&mut writer` and `ws_rx.next()`, breaking when
+  the writer finishes, makes a kick — and every app-side client drop — tear the
+  connection down at once, with no new state anywhere.
+* **Give the app a handle that kills the whole task.** The above is not enough
+  for the case that motivates the kick deadline. A peer that stops reading
+  applies TCP backpressure, the writer parks inside `ws_tx.send(..).await`, and
+  while parked it is not polling its `select!` — so it never notices `out_rx`
+  closing, never finishes, and the `JoinHandle` never resolves. Put the
+  connection task's `AbortHandle` in `NewConn` and on `Client`, and have
+  `reap_client` fire it. Dropping the task drops both halves and closes the
+  socket. Without it a wedged peer leaks a task and a file descriptor per kick,
+  which is a slow resource leak an attacker can drive on purpose.
+
+Note the same shape in the WebTransport pump (`lib.rs:661-662`), which should
+get the same treatment rather than being left as the one path that still hangs.
 
 **One cleanup path. That is the entire point.** A kick that removed the client
 inline would be a second copy of that logic, and a second copy is how an
@@ -656,11 +700,11 @@ inventory stops being saved.
 
 Two hardenings:
 
-* **A wedged client.** If the peer stops reading, the send blocks and the kick
-  never lands. Give `Client` a `kicked_at: Option<u64>` and force-remove after
-  ~2 s — but that path must run the *same* cleanup, so first extract phase 3's
-  body into a `reap_client` function and call it from both. Do the extraction
-  before you need it.
+* **A wedged client.** Per above, the kick never lands: the writer parks in
+  `ws_tx.send`. Give `Client` a `kicked_at: Option<u64>` and force-remove after
+  ~2 s, firing the `AbortHandle` on the way out — but that path must run the
+  *same* cleanup, so first extract phase 3's body into a `reap_client` function
+  and call it from both. Do the extraction before you need it.
 * **Duplicate sessions.** Nothing in the login path checks whether an account
   is already connected, so two sessions on one account are possible today and
   both write `SaveInventory` for the same key on disconnect, clobbering each
@@ -676,7 +720,7 @@ Two hardenings:
 |---|---|---|
 | **0** | `Role`; `Record` + `MAGIC` + atomic save in `auth.rs`; `Accounts::role`/`set_role`; `ServerConfig.admins` and `SOILS_ADMINS`; `Client.role` set at login | none |
 | **1** | **The one bump, v5 to v6.** Append `Command` and `UseItem` to `ClientMsg`; `Notice`, `CommandSpecs` and `Disconnect` to `ServerMsg`. Wire only `Command`/`Notice`/`CommandSpecs`. Registry, dispatch, and the cheap commands: `help list role tp spawn warp time give clear drop`. Socket size cap. Client: `ConsoleLog`, scrollback, merged `/help`, routing, delete the local `tp` | **v6** |
-| **2** | `/kick`: writer-recognised `Disconnect`, `reap_client` extraction, kick deadline | — |
+| **2** | `/kick`: writer-recognised `Disconnect`; read loop selects on the writer's `JoinHandle`; `AbortHandle` on `NewConn`/`Client`; `reap_client` extraction, kick deadline | — |
 | **3** | `World::fill_chunk`; light-queue dedup and column ordering; `BulkEdit` + `pump_bulk_edits`; `Manifest` re-broadcast; `/fill` | none |
 | **4** | Excavator in `items.yaml`; `UseItem` arm; pickup and demotion gates; `/give` minting | — |
 | **5** | Teleport settle (`PendingSettles`) | none |
@@ -745,6 +789,16 @@ socket; kicking matches every session of an account; and the important one —
 sees `EntityDespawn`, and the inventory was saved). That is what catches
 someone adding a second cleanup path.
 
+The teardown itself needs its own two, because it is the part with no existing
+mechanism. **A silent peer is still torn down**: connect a raw socket, log in,
+then stop reading and stop sending entirely, kick it, and assert the socket is
+observably closed within a few seconds — this fails outright without the
+`JoinHandle` select and the `AbortHandle`, and it is the only test that
+exercises the wedged path. And **the reader task does not outlive the client**:
+after kicking N clients, the server's accepted-connection count returns to
+baseline. Assert on connections rather than on tokio task counts; a leaked task
+is real but awkward to observe, and the socket is the thing that runs out.
+
 **Phase 3** (`tests/bulk_edit.rs`):
 
 * **a fill arrives as manifests, not per-voxel edits** — count `ServerMsg::Edit`
@@ -768,6 +822,14 @@ holding one (obtained by having an admin `/give` then `/drop`) can neither use
 nor pick it up; demotion strips it from a live inventory; use is reach-checked
 and rate-limited.
 
+**Phase 5** (`tests/commands.rs`): the one that matters is **a teleport to an
+unloaded destination does not drift** — `/tp` far outside the resident set,
+then assert across the next several snapshots that the reported position stays
+at the destination rather than descending. Without the re-pinning this fails by
+a growing margin every tick, which is exactly the signature to assert on. Also:
+the settle is released once the chunk is resident, and a destination that never
+loads gives up after `SETTLE_TICKS` instead of pinning forever.
+
 Bulk-edit tests are the slowest and `TestServer::start` serializes behind
 `SERVER_GATE`, so keep them in their own file rather than extending the other
 files' message deadlines.
@@ -785,6 +847,12 @@ files' message deadlines.
 * **The light pipeline can livelock** under a multi-tick fill that keeps
   re-dirtying a column in flight. Column ordering is not an optimization here;
   it is correctness.
+* **The server has no way to close a connection today.** `Client` drop is a
+  one-way signal that reaches the writer only, and the reader waits on the peer
+  forever. `/kick` is the first caller that needs teardown, so it has to build
+  it ([§8](#8-kick)) — not just call it. A half-built version leaks a task and
+  a socket per kick, and it leaks them for exactly the uncooperative clients
+  you most wanted to remove.
 * **Two sessions per account are already possible** and already clobber each
   other's saved inventory. `/kick` makes this visible; it does not cause it.
 * **The command set is a permanent surface.** Every command a player types is

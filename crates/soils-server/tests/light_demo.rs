@@ -44,7 +44,13 @@ const TAKE_SECS: &str = "35";
 /// world to finish streaming before cueing anyway. `await_ready`'s deadline is
 /// derived from both, so the two cannot drift apart.
 const RECORD_AFTER: f32 = 20.0;
-const RECORD_WAIT: f32 = 600.0;
+// Longer than the other demos on purpose. On a software rasteriser the chunk
+// pipeline drains slowly enough that `streaming.pending` does not reach zero
+// inside 600s, and the cue then times out into an unfinished world — which
+// underground means the phantom daylight this take exists to disprove. The
+// budget is honest now that the recorder reads `Time<Real>`, so this is 900
+// actual seconds rather than 900 of a clock that runs at half speed.
+const RECORD_WAIT: f32 = 900.0;
 
 fn client_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("SOILS_CLIENT_BIN") {

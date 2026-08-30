@@ -26,6 +26,7 @@
 use std::path::PathBuf;
 
 use bevy::prelude::*;
+use bevy::time::Real;
 
 /// How long the light backlog must sit at zero before the world counts as
 /// ready.
@@ -77,7 +78,16 @@ pub fn configured() -> Option<CaptureCue> {
 
 /// Signal readiness once the world is up, then end the take.
 pub fn cue(
-    time: Res<Time>,
+    // `Time<Real>`, not the default virtual clock. Bevy clamps virtual delta to
+    // `max_delta` (250 ms) so a slow frame cannot spiral the simulation, which
+    // means that below 4 fps virtual time advances *slower than wall time* —
+    // at ~2 fps, half. Every number here is wall-clock by definition ("wait 600
+    // seconds for the world", "record for 40 seconds"), and the test harness
+    // times out against a real-time budget, so reading the virtual clock made
+    // the cue fire late in proportion to how slow the renderer was. That is
+    // why a software-rasterised take timed out while the same budgets passed
+    // on a GPU.
+    time: Res<Time<Real>>,
     streaming: Res<crate::player::Streaming>,
     light: Res<crate::light::LightQueue>,
     light_ready: Option<Res<crate::gpu_light::LightReady>>,

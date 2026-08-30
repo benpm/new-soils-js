@@ -27,6 +27,7 @@
 use std::path::PathBuf;
 
 use bevy::prelude::*;
+use bevy::time::Real;
 
 use crate::player::{PendingInput, Player};
 
@@ -172,7 +173,7 @@ pub fn active(bot: Option<Res<Bot>>) -> bool {
 
 /// Replace keyboard input with the scripted routine and aim the camera.
 pub fn drive(
-    time: Res<Time>,
+    time: Res<Time<Real>>,
     mut bot: ResMut<Bot>,
     mut pending: ResMut<PendingInput>,
     mut query: Query<(&mut Player, &mut Transform)>,
@@ -273,7 +274,7 @@ fn hold(pending: &mut PendingInput, axes: Vec2, yaw: f32) {
 /// also what proves the client half of the integration is live: nothing here
 /// travels through the game server.
 pub fn chatter(
-    time: Res<Time>,
+    time: Res<Time<Real>>,
     mut bot: ResMut<Bot>,
     social: Res<crate::social::Social>,
 ) {
@@ -430,7 +431,7 @@ fn current_beat(t: f32) -> Option<(f32, InvAction)> {
 
 /// Fire the one-shot half of each beat exactly once.
 pub fn inventory_actions(
-    time: Res<Time>,
+    time: Res<Time<Real>>,
     mut bot: ResMut<Bot>,
     mut actions: ResMut<BotActions>,
 ) {
@@ -639,7 +640,7 @@ fn drive_light(
 
 /// Fire the light script's beats, one shot each.
 pub fn light_actions(
-    time: Res<Time>,
+    time: Res<Time<Real>>,
     mut bot: ResMut<Bot>,
     mut actions: ResMut<BotActions>,
 ) {

@@ -268,6 +268,15 @@ fn main() {
             bot::press_bot_buttons
                 .run_if(bot::active)
                 .before(ui::ui_hotkeys)
+                // Every consumer of `just_pressed` this synthesizes must run
+                // after it. `ButtonInput` clears the flag at the start of the
+                // next frame, so a consumer scheduled *before* this simply
+                // never sees the press — and with no ordering that is a
+                // per-frame coin flip. `select_hotbar_slot` was missing here
+                // while `edit_blocks` was not, so a bot's `SelectKey` was
+                // usually dropped and the following `Place` put down whatever
+                // key 0 held instead of the block the script asked for.
+                .before(inventory::hotbar::select_hotbar_slot)
                 .before(edit::edit_blocks),
             ui::track_alt,
             ui::ui_hotkeys.run_if(console::console_closed),
@@ -378,10 +387,17 @@ fn screenshot_once(
     mut hold: ResMut<player::CameraHold>,
     slots: Res<pool::ChunkSlots>,
     remote_actors: Query<&Transform, (With<Actor>, Without<Player>)>,
+    bot: Option<Res<bot::Bot>>,
 ) {
     if *taken || std::env::var("SOILS_SELFTEST").is_err() {
         return;
     }
+    // A bot's framing *is* the subject: it flew somewhere and aimed at
+    // something on purpose, and the whole reason to shoot a bot run is to see
+    // what the take will show. Parking the camera over spawn would photograph
+    // a different place than the one being filmed — which is exactly how a
+    // "verify the demo works" screenshot ends up proving nothing.
+    let keep_framing = gi_demo::demo_enabled() || bot.is_some();
     // Configurable so slow software-GPU CI (lavapipe) can allow more time to
     // stream/mesh/trace before the shot; defaults preserve local behaviour.
     if time.elapsed_secs() > env_secs("SOILS_SHOT_SECS", 9.0) {
@@ -389,7 +405,7 @@ fn screenshot_once(
         // In GI-demo mode keep the scene's own framing (see gi_demo.rs).
         // The hold stops the server position echo from dragging the framed
         // camera back toward the player's authoritative position mid-capture.
-        if !gi_demo::demo_enabled() {
+        if !keep_framing {
             hold.0 = true;
             if let Ok((mut p, mut t)) = camera.single_mut() {
                 if let Some(actor) = remote_actors.iter().next() {
@@ -610,9 +626,31 @@ fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) 
 /// `SOILS_AUTOLOGIN=<host:port>` with an optional `SOILS_NAME`. The latter
 /// exists so a recording session can point a spectating client at a server on
 /// an ephemeral port without anyone typing into a dialog.
-fn selftest_login(net: Res<NetClient>) {
+fn selftest_login(net: Res<NetClient>, mut sp: ResMut<singleplayer::Singleplayer>) {
     if gi_demo::demo_enabled() {
         return; // demo builds a local scene; no server/login
+    }
+    // `SOILS_DEMO=<id>` starts one of the demo worlds embedded and dials it,
+    // so a scene the recording tests build can be opened — or screenshotted —
+    // without a separate server or any clicking.
+    if let Some(demo) = singleplayer::from_env() {
+        match sp.ensure_started_demo(demo) {
+            Ok(port) => {
+                let name = std::env::var("SOILS_NAME")
+                    .unwrap_or_else(|_| singleplayer::LOCAL_NAME.into());
+                let url = format!("{}://127.0.0.1:{port}", net::default_scheme());
+                info!("demo world '{}': {url} as {name}", demo.id);
+                net.connect(url);
+                net.send(soils_protocol::ClientMsg::Login {
+                    name,
+                    password: String::new(),
+                    signup: true,
+                    protocol: soils_protocol::PROTOCOL_VERSION,
+                });
+            }
+            Err(e) => error!("SOILS_DEMO: could not start {}: {e}", demo.id),
+        }
+        return;
     }
     let addr = match std::env::var("SOILS_AUTOLOGIN") {
         Ok(a) if !a.is_empty() => a,

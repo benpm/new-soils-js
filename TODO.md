@@ -337,3 +337,6 @@ WIP, but will involve these things:
       on scripted beats included. `scripts/build_pages.py` folds one branch's
       videos into the site without disturbing the others. 2026-08-29,
       `ci-pipelines`. See [CHANGELOG.md](CHANGELOG.md).
+
+## Minor problems
+- [ ] 

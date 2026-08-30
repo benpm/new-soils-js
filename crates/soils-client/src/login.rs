@@ -57,6 +57,8 @@ pub(crate) struct LoginScreen;
 #[derive(Component, Clone, Copy)]
 pub(crate) enum LoginButton {
     Singleplayer,
+    /// Index into [`singleplayer::DEMOS`].
+    Demo(usize),
     FocusAddress,
     FocusName,
     FocusPassword,
@@ -88,7 +90,8 @@ const BTN_BG: Color = Color::srgba(0.20, 0.34, 0.46, 1.0);
 pub fn setup_login(mut commands: Commands) {
     // Self-test auto-logs in, so the screen is skipped — unless SOILS_LOGINSHOT
     // forces it up for a screenshot.
-    let auto = std::env::var("SOILS_AUTOLOGIN").is_ok_and(|v| !v.is_empty());
+    let auto = std::env::var("SOILS_AUTOLOGIN").is_ok_and(|v| !v.is_empty())
+        || singleplayer::from_env().is_some();
     if (auto || std::env::var("SOILS_SELFTEST").is_ok())
         && std::env::var("SOILS_LOGINSHOT").is_err()
     {
@@ -126,6 +129,16 @@ pub fn setup_login(mut commands: Commands) {
                 ));
                 // Local-first path: no server, no account details needed.
                 action(panel, "Singleplayer", LoginButton::Singleplayer);
+                // The scenes the recording tests build, each in its own save
+                // so none of them touch the real world.
+                for (i, demo) in singleplayer::DEMOS.iter().enumerate() {
+                    action(panel, demo.label, LoginButton::Demo(i));
+                    panel.spawn((
+                        Text::new(demo.blurb),
+                        TextFont { font_size: 12.0.into(), ..default() },
+                        TextColor(Color::srgb(0.62, 0.65, 0.70)),
+                    ));
+                }
                 field(panel, "Server", LoginButton::FocusAddress, AddressText);
                 field(panel, "Username", LoginButton::FocusName, NameText);
                 field(panel, "Password", LoginButton::FocusPassword, PasswordText);
@@ -269,6 +282,25 @@ pub fn login_buttons(
                 }
                 Err(e) => login.status = format!("could not start server: {e}"),
             },
+            LoginButton::Demo(i) => {
+                let Some(demo) = singleplayer::DEMOS.get(*i) else { continue };
+                match sp.ensure_started_demo(demo) {
+                    Ok(port) => {
+                        login.status = format!("starting {}…", demo.label);
+                        net.connect(format!(
+                            "{}://127.0.0.1:{port}",
+                            crate::net::default_scheme()
+                        ));
+                        net.send(ClientMsg::Login {
+                            name: singleplayer::LOCAL_NAME.into(),
+                            password: String::new(),
+                            signup: true,
+                            protocol: soils_protocol::PROTOCOL_VERSION,
+                        });
+                    }
+                    Err(e) => login.status = format!("could not start server: {e}"),
+                }
+            }
             LoginButton::FocusAddress => login.focus = Field::Address,
             LoginButton::FocusName => login.focus = Field::Name,
             LoginButton::FocusPassword => login.focus = Field::Password,

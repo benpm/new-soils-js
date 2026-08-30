@@ -516,9 +516,15 @@ const LIGHT_DESCENT: f32 = 113.0;
 /// does not call itself landed halfway.
 const LIGHT_LAND_BY: f32 = 1.0;
 
-/// Steep enough that the floor fills the lower frame and a placed lamp lands a
-/// few voxels ahead; shallow enough that six of them ring the player instead of
-/// piling at their feet.
+/// Tuned by looking at the frame, not by arithmetic.
+///
+/// The obvious model — lamp lands at eye height over `tan(pitch)`, so a
+/// shallower angle puts it further away and shows more room — is wrong here:
+/// -0.25 put the lamps *closer* and filled the frame with them, while -0.40
+/// sits them on the floor a few voxels out with the lit ground and the dark
+/// ceiling both in shot. Verify any change to this against a screenshot
+/// (`SOILS_SELFTEST=1 SOILS_SHOT_SECS=<end of the script>` keeps the bot's own
+/// framing) rather than against the geometry.
 const LIGHT_PITCH: f32 = -0.40;
 
 /// Yaw slew rate, radians per second. A 60-degree step takes about 0.75 s — a

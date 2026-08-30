@@ -1,5 +1,66 @@
 # Changelog
 ****
+## The lamp demo filmed cobblestone, and demo worlds are playable
+
+**Branch `lamp-demo`, 2026-08-30.** The published lighting take was dark from
+start to finish. Three candidates — the test not working, the recording not
+capturing it, or lighting being broken — and it was the first, by way of a
+scheduling bug that had nothing to do with lighting at all.
+
+### The bot was placing the wrong block
+
+`bot::press_bot_buttons` synthesizes the keypresses a script asks for, and
+declared `.before(ui_hotkeys)` and `.before(edit_blocks)` — but **not** before
+`inventory::hotbar::select_hotbar_slot`. `ButtonInput` clears `just_pressed` at
+the start of the next frame, so a consumer scheduled *before* the synthesizer
+never sees the press. With no ordering that is a per-frame coin flip, and it
+lost.
+
+So `SelectKey(LAMP_KEY)` was dropped while the following `Place` still fired —
+`edit_blocks` *was* ordered. The bot placed whatever key 0 held, which is
+Cobblestone, which emits nothing. Six cobblestones in a sealed room is a video
+of a dark room.
+
+The same latent bug applies to the inventory demo's `SelectKey(CRATE_KEY)`;
+that take got the block it wanted by luck of scheduling.
+
+Verified by screenshot rather than by reasoning: the frame after the script
+finishes now shows lamps glowing on a lit floor, the HUD reading `block Lamp
+Block`, and the hotbar down to 122 from 128 — six placed.
+
+### Screenshots of a bot run keep the bot's framing
+
+`screenshot_once` parked the camera high over spawn looking down, which for a
+bot run photographs somewhere other than the place being filmed. A bot's
+framing *is* the subject, so it is now preserved like the GI demo's. Without
+this a "verify the demo works" screenshot proves nothing.
+
+`LIGHT_PITCH` went to -0.25 and back to -0.40 on the evidence: the obvious
+model says a shallower angle puts the lamp further away and shows more room,
+and the frame says otherwise. The constant now carries that warning.
+
+### Demo worlds in single-player
+
+The scenes the recording tests build only existed inside `#[ignore]`d tests, so
+the only way to see one was to film it. `singleplayer::DEMOS` is a table of
+`ServerConfig` tweaks — lamp room, prop pile, critters — with a button each on
+the login screen and `SOILS_DEMO=<id>` for scripted runs. Each gets its own
+`data/demo-<id>` directory: a demo must not scribble on the real save, and the
+chamber in particular is carved only as chunks are *generated*, so pointed at a
+directory that already has terrain the room would silently not be there.
+
+Smoke-tested: `prop-pile` reports 300 actors, `critters` 8, and the lamp room
+lights up under the bot.
+
+### Also
+
+Deleted `crates/soils-client/assets/blocks.yaml`. It was a stale copy of the
+block registry — no `emission`, no categories, and now no Lamp Block — that
+nothing loads (the client uses the compiled-in `soils-worldgen` one). It cost
+an investigation on the theory that the client was reading it, which is what an
+unused duplicate of a source of truth is for.
+
+****
 ## A lamp to place, a room to place it in, and the flicker fixed
 
 **Branch `lamp-demo`, 2026-08-29.** Prompted by sunlight flickering in the

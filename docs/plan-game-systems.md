@@ -2,7 +2,7 @@
 
 > **Status (2026-07-04): implemented.** Milestones M1–M8 all shipped (TODO phases 1,
 > 5–11, 13–14), including pathfinding stages 1–4 and the WebTransport/QUIC transport.
-> Per-phase deferrals are recorded in `TODO.md`'s checkoffs. Current state:
+> Per-phase deferrals are recorded in `roadmap.md`'s checkoffs. Current state:
 > `architecture.md`; measurements: `perf-report.md`.
 
 Goal: restructure so the server owns simulation of arbitrary **entities**, replicates world-state

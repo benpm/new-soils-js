@@ -1,11 +1,11 @@
 # New Soils
-[CHANGELOG](CHANGELOG.md) - [Tasks](Tasks.md) - [TODO](TODO.md) - [docs](docs/README.md)
+[CHANGELOG](CHANGELOG.md) - [Roadmap](docs/roadmap.md) - [Tasks](docs/tasks.md) - [docs](docs/README.md)
 
 A Rust/[Bevy](https://bevyengine.org) port of the original Node.js + Three.js
 `new-soils` voxel sandbox — now a **client/server multiplayer game** with a
 headless authoritative server, GPU-resident rendering, client-side prediction,
 and a delta-replication pipeline. All 14 phases of the porting/optimization
-plan ([`TODO.md`](TODO.md)) are complete; see
+roadmap ([`docs/roadmap.md`](docs/roadmap.md)) are complete; see
 [`docs/architecture.md`](docs/architecture.md) for how it works and
 [`docs/perf-report.md`](docs/perf-report.md) for the performance story.
 
@@ -244,7 +244,7 @@ CI renders release screenshots headlessly under Mesa lavapipe
 ## Documentation
 
 - [`docs/README.md`](docs/README.md) — index of every doc and what it is for.
-- [`Tasks.md`](Tasks.md) — **open work**, one list: what is left and why it
+- [`docs/tasks.md`](docs/tasks.md) — **open work**, one list: what is left and why it
   matters, from inventory persistence through biomes.
 - [`docs/architecture.md`](docs/architecture.md) — how every system works
   today: protocol, transports, server tick, chunk lifecycle, inventory,
@@ -260,9 +260,8 @@ CI renders release screenshots headlessly under Mesa lavapipe
   guide: the traps this codebase actually produced (the asset-path void, delta
   snapshots that omit unchanged entities, barrier deadlocks that hide the real
   failure), and how to tell them apart quickly.
-- [`TODO.md`](TODO.md) — the implementation *log*: each checkoff records what
-  shipped, what was measured, and what was deferred and why. Historical —
-  open work lives in [`Tasks.md`](Tasks.md).
+- [`docs/roadmap.md`](docs/roadmap.md) — high-level product and technical
+  direction, including the completed foundations future work builds on.
 - [`docs/plan-rendering.md`](docs/plan-rendering.md) /
   [`docs/plan-game-systems.md`](docs/plan-game-systems.md) — the original
   plans the phases implement.

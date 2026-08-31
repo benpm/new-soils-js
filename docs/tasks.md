@@ -1,11 +1,11 @@
 # Tasks
 
-Open work, one list. Finished work and its rationale live in
-[`TODO.md`](TODO.md) (the 14-phase implementation log and its checkoffs) and
-[`CHANGELOG.md`](CHANGELOG.md).
+Individual actionable work. High-level direction lives in
+[`roadmap.md`](roadmap.md), and shipped work and rationale live in
+[`CHANGELOG.md`](../CHANGELOG.md).
 
 When a task lands: check it off here with the date, commit and branch, move the
-description into `CHANGELOG.md`, and leave only the one-line result behind.
+description into `../CHANGELOG.md`, and leave only the one-line result behind.
 
 ---
 
@@ -18,22 +18,22 @@ order that hurts:
       Wooden Crate (27 slots) and Clay Pot (9) hold items; contents live in a
       per-chunk block-data page addressed at the same slot index as that chunk's
       voxels, cached write-back and streamed off disk on demand. Protocol v5.
-      See [plan-storage.md](docs/plan-storage.md).
+      See [plan-storage.md](plan-storage.md).
 - [ ] **Inventory does not survive logout.** The disk half of this is now
       cheap — the write-back discipline exists and is tested — but a player key
       is not spatial, so it wants a file per account rather than a `paged` slot;
-      see [plan-storage.md §6](docs/plan-storage.md#6-phase-2--the-remaining-tenants)
+      see [plan-storage.md §6](plan-storage.md#6-phase-2--the-remaining-tenants)
       for why forcing it into the same file would be a second format wearing the
       first one's name. It is session state on the server,
       so a reconnecting player is re-stocked with the starter kit — generous
       rather than correct, and the one gap that makes the feature feel unreal.
       Copy the `player_profile` shape: authoritative in `soils-server` during a
       session, written to SpacetimeDB on logout. Needs a module schema change
-      and a republish. See [plan-ui.md §9](docs/plan-ui.md#9-what-is-left).
+      and a republish. See [plan-ui.md §9](plan-ui.md#9-what-is-left).
 - [ ] **Decide whether the starter kit should exist.** New players get 128 each
       of nine block kinds so building works from the first second, as it did
       before placement cost anything. That is a sandbox answer to a survival
-      design (`docs/concepts.md`). Options: keep it, shrink it, or
+      design (`concepts.md`). Options: keep it, shrink it, or
       replace it with a "creative mode" flag. Cheap to change — one const in
       `app.rs`.
 - [ ] **Nearby drops do not merge.** Uncollected items are reaped after 5 min,
@@ -48,7 +48,7 @@ order that hurts:
       key), and a key whose item runs out rebinds itself to another of the same
       category, function and effect — or goes empty and wiggles when pressed.
       The screen groups by category instead of showing raw slots. See
-      [plan-ui.md §10](docs/plan-ui.md#10-phase-6--the-hotbar-2026-08-28).
+      [plan-ui.md §10](plan-ui.md#10-phase-6--the-hotbar-2026-08-28).
 - [ ] **No crafting, durability, or drop tables.** `ItemStack::durability` is
       carried on the wire and never decremented; a broken block yields exactly
       itself. This is where item *identity* starts to matter and the
@@ -80,7 +80,7 @@ order that hurts:
 
 - [ ] **A grave is nobody's.** Any player can open any container, including one
       that appears where someone died (planned in
-      [plan-death-chest.md](docs/plan-death-chest.md)). Ownership is a real
+      [plan-death-chest.md](plan-death-chest.md)). Ownership is a real
       design question — timers, locks, owner-only tombstones — and guessing at
       it is worse than leaving it open on a game this size. Decide it before
       graves ship, not after.
@@ -96,7 +96,7 @@ order that hurts:
       the same change: one `u32` per voxel (`R5 G5 B5 S5`) replacing the packed
       byte, `N_SLOTS` halved to pay for it. Designed in full, including phasing
       and the pool-sizing risk:
-      [plan-rgb-light-rework.md](docs/plan-rgb-light-rework.md). A sketch of
+      [plan-rgb-light-rework.md](plan-rgb-light-rework.md). A sketch of
       step 1 is in a git stash (`wip: rgb light format`) — read the plan, not
       the stash.
 - [ ] **Author the lamp blocks** (partly done). The *room* landed 2026-08-29
@@ -108,7 +108,7 @@ order that hurts:
       What is still open is the *hue circle*: there are now three emissive
       blocks and they are all warm-to-cyan, so colour blending still cannot be
       seen. That wants a set spanning the wheel, and it is worth doing after
-      [plan-rgb-light-rework.md](docs/plan-rgb-light-rework.md) rather than
+      [plan-rgb-light-rework.md](plan-rgb-light-rework.md) rather than
       before: the L0 grid is a single monochrome level today and `atlas.wgsl`
       tints every block light with one hardcoded warm constant, so an authored
       hue reaches the screen only through the GI bounce.
@@ -116,7 +116,7 @@ order that hurts:
       lit identically at dawn and noon and a wall lights the same on both sides.
       A second 5-bit channel in the light word's spare bits, flooded along a
       quantized sun direction:
-      [plan-sun.md](docs/plan-sun.md). The re-flood cadence is the whole gamble
+      [plan-sun.md](plan-sun.md). The re-flood cadence is the whole gamble
       — measure before committing.
 
 ## Next — streaming
@@ -128,6 +128,15 @@ order that hurts:
       but check what a missing chunk means to the client's `voxel_at` and to
       `reseed`'s "chunk above unmapped = open sky" heuristic before assuming it.
       This is also what buys the headroom the RGB pool halving spends.
+
+## Next — performance
+
+- [ ] **Instrument critical paths and add benchmark coverage.** Start with
+      chunk generation, then extend measurement to disk and network I/O where
+      existing regression tests do not expose cost.
+- [ ] **Cull hidden faces across chunk boundaries.** Meshing currently emits
+      geometry between adjacent solid chunks. Give the mesher neighbor data so
+      faces with solid voxels on both sides are not generated.
 
 ## Next — hardening
 
@@ -173,7 +182,7 @@ order that hurts:
       phase until the server is measurably N blocks ahead instead of for a
       fixed 150 ticks, or measure divergence relative to the walk distance
       actually achieved. Do **not** weaken the assertion to make a suite green
-      — see `docs/dev/debug.md` on tests that pass without testing anything.
+      — see `dev/debug.md` on tests that pass without testing anything.
       Note this got closer to the edge when breaking a block started spawning
       a dropped item: that test breaks 27 of them, so it now replicates and
       steps 27 extra entities during the measurement.
@@ -248,14 +257,14 @@ order that hurts:
 
 ## Docs and hygiene
 
-- [ ] **Organize [`docs/concepts.md`](docs/concepts.md).** Much of it refers to
+- [ ] **Organize [`concepts.md`](concepts.md).** Much of it refers to
       Minecraft; research Minecraft's mechanics and take notes before
       interpreting and rewriting it. Note there are now two design docs —
       `concepts.md` (philosophy, mechanics) and `conceptual_design.md` (story,
       setting) — and it is worth deciding whether that split is intended.
-- [x] **Prune `TODO.md`** — narrowed and mostly declined, 2026-08-30
-      (`light-falloff`). It was titled `# Tasks`, the same as this file, which
-      is the part that was actually wrong; it is now `# Implementation log`.
+- [x] **Separate roadmap and task tracking** — narrowed and mostly declined,
+      2026-08-30 (`light-fall`). The former roadmap was titled `# Tasks`, the
+      same as this file, which was the part that was actually wrong.
       The prune itself is a bad trade and should not be done: the file's own
       header says the detail *is* the point ("what shipped in each phase, what
       was measured, and what was deferred with the reasoning"), and the
@@ -296,10 +305,9 @@ order that hurts:
 
 ## Staging — unsorted
 
-Carried over from the old `TODO.md` when that file became the implementation
-log (merge of `origin/master` into `big_textures`). Not yet triaged into the
-sections above, and some overlap the *Later* entries — fold them in as they
-get detail.
+Carried over from the former root task documents. Not yet triaged into the
+sections above, and some overlap the *Later* entries — fold them in as they get
+detail.
 
 - [ ] Compress world data
 - [ ] Portals
@@ -324,7 +332,7 @@ get detail.
 
 ## Cross-cutting notes
 
-Kept from `TODO.md` because they change how the tasks above should be built.
+Kept with the task list because they change how the tasks above should be built.
 
 - **Biomes / structures ↔ SpacetimeDB.** Blue-noise structure seeds spanning
   chunk boundaries are exactly the sparse relational state SpacetimeDB is good

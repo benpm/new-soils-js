@@ -212,7 +212,7 @@ it has already authenticated.
 
 ## Not wired yet
 
-Tracked in `TODO.md`. Built on both sides and currently unreachable:
+Tracked in `../docs/roadmap.md`. Built on both sides and currently unreachable:
 
 Nothing, as of the client layer landing. `account`, `chat_message` and
-`game_server` all have consumers now; see `TODO.md` for what is left.
+`game_server` all have consumers now; see `../docs/tasks.md` for what is left.

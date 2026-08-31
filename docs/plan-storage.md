@@ -188,7 +188,7 @@ chest either voids its contents or leaves orphan data that the next chest built
 on that voxel inherits.
 
 Known gap: a *script* edit (`run_scripts`) that removes a container block does
-not go through this path. Recorded in `Tasks.md`.
+not go through this path. Recorded in `tasks.md`.
 
 ---
 
@@ -212,7 +212,7 @@ the first one's name. Two honest options:
 
 1. One file per account under `worlds/<name>/players/`, with the same write-back
    discipline (dirty in RAM, flushed by the persist thread) but a trivial
-   whole-file codec. This is what the `Tasks.md` item "inventory does not survive
+   whole-file codec. This is what the `tasks.md` item "inventory does not survive
    logout" actually wants, and it is small.
 2. Keep owning it in SpacetimeDB, which already has `SaveInventory` and
    `SaveProfile`, and treat the disk path as the offline fallback.

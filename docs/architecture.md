@@ -1,6 +1,6 @@
 # Architecture
 
-How the system works as implemented — all 14 phases of `TODO.md` are
+How the system works as implemented — all 14 phases recorded in `roadmap.md` are
 complete. This is the "what is" companion to the "what should be" plans
 (`plan-rendering.md`, `plan-game-systems.md`) and the measurements in
 `perf-report.md`. File references are starting points, not an API contract.
@@ -391,7 +391,7 @@ row-granular deltas.
   that the table is an ever-growing broadcast — unbounded memory in every
   client's cache and an initial sync that never stops getting slower.
 
-Known limits are tracked in [`Tasks.md`](../Tasks.md).
+Known limits are tracked in [`tasks.md`](tasks.md).
 
 ## Testing
 
@@ -456,8 +456,8 @@ Known limits are tracked in [`Tasks.md`](../Tasks.md).
 
 ## Known deferrals
 
-Each `TODO.md` checkoff records its own, and open work is listed in
-[`Tasks.md`](../Tasks.md); the ones that shape future work:
+Each `roadmap.md` checkoff records its own, and open work is listed in
+[`tasks.md`](tasks.md); the ones that shape future work:
 pooled quad memory / merged draws (the current frame bound), GI 3D-texture +
 DDA marching and default-on, async pathfinding + a flow-field consumer (the
 mob spawner), snapshot MTU packing, wasm client with cert-hash pinning, and

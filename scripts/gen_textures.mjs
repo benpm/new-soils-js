@@ -8,7 +8,7 @@
 // 1024×1024 "mega-tile" that repeats over 16×16 blocks (64 px per block). The
 // client samples them as one texture array: `assets/blocks_mega.png` is the
 // 24 tiles stacked vertically (1024 × 24576) and reinterpreted as 24 layers at
-// load (gpu_mesh.rs). Tile row 0 of each 64 px band is the TOP of a block on
+// load (gpu_mesh.rs). Tile row 0 of each 64 px band is the BOTTOM of a block on
 // side faces (same convention as the old 16 px atlas).
 //
 // Outputs:
@@ -23,6 +23,7 @@
 // tiles keep each feature inside its own 64 px cell.
 
 import { mkdirSync, writeFileSync } from "node:fs";
+import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
@@ -195,7 +196,7 @@ function grassTop(rng) {
 
 /** Grass cap + hanging blades at the top of every 64 px band (drawn over dirt). */
 function grassCap(rng) {
-  let out = `<g id="grass-cap">\n`;
+  let out = `<g id="grass-cap" transform="translate(0 ${SIZE}) scale(1 -1)">\n`;
   for (let band = 0; band < CELLS; band++) {
     const y0 = band * CELL;
     const terms = waveTerms(rng, 3);
@@ -215,6 +216,25 @@ function grassCap(rng) {
     out += `<g fill="${GRASS.blade}">${blades}<g transform="translate(-${SIZE} 0)">${blades}</g><g transform="translate(${SIZE} 0)">${blades}</g></g>\n`;
   }
   return out + "</g>\n";
+}
+
+function grassPixels(image, y0, y1) {
+  let count = 0;
+  for (let y = y0; y < y1; y++) for (let x = 0; x < image.width; x++) {
+    const i = (y * image.width + x) * 4;
+    if (image.data[i + 1] > image.data[i] && image.data[i + 1] > image.data[i + 2]) count++;
+  }
+  return count;
+}
+
+function assertGrassSideOrientation(image) {
+  for (let band = 0; band < CELLS; band++) {
+    const y0 = band * CELL;
+    assert(
+      grassPixels(image, y0 + CELL - 4, y0 + CELL) > grassPixels(image, y0, y0 + 4),
+      `grass_side band ${band} must place grass at the image bottom (block top)`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------- cell-feature tiles
@@ -484,6 +504,7 @@ TILES.forEach(([name, build], idx) => {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}" viewBox="0 0 ${SIZE} ${SIZE}">\n${build(rng)}</svg>\n`;
   writeFileSync(join(SVG_DIR, `${String(idx).padStart(2, "0")}_${name}.svg`), svg);
   const full = PNG.sync.read(new Resvg(svg).render().asPng());
+  if (name === "grass_side") assertGrassSideOrientation(full);
   for (let i = 0; i < full.data.length; i += 4) {
     full.data[i] = Math.round(full.data[i] * ALBEDO_SCALE);
     full.data[i + 1] = Math.round(full.data[i + 1] * ALBEDO_SCALE);

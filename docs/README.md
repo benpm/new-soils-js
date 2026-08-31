@@ -1,7 +1,8 @@
 # Documentation
 
 Mostly agent-maintained documentation of the project. Start with
-`architecture.md` for how things work now, and `../Tasks.md` for what is left.
+`architecture.md` for how things work now, `roadmap.md` for direction, and
+`tasks.md` for what is left.
 Setting up a machine to build this repo: [`dev/toolchain.md`](dev/toolchain.md).
 
 ## Current state
@@ -9,6 +10,8 @@ Setting up a machine to build this repo: [`dev/toolchain.md`](dev/toolchain.md).
 | File | What it is |
 |---|---|
 | [`architecture.md`](architecture.md) | How every system works today: protocol, transports, server tick, chunk lifecycle, inventory, rendering, GI, prediction, SpacetimeDB mirror, testing. The first thing to read. |
+| [`roadmap.md`](roadmap.md) | High-level product and technical direction, including completed foundations and deferred upgrades. |
+| [`tasks.md`](tasks.md) | Individual actionable work, ordered from current priorities to staged ideas. |
 | [`perf-report.md`](perf-report.md) | The optimization narrative with measurements, the methodology, and the ranked list of what to optimize next. |
 | [`dev/`](dev/) | Working notes for people (and agents) touching the code — see below. |
 
@@ -30,7 +33,7 @@ implemented — `architecture.md` describes what actually shipped.
 | [`analysis.md`](analysis.md) | The original analysis the rewrite was planned from. |
 | [`plan-game-systems.md`](plan-game-systems.md) | Entities, authoritative server, delta replication. **Implemented.** |
 | [`plan-rendering.md`](plan-rendering.md) | Renderer, lighting, GI. **Implemented.** |
-| [`plan-ui.md`](plan-ui.md) | Inventory, the item ring, and the `UiMode` refactor. **Phases 0–5 shipped**; remainder in `../Tasks.md`. |
+| [`plan-ui.md`](plan-ui.md) | Inventory, the item ring, and the `UiMode` refactor. **Phases 0–5 shipped**; remainder in [`tasks.md`](tasks.md). |
 | [`plan-rgb-light-rework.md`](plan-rgb-light-rework.md) | RGB blocklight in a `u32` (5:5:5:5) with range 31, and the pool halving that pays for it. **Designed, not landed.** |
 | [`plan-sun.md`](plan-sun.md) | Semidirectional sunlight: a directional channel in the light word's spare bits. **Design only.** |
 | [`plan-better-lighting.md`](plan-better-lighting.md) | Coarse light stored with world data, fine light GPU-only. **Sketch.** |

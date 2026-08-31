@@ -13,13 +13,13 @@
 >
 > Companion to `plan-game-systems.md` (authority, protocol) and
 > `architecture.md` (current state). The remaining work is tracked in
-> [`../Tasks.md`](../Tasks.md).
+> [`tasks.md`](tasks.md).
 
 Goal: replace the placeholder nine-slot block hotbar with an actual inventory —
 an item model, a radial selector for tools/weapons/consumables, and a full
 inventory screen — without inheriting Minecraft's UI.
 
-The design intent is recorded in `TODO.md`:
+The design intent is recorded in `roadmap.md`:
 
 * No hotbar. A **ring** shows every tool, weapon and consumable carried.
 * Hotkeys drive the UI; **Alt** releases the cursor for mouse interaction.
@@ -195,7 +195,7 @@ proves annoying.
 ## 7. Later: authority and persistence
 
 Out of scope for the UI work, and listed here so the phases above do not
-accidentally foreclose it. `TODO.md` already records the intended split:
+accidentally foreclose it. `roadmap.md` already records the intended split:
 authoritative in `soils-server` during a session, persisted to SpacetimeDB on
 logout — the same shape as `player_profile`.
 
@@ -223,7 +223,7 @@ before anything was built on it.
 
 ## 9. What is left
 
-Tracked as tasks in [`../Tasks.md`](../Tasks.md); the reasoning is here.
+Tracked as tasks in [`tasks.md`](tasks.md); the reasoning is here.
 
 * ~~**The ring is a strip, not a ring.**~~ Closed by phase 6, which deleted
   both the ring and the `HeldItem` indicator rather than making the strip
@@ -234,7 +234,7 @@ Tracked as tasks in [`../Tasks.md`](../Tasks.md); the reasoning is here.
 * **Inventory does not survive logout.** It is session state on the server. The
   shape to copy is `player_profile` in SpacetimeDB — the same "authoritative in
   `soils-server` during a session, persisted on logout" split recorded in
-  `TODO.md`. Until then a reconnecting player is re-stocked with the starter
+  `roadmap.md`. Until then a reconnecting player is re-stocked with the starter
   kit, which is generous rather than correct.
 * **Nearby drops do not merge.** An uncollected item is reaped after
   `DROP_TTL_TICKS` (5 min), so they no longer accumulate forever, but strip

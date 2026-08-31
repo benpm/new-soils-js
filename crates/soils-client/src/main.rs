@@ -73,8 +73,8 @@ const PROVISIONAL_SPAWN: Vec3 = Vec3::new(282.0, 285.0, 268.0);
 fn main() {
     let mut app = App::new();
     // The UI art is 16x16 pixel art magnified hard, so the linear default is
-    // rarely what's wanted. Both atlases pin their own sampler (`load_atlas`
-    // nearest, `load_mega_atlas` linear+repeat); this is the backstop for
+    // rarely what's wanted. Both atlases pin their own nearest sampler, with
+    // the mega atlas additionally using repeat; this is the backstop for
     // anything loaded without settings.
     app.add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()).set(WindowPlugin {
         primary_window: Some(Window {

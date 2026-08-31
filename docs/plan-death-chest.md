@@ -84,7 +84,7 @@ produce. Protocol bumps to v6.
 
 No combat, no mobs that hurt, no drowning, no starvation, no armour, no
 durability, no XP. Each is a separate design conversation and none is needed to
-make a grave. `Tasks.md` already tracks durability and drop tables.
+make a grave. `tasks.md` already tracks durability and drop tables.
 
 ---
 

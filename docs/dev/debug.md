@@ -398,7 +398,7 @@ Two tables are readable by any client and should not be:
 
 Both must be public because the *game server* reads them through the SDK cache,
 and a private table has no client accessor at all. Row-level security is the
-right tool and is unimplemented in 2.7.1. This is recorded in `Tasks.md`; it is
+right tool and is unimplemented in 2.7.1. This is recorded in `../tasks.md`; it is
 a known limitation, not an oversight to re-report.
 
 Likewise `send_chat` trusts the caller's `world_id`, and `grant_server` is

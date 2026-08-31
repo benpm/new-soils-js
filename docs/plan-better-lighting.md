@@ -258,4 +258,4 @@ payload-size risk in phase A is the thing most likely to sink it, and it should
 be measured against the format that will actually ship rather than one that is
 already scheduled for replacement. `plan-rgb-light-rework.md` also notes it
 pays for itself by halving `N_SLOTS`, which interacts with the "cull all-air
-chunks" item in `Tasks.md` — that is where the headroom comes from.
+chunks" item in `tasks.md` — that is where the headroom comes from.

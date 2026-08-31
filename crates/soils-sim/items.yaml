@@ -7,7 +7,7 @@
 # class in `blocks.yaml`, resolved through `BlockRegistry`.
 #
 # All three lists are empty because nothing in the game is a tool, weapon or
-# consumable yet (see `Tasks.md`). The registry exists anyway so the inventory,
+# consumable yet (see `docs/tasks.md`). The registry exists anyway so the inventory,
 # the hotbar and its substitution rule are written against real data instead of
 # a special case, and so authoring the first fruit is a YAML edit:
 #

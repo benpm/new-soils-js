@@ -1,14 +1,16 @@
-# Implementation log
+# Roadmap
 
-> **Open work lives in [`Tasks.md`](Tasks.md).** This file is the historical
-> record: what shipped in each phase, what was measured, and what was deferred
-> with the reasoning. Checkoffs here are not re-litigated; they are evidence.
->
-> `soils-terrainlab` keeps its own:
-> [`crates/soils-terrainlab/TODO.md`](crates/soils-terrainlab/TODO.md).
+High-level product and technical direction. Individual work items live in
+[`tasks.md`](tasks.md); shipped changes live in
+[`CHANGELOG.md`](../CHANGELOG.md).
 
-<!-- As you complete tasks, add descriptions of your implementation to CHANGELOG.md, and then reference them here, removing their descriptions from here. -->
-<!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. --> 
+Completed sections record the foundation future work builds on. Planned and
+deferred sections describe direction rather than implementation checklists.
+
+## (PRIORITY) Performance
+
+Improve observability and remove avoidable chunk-generation, meshing, storage,
+and network costs. Concrete work is tracked in [`tasks.md`](tasks.md).
 
 ## UI
 
@@ -35,18 +37,18 @@ having here: it is a set of standing intentions, not eight more slots to
 micromanage. The ring and the one-slot held-item indicator are gone; the
 inventory screen groups by category instead of showing raw slots.
 
-Phasing, rationale and per-phase test gates: [plan-ui.md](docs/plan-ui.md).
+Phasing, rationale and per-phase test gates: [plan-ui.md](plan-ui.md).
 
 **Shipped 2026-08-25 (`ui-inventory`).** The loop works: breaking a block drops
 it as a world entity, walking into the drop collects it, placing spends it, and
 the server owns the inventory (protocol v4). What is left is listed under
-[plan-ui.md §9](docs/plan-ui.md#9-what-is-left) — persistence across logout, the
+[plan-ui.md §9](plan-ui.md#9-what-is-left) — persistence across logout, the
 radial *shape* of the ring, and a TTL for uncollected drops.
 
 - [x] **Decide the Escape binding.** The intent above lists Escape as an
       inventory key, but Escape is currently the cursor release and therefore
       the pause menu; both cannot hold. Recommendation and the alternative:
-      [plan-ui.md §6](docs/plan-ui.md#6-open-decisions). Blocks phase 0.
+      [plan-ui.md §6](plan-ui.md#6-open-decisions). Blocks phase 0.
 - [x] **Phase 0 — `UiMode` state.** The client has no UI state machine: the
       pause menu is shown whenever the cursor is released (`pause.rs:211`), and
       any click re-grabs it (`player.rs:313`), so an inventory screen cannot be
@@ -64,14 +66,14 @@ radial *shape* of the ring, and a TTL for uncollected drops.
       `blocks.yaml` resolves to an in-range tile.
 - [x] **Phase 3 — the ring** (partial). `Hotbar` retired; the strip shows the
       carried tools/weapons/consumables. Radial layout and hold-to-open
-      selection deferred until tools exist — tracked in `Tasks.md`.
+      selection deferred until tools exist — tracked in `tasks.md`.
 - [x] **Phase 4 — inventory screen.** E/I/Tab into `UiMode::Inventory`, slot
       grid, click-to-pick/click-to-place, and the backpack affordance with the
       circled "E". Gate: open/close per binding; moving a stack conserves it;
       closing with a stack in hand returns it rather than voiding it.
 - [x] **Phase 5 — authority** (persistence deferred). Protocol v4, server-owned
       inventory, client mirrors only. Persistence across logout is tracked in
-      `Tasks.md`.
+      `tasks.md`.
 
 ## BigRefactor
 
@@ -227,7 +229,7 @@ what was measured, and what was deferred with rationale. Current-state documenta
 - [x] Angular velocity replicated (`MASK_ANGVEL` / `BodyAngVel`), so the client
       predicts a prop's spin between snapshots. Remaining follow-ups (two-way
       player via an Avian character controller, sub-tick interpolation) are in
-      `Tasks.md`.
+      `tasks.md`.
 
 ## SpacetimeDB (`stdb/soils-module`, `soils-stdb`) — behind `SOILS_STDB_URI`
 
@@ -235,7 +237,7 @@ Hybrid by design: SpacetimeDB owns cold/relational/persistent/social state,
 `soils-server` stays authoritative for movement, chunks, entities and physics.
 Mirroring is strictly opt-in — unset `SOILS_STDB_URI` and the server is exactly
 as it was, region files only. Setup and schema notes in
-[`stdb/README.md`](stdb/README.md).
+[`stdb/README.md`](../stdb/README.md).
 
 ### Done
 
@@ -296,14 +298,14 @@ as it was, region files only. Setup and schema notes in
 
 ### Remaining
 
-Moved to [`Tasks.md`](Tasks.md) — the known limits of the hybrid split
+Moved to [`tasks.md`](tasks.md) — the known limits of the hybrid split
 (world-readable `player_profile`/`chunk_blob`, `send_chat` world trust, the
 new-world join stall, database-down logins, `grant_server` trust-on-first-use)
 and the cross-cutting notes that shape work elsewhere on the list.
 
 ## The First Content Expansion
 
-Moved to [`Tasks.md`](Tasks.md): Minecraft-parity block types, biomes, and
+Moved to [`tasks.md`](tasks.md): Minecraft-parity block types, biomes, and
 neural tile/structure generation.
 
 ---
@@ -312,7 +314,7 @@ neural tile/structure generation.
 ## Light Upgrade 2.0
 
 **Planned, not started.** The detailed plan is written:
-[plan-better-lighting.md](docs/plan-better-lighting.md). Four phases, each
+[plan-better-lighting.md](plan-better-lighting.md). Four phases, each
 test-gated, with the payoff concentrated in the first.
 
 Two findings from writing it are worth having here, because they change what
@@ -353,13 +355,13 @@ Both need a plan doc before they need code. Notes toward one:
   different constraint: it has to be decompressible by the mesher, not by the
   CPU.
 - The cheaper prerequisite is already listed in
-  [`Tasks.md`](Tasks.md): *cull all-air chunks*. Occlusion culling withholds
+  [`tasks.md`](tasks.md): *cull all-air chunks*. Occlusion culling withholds
   sealed chunks but still sends every empty chunk above the terrain, and
   roughly half the cube is sky. That is the largest single win available here
   and it needs no new format.
 - LOD interacts with the lighting plan: a downsampled chunk needs downsampled
   light, and whether that is derived on the client or shipped is the same
-  question [plan-better-lighting.md](docs/plan-better-lighting.md) phase A
+  question [plan-better-lighting.md](plan-better-lighting.md) phase A
   asks about full-resolution light. Decide them together.
 
 ## GitHub Actions
@@ -381,13 +383,4 @@ Both need a plan doc before they need code. Notes toward one:
       unchanged — so a published video is a take the test *passed*, assertions
       on scripted beats included. `scripts/build_pages.py` folds one branch's
       videos into the site without disturbing the others. 2026-08-29,
-      `ci-pipelines`. See [CHANGELOG.md](CHANGELOG.md).
-
-## `optimization`
-This branch should focus on making performance improvements to chunk generation, disk i/o, network i/o, etc.
-
-- [ ] Add instrumentation to critical functions such as chunk gen, then create some benchmark tests
-- [ ] ADd
-- [ ] 
-- [ ] 
-- [ ] 
+      `ci-pipelines`. See [CHANGELOG.md](../CHANGELOG.md).

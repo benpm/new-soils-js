@@ -143,7 +143,7 @@ demo exists to show is gone.
 ## CI builds releases, and publishes the recordings per branch
 
 **Branch `ci-pipelines`, 2026-08-29.** Closes the two GitHub Actions items in
-`TODO.md`. Two workflows and two scripts; no game code changed.
+`docs/roadmap.md`. Two workflows and two scripts; no game code changed.
 
 ### Releases
 
@@ -225,7 +225,7 @@ placement needed) and `props_demo` (two clients, tiled). `demo` and
 **Branch `ui-inventory`, 2026-08-29.** An independent review of the container
 and hotbar work (gemini CLI over the diff, every finding then verified against
 the code). Nine of its eighteen findings did not survive that check; five that
-did are fixed here, and one is recorded in `Tasks.md` because it is a design
+did are fixed here, and one is recorded in `docs/tasks.md` because it is a design
 decision rather than a bug.
 
 ### Warping with a chest open unpinned the wrong world
@@ -253,7 +253,7 @@ inherited by whatever was built on that voxel next.
 
 `if !placing` became `if old != 0`. That whether placement should require air
 at all is a separate question — a gameplay decision about which blocks are
-replaceable in place, not just a missing check — is now in `Tasks.md`.
+replaceable in place, not just a missing check — is now in `docs/tasks.md`.
 
 ### A page whose write was still in flight could be evicted and re-read stale
 
@@ -389,7 +389,7 @@ health system first and a recording last.
 ## The hotbar holds references, and the inventory groups by category
 
 **Branch `ui-inventory`, 2026-08-28.** Worked from the design mockup in
-`scratch/`. Reverses the "No hotbar, just a ring" line in `TODO.md` — the
+`scratch/`. Reverses the "No hotbar, just a ring" line in `docs/roadmap.md` — the
 reasoning is in [plan-ui.md §10](docs/plan-ui.md#10-phase-6--the-hotbar-2026-08-28).
 
 ### The bar holds references, not items

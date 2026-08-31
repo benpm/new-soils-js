@@ -2,10 +2,10 @@
 
 Where the time went, what was done about it, and what's left on the table.
 Covers the optimization arc from the first "performance is very, very bad"
-profile (2026-07-02) through the completion of all 14 `TODO.md` phases
+profile (2026-07-02) through the completion of all 14 `roadmap.md` phases
 (2026-07-04). Companion: `architecture.md` (how the system works now),
 `plan-rendering.md` / `plan-game-systems.md` (the original plans), and the
-per-phase measurements recorded in `TODO.md`'s checkoffs.
+per-phase measurements recorded in `roadmap.md`'s checkoffs.
 
 Reference machine: RTX 5070 / Ryzen 5 3600, Windows 11, vsync off, release
 builds, static self-test viewpoint unless noted.
@@ -228,7 +228,7 @@ Ranked by expected payoff on the reference hardware:
    taps per trace cycle. Pair with *shortening the cascade intervals* now
    that L0 seeding supplies far-field sky occlusion.
 4. **GI default-on** — blocked on stability evidence across drivers, not
-   performance (see `TODO.md` phase 12 deferral note).
+   performance (see `roadmap.md` phase 12 deferral note).
 5. **Snapshot MTU packing** — the snapshot budget (410 B) is conservative
    against the ~1200 B QUIC datagram floor; entity coverage per tick could
    roughly double before fragmentation risk.

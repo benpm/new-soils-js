@@ -5,7 +5,7 @@
 //! (see `pool.rs` for the buffers and `world_draw.rs` for the draw).
 
 use bevy::image::{
-    ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor,
+    ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor,
 };
 use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
@@ -107,20 +107,15 @@ pub fn load_atlas(asset_server: &AssetServer) -> Handle<Image> {
 /// it only through [`load_mega_atlas`].
 pub const MEGA_ATLAS_PATH: &str = "blocks_mega.png";
 
-/// Linear + repeat: `atlas.wgsl` samples at `face_uv / 16` with no `fract`, so
-/// the texture wraps on its own and filters smoothly at 64 px/block. No mips
-/// are generated (accepted first pass: some shimmer at distance). Main-world
-/// only — [`promote_block_textures`] releases it to the render world after
-/// reinterpreting it as an array.
+/// Nearest + repeat: `atlas.wgsl` samples at `face_uv / 16` with no `fract`, so
+/// the texture wraps on its own without bleeding across each block boundary.
+/// Main-world only — [`promote_block_textures`] releases it to the render world
+/// after reinterpreting it as an array.
 fn mega_atlas_settings(s: &mut ImageLoaderSettings) {
-    s.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-        address_mode_u: ImageAddressMode::Repeat,
-        address_mode_v: ImageAddressMode::Repeat,
-        mag_filter: ImageFilterMode::Linear,
-        min_filter: ImageFilterMode::Linear,
-        mipmap_filter: ImageFilterMode::Linear,
-        ..default()
-    });
+    let mut sampler = ImageSamplerDescriptor::nearest();
+    sampler.address_mode_u = ImageAddressMode::Repeat;
+    sampler.address_mode_v = ImageAddressMode::Repeat;
+    s.sampler = ImageSampler::Descriptor(sampler);
     s.asset_usage = RenderAssetUsages::MAIN_WORLD;
 }
 
@@ -128,9 +123,8 @@ fn mega_atlas_settings(s: &mut ImageLoaderSettings) {
 ///
 /// Same one-loader-per-path rule as [`load_atlas`], and for the same reason:
 /// `AssetServer` keys by path, so the first load fixes the settings. The two
-/// atlases are deliberately separate assets — terrain wants a repeating,
-/// linearly filtered array, the inventory icons want a nearest-sampled 2D grid
-/// — and sharing one handle between them cannot give both.
+/// atlases are deliberately separate assets because terrain wants a repeating
+/// array while inventory icons use a clamped 2D grid.
 pub fn load_mega_atlas(asset_server: &AssetServer) -> Handle<Image> {
     asset_server.load_builder().with_settings(mega_atlas_settings).load(MEGA_ATLAS_PATH)
 }
@@ -335,6 +329,28 @@ mod tests {
         assert_eq!(d.mipmap_filter, ImageFilterMode::Nearest, "mipmap");
     }
 
+    #[test]
+    fn mega_atlas_samples_nearest_and_repeats() {
+        let mut s = ImageLoaderSettings::default();
+        mega_atlas_settings(&mut s);
+        let ImageSampler::Descriptor(d) = s.sampler else {
+            panic!("mega atlas inherits the ImagePlugin default sampler");
+        };
+        assert_eq!(
+            d.address_mode_u,
+            ImageAddressMode::Repeat,
+            "horizontal address mode"
+        );
+        assert_eq!(
+            d.address_mode_v,
+            ImageAddressMode::Repeat,
+            "vertical address mode"
+        );
+        assert_eq!(d.mag_filter, ImageFilterMode::Nearest, "magnification");
+        assert_eq!(d.min_filter, ImageFilterMode::Nearest, "minification");
+        assert_eq!(d.mipmap_filter, ImageFilterMode::Nearest, "mipmap");
+    }
+
     /// A second load of the atlas by literal path would race [`load_atlas`] and
     /// could win with the default sampler, so the path belongs in exactly one
     /// place. This is the test that catches the bug coming back: the symptom is
@@ -380,9 +396,9 @@ mod tests {
         );
         // The plugin default is linear, so the call above is the only thing
         // standing between a settings-less load and bilinear filtering.
-        assert_eq!(
-            ImagePlugin::default_nearest().default_sampler.mag_filter,
-            ImageFilterMode::Nearest
-        );
+        let sampler = ImagePlugin::default_nearest().default_sampler;
+        assert_eq!(sampler.mag_filter, ImageFilterMode::Nearest, "magnification");
+        assert_eq!(sampler.min_filter, ImageFilterMode::Nearest, "minification");
+        assert_eq!(sampler.mipmap_filter, ImageFilterMode::Nearest, "mipmap");
     }
 }

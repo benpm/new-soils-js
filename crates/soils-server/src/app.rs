@@ -1369,7 +1369,7 @@ fn drain_inboxes(
                     // no container in front of it — invisible, unreachable, and
                     // inherited by whatever is built on that voxel next. Whether
                     // placement should require air at all is a separate
-                    // authority question, tracked in `Tasks.md`.
+                    // authority question, tracked in `docs/tasks.md`.
                     if old != 0 {
                         release_block_data(
                             &mut commands,

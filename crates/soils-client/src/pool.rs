@@ -35,7 +35,7 @@ pub const N_MESH: u32 = 4096;
 /// A feature rather than a runtime clamp because these are `const` and feed
 /// buffer sizes, free-lists and slot arithmetic all over this module; sizing
 /// them dynamically is a real change to the renderer, and this is a build
-/// profile. Tracked in `Tasks.md` as the thing to do properly.
+/// profile. Tracked in `docs/tasks.md` as the thing to do properly.
 ///
 /// The ratio is preserved (`N_SLOTS > N_MESH`): light slots cover padded
 /// neighbours, so there must be more of them than mesh slots. Nothing needs

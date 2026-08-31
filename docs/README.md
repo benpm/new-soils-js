@@ -2,6 +2,7 @@
 
 Mostly agent-maintained documentation of the project. Start with
 `architecture.md` for how things work now, and `../Tasks.md` for what is left.
+Setting up a machine to build this repo: [`dev/toolchain.md`](dev/toolchain.md).
 
 ## Current state
 
@@ -41,6 +42,7 @@ implemented — `architecture.md` describes what actually shipped.
 
 | File | What it is |
 |---|---|
+| [`dev/toolchain.md`](dev/toolchain.md) | Building on Windows with LLVM/mingw-w64 (`gnullvm`) instead of MSVC: the sysroot, the cc-rs trap, and static CRT linking. |
 | [`dev/debug.md`](dev/debug.md) | Symptom-first debugging field guide: the traps this codebase actually produced, and how to tell them apart quickly. Read this before a long debugging session. |
 | [`dev/server-tick.md`](dev/server-tick.md) | Tick phase ordering, the determinism rules, and why login runs off the tick thread. |
 | [`dev/dashboard.md`](dev/dashboard.md) | The public dashboard of recorded test videos, and how it is deployed. |

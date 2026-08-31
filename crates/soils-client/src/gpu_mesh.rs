@@ -76,31 +76,73 @@ impl Plugin for GpuMeshPlugin {
     }
 }
 
-/// Start loading the block texture array and build the faces-table buffer.
+/// The 16x16-tile icon atlas. Load it only through [`load_atlas`].
+///
+/// Since the terrain moved to [`MEGA_ATLAS_PATH`] this is no longer what
+/// clothes a voxel face: it is the art behind the inventory icons and the
+/// dropped-item cubes, which slice it as a fixed 8x8 grid of 16x16 tiles
+/// (`inventory/mod.rs`). It is hand-maintained — `scripts/gen_textures.mjs`
+/// regenerates the mega atlas only.
+pub const ATLAS_PATH: &str = "blocks.png";
+
+/// Nearest in every direction: the tiles are 16x16 pixel-art, magnified hard
+/// into an icon or onto a dropped cube's face, and linear filtering both blurs
+/// them and bleeds the neighbouring tile across the cell edge.
+fn atlas_settings(s: &mut ImageLoaderSettings) {
+    s.sampler = ImageSampler::nearest();
+}
+
+/// Load the block atlas, sampled nearest.
+///
+/// Every caller must come through here. `AssetServer` keys by path, so the
+/// *first* load of a path fixes its settings and later ones quietly inherit
+/// them — two unordered `Startup` systems loading this with different samplers
+/// is a race, and the losing outcome is bilinear-blurred voxels for the
+/// session. One loader means there is nothing to win.
+pub fn load_atlas(asset_server: &AssetServer) -> Handle<Image> {
+    asset_server.load_builder().with_settings(atlas_settings).load(ATLAS_PATH)
+}
+
+/// The block *mega* atlas, one 1024² tile per index stacked vertically. Load
+/// it only through [`load_mega_atlas`].
+pub const MEGA_ATLAS_PATH: &str = "blocks_mega.png";
+
+/// Linear + repeat: `atlas.wgsl` samples at `face_uv / 16` with no `fract`, so
+/// the texture wraps on its own and filters smoothly at 64 px/block. No mips
+/// are generated (accepted first pass: some shimmer at distance). Main-world
+/// only — [`promote_block_textures`] releases it to the render world after
+/// reinterpreting it as an array.
+fn mega_atlas_settings(s: &mut ImageLoaderSettings) {
+    s.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    s.asset_usage = RenderAssetUsages::MAIN_WORLD;
+}
+
+/// Load the terrain mega atlas.
+///
+/// Same one-loader-per-path rule as [`load_atlas`], and for the same reason:
+/// `AssetServer` keys by path, so the first load fixes the settings. The two
+/// atlases are deliberately separate assets — terrain wants a repeating,
+/// linearly filtered array, the inventory icons want a nearest-sampled 2D grid
+/// — and sharing one handle between them cannot give both.
+pub fn load_mega_atlas(asset_server: &AssetServer) -> Handle<Image> {
+    asset_server.load_builder().with_settings(mega_atlas_settings).load(MEGA_ATLAS_PATH)
+}
+
+/// Build the atlas texture and the faces-table buffer.
 fn setup_gpu_assets(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     blocks: Res<Blocks>,
 ) {
-    // Linear + repeat: atlas.wgsl samples at face_uv / 16 with no fract, so
-    // the texture wraps on its own and filters smoothly at 64 px/block. No
-    // mips are generated (accepted first pass: some shimmer at distance).
-    let texture = asset_server
-        .load_builder()
-        .with_settings(|s: &mut ImageLoaderSettings| {
-            s.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-                address_mode_u: ImageAddressMode::Repeat,
-                address_mode_v: ImageAddressMode::Repeat,
-                mag_filter: ImageFilterMode::Linear,
-                min_filter: ImageFilterMode::Linear,
-                mipmap_filter: ImageFilterMode::Linear,
-                ..default()
-            });
-            // Keep it out of the render world until it is an array.
-            s.asset_usage = RenderAssetUsages::MAIN_WORLD;
-        })
-        .load("blocks_mega.png");
+    let texture = load_mega_atlas(&asset_server);
 
     let faces: Vec<UVec4> = blocks.0.faces_table().into_iter().map(UVec4::from_array).collect();
     let faces_buf = buffers.add(ShaderBuffer::from(faces));
@@ -272,4 +314,75 @@ pub(crate) fn voxel_mesh_pass(
     pass.dispatch_workgroups(3, 33, jobs.count);
     pass.set_pipeline(finalize);
     pass.dispatch_workgroups(jobs.count, 1, 1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::image::ImageFilterMode;
+
+    /// The atlas must pin its own sampler rather than inherit the `ImagePlugin`
+    /// default, which is linear and blurs every voxel face.
+    #[test]
+    fn atlas_samples_nearest() {
+        let mut s = ImageLoaderSettings::default();
+        atlas_settings(&mut s);
+        let ImageSampler::Descriptor(d) = s.sampler else {
+            panic!("atlas inherits the ImagePlugin default sampler");
+        };
+        assert_eq!(d.mag_filter, ImageFilterMode::Nearest, "magnification");
+        assert_eq!(d.min_filter, ImageFilterMode::Nearest, "minification");
+        assert_eq!(d.mipmap_filter, ImageFilterMode::Nearest, "mipmap");
+    }
+
+    /// A second load of the atlas by literal path would race [`load_atlas`] and
+    /// could win with the default sampler, so the path belongs in exactly one
+    /// place. This is the test that catches the bug coming back: the symptom is
+    /// a startup-order race, so a normal run may reproduce it only sometimes.
+    ///
+    /// The needle is built from [`ATLAS_PATH`] rather than written out, so this
+    /// test does not count itself.
+    #[test]
+    fn the_atlas_path_is_written_once() {
+        let needle = format!("{ATLAS_PATH:?}");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension() == Some(std::ffi::OsStr::new("rs")) {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for (n, line) in text.lines().enumerate() {
+                        if line.contains(&needle) && !line.trim_start().starts_with("//") {
+                            let rel = path.strip_prefix(&src).unwrap();
+                            hits.push(format!("{}:{}", rel.display(), n + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(hits.len(), 1, "load the atlas via `load_atlas`, not by path; found {hits:?}");
+    }
+
+    /// The global default backs up [`load_atlas`] for anything loaded without
+    /// settings. Losing it is silent — nothing fails, textures just go blurry —
+    /// so pin it here.
+    #[test]
+    fn the_app_sets_the_global_nearest_default() {
+        let main = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let text = std::fs::read_to_string(main).unwrap();
+        assert!(
+            text.contains("ImagePlugin::default_nearest()"),
+            "DefaultPlugins must .set(ImagePlugin::default_nearest())"
+        );
+        // The plugin default is linear, so the call above is the only thing
+        // standing between a settings-less load and bilinear filtering.
+        assert_eq!(
+            ImagePlugin::default_nearest().default_sampler.mag_filter,
+            ImageFilterMode::Nearest
+        );
+    }
 }

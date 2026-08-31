@@ -24,6 +24,8 @@
 
 mod common;
 
+use common::{demo_budget, demo_secs, demo_var, recorder, workspace_root};
+
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -32,14 +34,6 @@ use std::time::Duration;
 const PROPS: u16 = 300;
 /// Seconds of routine to record, once both clients report the world is up.
 const TAKE_SECS: &str = "45";
-
-fn workspace_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/<pkg> lives two levels below the workspace root")
-        .to_path_buf()
-}
 
 fn client_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("SOILS_CLIENT_BIN") {
@@ -51,24 +45,6 @@ fn client_binary() -> Option<std::path::PathBuf> {
         .iter()
         .map(|d| root.join(d).join(exe))
         .find(|p| p.exists())
-}
-
-fn obs(action: &str) -> String {
-    let script = workspace_root().join("scripts/obs_record.py");
-    let out = Command::new("python")
-        .arg(&script)
-        .arg(action)
-        .current_dir(workspace_root())
-        .output()
-        .unwrap_or_else(|e| panic!("could not run {}: {e}", script.display()));
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(
-        out.status.success(),
-        "obs_record.py {action} failed:\n{text}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    println!("obs {action}: {text}");
-    text
 }
 
 /// Launch one bot client. `role` selects the mirrored half of the routine.
@@ -92,20 +68,20 @@ fn spawn_bot(
         .env("SOILS_BOT", role)
         .env("SOILS_BOT_START", start_file)
         .env("SOILS_READY_FILE", ready_file)
-        .env("SOILS_RECORD_AFTER", "20")
-        .env("SOILS_RECORD_WAIT", "60")
+        .env("SOILS_RECORD_AFTER", demo_secs(20.0))
+        .env("SOILS_RECORD_WAIT", demo_secs(60.0))
         .env("SOILS_RECORD_SECS", TAKE_SECS)
         .env("SOILS_RECORD_EXIT", "1")
-        .env("SOILS_RADIUS", "2")
+        .env("SOILS_RADIUS", demo_var("SOILS_DEMO_RADIUS", "2"))
         .env("SOILS_DAYTIME", "0.0")
-        .env("SOILS_NOFOCUS", "1")
+        .env("SOILS_NOFOCUS", demo_var("SOILS_DEMO_NOFOCUS", "1"))
         .env("SOILS_VSYNC", "1")
         .spawn()
         .expect("launch bot client")
 }
 
 fn await_ready(paths: &[std::path::PathBuf], kids: &mut [Child]) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let deadline = std::time::Instant::now() + demo_budget(300.0);
     loop {
         if paths.iter().all(|p| p.exists()) {
             return;
@@ -152,7 +128,7 @@ fn record_two_first_person_views() {
     // bots together — the two takes are only comparable if the routines start
     // on the same signal.
     await_ready(&ready, &mut kids);
-    obs("start");
+    recorder("start");
     std::fs::write(&start, "go").expect("write bot start file");
     println!("both clients ready; bots released");
 
@@ -160,7 +136,7 @@ fn record_two_first_person_views() {
         let status = k.wait().expect("client");
         println!("client {i} exited: {status}");
     }
-    let recorded = obs("stop");
+    let recorded = recorder("stop");
 
     let path = recorded
         .lines()

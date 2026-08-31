@@ -148,11 +148,12 @@ async fn warp_to_a_new_world_creates_it_on_demand() {
 
     // Warp to a never-seen world name: the server generates it on demand.
     a.send(&ClientMsg::Warp { world: "a-brand-new-world".into() }).await;
-    a.recv_until(|m| match m {
-        ServerMsg::Warp { .. } => Some(()),
-        _ => None,
-    })
-    .await;
+    let spawn = a
+        .recv_until(|m| match m {
+            ServerMsg::Warp { spawn, .. } => Some(spawn),
+            _ => None,
+        })
+        .await;
 
     // The on-demand world is generated and streamed: its spawn chunk arrives.
     // The default world's copy of this chunk was already consumed above, so this
@@ -167,9 +168,18 @@ async fn warp_to_a_new_world_creates_it_on_demand() {
     // because the target chunk wasn't resident yet mid-join; now the terrain is
     // resident. Retry a few times to absorb the edit-rate bucket / a residency
     // refcount blip — every attempt gets a definitive response.
+    //
+    // The target comes from the spawn the warp itself reported, not the
+    // default world's `NEAR_VOXEL` and not the client's cached position: each
+    // named world has its own seed, so the spawn follows a different surface,
+    // and the cached position is still the *old* world's until a snapshot
+    // arrives — which is exactly the trap that made this read as a reach
+    // failure.
+    let target = [spawn[0] as i32, spawn[1] as i32 - 5, spawn[2] as i32];
+
     let mut accepted = false;
     for _ in 0..5 {
-        let seq = a.edit(NEAR_VOXEL, 5).await;
+        let seq = a.edit(target, 5).await;
         let ok = a
             .recv_until(|m| match m {
                 ServerMsg::EditAccepted { seq: s, .. } if s == seq => Some(true),

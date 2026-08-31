@@ -4,7 +4,7 @@
 //   node scripts/gen_textures.mjs            # regenerate everything
 //   node scripts/gen_textures.mjs --only 2,3 # subset (contact sheet still full)
 //
-// Every atlas tile index (see crates/soils-client/assets/blocks.yaml) gets a
+// Every atlas tile index (see crates/soils-worldgen/blocks.yaml) gets a
 // 1024×1024 "mega-tile" that repeats over 16×16 blocks (64 px per block). The
 // client samples them as one texture array: `assets/blocks_mega.png` is the
 // 24 tiles stacked vertically (1024 × 24576) and reinterpreted as 24 layers at

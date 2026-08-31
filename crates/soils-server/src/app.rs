@@ -31,7 +31,7 @@ use bevy_ecs::prelude::{
 use bevy_time::{Fixed, Time, TimePlugin};
 use glam::{IVec2, IVec3, Quat, Vec3};
 use soils_protocol::{
-    CHUNK_BIT, ChunkInfo, ClientMsg, ChunkVolume, QuantState, ServerMsg, encode_snapshot,
+    CHUNK_BIT, ChunkInfo, ClientMsg, ChunkVolume, QuantState, ServerMsg, SlotRef, encode_snapshot,
 };
 use soils_script::{ScriptCommand, ScriptEvent, ScriptRuntime, ScriptWorld};
 use soils_sim::{KIND_CRITTER, KIND_PHYSICS_CUBE, KIND_PLAYER, nav};
@@ -46,6 +46,19 @@ use crate::{BUNDLE_SIZE, DAY_SECONDS, DEFAULT_WORLD, NewConn, WAVE_SIZE, world_s
 /// Broadcast actor positions every Nth tick (matches the old 100 ms cadence
 /// at 20 Hz).
 const ACTOR_EVERY_N_TICKS: u64 = 2;
+/// Ticks before a freshly broken block's item can be collected. Short enough to
+/// feel instant while mining, long enough that the item actually exists in the
+/// world and a test can observe it there.
+const PICKUP_DELAY_TICKS: u64 = 10;
+/// The same gate for a deliberately thrown item, long enough that the thrower
+/// walks clear instead of instantly re-collecting it.
+const THROW_DELAY_TICKS: u64 = 30;
+/// How long an uncollected item lies in the world before it is reaped
+/// (5 minutes at 20 Hz).
+///
+/// Without this every block ever broken and not picked up stays an entity
+/// forever — replicated to everyone in range, for the life of the world.
+const DROP_TTL_TICKS: u64 = 5 * 60 * soils_sim::SERVER_TICK_HZ as u64;
 /// Cap on chunk waves a single client can be served from cache/disk in one
 /// tick, bounding per-tick disk I/O. Generation is not capped this way — it
 /// runs off-thread and only adoption/serialization lands on the tick.
@@ -81,6 +94,21 @@ const SNAPSHOT_BUDGET: usize = 410;
 const BASELINE_RING: usize = 64;
 /// Per-client edit rate cap (edits per second, bucketed like inputs).
 const EDIT_RATE: f32 = 32.0;
+/// Per-client cap on inventory and container messages (per second, bucketed
+/// like edits).
+///
+/// These were the only client-driven messages that spent nothing. `Edit` and
+/// `Inputs` have always been bucketed, and `InventoryUpdate` is coalesced to
+/// one per client per tick via `inventory_dirty` — but `TransferItem` does a
+/// fresh `container_view` allocation and sends a `ContainerUpdate` to *every*
+/// viewer, immediately, and `drain_inboxes` pulls the inbox in an unbounded
+/// loop. So a client shuffling one item back and forth forced unbounded
+/// per-tick work and outbound traffic to everyone else in the chest.
+///
+/// Higher than `EDIT_RATE` because these are cheap and a person really does
+/// click fast when moving a pack around; the point is a ceiling, not a
+/// throttle anyone reaches by hand.
+const UI_RATE: f32 = 64.0;
 
 pub(crate) struct Client {
     inbox: UnboundedReceiver<ClientMsg>,
@@ -123,6 +151,8 @@ pub(crate) struct Client {
     input_tokens: f32,
     /// Remaining edits allowed (token bucket, see [`EDIT_RATE`]).
     edit_tokens: f32,
+    /// Remaining inventory/container messages allowed (see [`UI_RATE`]).
+    ui_tokens: f32,
     /// View radius in chunks (client-requested via `ViewRadius`, clamped).
     radius: i32,
     /// Client opted out of local generation (graph-hash mismatch / gen
@@ -132,8 +162,34 @@ pub(crate) struct Client {
     center: Option<IVec3>,
     /// The chunks this client is subscribed to (holds a ref on each).
     subs: HashSet<IVec3>,
+    /// Subscribed, generated, and deliberately withheld: every neighbour
+    /// presents a solid layer towards it, so nothing of it can be seen or
+    /// walked into (see [`World::sealed`]). Held rather than forgotten so an
+    /// edit that breaks the seal can hand it over.
+    culled: HashSet<IVec3>,
+    /// Subscribed chunks whose seal verdict needs a neighbour that has not
+    /// been generated yet. Re-examined every tick until it resolves; nothing
+    /// reaches the client from here without a verdict.
+    deferred: VecDeque<IVec3>,
     /// Queued streaming jobs (subscription enters), served FIFO in waves.
     jobs: VecDeque<ChunkJob>,
+    /// The authoritative inventory. The client mirrors it for the UI but never
+    /// decides it — a client-owned inventory is a client-owned item spawner.
+    ///
+    /// Session-scoped: not yet persisted across logout. See `docs/plan-ui.md`.
+    inventory: soils_sim::Inventory,
+    /// Set when `inventory` changed this tick; drained into one
+    /// `InventoryUpdate` at the end of the drain rather than one per change,
+    /// so a single break/place cannot send several.
+    inventory_dirty: bool,
+    /// The container block this client is viewing, as an absolute voxel
+    /// position — and nothing else. Whether it *may* still be viewed is
+    /// re-decided from the world on every use, so a client cannot keep a chest
+    /// open by not sending `CloseContainer`.
+    ///
+    /// Holds a pin on that chunk's block-data page, which is why every path
+    /// that clears this field goes through [`close_container`].
+    open_container: Option<IVec3>,
 }
 
 /// Server-allocated replication id; never reused within a session.
@@ -155,6 +211,14 @@ struct InWorld(String);
 #[derive(Component)]
 #[allow(dead_code)] // client id: read when gameplay systems need "who did it"
 struct PlayerControlled(u16);
+/// An item lying in the world. The stack rides on `EntitySpawn` rather than the
+/// per-tick snapshot because it never changes once dropped.
+#[derive(Component, Clone, Copy)]
+struct DroppedItem(soils_sim::ItemStack);
+/// Server tick before which this item cannot be picked up. Without it a player
+/// re-collects what they just dropped on the same tick they dropped it.
+#[derive(Component, Clone, Copy)]
+struct PickupAfter(u64);
 /// Marks an Avian rigid-body entity whose transform is driven by the physics
 /// world (not `soils-sim`). Its `SimState`/`BodyRot` are mirrored from Avian
 /// each tick so the existing replication path ships them.
@@ -293,6 +357,7 @@ struct AuthPool {
     tx: crossbeam_channel::Sender<AuthReq>,
     /// Highest number of checks ever running at once. Only read by tests, but
     /// it is the one property worth asserting and cannot be seen from outside.
+    #[cfg_attr(not(test), allow(dead_code))]
     peak: Arc<AtomicUsize>,
 }
 
@@ -373,13 +438,17 @@ struct Worlds {
     /// SpacetimeDB mirror, when enabled. Each world registers itself here on
     /// first open and then keys its chunk saves by `world_id_for(name)`.
     stdb: Option<Arc<soils_stdb::StdbLink>>,
+    /// Carved into every world this server opens, on generation. `None` in
+    /// normal play.
+    chamber: Option<crate::Chamber>,
 }
 
 impl Worlds {
     /// Fetch a world by name, creating (opening) it on first request.
     fn get_or_create(&mut self, name: &str) -> &mut World {
         if !self.map.contains_key(name) {
-            let mut world = World::new(&self.data_dir, name, world_seed(name), self.persist.clone());
+            let mut world =
+                World::new(&self.data_dir, name, world_seed(name), self.persist.clone(), self.chamber);
             if let Some(stdb) = &self.stdb {
                 // The id is a stable hash of the name, so this needs no
                 // round-trip and survives restarts; the module rejects a
@@ -476,6 +545,7 @@ pub(crate) fn run_app(
     scripts_dir: Option<PathBuf>,
     physics_enabled: bool,
     props: u16,
+    chamber: Option<crate::Chamber>,
     stdb: Option<Arc<soils_stdb::StdbLink>>,
     server_name: String,
     bind_addr: String,
@@ -495,7 +565,7 @@ pub(crate) fn run_app(
         name: server_name,
         addr: bind_addr,
     });
-    let mut worlds = Worlds { map: HashMap::new(), data_dir, persist, stdb };
+    let mut worlds = Worlds { map: HashMap::new(), data_dir, persist, stdb, chamber };
     // Pre-create the default world so it's ready before the first client.
     worlds.get_or_create(DEFAULT_WORLD);
 
@@ -555,10 +625,17 @@ pub(crate) fn run_app(
             accept_connections,
             drain_inboxes,
             wander_critters,
+            fall_dropped_items,
+            pick_up_items,
+            close_unreachable_containers,
             // Scripts run after inputs/AI mutate state and before
             // replication, so their edits/spawns replicate the same tick.
             run_scripts,
             pump_chunk_jobs,
+            // After the wave pump, so a chunk whose last missing neighbour
+            // just landed resolves in the same tick rather than the next.
+            pump_deferred,
+            flush_inventory_updates,
             replicate_entities,
             tick_clock,
             stdb_heartbeat,
@@ -853,8 +930,21 @@ fn world_lifecycle(time: Res<Time>, mut worlds: ResMut<Worlds>, mut acc: Local<(
     }
     if acc.1 >= FLUSH_SECS {
         acc.1 = 0.0;
-        for w in worlds.map.values_mut() {
+        for (name, w) in worlds.map.iter_mut() {
             w.flush_dirty();
+            // A cache nobody can see the hit rate of is a cache nobody can tell
+            // is broken. Logged on the flush interval, and only once anything
+            // has actually been stored, so an ordinary world stays silent.
+            let s = w.block_data_stats();
+            if s.writes > 0 {
+                println!(
+                    "world {name}: block data {} pages resident, {} loads, {} writes, {} evictions",
+                    w.block_data_pages(),
+                    s.loads,
+                    s.writes,
+                    s.evictions
+                );
+            }
         }
     }
 }
@@ -882,11 +972,17 @@ fn accept_connections(mut rx: ResMut<NetRx>, mut clients: ResMut<Clients>) {
                 last_seq: 0,
                 input_tokens: INPUT_BURST,
                 edit_tokens: EDIT_RATE,
+                ui_tokens: UI_RATE,
                 radius: DEFAULT_RADIUS,
                 full_streams: false,
                 center: None,
                 subs: HashSet::new(),
+                culled: HashSet::new(),
+                deferred: VecDeque::new(),
                 jobs: VecDeque::new(),
+                inventory: soils_sim::Inventory::default(),
+                inventory_dirty: false,
+                open_container: None,
             },
         );
     }
@@ -919,6 +1015,7 @@ fn send_world_subscribed(clients: &Clients, world: &str, except: u16, cpos: IVec
 #[allow(clippy::too_many_arguments)]
 fn drain_inboxes(
     time: Res<Time>,
+    ticks: Res<TickCount>,
     mut commands: Commands,
     mut clients: ResMut<Clients>,
     mut worlds: ResMut<Worlds>,
@@ -973,6 +1070,7 @@ fn drain_inboxes(
     for (&id, c) in clients.0.iter_mut() {
         c.input_tokens = (c.input_tokens + dt * soils_sim::TICK_HZ as f32).min(INPUT_BURST);
         c.edit_tokens = (c.edit_tokens + dt * EDIT_RATE).min(EDIT_RATE);
+        c.ui_tokens = (c.ui_tokens + dt * UI_RATE).min(UI_RATE);
         loop {
             match c.inbox.try_recv() {
                 Ok(m) => msgs.push((id, m)),
@@ -1078,6 +1176,7 @@ fn drain_inboxes(
                             spawn = [p.x, p.y, p.z];
                             println!("login: {name} resumed at {spawn:?}");
                         }
+                        let starter_kit = starter_block_ids(&world.registry);
                         let c = clients.0.get_mut(&id).unwrap();
                         // (Re)spawn this connection's player entity.
                         if let Some(old) = c.entity.take() {
@@ -1111,6 +1210,25 @@ fn drain_inboxes(
                             worldgen,
                             daytime: clock.daytime,
                         });
+                        // Seed the client's mirror. Flushed with everything
+                        // else at the end of the tick.
+                        c.inventory_dirty = true;
+                        if c.inventory.is_empty() {
+                            // A returning player gets what they logged out
+                            // with; only a genuinely new one is stocked.
+                            // `None` covers both "nothing stored" and "cache
+                            // not warm", and the two must be treated alike:
+                            // stocking on a cold cache would hand a returning
+                            // player a second starter kit every reconnect.
+                            let restored = stdb
+                                .as_ref()
+                                .and_then(|s| s.link.inventory(&name))
+                                .and_then(|bytes| restore_inventory(&bytes));
+                            match restored {
+                                Some(inv) => c.inventory = inv,
+                                None => stock_starter_blocks(&mut c.inventory, &starter_kit),
+                            }
+                        }
                         // Server-driven streaming: subscribing around the spawn
                         // point starts the join burst — no client request.
                         c.center = Some(chunk_at(spawn));
@@ -1219,13 +1337,70 @@ fn drain_inboxes(
                     c.edit_tokens -= 1.0;
                 }
                 let target = IVec3::new(pos[0], pos[1], pos[2]);
+                // Placing spends an item. Check stock *before* touching the
+                // world so a refused placement costs nothing and needs no
+                // refund path.
+                let placing = value != 0;
+                let stocked = !placing
+                    || clients.0[&id].inventory.count_of(soils_sim::ItemKind::Block(value)) > 0;
                 let world = worlds.get_or_create(&world_name);
                 let valid = rate_ok
+                    && stocked
                     && soils_sim::validate_edit(eye, target, value, &world.registry)
                     && world.ensure_resident(soils_protocol::chunk_of(target));
                 // Read the pre-edit block so scripts see the real `old` value.
                 let old = if valid { world.voxel(target) } else { 0 };
                 let applied = valid && world.edit(pos[0], pos[1], pos[2], value);
+                if applied {
+                    expose_neighbours(
+                        &mut clients,
+                        &world_name,
+                        soils_protocol::chunk_of(target),
+                    );
+                    // A block that stops existing takes its state with it — and
+                    // gives back everything that state was holding. A chest
+                    // that swallowed its contents on break would be worse than
+                    // one that never opened.
+                    //
+                    // The condition is "the old block is gone", not "this was a
+                    // break". Nothing here requires the target to be air before
+                    // placing, so a client can send a place *onto* a container
+                    // voxel; keyed on `!placing` that left the page entry with
+                    // no container in front of it — invisible, unreachable, and
+                    // inherited by whatever is built on that voxel next. Whether
+                    // placement should require air at all is a separate
+                    // authority question, tracked in `Tasks.md`.
+                    if old != 0 {
+                        release_block_data(
+                            &mut commands,
+                            &mut next_net,
+                            &mut clients,
+                            world,
+                            &world_name,
+                            target,
+                            ticks.0 + PICKUP_DELAY_TICKS,
+                        );
+                    }
+                    let c = clients.0.get_mut(&id).unwrap();
+                    if placing {
+                        let spent = c.inventory.remove(soils_sim::ItemKind::Block(value), 1);
+                        debug_assert_eq!(spent, 1, "stock was checked above");
+                        c.inventory_dirty = true;
+                    } else if old != 0 {
+                        // Breaking yields the block as an item, dropped where it
+                        // stood rather than teleported into the inventory: the
+                        // player may be out of room, and a drop the world can see
+                        // is the honest outcome either way.
+                        spawn_drop(
+                            &mut commands,
+                            &mut next_net,
+                            &world_name,
+                            target.as_vec3() + Vec3::splat(0.5),
+                            soils_sim::ItemStack::one(soils_sim::ItemKind::Block(old)),
+                            ticks.0 + PICKUP_DELAY_TICKS,
+                        );
+                    }
+                }
                 let c = &clients.0[&id];
                 if applied {
                     let _ = c.outbox.send(ServerMsg::EditAccepted { seq, pos, value });
@@ -1249,6 +1424,172 @@ fn drain_inboxes(
                 } else {
                     let _ = c.outbox.send(ServerMsg::EditRejected { seq });
                 }
+            }
+            ClientMsg::MoveItem { from, to } => {
+                let c = clients.0.get_mut(&id).unwrap();
+                if !c.authenticated {
+                    continue;
+                }
+                if c.ui_tokens < 1.0 {
+                    continue;
+                }
+                c.ui_tokens -= 1.0;
+                if c.inventory.move_slot(from as usize, to as usize) {
+                    c.inventory_dirty = true;
+                }
+            }
+            ClientMsg::DropItem { slot, count } => {
+                let c = clients.0.get_mut(&id).unwrap();
+                if !c.authenticated {
+                    continue;
+                }
+                if c.ui_tokens < 1.0 {
+                    continue;
+                }
+                c.ui_tokens -= 1.0;
+                let world_name = c.world.clone();
+                let Some(stack) = c.inventory.split(slot as usize, count) else { continue };
+                c.inventory_dirty = true;
+                let Some(entity) = c.entity else { continue };
+                let Ok((sim, yaw, ..)) = sims.get(entity) else { continue };
+                // Thrown a little ahead of the player so it does not land
+                // inside them and read as "nothing happened".
+                let facing = Vec3::new(-yaw.0.sin(), 0.0, -yaw.0.cos());
+                let pos = sim.0.pos - Vec3::Y * (soils_sim::EYE_TO_FEET * 0.5) + facing;
+                // Long enough that the thrower walks clear before it is
+                // collectable; otherwise dropping is a no-op.
+                spawn_drop(
+                    &mut commands,
+                    &mut next_net,
+                    &world_name,
+                    pos,
+                    stack,
+                    ticks.0 + THROW_DELAY_TICKS,
+                );
+            }
+            ClientMsg::OpenContainer { pos } => {
+                let c = clients.0.get_mut(&id).unwrap();
+                if !c.authenticated {
+                    continue;
+                }
+                if c.ui_tokens < 1.0 {
+                    continue;
+                }
+                c.ui_tokens -= 1.0;
+                let world_name = c.world.clone();
+                let target = IVec3::from_array(pos);
+                // Same reach rule as an edit: a chest you cannot touch is a
+                // chest you cannot loot, whatever the client believes.
+                let Some((sim, ..)) = c.entity.and_then(|e| sims.get(e).ok()) else { continue };
+                if !soils_sim::within_reach(sim.0.pos, target) {
+                    continue;
+                }
+                let world = worlds.get_or_create(&world_name);
+                if !world.ensure_resident(soils_protocol::chunk_of(target)) {
+                    continue;
+                }
+                // A block that is not a container is not an error — a stale UI
+                // can ask about one that was broken a tick ago — so it is
+                // simply not answered.
+                let Some(slots) = container_slots(world, target) else { continue };
+                let contents = world.container_view(target, slots);
+                let c = clients.0.get_mut(&id).unwrap();
+                // One open container per client, so `TransferItem` never has to
+                // say which. Re-opening replaces.
+                close_container(c, world);
+                c.open_container = Some(target);
+                world.pin_block_data(soils_protocol::chunk_of(target));
+                let _ = c
+                    .outbox
+                    .send(ServerMsg::ContainerUpdate { pos, slots: contents });
+            }
+            ClientMsg::CloseContainer => {
+                let c = clients.0.get_mut(&id).unwrap();
+                if c.ui_tokens < 1.0 {
+                    continue;
+                }
+                c.ui_tokens -= 1.0;
+                let world_name = c.world.clone();
+                let world = worlds.get_or_create(&world_name);
+                close_container(clients.0.get_mut(&id).unwrap(), world);
+            }
+            ClientMsg::TransferItem { from, count } => {
+                let c = clients.0.get_mut(&id).unwrap();
+                if !c.authenticated {
+                    continue;
+                }
+                if c.ui_tokens < 1.0 {
+                    continue;
+                }
+                c.ui_tokens -= 1.0;
+                let Some(target) = c.open_container else { continue };
+                let world_name = c.world.clone();
+                let eye = c.entity.and_then(|e| sims.get(e).ok()).map(|(s, ..)| s.0.pos);
+                let world = worlds.get_or_create(&world_name);
+                // Re-check on every transfer, not just on open: the alternative
+                // is a chest you keep looting as you walk away from it.
+                let ok = eye.is_some_and(|eye| soils_sim::within_reach(eye, target));
+                let Some(slots) = container_slots(world, target).filter(|_| ok) else {
+                    close_container(clients.0.get_mut(&id).unwrap(), world);
+                    continue;
+                };
+                let c = clients.0.get_mut(&id).unwrap();
+                // Take from the named side, insert into the other. Whatever
+                // does not fit goes straight back where it came from — the side
+                // it left had room for it a statement ago, so this cannot fail.
+                // The side it left had room for it a statement ago, so the
+                // put-back cannot fail — but `debug_assert` compiles out, and
+                // what it was guarding is items ceasing to exist. So the
+                // remainder is spilled into the world instead: loud in the log,
+                // and still collectable. Reachable only if a partial split of a
+                // non-mergeable stack ever meets a full pack, which needs a
+                // durability item with `max_stack > 1`; there is none today,
+                // and this is what stops the first one from being a dupe bug.
+                let mut orphan = |stack: Option<soils_sim::ItemStack>, side: &str| {
+                    if let Some(stack) = stack {
+                        eprintln!(
+                            "transfer at {target:?}: {side} would not take {stack:?} back — \
+                             spilling it into the world"
+                        );
+                        spawn_drop(
+                            &mut commands,
+                            &mut next_net,
+                            &world_name,
+                            target.as_vec3() + Vec3::splat(0.5),
+                            stack,
+                            ticks.0 + PICKUP_DELAY_TICKS,
+                        );
+                    }
+                };
+                let (taken, refused) = match from {
+                    SlotRef::Pack(i) => {
+                        let Some(taken) = c.inventory.split(i as usize, count) else { continue };
+                        let refused = world.container_mut(target, slots).insert(taken);
+                        if let Some(rest) = refused {
+                            orphan(c.inventory.insert(rest), "the pack");
+                        }
+                        (taken, refused)
+                    }
+                    SlotRef::Container(i) => {
+                        let Some(taken) =
+                            world.container_mut(target, slots).split(i as usize, count)
+                        else {
+                            continue;
+                        };
+                        let refused = c.inventory.insert(taken);
+                        if let Some(rest) = refused {
+                            orphan(world.container_mut(target, slots).insert(rest), "the container");
+                        }
+                        (taken, refused)
+                    }
+                };
+                if refused == Some(taken) {
+                    continue; // nothing moved; no update to send
+                }
+                c.inventory_dirty = true;
+                world.prune_block_data(soils_protocol::chunk_of(target));
+                let contents = world.container_view(target, slots);
+                broadcast_container(&clients, &world_name, target, contents);
             }
             ClientMsg::Inputs { ack_tick, frames } => {
                 // Server authority: the client sends *inputs*, the server
@@ -1333,6 +1674,15 @@ fn drain_inboxes(
                 c.jobs.clear();
                 c.known.clear();
                 let old_world = worlds.get_or_create(&old);
+                // Before anything else: an open container pins a block-data
+                // page in the world it lives in. Closing it after `c.world` has
+                // been replaced unpins the *new* world's store instead — which
+                // both leaks the old page (pinned pages are never evicted) and
+                // decrements a pin another player may be holding on the same
+                // chunk over there, letting a live chest's page be evicted
+                // underneath them. `close_unreachable_containers` would do
+                // exactly that on the next tick if this were left to it.
+                close_container(c, old_world);
                 for pos in c.subs.drain() {
                     old_world.dec_ref(pos);
                 }
@@ -1361,12 +1711,20 @@ fn drain_inboxes(
     // Phase 3: disconnects (any final messages above were already applied).
     // Peers learn via the interest diff once the entity despawns.
     for id in gone {
-        if let Some(c) = clients.0.remove(&id) {
+        if let Some(mut c) = clients.0.remove(&id) {
             if let Some(entity) = c.entity {
                 commands.entity(entity).despawn();
             }
             if c.authenticated {
                 if let Some(stdb) = &stdb {
+                    // Inventory first, and deliberately outside the entity
+                    // lookup below: a player whose entity has already gone
+                    // still owns what they were carrying, and gating this on a
+                    // live entity would quietly lose it.
+                    let _ = stdb.link.send(soils_stdb::StdbCmd::SaveInventory {
+                        account: c.account.clone(),
+                        items: soils_protocol::encode(&c.inventory.slots().to_vec()),
+                    });
                     // Last known position, so a returning player resumes where
                     // they left off rather than at spawn.
                     if let Some((sim, yaw, ..)) = c.entity.and_then(|e| sims.get(e).ok()) {
@@ -1387,6 +1745,7 @@ fn drain_inboxes(
                 player_count.0.fetch_sub(1, Ordering::Relaxed);
                 script_events.0.push(ScriptEvent::PlayerLeave { netid: c.self_net as u32 });
                 let world = worlds.get_or_create(&c.world);
+                close_container(&mut c, world);
                 for pos in c.subs {
                     world.dec_ref(pos);
                 }
@@ -1408,7 +1767,7 @@ fn run_scripts(
     mut rt: NonSendMut<ScriptRt>,
     mut events: ResMut<ScriptEvents>,
     mut worlds: ResMut<Worlds>,
-    clients: Res<Clients>,
+    mut clients: ResMut<Clients>,
     mut next_net: ResMut<NextNetId>,
     mut commands: Commands,
     mut sims: Query<(Entity, &NetId, &Kind, &mut SimState, &InWorld)>,
@@ -1442,8 +1801,27 @@ fn run_scripts(
             ScriptCommand::Edit { x, y, z, id } => {
                 let world = worlds.get_or_create(world_name);
                 let target = IVec3::new(x, y, z);
-                if world.ensure_resident(soils_protocol::chunk_of(target)) && world.edit(x, y, z, id)
-                {
+                let resident = world.ensure_resident(soils_protocol::chunk_of(target));
+                // Read before the write, so the block being replaced can give
+                // back what it was holding.
+                let old = if resident { world.voxel(target) } else { 0 };
+                if resident && world.edit(x, y, z, id) {
+                    if old != 0 {
+                        release_block_data(
+                            &mut commands,
+                            &mut next_net,
+                            &mut clients,
+                            world,
+                            world_name,
+                            target,
+                            tick.0 + PICKUP_DELAY_TICKS,
+                        );
+                    }
+                    expose_neighbours(
+                        &mut clients,
+                        world_name,
+                        soils_protocol::chunk_of(target),
+                    );
                     // No `except` client: broadcast to everyone in the world.
                     send_world(&clients, world_name, u16::MAX, &ServerMsg::Edit {
                         pos: [x, y, z],
@@ -1518,8 +1896,14 @@ fn resubscribe(c: &mut Client, world: &mut World) {
         .collect();
     for pos in leaves {
         c.subs.remove(&pos);
+        // A withheld chunk was never sent, so it must not be unloaded either:
+        // `ChunkUnload` for a chunk the client never had is a protocol lie.
+        let withheld = c.culled.remove(&pos);
+        c.deferred.retain(|p| *p != pos);
         world.dec_ref(pos);
-        let _ = c.outbox.send(ServerMsg::ChunkUnload { pos: [pos.x, pos.y, pos.z] });
+        if !withheld {
+            let _ = c.outbox.send(ServerMsg::ChunkUnload { pos: [pos.x, pos.y, pos.z] });
+        }
     }
 
     let r = c.radius;
@@ -1625,7 +2009,16 @@ fn pump_chunk_jobs(mut clients: ResMut<Clients>, mut worlds: ResMut<Worlds>) {
                 // per-connection stream is FIFO).
                 let deliver: Vec<IVec3> =
                     wave.positions.into_iter().filter(|p| c.subs.contains(p)).collect();
-                send_wave(world, &deliver, &c.outbox, c.full_streams);
+                let (culled, deferred) = send_wave(
+                    &c.subs,
+                    c.center,
+                    &c.outbox,
+                    c.full_streams,
+                    world,
+                    &deliver,
+                );
+                c.culled.extend(culled);
+                c.deferred.extend(deferred);
             }
             if blocked {
                 break;
@@ -1641,15 +2034,77 @@ fn pump_chunk_jobs(mut clients: ResMut<Clients>, mut worlds: ResMut<Worlds>) {
     }
 }
 
-/// Stream one wave's chunks in request order, bundled `BUNDLE_SIZE` at a time.
-fn send_wave(
+/// What to do with a chunk whose generation has finished.
+enum Verdict {
+    /// Visible: put it on the wire.
+    Send,
+    /// Sealed off by its neighbours: withhold it.
+    Cull,
+    /// A neighbour has not been generated yet; ask again next tick.
+    Wait,
+}
+
+/// Chunks this close to the player are always sent, sealed or not.
+///
+/// Insurance, not optimization: a spawn, a warp or a teleport can drop a player
+/// inside terrain that the seal test would happily have hidden, and a player
+/// with no chunk under them falls through the world. One chunk of margin costs
+/// 27 chunks out of thousands.
+const CULL_KEEP: i32 = 1;
+
+/// Decide whether `pos` can be withheld from this client.
+///
+/// Takes the pieces rather than the `Client` so it can be called while the
+/// caller still holds a borrow on the client's job queue.
+fn cull_verdict(
+    subs: &HashSet<IVec3>,
+    center: Option<IVec3>,
     world: &World,
-    positions: &[IVec3],
+    pos: IVec3,
+) -> Verdict {
+    if let Some(center) = center {
+        let d = (pos - center).abs();
+        if d.x.max(d.y).max(d.z) <= CULL_KEEP {
+            return Verdict::Send;
+        }
+    }
+    // Only chunks this client would ever receive count as cover; anything
+    // past the subscription is treated as open, which is what stops the
+    // outermost shell from waiting forever on a neighbour nobody will generate.
+    match world.sealed(pos, |n| subs.contains(&n)) {
+        Some(true) => Verdict::Cull,
+        Some(false) => Verdict::Send,
+        None => Verdict::Wait,
+    }
+}
+
+/// Stream one wave's chunks in request order, bundled `BUNDLE_SIZE` at a time.
+///
+/// Sealed chunks are withheld and undecided ones deferred, so what reaches the
+/// client is only what it can actually see.
+fn send_wave(
+    subs: &HashSet<IVec3>,
+    center: Option<IVec3>,
     out: &UnboundedSender<ServerMsg>,
     full_streams: bool,
-) {
+    world: &World,
+    positions: &[IVec3],
+) -> (Vec<IVec3>, Vec<IVec3>) {
     let mut batch: Vec<ChunkInfo> = Vec::with_capacity(BUNDLE_SIZE);
+    let mut culled: Vec<IVec3> = Vec::new();
+    let mut deferred: Vec<IVec3> = Vec::new();
     for &pos in positions {
+        match cull_verdict(subs, center, world, pos) {
+            Verdict::Send => {}
+            Verdict::Cull => {
+                culled.push(pos);
+                continue;
+            }
+            Verdict::Wait => {
+                deferred.push(pos);
+                continue;
+            }
+        }
         // Every position is resident by now (cached at dispatch or adopted
         // above); a miss would mean a logic bug, not a recoverable state.
         let Some(edited) = world.chunk_edited(pos) else { continue };
@@ -1667,7 +2122,59 @@ fn send_wave(
     if !batch.is_empty() {
         let _ = out.send(ServerMsg::Manifest { chunks: batch });
     }
+    (culled, deferred)
 }
+
+/// Re-examine deferred chunks now that more neighbours exist. Bounded per tick
+/// so a huge radius cannot turn one tick into a full sweep; anything still
+/// undecided stays queued.
+fn pump_deferred(mut clients: ResMut<Clients>, mut worlds: ResMut<Worlds>) {
+    for c in clients.0.values_mut() {
+        let world = worlds.get_or_create(&c.world.clone());
+        let mut ready: Vec<IVec3> = Vec::new();
+        let budget = c.deferred.len().min(DEFERRED_PER_TICK);
+        for _ in 0..budget {
+            let Some(pos) = c.deferred.pop_front() else { break };
+            if !c.subs.contains(&pos) {
+                continue; // unsubscribed while it waited
+            }
+            match cull_verdict(&c.subs, c.center, world, pos) {
+                Verdict::Send => ready.push(pos),
+                Verdict::Cull => {
+                    c.culled.insert(pos);
+                }
+                Verdict::Wait => c.deferred.push_back(pos),
+            }
+        }
+        if !ready.is_empty() {
+            let (culled, deferred) =
+                send_wave(&c.subs, c.center, &c.outbox, c.full_streams, world, &ready);
+            c.culled.extend(culled);
+            c.deferred.extend(deferred);
+        }
+    }
+}
+
+/// Deferred chunks re-examined per client per tick.
+const DEFERRED_PER_TICK: usize = 256;
+
+/// An edit can break a seal: hand back any neighbour of the edited chunk that
+/// a client is withholding, so the newly exposed face has geometry behind it.
+fn expose_neighbours(clients: &mut Clients, world_name: &str, cpos: IVec3) {
+    for c in clients.0.values_mut() {
+        if c.world != world_name {
+            continue;
+        }
+        for dir in crate::world::FACE_DIRS {
+            let n = cpos + dir;
+            if c.culled.remove(&n) {
+                c.deferred.push_back(n);
+            }
+        }
+    }
+}
+
+
 
 /// How far critters notice players (voxels).
 const SEEK_RANGE: f32 = 48.0;
@@ -1806,6 +2313,270 @@ fn wander_critters(
     }
 }
 
+
+/// Blocks a new player starts with, by name. This keeps building available
+/// from the first second, as it was before placement cost anything; mining
+/// refills it. Names that a world's registry does not define are skipped.
+const STARTER_BLOCKS: [&str; 10] = [
+    "Cobblestone", "Moss Stone", "Stone Bricks", "Dirt", "Grass", "Wooden Crate", "Clay Pot",
+    // Index 7 is deliberate. The bar auto-fills in inventory order and has
+    // eight keys, so this index *is* the hotbar key a bot selects — see
+    // `LAMP_KEY` in `soils-client::bot`. Inserting anywhere below index 6
+    // would also shift `CRATE_KEY` and silently make the container demo place
+    // the wrong block.
+    "Lamp Block",
+    "Log", "Leaves",
+];
+/// How many of each. Two full stacks apiece — one stack is 64, and a single
+/// 13x5 platform is 65 blocks, so one stack runs out during ordinary building.
+const STARTER_COUNT: u16 = 128;
+
+fn starter_block_ids(registry: &soils_worldgen::BlockRegistry) -> Vec<u8> {
+    STARTER_BLOCKS.iter().filter_map(|n| registry.id_of(n)).collect()
+}
+
+/// Rebuild an inventory from stored bytes.
+///
+/// Returns `None` on anything unparseable rather than panicking or silently
+/// yielding an empty inventory: a decode failure means the stored format moved
+/// on, and the honest response is to fall back to the starter kit rather than
+/// to hand the player nothing and call it their inventory.
+fn restore_inventory(bytes: &[u8]) -> Option<soils_sim::Inventory> {
+    let slots: Vec<Option<soils_sim::ItemStack>> = soils_protocol::decode(bytes)?;
+    let mut inv = soils_sim::Inventory::new(slots.len().max(soils_sim::Inventory::DEFAULT_SLOTS));
+    for (i, slot) in slots.into_iter().enumerate() {
+        if let Some(stack) = slot {
+            let _ = inv.put(i, stack);
+        }
+    }
+    Some(inv)
+}
+
+fn stock_starter_blocks(inventory: &mut soils_sim::Inventory, ids: &[u8]) {
+    for &id in ids {
+        let Some(stack) = soils_sim::ItemStack::new(soils_sim::ItemKind::Block(id), STARTER_COUNT)
+        else {
+            continue;
+        };
+        // A default inventory has room for all nine; a remainder here would
+        // only mean someone shrank it, and dropping it is right.
+        let _ = inventory.insert(stack);
+    }
+}
+
+/// Dropped items fall under gravity and rest on the first solid voxel beneath
+/// them, and are reaped once they have lain around for [`DROP_TTL_TICKS`].
+///
+/// Without the fall, breaking a block above your head leaves its item hanging
+/// permanently out of reach.
+fn fall_dropped_items(
+    ticks: Res<TickCount>,
+    mut commands: Commands,
+    mut worlds: ResMut<Worlds>,
+    mut items: Query<(Entity, &InWorld, &mut SimState, &PickupAfter), With<DroppedItem>>,
+) {
+    let dt = 1.0 / soils_sim::SERVER_TICK_HZ as f32;
+    for (entity, in_world, mut sim, after) in &mut items {
+        // `PickupAfter` is set from the spawn tick, so it doubles as the item's
+        // age without a second component.
+        if ticks.0 > after.0 + DROP_TTL_TICKS {
+            commands.entity(entity).despawn();
+            continue;
+        }
+        let Some(world) = worlds.map.get_mut(&in_world.0) else { continue };
+        // Terrain not resident: hold position. Falling against a world that
+        // reads as all-air would sink the item through the floor forever.
+        if !world.has_chunk(chunk_at(sim.0.pos.to_array())) {
+            continue;
+        }
+        let (mut pos, mut vel) = (sim.0.pos, sim.0.vel);
+        soils_sim::fall_item(&mut pos, &mut vel, dt, &|v: IVec3| world.voxel(v));
+        sim.0.pos = pos;
+        sim.0.vel = vel;
+    }
+}
+
+/// Collect dropped items a player has walked into.
+fn pick_up_items(
+    ticks: Res<TickCount>,
+    mut commands: Commands,
+    mut clients: ResMut<Clients>,
+    mut items: Query<(Entity, &InWorld, &SimState, &mut DroppedItem, &PickupAfter)>,
+    players: Query<&SimState, With<PlayerControlled>>,
+) {
+    // An item despawned by one player is still visible to the next client in
+    // this loop — `commands` is deferred — so claims are tracked here. Without
+    // it, two players standing on one item each receive a copy.
+    let mut claimed: HashSet<Entity> = HashSet::new();
+    for c in clients.0.values_mut() {
+        if !c.authenticated {
+            continue;
+        }
+        let Some(player) = c.entity else { continue };
+        let Ok(psim) = players.get(player) else { continue };
+        let eye = psim.0.pos;
+        let feet_y = eye.y - soils_sim::EYE_TO_FEET;
+        for (entity, in_world, sim, mut item, after) in &mut items {
+            if claimed.contains(&entity) || in_world.0 != c.world || ticks.0 < after.0 {
+                continue;
+            }
+            // Nearest point on the player's vertical extent, so an item at the
+            // feet and one at head height are equally collectable.
+            let near = Vec3::new(eye.x, sim.0.pos.y.clamp(feet_y, eye.y), eye.z);
+            if sim.0.pos.distance(near) > soils_sim::PICKUP_RADIUS {
+                continue;
+            }
+            match c.inventory.insert(item.0) {
+                None => {
+                    claimed.insert(entity);
+                    commands.entity(entity).despawn();
+                    c.inventory_dirty = true;
+                }
+                // Partial: the inventory took what it could and the rest stays
+                // on the ground rather than evaporating.
+                Some(left) if left.count < item.0.count => {
+                    item.0 = left;
+                    c.inventory_dirty = true;
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// How many slots the block standing at `v` holds, or `None` if it holds
+/// nothing. Read from the world, never from what the client claims is there.
+fn container_slots(world: &World, v: IVec3) -> Option<usize> {
+    world.registry.get(world.voxel(v))?.container.map(|n| n as usize)
+}
+
+/// Push a container's contents to everyone viewing it. Two players may hold
+/// one chest open; neither may see a stale copy of it.
+fn broadcast_container(
+    clients: &Clients,
+    world_name: &str,
+    pos: IVec3,
+    slots: Vec<Option<soils_sim::ItemStack>>,
+) {
+    for c in clients.0.values() {
+        if c.world == world_name && c.open_container == Some(pos) {
+            let _ = c.outbox.send(ServerMsg::ContainerUpdate {
+                pos: pos.to_array(),
+                slots: slots.clone(),
+            });
+        }
+    }
+}
+
+/// Release whatever `c` had open and tell it so. A no-op when nothing is open,
+/// because the paths that call it (disconnect, warp, walked away, block broken)
+/// mostly do not know.
+fn close_container(c: &mut Client, world: &mut World) {
+    let Some(pos) = c.open_container.take() else { return };
+    world.unpin_block_data(soils_protocol::chunk_of(pos));
+    let _ = c.outbox.send(ServerMsg::ContainerClosed { pos: pos.to_array() });
+}
+
+/// Give back what a vanishing block was holding: spill its contents as world
+/// items and close the panel for everyone looking at it.
+///
+/// One function because there are two places a block stops existing — a player
+/// edit and a script edit — and they had drifted. The script path did not do
+/// this at all, so a script that deleted a chest left its contents on the
+/// block-data page with no block in front of them: invisible, unreachable, and
+/// inherited by whatever was built on that voxel next.
+fn release_block_data(
+    commands: &mut Commands,
+    next_net: &mut NextNetId,
+    clients: &mut Clients,
+    world: &mut World,
+    world_name: &str,
+    target: IVec3,
+    ready_at: u64,
+) {
+    let spilled = world.take_block_data(target).map(|d| d.contents()).unwrap_or_default();
+    for c in clients.0.values_mut() {
+        if c.world == world_name && c.open_container == Some(target) {
+            close_container(c, world);
+        }
+    }
+    for stack in spilled {
+        spawn_drop(
+            commands,
+            next_net,
+            world_name,
+            target.as_vec3() + Vec3::splat(0.5),
+            stack,
+            ready_at,
+        );
+    }
+}
+
+/// Drop `stack` into the world at `pos`, collectable after `ready_at`.
+///
+/// One helper for all three sources — a broken block, a thrown item, and a
+/// container spilling its contents — because they differ only in where and
+/// when, and a fourth divergent copy is how one of them ends up unreplicated.
+#[allow(clippy::too_many_arguments)]
+fn spawn_drop(
+    commands: &mut Commands,
+    next_net: &mut NextNetId,
+    world_name: &str,
+    pos: Vec3,
+    stack: soils_sim::ItemStack,
+    ready_at: u64,
+) {
+    let net = next_net.0;
+    next_net.0 += 1;
+    commands.spawn((
+        NetId(net),
+        Kind(soils_sim::KIND_DROPPED_ITEM),
+        SimState(soils_sim::PlayerState { pos, flying: false, ..Default::default() }),
+        Yaw(0.0),
+        InWorld(world_name.to_string()),
+        DroppedItem(stack),
+        PickupAfter(ready_at),
+    ));
+}
+
+/// Close containers whose viewer walked out of reach, or whose block is no
+/// longer there.
+///
+/// Not a security boundary — reach is re-checked on every transfer — but the
+/// difference between a panel that closes when you step back and one that
+/// hangs around until you click it. It is also what releases the page pin when
+/// a player simply wanders off.
+fn close_unreachable_containers(
+    mut clients: ResMut<Clients>,
+    mut worlds: ResMut<Worlds>,
+    sims: Query<&SimState>,
+) {
+    for c in clients.0.values_mut() {
+        let Some(pos) = c.open_container else { continue };
+        let eye = c.entity.and_then(|e| sims.get(e).ok()).map(|s| s.0.pos);
+        let world = worlds.get_or_create(&c.world);
+        let reachable = eye.is_some_and(|eye| soils_sim::within_reach(eye, pos))
+            && container_slots(world, pos).is_some();
+        if !reachable {
+            close_container(c, world);
+        }
+    }
+}
+
+/// Push the authoritative inventory to every client whose copy changed this
+/// tick. One message per tick per client, however many changes landed.
+fn flush_inventory_updates(mut clients: ResMut<Clients>) {
+    for c in clients.0.values_mut() {
+        // Authentication is checked *first*: taking the flag from a client that
+        // cannot be sent to would clear it and lose the update.
+        if !c.authenticated || !std::mem::take(&mut c.inventory_dirty) {
+            continue;
+        }
+        let slots = c.inventory.slots().to_vec();
+        let _ = c.outbox.send(ServerMsg::InventoryUpdate { slots });
+    }
+}
+
 /// Chunk coordinate containing a voxel.
 fn chunk_of(v: IVec3) -> IVec3 {
     IVec3::new(v.x >> CHUNK_BIT, v.y >> CHUNK_BIT, v.z >> CHUNK_BIT)
@@ -1829,6 +2600,7 @@ fn replicate_entities(
         &Yaw,
         Option<&BodyRot>,
         Option<&BodyAngVel>,
+        Option<&DroppedItem>,
     )>,
 ) {
     struct Snap {
@@ -1836,9 +2608,10 @@ fn replicate_entities(
         kind: u16,
         pos: [f32; 3],
         quant: QuantState,
+        item: Option<soils_sim::ItemStack>,
     }
     let mut by_col: HashMap<(&str, IVec2), Vec<Snap>> = HashMap::new();
-    for (net, kind, in_world, sim, yaw, body_rot, body_angvel) in &entities {
+    for (net, kind, in_world, sim, yaw, body_rot, body_angvel, dropped) in &entities {
         let col = IVec2::new(
             (sim.0.pos.x.floor() as i32) >> CHUNK_BIT,
             (sim.0.pos.z.floor() as i32) >> CHUNK_BIT,
@@ -1860,6 +2633,7 @@ fn replicate_entities(
             kind: kind.0,
             pos,
             quant,
+            item: dropped.map(|d| d.0),
         });
     }
     let tick = ticks.0 as u32;
@@ -1889,6 +2663,7 @@ fn replicate_entities(
                         id: snap.net,
                         kind: snap.kind,
                         pos: snap.pos,
+                        item: snap.item,
                     });
                 }
             }

@@ -119,6 +119,13 @@ impl Drop for TestServer {
 ///
 /// Messages travel through [`spawn_link`], so an optional [`NetSim`] can add
 /// latency, gaussian jitter, and loss without any test needing to know.
+/// A block every new player is stocked with (`STARTER_BLOCKS` in the server).
+///
+/// Placement spends an item, so a test that places a block the player does not
+/// hold gets `EditRejected` — and a wait for `EditAccepted` then spins forever,
+/// because other traffic keeps the receive deadline alive.
+pub const HELD_BLOCK: u8 = 4; // Cobblestone
+
 pub struct Client {
     out: UnboundedSender<ClientMsg>,
     inbox: UnboundedReceiver<ServerMsg>,
@@ -135,6 +142,13 @@ pub struct Client {
     /// message it sees; so does this one.
     seen_chunks: std::collections::HashMap<[i32; 3], ChunkInfo>,
     seen_spawns: std::collections::HashMap<u32, u16>,
+    /// Item carried by each dropped-item entity, from its `EntitySpawn`.
+    seen_items: std::collections::HashMap<u32, soils_sim::ItemStack>,
+    /// Mirror of the server's authoritative inventory, from `InventoryUpdate`.
+    inventory: Vec<Option<soils_sim::ItemStack>>,
+    /// Mirror of the open container, from `ContainerUpdate`. `None` once the
+    /// server says it is closed — a real client never decides that itself.
+    container: Option<([i32; 3], Vec<Option<soils_sim::ItemStack>>)>,
     /// Last position seen for each entity.
     ///
     /// Snapshots are deltas: an entity that has not moved is simply absent, so
@@ -175,6 +189,9 @@ impl Client {
             held: std::collections::VecDeque::new(),
             seen_chunks: std::collections::HashMap::new(),
             seen_spawns: std::collections::HashMap::new(),
+            seen_items: std::collections::HashMap::new(),
+            inventory: Vec::new(),
+            container: None,
             known: std::collections::HashMap::new(),
             id: 0,
             self_entity: 0,
@@ -253,8 +270,11 @@ impl Client {
                     self.seen_chunks.insert(info.pos(), info.clone());
                 }
             }
-            ServerMsg::EntitySpawn { id, kind, pos } => {
+            ServerMsg::EntitySpawn { id, kind, pos, item } => {
                 self.seen_spawns.insert(*id, *kind);
+                if let Some(item) = item {
+                    self.seen_items.insert(*id, *item);
+                }
                 // Seed the position table from the spawn message. A body that
                 // settles never appears in a delta snapshot again, so without
                 // this its position would only ever be knowable if it happened
@@ -263,10 +283,91 @@ impl Client {
             }
             ServerMsg::EntityDespawn { id } => {
                 self.seen_spawns.remove(id);
+                self.seen_items.remove(id);
                 self.known.remove(id);
+            }
+            ServerMsg::InventoryUpdate { slots } => self.inventory = slots.clone(),
+            ServerMsg::ContainerUpdate { pos, slots } => {
+                self.container = Some((*pos, slots.clone()))
+            }
+            ServerMsg::ContainerClosed { pos } => {
+                if self.container.as_ref().is_some_and(|(p, _)| p == pos) {
+                    self.container = None;
+                }
             }
             _ => {}
         }
+    }
+
+    /// NetIds of every dropped item the server has announced, with contents.
+    pub fn items_seen(&self) -> Vec<(u32, soils_sim::ItemStack)> {
+        let mut v: Vec<_> = self.seen_items.iter().map(|(id, s)| (*id, *s)).collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
+    }
+
+    /// The last inventory the server pushed.
+    pub fn inventory(&self) -> &[Option<soils_sim::ItemStack>] {
+        &self.inventory
+    }
+
+    /// Contents of the container the server says we have open.
+    pub fn container(&self) -> Option<&[Option<soils_sim::ItemStack>]> {
+        self.container.as_ref().map(|(_, s)| s.as_slice())
+    }
+
+    /// How many of `kind` the open container holds.
+    pub fn container_count(&self, kind: soils_sim::ItemKind) -> u32 {
+        self.container()
+            .unwrap_or_default()
+            .iter()
+            .flatten()
+            .filter(|s| s.kind == kind)
+            .map(|s| s.count as u32)
+            .sum()
+    }
+
+    /// Index of the first container slot holding `kind`.
+    pub fn container_slot_of(&self, kind: soils_sim::ItemKind) -> Option<u16> {
+        self.container()?
+            .iter()
+            .position(|s| s.is_some_and(|s| s.kind == kind))
+            .map(|i| i as u16)
+    }
+
+    /// Index of the first pack slot holding `kind`.
+    pub fn pack_slot_of(&self, kind: soils_sim::ItemKind) -> Option<u16> {
+        self.inventory
+            .iter()
+            .position(|s| s.is_some_and(|s| s.kind == kind))
+            .map(|i| i as u16)
+    }
+
+    /// How many of `kind` the server says we hold.
+    pub fn count_of(&self, kind: soils_sim::ItemKind) -> u32 {
+        self.inventory.iter().flatten().filter(|s| s.kind == kind).map(|s| s.count as u32).sum()
+    }
+
+    /// Pump messages until `cond` holds over the mirrored inventory, or the
+    /// deadline passes. Returns whether it held.
+    pub async fn await_inventory(
+        &mut self,
+        mut cond: impl FnMut(&Self) -> bool,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while !cond(self) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            let Ok(msg) = tokio::time::timeout(Duration::from_millis(500), self.inbox.recv()).await
+            else {
+                continue;
+            };
+            let Some(msg) = msg else { return false };
+            self.record(&msg);
+        }
+        true
     }
 
     /// Last known position of an entity, without waiting for it to move.
@@ -536,6 +637,26 @@ impl Client {
         seq
     }
 
+    /// Wait for the server's verdict on `seq`. Returns whether it was applied.
+    ///
+    /// Always prefer this to matching `EditAccepted` alone: a rejection sends
+    /// no accept, and the surrounding traffic keeps `next_msg` from ever timing
+    /// out, so the bare version hangs instead of failing.
+    pub async fn edit_verdict(&mut self, seq: u32) -> bool {
+        self.recv_until(|msg| match msg {
+            ServerMsg::EditAccepted { seq: s, .. } if s == seq => Some(true),
+            ServerMsg::EditRejected { seq: s } if s == seq => Some(false),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Place `value` and assert the server applied it.
+    pub async fn place(&mut self, pos: [i32; 3], value: u8) {
+        let seq = self.edit(pos, value).await;
+        assert!(self.edit_verdict(seq).await, "edit {seq} at {pos:?} (value {value}) was rejected");
+    }
+
     /// Apply the next snapshot and return the entities it updated.
     pub async fn next_snapshot(&mut self) -> Vec<EntityState> {
         loop {
@@ -631,6 +752,46 @@ impl Client {
         let mut out = CollectedChunks::default();
         while out.payloads.len() < want.len() {
             if let ServerMsg::Manifest { chunks } = self.next_msg().await {
+                for info in chunks {
+                    let pos = info.pos();
+                    if !want.contains(&pos) {
+                        continue;
+                    }
+                    match &info {
+                        ChunkInfo::Edited { payload, .. } => {
+                            out.edited += 1;
+                            out.wire_bytes += payload.len() + 13;
+                        }
+                        ChunkInfo::Pristine { .. } => out.wire_bytes += 13,
+                    }
+                    let vol = self.materialize(&info);
+                    out.payloads.insert(pos, soils_protocol::encode_chunk(&vol));
+                }
+            }
+        }
+        out
+    }
+    /// Drain pushed chunks until the manifest stream goes quiet for `quiet`,
+    /// keeping only positions in `want`.
+    ///
+    /// The counterpart to [`collect_chunks`](Self::collect_chunks) for anything
+    /// the server may legitimately never send: occlusion culling withholds
+    /// chunks sealed behind solid neighbours, so waiting for a fixed set hangs
+    /// forever. Quiet is measured on *manifests*, not on the socket — snapshots
+    /// go out every tick, so the connection is never idle.
+    pub async fn collect_available(
+        &mut self,
+        want: &[[i32; 3]],
+        quiet: Duration,
+    ) -> CollectedChunks {
+        let want: std::collections::HashSet<[i32; 3]> = want.iter().copied().collect();
+        let mut out = CollectedChunks::default();
+        let mut last = tokio::time::Instant::now();
+        while last.elapsed() < quiet {
+            if let Ok(ServerMsg::Manifest { chunks }) =
+                tokio::time::timeout(Duration::from_millis(150), self.next_msg()).await
+            {
+                last = tokio::time::Instant::now();
                 for info in chunks {
                     let pos = info.pos();
                     if !want.contains(&pos) {
@@ -796,4 +957,88 @@ pub fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(20));
     }
     cond()
+}
+
+/// The workspace root, from this crate's manifest directory.
+pub fn workspace_root() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/<pkg> lives two levels below the workspace root")
+        .to_path_buf()
+}
+
+/// Run the recorder script's `<action>` and return its stdout.
+///
+/// Which script is `SOILS_RECORDER`, relative to the workspace root, defaulting
+/// to `scripts/obs_record.py`. The demo tests are the same either way — the
+/// only OBS-specific thing about them was this function, and the `ensure /
+/// start / stop / status` shape is a contract both recorders implement:
+///
+/// * `scripts/obs_record.py` drives OBS Studio over obs-websocket, which is
+///   what a local Windows recording session uses. `muesli/obs-cli` cannot be
+///   used for it: it is pinned to obs-websocket protocol 4 and OBS 28+ serves
+///   protocol 5 only, so it fails the handshake.
+/// * `scripts/ffmpeg_record.py` grabs the X display, which is what CI uses —
+///   OBS needs a compositor to capture from, and an Xvfb display already is
+///   one.
+///
+/// `stop` prints the file that was written, so a caller can assert on it.
+pub fn recorder(action: &str) -> String {
+    let script = workspace_root().join(
+        std::env::var("SOILS_RECORDER").unwrap_or_else(|_| "scripts/obs_record.py".into()),
+    );
+    let out = std::process::Command::new("python")
+        .arg(&script)
+        .arg(action)
+        .current_dir(workspace_root())
+        .output()
+        .unwrap_or_else(|e| panic!("could not run {}: {e}", script.display()));
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        out.status.success(),
+        "{} {action} failed:\n{text}\n{}",
+        script.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    println!("recorder {action}: {text}");
+    text
+}
+
+/// Multiplier for the demo tests' wall-clock budgets, from `SOILS_DEMO_SCALE`.
+///
+/// Every timing in a recording test is calibrated for a real GPU: how long to
+/// wait for the world to stream, when to cue the recorder, how long to let the
+/// take run. Under a software rasteriser (Mesa lavapipe on a CI runner, no GPU
+/// at all) the same work takes an order of magnitude longer, and every one of
+/// those budgets is wrong by the same factor — so they scale together rather
+/// than being re-tuned one at a time.
+///
+/// Defaults to 1.0, which is exactly the numbers that were there before.
+pub fn demo_scale() -> f32 {
+    std::env::var("SOILS_DEMO_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0)
+}
+
+/// `secs` scaled by [`demo_scale`], as a string for a child's environment.
+pub fn demo_secs(secs: f32) -> String {
+    format!("{:.0}", secs * demo_scale())
+}
+
+/// `secs` scaled by [`demo_scale`], as a [`Duration`] for a test-side deadline.
+pub fn demo_budget(secs: f32) -> Duration {
+    Duration::from_secs_f32(secs * demo_scale())
+}
+
+/// A demo-test knob overridable from the environment, so CI can trade fidelity
+/// for wall-clock without editing the tests.
+///
+/// The one that matters is `SOILS_DEMO_RADIUS`. Chunk *application* on the
+/// client is time-boxed per frame, so at one or two frames per second a
+/// software rasteriser applies chunks at a crawl and `streaming.pending` takes
+/// minutes to reach zero — which is the cue the recorder waits for. Shrinking
+/// the view radius cuts the chunk count cubically and is the difference
+/// between a take that starts and one that times out. The demos are filmed
+/// nose-to-the-ground anyway.
+pub fn demo_var(key: &str, default: &str) -> String {
+    std::env::var(key).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.into())
 }

@@ -34,7 +34,7 @@ use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 use soils_protocol::chunk_of;
 
 use crate::chunk::Blocks;
-use crate::light::LightQueue;
+use crate::light::{LightQueue, PlayerLight};
 use crate::pool::{ChunkSlots, NO_MESH};
 
 /// Dirty chunks lit per frame (the rest carry over in the LightQueue).
@@ -55,6 +55,24 @@ pub struct GpuLightJob {
 unsafe impl bytemuck::Pod for GpuLightJob {}
 unsafe impl bytemuck::Zeroable for GpuLightJob {}
 
+/// A blocklight emitter that is not a block — currently just the player (see
+/// [`PlayerLight`]). Mirrors `PointLight` in light_flood.wgsl, 16 B.
+///
+/// The reseed pass stamps these into the light grid alongside the emissive
+/// blocks, so everything downstream (beam, relax, the terrain shader's
+/// `light_at`) treats them as ordinary blocklight and occludes them properly.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct GpuPointLight {
+    voxel: [i32; 3],
+    /// Emission level; 0 is the disabled row the binding needs when there are
+    /// no emitters at all (a zero-sized storage binding is not allowed).
+    level: u32,
+}
+
+unsafe impl bytemuck::Pod for GpuPointLight {}
+unsafe impl bytemuck::Zeroable for GpuPointLight {}
+
 /// This frame's planned jobs, handed to the render world.
 #[derive(Resource, Clone, Default, ExtractResource)]
 pub struct LightBatch {
@@ -64,6 +82,10 @@ pub struct LightBatch {
     pub relax: Vec<GpuLightJob>,
     /// Distinct chunk-y layers in `core` (beam repeat count).
     pub beam_rounds: u32,
+    /// Non-block emitters to stamp in during reseed. Never empty — a disabled
+    /// row stands in for "none" so the binding always has something to point
+    /// at.
+    pub points: Vec<GpuPointLight>,
 }
 
 /// Per-block emission levels as a GPU table (u32 rows).
@@ -118,11 +140,16 @@ pub fn plan_light_jobs(
     mut queue: ResMut<LightQueue>,
     slots: Res<ChunkSlots>,
     ready: Option<Res<LightReady>>,
+    player_light: Res<PlayerLight>,
     mut batch: ResMut<LightBatch>,
 ) {
     batch.core.clear();
     batch.relax.clear();
     batch.beam_rounds = 0;
+    // Rebuilt every frame, batch or no batch: a chunk reflooded for an
+    // unrelated reason must still stamp the player's light back in, or walking
+    // next to someone else's edit would punch a hole in your own glow.
+    batch.points = point_lights(&player_light);
     if ready.is_none() {
         return; // pipelines still compiling; the queue carries over
     }
@@ -199,6 +226,16 @@ pub fn plan_light_jobs(
         .collect();
 }
 
+/// The frame's non-block emitters, with a disabled row when there are none.
+fn point_lights(player: &PlayerLight) -> Vec<GpuPointLight> {
+    match player.voxel {
+        Some(v) if player.level > 0 => {
+            vec![GpuPointLight { voxel: v.to_array(), level: u32::from(player.level) }]
+        }
+        _ => vec![GpuPointLight::default()],
+    }
+}
+
 /// Tell the main world the flood pipelines are dispatchable.
 fn mirror_ready(
     mut main: ResMut<bevy::render::MainWorld>,
@@ -233,6 +270,7 @@ pub(crate) struct LightPipeline {
 pub(crate) struct LightJobsGpu {
     core: Option<RawBufferVec<GpuLightJob>>,
     relax: Option<RawBufferVec<GpuLightJob>>,
+    points: Option<RawBufferVec<GpuPointLight>>,
     core_bg: Option<BindGroup>,
     relax_bg: Option<BindGroup>,
     core_count: u32,
@@ -256,6 +294,7 @@ fn init_pipeline(
                 storage_buffer_read_only_sized(false, None), // slot table
                 storage_buffer_read_only_sized(false, None), // emitters
                 storage_buffer_read_only_sized(false, None), // jobs
+                storage_buffer_read_only_sized(false, None), // point lights
             ),
         ),
     );
@@ -317,6 +356,22 @@ fn prepare_light(
     };
     upload(&batch.core, &mut jobs.core, &device, &render_queue);
     upload(&batch.relax, &mut jobs.relax, &device, &render_queue);
+    {
+        let vec = jobs.points.get_or_insert_with(|| RawBufferVec::new(BufferUsages::STORAGE));
+        vec.clear();
+        for p in &batch.points {
+            vec.push(*p);
+        }
+        // The planner always leaves a row here, but a stale empty buffer would
+        // fail the binding — keep the invariant local.
+        if batch.points.is_empty() {
+            vec.push(GpuPointLight::default());
+        }
+        vec.write_buffer(&device, &render_queue);
+    }
+    let Some(points_buf) = jobs.points.as_ref().and_then(|v| v.buffer()).cloned() else {
+        return;
+    };
 
     let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
     let bg = |jobs_buf: &RawBufferVec<GpuLightJob>| {
@@ -330,6 +385,7 @@ fn prepare_light(
                 pools.table.as_entire_buffer_binding(),
                 emitters_buf.buffer.as_entire_buffer_binding(),
                 jobs_buf.buffer().unwrap().as_entire_buffer_binding(),
+                points_buf.as_entire_buffer_binding(),
             )),
         )
     };

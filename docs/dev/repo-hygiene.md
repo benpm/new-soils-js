@@ -85,12 +85,19 @@ Denied there:
 * `recordings/**`, `artifact/**`, `node_modules/**` — captures, generated
   pages, and dependencies.
 
-`target/` and `.tools/` are deliberately **not** denied, though the obvious
-advice says to deny them. Build artifacts get inspected (does the exe exist,
-how big is it), the pinned SpacetimeDB CLI lives in `.tools/`, and Glob/Grep
-already skip gitignored paths — so denying them buys nothing and blocks real
-work. The first version of this file denied both and immediately blocked a
-build-artifact check.
+`target/`, `.tools/` and `recordings/` are deliberately **not** denied, though
+the obvious advice says to deny all three. Build artifacts get inspected (does
+the exe exist, how big is it), the pinned SpacetimeDB CLI lives in `.tools/`,
+demo takes have to be listed and probed before they are published, and
+Glob/Grep already skip gitignored paths — so denying them buys nothing and
+blocks real work.
+
+Each of those was learned the same way, twice: the first version of this file
+denied `target/` and blocked a build-artifact check within the hour, and the
+`recordings/` rule blocked the inspection of a demo take that turned out to be
+broken. The general lesson is that a deny list should name things nobody needs
+to look at, not things that merely *sound* like build output. A gitignored path
+is not automatically a path an agent should be blind to.
 
 The same file disables plugins that have no bearing on a Rust workspace
 (`playwright`, `clangd-lsp`, `skill-creator`, `plugin-dev`,

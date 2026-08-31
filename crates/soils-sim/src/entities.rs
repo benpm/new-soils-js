@@ -61,6 +61,9 @@ pub const KIND_CRITTER: u16 = 1;
 /// Server-spawned rigid-body physics prop (Avian). Replicated with a full
 /// orientation quaternion; the client renders it as an oriented cube.
 pub const KIND_PHYSICS_CUBE: u16 = 2;
+/// An item lying in the world, waiting to be walked over. The item it carries
+/// rides on `EntitySpawn`, not on the per-tick snapshot — it never changes.
+pub const KIND_DROPPED_ITEM: u16 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -72,6 +75,7 @@ mod tests {
         assert_eq!(reg.id_of("Player"), Some(KIND_PLAYER));
         assert_eq!(reg.id_of("Critter"), Some(KIND_CRITTER));
         assert_eq!(reg.id_of("PhysicsCube"), Some(KIND_PHYSICS_CUBE));
+        assert_eq!(reg.id_of("DroppedItem"), Some(KIND_DROPPED_ITEM));
         let player = reg.get(KIND_PLAYER).unwrap();
         assert_eq!(player.render, "capsule");
         assert!(player.speed > 0.0 && player.half_extents[1] > 0.0);

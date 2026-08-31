@@ -35,7 +35,7 @@ use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 
 use crate::chunk::{Blocks, ChunkMap};
 use crate::demand::ChunkDirectory;
-use crate::pool::{ChunkSlots, PoolOpQueue};
+use crate::pool::{ChunkSlots, DirtyMesh, PoolOpQueue};
 use crate::server_msg::ClientGen;
 
 /// Max GPU gen jobs dispatched per frame (also sizes the lattice scratch and
@@ -215,6 +215,7 @@ fn on_gen_occ(
     mut batches: ResMut<GenBatches>,
     mut slots: ResMut<ChunkSlots>,
     mut pool_ops: ResMut<PoolOpQueue>,
+    mut dirty_mesh: ResMut<DirtyMesh>,
     map: Res<ChunkMap>,
     dir: Res<ChunkDirectory>,
 ) {
@@ -238,7 +239,7 @@ fn on_gen_occ(
         {
             continue;
         }
-        slots.demote_mesh(&mut pool_ops, cpos);
+        slots.demote_mesh(&mut pool_ops, &mut dirty_mesh, cpos);
     }
 }
 

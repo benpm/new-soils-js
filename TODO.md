@@ -1,46 +1,77 @@
-# Todo - main
-Commit 
-each task. Test before commit. Each header is a different project, likely needing its own branch. After completing tasks, move them to CHANGELOG.md
+# Implementation log
 
-## Staging
-Move these tasks into their respective categories (you can make more categories if needed). If it lacks detail or is too vague, add "??" to the item right before the description
-- [ ] Compress world data
-- [ ] Portals
-- [ ] NPCs with pathfinding
-- [ ] Server only sends chunk DELTAs, client uses world's seed (from server)
-      - Make sure to separate just the voxel generation from other parts of world gen
-- [ ] Structure generation - implementation must be able to be done 100% independently. You must be able to only generate one chunk from inside a structure, and be able to generate the rest later. 
-      - Bounding box has an origin which represents the internal voxel location it is translated relative to - for example a tree's origin is at its base, where the trunk should meet the ground
-      - Structures have unique identifiers (32-bit uint). 
-      - Output from terrain gen also a table
-- [ ] Client will generate a chunk while waiting for real chunk data from server. Server
-- [ ] NPCs have inventories, make armor for NPCs, 
-- [ ] NPC crafting - make houses and NPCs move in. Their inventories are accessible by interacting with them. They have roles, like Blacksmith, which allows them to craft. They are not created with these roles, but they train and specialize in whatever item is requested by the player. They need equipment to craft. Blacksmith needs 
-- [ ] Stars are vertices
-- [ ] Bow and arrows
-- [ ] Blocks should be shaped by their neighbors - block with exposed edge is sloped, exposed corner is also sloped
-- [ ] Breaking blocks should drop soil, sometimes grass seeds
-- [ ] Grass seeds can be crafted into Organic Brick
-- [ ] Throwable knife
-
-Other todo files:
-- [`crates/soils-terrainlab/TODO.md`](crates/soils-terrainlab/TODO.md)
+> **Open work lives in [`Tasks.md`](Tasks.md).** This file is the historical
+> record: what shipped in each phase, what was measured, and what was deferred
+> with the reasoning. Checkoffs here are not re-litigated; they are evidence.
+>
+> `soils-terrainlab` keeps its own:
+> [`crates/soils-terrainlab/TODO.md`](crates/soils-terrainlab/TODO.md).
 
 <!-- As you complete tasks, add descriptions of your implementation to CHANGELOG.md, and then reference them here, removing their descriptions from here. -->
-<!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. -->
-
-## Design
-- [ ] Organize the information in [concepts.md](concepts.md). Some of it refers to Minecraft, so you should research Minecraft and take extensive notes on its mechanics before interpreting and rewriting concepts.md
-- [ ] Clean up this file, moving the finished tasks into [[CHANGELOG]]
+<!-- For each of these, do them one at a time, but first looking for dependencies. If there are dependencies, reorder the TODO items to be in the order they need to be implemented in due to dependency (but keeping the sections). When you complete a task, mark it off. Add the current date, commit hash, and branch to the end of each. Then, commit and push. Before working, check if the task is already complete. Also, make sure to understand perfectly what the user actually wants by asking questions. --> 
 
 ## UI
 
 ### Inventory
+
+Design intent (the source of truth for the plan below):
+
 User interface is not like Minecraft's very much.
 - No hotbar, just a ring indicating all tools and weapons and consumables in your inventory.
 - You can use various hotkeys to navigate the UI or pressing Alt to release the mouse cursor for UI interaction.
 - Inventory screen comes up by pressing E, I, Tab, or Escape.
 - A backpack icon with a cirled "E" on it is shown in the left corner of screen, indicating how to open inventory.
+
+**Revised 2026-08-28: there is a hotbar, and it is not Minecraft's.** The first
+bullet no longer holds. Working from the mockup in `scratch/`, the ring was
+replaced by an eight-key bar that holds **references** to item kinds rather than
+items: assigning costs no message and moves nothing, the item stays listed in
+the inventory (dimmed, badged with its key), and when the item runs out the key
+rebinds itself to another of the same category, function and effect — a spent
+Cobblestone becomes Moss Stone, an eaten fruit becomes another healing
+consumable. With no like item to hand the key goes empty and wiggles when
+pressed. That is the part Minecraft does not do, and it is why a bar is worth
+having here: it is a set of standing intentions, not eight more slots to
+micromanage. The ring and the one-slot held-item indicator are gone; the
+inventory screen groups by category instead of showing raw slots.
+
+Phasing, rationale and per-phase test gates: [plan-ui.md](docs/plan-ui.md).
+
+**Shipped 2026-08-25 (`ui-inventory`).** The loop works: breaking a block drops
+it as a world entity, walking into the drop collects it, placing spends it, and
+the server owns the inventory (protocol v4). What is left is listed under
+[plan-ui.md §9](docs/plan-ui.md#9-what-is-left) — persistence across logout, the
+radial *shape* of the ring, and a TTL for uncollected drops.
+
+- [x] **Decide the Escape binding.** The intent above lists Escape as an
+      inventory key, but Escape is currently the cursor release and therefore
+      the pause menu; both cannot hold. Recommendation and the alternative:
+      [plan-ui.md §6](docs/plan-ui.md#6-open-decisions). Blocks phase 0.
+- [x] **Phase 0 — `UiMode` state.** The client has no UI state machine: the
+      pause menu is shown whenever the cursor is released (`pause.rs:211`), and
+      any click re-grabs it (`player.rs:313`), so an inventory screen cannot be
+      clicked without dismissing itself. Replace the inferred state with a real
+      one, give cursor grab a single owner, and add Alt as a modifier over it.
+      Ships alone with no new UI. Gate: transitions both ways, plus a test that
+      a click in `Inventory` does not re-grab.
+- [x] **Phase 1 — item model in `soils-sim`.** `ItemKind` / `ItemStack` /
+      `Inventory` as plain data, so the server can reuse it unchanged when
+      inventory becomes authoritative. Gate: stacking and count-conservation
+      tests, including insert-into-full returning the remainder.
+- [x] **Phase 2 — item icons.** `blocks.png` is an 8x8 grid of 16x16 tiles and
+      `BlockDef.faces[1]` is the top face, so block icons need no new art.
+      Placeholder tiles for tools/weapons/consumables. Gate: every block in
+      `blocks.yaml` resolves to an in-range tile.
+- [x] **Phase 3 — the ring** (partial). `Hotbar` retired; the strip shows the
+      carried tools/weapons/consumables. Radial layout and hold-to-open
+      selection deferred until tools exist — tracked in `Tasks.md`.
+- [x] **Phase 4 — inventory screen.** E/I/Tab into `UiMode::Inventory`, slot
+      grid, click-to-pick/click-to-place, and the backpack affordance with the
+      circled "E". Gate: open/close per binding; moving a stack conserves it;
+      closing with a stack in hand returns it rather than voiding it.
+- [x] **Phase 5 — authority** (persistence deferred). Protocol v4, server-owned
+      inventory, client mirrors only. Persistence across logout is tracked in
+      `Tasks.md`.
 
 ## BigRefactor
 
@@ -193,7 +224,10 @@ what was measured, and what was deferred with rationale. Current-state documenta
 - [x] Client local Avian world: predicts props, rebases to server snapshots past an epsilon; client terrain colliders from `ChunkMap`. Rendered from the predicted transform. (In-game validated.)
 - [x] Kinematic player proxy (server + client) so props are shoved by the player, movement feel unchanged.
 - [x] `spawn`/`cube` console command → `ClientMsg::SpawnCube` (reach-checked, rate-limited); test.
-- [ ] Optional follow-ups: replicate angular velocity (smoother predicted spin); full two-way player via an Avian character controller (ride on / be pushed by props); interpolation plugin for sub-tick smoothing.
+- [x] Angular velocity replicated (`MASK_ANGVEL` / `BodyAngVel`), so the client
+      predicts a prop's spin between snapshots. Remaining follow-ups (two-way
+      player via an Avian character controller, sub-tick interpolation) are in
+      `Tasks.md`.
 
 ## SpacetimeDB (`stdb/soils-module`, `soils-stdb`) — behind `SOILS_STDB_URI`
 
@@ -262,60 +296,98 @@ as it was, region files only. Setup and schema notes in
 
 ### Remaining
 
-- [ ] **`player_profile` is world-readable**, and it holds every player's last
-      known position. It has to be public: the game server reads it from the
-      SDK cache on login, and a private table has no client accessor at all.
-      Row-level security is the fix and is unimplemented in 2.7.1 — revisit
-      when upstream lands it, rather than declaring a filter that does nothing.
-      The same applies to `chunk_blob`, where the exposure is the stored world
-      rather than player locations.
-- [ ] **`send_chat` trusts the caller's `world_id`.** A client can post into
-      any world's channel. The check wants a presence row for the sender's
-      account in that world, which needs the client to know its real
-      `world_id_for(name)` first — today `Social::chat_world` defaults to 0.
-      Worth doing together with per-world chat channels rather than alone.
-- [ ] **Opening a *new* world on login blocks the tick** for up to 5 s while
-      the restore runs. Correct as written — pristine terrain must not be
-      generated over chunks being recovered — but it is a stall a joining
-      player imposes on everyone. Wants world creation to become asynchronous
-      with joins held until it completes, not a shorter timeout.
-- [ ] **A database-only account cannot log in while the database is down.**
-      The local account file is a cache written when *this* server registers or
-      migrates an account, so a player who signed up against another server has
-      no local record here and `local_auth` answers "no such account". Keeping
-      a local verifier for every successful database login would fix it, at the
-      cost of scattering verifiers across every server a player touches —
-      a deliberate trade, not an oversight.
-- [ ] **`grant_server` is trust-on-first-use.** Whoever claims an empty
-      allowlist first becomes a server. Fine for a local database, a race on a
-      public one; seed the first identity from a trusted console instead.
-- [ ] Decision gate: re-evaluate whether the hybrid split still earns its keep,
-      or whether more should move across.
-
-### Considerations for other work on this list
-
-These are not SpacetimeDB tasks, but they interact with it and will be cheaper
-to get right if the interaction is settled first.
-
-- **Biomes / structures** (Content Expansion below): structure "seeds" placed by
-  blue noise across chunk boundaries are exactly the kind of sparse relational
-  state SpacetimeDB is good at, and a structure spanning chunks needs a claim
-  that survives a server restart. Worth deciding before the generator is written
-  whether seed ownership lives in region files or the database.
-- **Inventory / UI** (above): item stacks are cold relational state and a natural
-  fit for a table, but inventory is also latency-sensitive during play. The
-  likely split is authoritative in `soils-server` during a session, persisted to
-  SpacetimeDB on logout — the same shape as `player_profile`.
-- **Blocks with data-parity to Minecraft**: a larger block registry changes the
-  chunk payload size, and `chunk_blob` payloads above 992 bytes land in
-  SpacetimeDB's content-addressed blob store. Worth re-measuring dedupe rates
-  once palettes get wider.
-- **Networked physics follow-ups**: prop state is hot and per-tick; it should
-  stay out of the database entirely. Anything persisted should be the *resting*
-  state at unload, if at all.
+Moved to [`Tasks.md`](Tasks.md) — the known limits of the hybrid split
+(world-readable `player_profile`/`chunk_blob`, `send_chat` world trust, the
+new-world join stall, database-down logins, `grant_server` trust-on-first-use)
+and the cross-cutting notes that shape work elsewhere on the list.
 
 ## The First Content Expansion
-- [ ] Robust, neural texture gen techniques for tile gen with constraints to create complex 3d structures based on inferred structural relationships and probabilies from example. Ingest minecraft builds from the internet, parsing them, converting them to a compressed structure format. These should be editable in a new mode in game: structure design. Structure design should allow the instant output of applying the structure generation algorithm to your structure as input. You should be aple to tweak the ruleset that gets generated from your source map. Use techniques from the internet
-- [ ] Create block types (even with no real properties yet) to match all blocks in this Minecraft texture pack: (https://github.com/Unity-Resource-Pack/Unity-Modded). Use data files from the texture pack to help understand which tiles are what. Also, start creating some amount of data parity with minecraft files. Replace existing textures with these.
-- [ ] Biomes. Biomes should blend into each other oranically. The color of grass should able to shift in a subtle gradient stored a individual block data. Some biomes have tall trees, some short, some none. Some have rain, clouds, storms. Others, a barren moon-like landscape. Biome transitions might be able to have unique structures, such as small, sparse ponds between wetlands and a desert, or a desert and a tundra. Some biomes are more unique and have more extreme boundaries, such as the Crater Forest, where the boundary is a sheer cliff straight into the dense cannopy of massive trees. Make sure structures can be generated at great quantity along chunk boundaries use blue noise to place structure "seeds", which can fully generate as structures and thus "completing" the chunks it resides, only if all chunks it intersects are otherwise fully generated. Generate chunks in 2x2 blocks of chunks to mitigate large structures being incomplete.
-- [ ] Upgrade to Bevy 0.19
+
+Moved to [`Tasks.md`](Tasks.md): Minecraft-parity block types, biomes, and
+neural tile/structure generation.
+
+---
+*After `ui-inventory` is merged and all tasks above are put into the changelog and removed from this file...*
+
+## Light Upgrade 2.0
+
+**Planned, not started.** The detailed plan is written:
+[plan-better-lighting.md](docs/plan-better-lighting.md). Four phases, each
+test-gated, with the payoff concentrated in the first.
+
+Two findings from writing it are worth having here, because they change what
+the section is asking for:
+
+- Three of the idea's five bullets already hold. Fine lighting is GPU-only and
+  never copied back, and it already runs only near the player — phase 12 did
+  that. What is left is shipping the *coarse* grid rather than recomputing it,
+  smoothing it, and ordering the queue.
+- That first item is not a micro-optimisation. The client re-floods every chunk
+  it receives, and the client frame is light-bound: a fresh join spends four to
+  five minutes at ~46 fps against a 116 fps steady state, redoing work the
+  server did moments earlier and discarded.
+
+The reference implementation the idea names, `~/projects/voxel_radiance_cascades`,
+turns out to be missing its cascade passes — all six shader files are
+byte-identical copies of `common.glsl` (md5-verified 2026-08-29, and its own
+`CLAUDE.md` warns of exactly this). The plan records the part that does
+survive, which is the probe layout, and explains why it is worth reading for
+ideas rather than porting: this repo already has a working, oracle-tested
+radiance-cascades implementation using a different direction encoding, and
+none of the five bullets is about direction encoding.
+
+## Draw Distance Upgrade 2.0
+
+**Deferred — not enough detail to build.** Self-labelled WIP, and the two
+bullets name outcomes rather than designs:
+
+- Chunk compression over the network and before the copy to GPU memory
+- Chunk LOD, also over the network and on the GPU
+
+Both need a plan doc before they need code. Notes toward one:
+
+- Chunks are *already* compressed on the wire — palette + LZ4, which took the
+  join burst from 23 MB to 498 KB and has a 2 MB regression gate. So the
+  network half of bullet one is done, and what is actually being asked for is
+  compression **of the GPU-side copy**, which is a different problem with a
+  different constraint: it has to be decompressible by the mesher, not by the
+  CPU.
+- The cheaper prerequisite is already listed in
+  [`Tasks.md`](Tasks.md): *cull all-air chunks*. Occlusion culling withholds
+  sealed chunks but still sends every empty chunk above the terrain, and
+  roughly half the cube is sky. That is the largest single win available here
+  and it needs no new format.
+- LOD interacts with the lighting plan: a downsampled chunk needs downsampled
+  light, and whether that is derived on the client or shipped is the same
+  question [plan-better-lighting.md](docs/plan-better-lighting.md) phase A
+  asks about full-resolution light. Decide them together.
+
+## GitHub Actions
+
+- [x] **Release builds through the Releases section.**
+      `.github/workflows/release.yml` — pushing a `v*` tag builds the client
+      and server for Linux and Windows, packages each with `assets/` beside the
+      binaries, and publishes a Release with both archives attached. The
+      existing `screenshots.yml` listens for `release: published`, so the
+      rendered screenshots land in the notes underneath the downloads with no
+      coupling between the two. 2026-08-29, `ci-pipelines`.
+- [x] **GitHub Pages site of recorded test cases, tabbed by branch.**
+      `.github/workflows/videos.yml` runs the `#[ignore]`d recording tests on
+      every push to every branch and publishes their videos to `gh-pages`.
+      What made this possible was making the recorder pluggable rather than
+      writing a second CI-only driver: `SOILS_RECORDER` selects
+      `scripts/obs_record.py` (OBS, local, Windows) or the new
+      `scripts/ffmpeg_record.py` (X11 grab, CI), and the tests are otherwise
+      unchanged — so a published video is a take the test *passed*, assertions
+      on scripted beats included. `scripts/build_pages.py` folds one branch's
+      videos into the site without disturbing the others. 2026-08-29,
+      `ci-pipelines`. See [CHANGELOG.md](CHANGELOG.md).
+
+## `optimization`
+This branch should focus on making performance improvements to chunk generation, disk i/o, network i/o, etc.
+
+- [ ] Add instrumentation to critical functions such as chunk gen, then create some benchmark tests
+- [ ] ADd
+- [ ] 
+- [ ] 
+- [ ] 

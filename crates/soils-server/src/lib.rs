@@ -10,8 +10,10 @@
 
 mod app;
 mod auth;
+mod paged;
 mod persist;
 mod region;
+mod store;
 mod world;
 
 use persist::{PersistHandle, Persister};
@@ -33,9 +35,54 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
-/// Real seconds for a full day cycle (JS used ~20 minutes; shortened so the
-/// effect is visible while testing the slice).
-pub(crate) const DAY_SECONDS: f32 = 120.0;
+use crate::world::SPAWN_CLEARANCE;
+
+/// Real seconds for a full day cycle: 30 minutes. The clock advances (and
+/// broadcasts) once a second, which is 0.2 degrees of sun rotation per step —
+/// far below anything visible.
+pub(crate) const DAY_SECONDS: f32 = 30.0 * 60.0;
+/// A hollow room carved into the rock under a world's spawn column.
+///
+/// Exists for the lighting demo (`tests/light_demo.rs`), which needs somewhere
+/// genuinely dark to place lamps: natural caves at this generator's settings
+/// are 8-20 voxel tubes at 1-2% density, nothing like a hall. `None` — the
+/// default — leaves terrain exactly as generated.
+///
+/// Carved in [`World::adopt`], so it applies to freshly *generated* chunks. A
+/// data directory persisted from a chamber-off run is never carved; the demo
+/// test uses a fresh temp dir.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chamber {
+    /// Depth of the floor's topmost solid voxel below the spawn column's
+    /// surface height, in voxels.
+    pub depth: i32,
+    /// Interior half-extent on x and z. Above 16 the room always spans two
+    /// chunks on both axes, which is what stops occlusion culling from ever
+    /// withholding it (see `World::sealed`).
+    pub half: i32,
+    /// Interior height.
+    pub height: i32,
+}
+
+impl Chamber {
+    /// The room `light_demo.rs` films: 49 x 24 x 49 of air, 96 voxels down.
+    ///
+    /// Wide enough that six lamps ringing the player light an island in the
+    /// middle with the walls still dark — a room uniformly lit shows nothing
+    /// about how far light travels.
+    pub const DEMO: Chamber = Chamber { depth: 96, half: 24, height: 24 };
+
+    /// How far below the spawn eye a body must travel to end up mid-room.
+    ///
+    /// Exposed because the spawn height follows the terrain, so a client can
+    /// only be told a *delta*. The demo derives the bot's descent from this
+    /// rather than hardcoding a literal that would rot the moment the depth
+    /// changed.
+    pub fn descent_from_spawn(&self) -> f32 {
+        SPAWN_CLEARANCE + (self.depth - self.height / 2) as f32
+    }
+}
+
 /// Chunks per `Bundle` response. Small because solid chunks are ~32 KB each.
 pub(crate) const BUNDLE_SIZE: usize = 16;
 /// Chunks generated per wave. A fresh world's first request is up to 9³=729
@@ -103,6 +150,9 @@ pub struct ServerConfig {
     /// the case that shows what entity replication actually costs.
     /// `SOILS_PROPS` on the dedicated binary.
     pub props: u16,
+    /// Carve a [`Chamber`] under spawn. `None` leaves terrain as generated.
+    /// `SOILS_CHAMBER=1` on the dedicated binary.
+    pub chamber: Option<Chamber>,
     /// SpacetimeDB mirroring. `None` (the default) keeps persistence entirely
     /// on region files, so single-player and offline play need no database.
     /// Set via `SOILS_STDB_URI` / `SOILS_STDB_DB` / `SOILS_STDB_TOKEN`.
@@ -200,6 +250,7 @@ impl Default for ServerConfig {
             scripts_dir: None,
             physics: false,
             props: 0,
+            chamber: None,
             stdb: None,
         }
     }
@@ -394,13 +445,14 @@ async fn serve(
         let scripts_dir = config.scripts_dir.clone();
         let physics = config.physics;
         let props = config.props;
+        let chamber = config.chamber;
         let stdb = stdb.clone();
         let server_name = config.name.clone();
         let bind_addr = config.bind.clone();
         std::thread::Builder::new().name("soils-ecs".into()).spawn(move || {
             app::run_app(
                 conns_rx, shutdown, data_dir, persist, accounts, player_count, critters,
-                scripts_dir, physics, props, stdb, server_name, bind_addr,
+                scripts_dir, physics, props, chamber, stdb, server_name, bind_addr,
             );
         })?
     };

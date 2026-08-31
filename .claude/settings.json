@@ -1,10 +1,9 @@
 {
-  "$comment": "Project-scoped Claude Code settings. See docs/dev/repo-hygiene.md. Denies cover paths that are pure noise to read; target/ and .tools/ are deliberately NOT denied — build artifacts get inspected and the SpacetimeDB CLI lives there, and gitignore-aware search already skips them.",
+  "$comment": "Project-scoped Claude Code settings. See docs/dev/repo-hygiene.md. Denies cover paths that are pure noise to read. target/, .tools/ and recordings/ are deliberately NOT denied: build artifacts get inspected, the SpacetimeDB CLI lives in .tools/, demo takes have to be listed and probed, and gitignore-aware search already skips all three.",
   "permissions": {
     "deny": [
       "Read(./.claude/worktrees/**)",
       "Read(./crates/soils-stdb/src/module_bindings/**)",
-      "Read(./recordings/**)",
       "Read(./artifact/**)",
       "Read(./node_modules/**)"
     ]

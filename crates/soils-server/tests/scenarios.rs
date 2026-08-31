@@ -214,14 +214,14 @@ async fn edits_are_acked_and_replicate_without_echo() {
     // B replies with its own edit. Per-connection order means the FIRST plain
     // edit A receives must be B's — no echo of A's own.
     let pb = [NEAR_VOXEL[0] + 1, NEAR_VOXEL[1], NEAR_VOXEL[2]];
-    b.edit(pb, 7).await;
+    b.edit(pb, 11).await;
     let got = a
         .recv_until(|msg| match msg {
             ServerMsg::Edit { pos, value } => Some((pos, value)),
             _ => None,
         })
         .await;
-    assert_eq!(got, (pb, 7), "first edit at A must be B's, never an echo of A's own");
+    assert_eq!(got, (pb, 11), "first edit at A must be B's, never an echo of A's own");
 }
 
 #[tokio::test]
@@ -306,14 +306,14 @@ async fn warp_isolates_edits_and_actors_by_world() {
     })
     .await;
     let pb = [NEAR_VOXEL[0] + 1, NEAR_VOXEL[1], NEAR_VOXEL[2]];
-    a.edit(pb, 7).await;
+    a.edit(pb, 11).await;
     let got = b
         .recv_until(|msg| match msg {
             ServerMsg::Edit { pos, value } => Some((pos, value)),
             _ => None,
         })
         .await;
-    assert_eq!(got, (pb, 7), "edit made while B was in another world leaked through");
+    assert_eq!(got, (pb, 11), "edit made while B was in another world leaked through");
 }
 
 #[tokio::test]
@@ -325,8 +325,15 @@ async fn concurrent_requests_serve_identical_chunks() {
     // Both clients' join bursts race over the same fresh region. Generation
     // runs off the tick, so the adoption guard must dedupe: both clients get
     // byte-identical chunks for every position.
-    let wave: Vec<[i32; 3]> =
-        (4..8).flat_map(|x| (6..9).map(move |y| [x, y, 8])).collect();
+    //
+    // The wave is the box around the spawn chunk, not an arbitrary deep slab:
+    // occlusion culling withholds chunks sealed behind solid neighbours, and
+    // `collect_chunks` waits for *every* position it is given, so asking for a
+    // buried chunk hangs forever. `CULL_KEEP` guarantees this box is always
+    // delivered, and it is just as freshly generated as anywhere else.
+    let wave: Vec<[i32; 3]> = (7..=9)
+        .flat_map(|x| (7..=9).flat_map(move |y| (7..=9).map(move |z| [x, y, z])))
+        .collect();
     let (got_a, got_b) =
         tokio::join!(a.collect_chunks(&wave), b.collect_chunks(&wave));
     for pos in &wave {

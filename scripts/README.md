@@ -79,9 +79,26 @@ artifact pages, and are never loaded by the server.
 | `obs_scene.py` | Writes a dedicated OBS scene collection that captures the game window (one pane per client, for side-by-side comparisons). Leaves existing collections alone. |
 | `obs_record.py` | `ensure` / `start` / `stop` / `status` against OBS over obs-websocket **v5**. Not `muesli/obs-cli`, which is pinned to protocol 4 and cannot talk to OBS 28+. |
 | `build_artifact.py`, `build_props_artifact.py` | Build the demo pages with their videos inlined as data URIs. |
+| `ffmpeg_record.py` | The CI recorder: same `ensure`/`start`/`stop`/`status` surface as `obs_record.py`, grabbing the X display instead of driving OBS. Selected by `SOILS_RECORDER`. |
+| `build_pages.py` | Folds one branch's recorded videos into the `gh-pages` site, one tab per branch. Driven by `.github/workflows/videos.yml`. |
 
 The recordings themselves are produced by the `#[ignore]`d tests
 `soils-server/tests/demo.rs` and `soils-server/tests/props_demo.rs`.
+
+**Which recorder runs** is `SOILS_RECORDER`, a path relative to the workspace
+root, defaulting to `scripts/obs_record.py`. The demo tests do not otherwise
+know the difference — the server, the scripted bots, the readiness handshake
+and the assertions on which beats fired are the same either way, which is what
+lets CI publish a video only when the test that produced it passed.
+
+```sh
+# Locally, on Windows: OBS.
+cargo test --release -p soils-server --test inventory_demo -- --ignored
+
+# On CI, under Xvfb: ffmpeg's X11 grabber.
+SOILS_RECORDER=scripts/ffmpeg_record.py DISPLAY=:99 \
+  cargo test --release -p soils-server --test inventory_demo -- --ignored
+```
 
 ## Block textures (`gen_textures.mjs`)
 
@@ -93,7 +110,7 @@ node scripts/gen_textures.mjs       # regenerate every block texture
 node scripts/gen_textures.mjs --only 2,3   # a subset, for iterating on a tile
 ```
 
-Every atlas tile index in `crates/soils-client/assets/blocks.yaml` is authored
+Every atlas tile index in `crates/soils-worldgen/blocks.yaml` is authored
 as SVG in that script (one builder per tile; `scripts/textures/svg/` holds the
 emitted sources) and rendered to a 1024×1024 mega-tile that repeats over 16×16
 blocks (64 px per block). The tiles are stacked into

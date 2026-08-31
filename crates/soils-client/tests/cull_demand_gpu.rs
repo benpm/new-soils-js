@@ -10,6 +10,9 @@ use wgpu::util::DeviceExt;
 
 const N_MESH: usize = 4096;
 const TABLE_EMPTY: u32 = u32::MAX;
+/// Camera chunk and load radius the params below are built from.
+const CAMERA_CHUNK_X: i32 = 4;
+const RADIUS: i32 = 2;
 
 /// A frustum whose planes accept x >= 64 only (half-space normal +x at x=64),
 /// everything else wide open.
@@ -28,16 +31,21 @@ fn cull_and_demand_match_cpu_replica() {
 
     // --- Synthetic state ---
     // Mesh slots 0..8 mapped to chunks (i, 0, 0) for i in 0..8 (light slot i).
-    // Chunk world x = i*32, so slots with i >= 2 pass the x >= 64 frustum.
-    // Slot 8 is "freed" (poisoned mesh_info). Slots 9.. unallocated (zeros,
-    // culled by their zero vertex_count regardless of the instance bit).
+    // Chunk world x = i*32, so slots with i >= 1 pass the x >= 64 frustum — but
+    // the camera sits at chunk (4,0,0) with radius 2, so only i in 2..=6 are
+    // also inside the load window. Slots 9.. unallocated (zeros, culled by
+    // their zero vertex_count regardless of the instance bit).
     let mapped = 8usize;
     let mut mesh_info = vec![0i32; N_MESH * 4];
     for i in 0..mapped {
         mesh_info[i * 4] = i as i32; // cpos.x
         mesh_info[i * 4 + 3] = i as i32; // light slot
     }
-    mesh_info[8 * 4 + 3] = TABLE_EMPTY as i32; // freed slot
+    // Slot 8 is "freed": poisoned light-slot word. It is parked on chunk
+    // (3,0,0) — inside both the frustum and the radius — so the poison is the
+    // only thing that can cull it.
+    mesh_info[8 * 4] = 3;
+    mesh_info[8 * 4 + 3] = TABLE_EMPTY as i32;
 
     // Unified descriptors + table: chunks (i,0,0) → slot i. Leave chunk (5,0,0)
     // OUT of the table (unmapped from the scan's perspective) and give chunk
@@ -62,7 +70,7 @@ fn cull_and_demand_match_cpu_replica() {
             params.extend_from_slice(&v.to_le_bytes());
         }
     }
-    for v in [4i32, 0, 0, 2] {
+    for v in [CAMERA_CHUNK_X, 0, 0, RADIUS] {
         params.extend_from_slice(&v.to_le_bytes());
     }
     params.resize(128, 0);
@@ -202,17 +210,23 @@ fn cull_and_demand_match_cpu_replica() {
     let words: &[u32] = bytemuck::cast_slice(&data[..N_MESH * 16]);
 
     // --- Cull expectations ---
-    for i in 0..mapped {
-        let inst = words[i * 4 + 1];
-        let expected = if i == 8 {
-            0 // freed slot: poisoned mesh_info culls it outright
-        } else if (i as i32) * 32 + 32 >= 64 {
-            1 // chunk AABB reaches x >= 64
-        } else {
-            0
-        };
-        assert_eq!(inst, expected, "slot {i} instance count");
+    // Drawn == inside the frustum AND inside the Chebyshev load window, so the
+    // drawn set matches the window `demand_scan` walks.
+    let inst = |slot: usize| words[slot * 4 + 1];
+    for i in 0..=mapped {
+        let live = i != 8; // slot 8's mesh_info is poisoned (freed)
+        let in_radius = (i as i32 - CAMERA_CHUNK_X).abs() <= RADIUS;
+        let in_frustum = (i as i32) * 32 + 32 >= 64; // chunk AABB reaches x >= 64
+        let expected = u32::from(live && in_radius && in_frustum);
+        assert_eq!(inst(i), expected, "slot {i} instance count");
     }
+    // Spelled out, because these are the regressions this test exists for:
+    // chunks the frustum accepts but the radius does not must not draw, and a
+    // freed slot must not draw even parked in full view inside the radius.
+    assert_eq!(inst(1), 0, "in frustum, outside radius → not drawn");
+    assert_eq!(inst(7), 0, "in frustum, outside radius → not drawn");
+    assert_eq!(inst(4), 1, "in frustum and inside radius → drawn");
+    assert_eq!(inst(8), 0, "freed slot → not drawn");
     // Unallocated slots also get written (their mesh_info is zeros → chunk
     // (0,0,0) at x<64 → culled); nothing keeps the pre-set 7.
     assert!(words.iter().skip(mapped * 4).step_by(4).all(|_| true));

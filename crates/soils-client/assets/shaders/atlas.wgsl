@@ -60,6 +60,32 @@ const TABLE_EMPTY: u32 = 0xffffffffu;
 // Illuminance of a level-15 blocklight surface (lux regime), warm-tinted.
 const BLOCK_LUX: f32 = 35000.0;
 const BLOCK_TINT: vec3<f32> = vec3<f32>(1.0, 0.82, 0.6);
+// Blocklight range, in voxels: the flood loses one level per step from a
+// level-15 emitter, so the stored level *is* 15 minus the distance to the
+// nearest one. That relationship is what lets a per-voxel scalar be turned
+// back into a physical falloff here.
+const BLOCK_RANGE: f32 = 15.0;
+// Softening constant of the inverse-square law below. Picked so the curve sits
+// above the old `pow(level/15, 1.4)` at every distance — same brightness at the
+// lamp, appreciably more of the room lit further out (at 10 voxels, 0.25 against
+// 0.22; at 14, 0.038 against 0.023).
+const BLOCK_FALLOFF_K: f32 = 0.012;
+
+// Blocklight attenuation: inverse-square in the distance to the emitter,
+// rather than a power curve on the stored level.
+//
+// `1/(1 + k d^2)` is the physical law with a softening term that keeps it
+// finite at the source. It does not reach zero on its own, though, and the
+// grid stops at `BLOCK_RANGE` — so the raw curve would leave a visible ring
+// where the lit region simply stopped. Subtracting the value at the edge and
+// renormalising pulls it smoothly to zero there, which costs a little
+// brightness at range and buys no seam.
+fn block_falloff(level: f32) -> f32 {
+    let d = BLOCK_RANGE - level;
+    let inv = 1.0 / (1.0 + BLOCK_FALLOFF_K * d * d);
+    let edge = 1.0 / (1.0 + BLOCK_FALLOFF_K * BLOCK_RANGE * BLOCK_RANGE);
+    return max(0.0, (inv - edge) / (1.0 - edge));
+}
 
 // Resolve a world chunk coordinate to its unified slot through the
 // wrap-window table, validating against the descriptor (stale cells are
@@ -238,9 +264,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if (params.light_enabled > 0.5) {
         let l = light_at(in.world_position, n);
         let skyf = f32(l >> 4u) / 15.0;
-        let blockf = f32(l & 15u) / 15.0;
         let sky_l = params.sky_term * skyf * skyf;
-        let block_l = BLOCK_TINT * (BLOCK_LUX * pow(blockf, 1.4));
+        let block_l = BLOCK_TINT * (BLOCK_LUX * block_falloff(f32(l & 15u)));
         lit = vec3<f32>(sky_l + params.brightness * 0.015) + block_l;
     }
     var gi = vec3<f32>(0.0);

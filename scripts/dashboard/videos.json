@@ -4,6 +4,22 @@
   "ref": "master",
   "videos": [
     {
+      "id": "2026-08-25_inventory-loop",
+      "date": "2026-08-25",
+      "title": "Inventory: mine, drop, collect",
+      "source": "recordings/obs/2026-08-25_11-56-13.mp4",
+      "test": "crates/soils-server/tests/inventory_demo.rs",
+      "test_name": "record_the_inventory_loop",
+      "tags": [
+        "inventory",
+        "items",
+        "ui",
+        "single-client",
+        "obs"
+      ],
+      "blurb": "One player working the whole loop: place a block from the starter kit, mine it back, and watch it drop where it stood as a small cube wearing that block&rsquo;s own texture. Walking onto it collects it. Watch the counter under the crosshair &mdash; 64 before the placement, 63 while the item is on the ground, 64 again once it is picked up. Placement <em>spends</em> the block, so that number is the server&rsquo;s answer, not the client&rsquo;s: <code>soils-server</code> owns the inventory and pushes it whole, and the client only ever draws what it is told. The screen that opens on <kbd>E</kbd> is the same data &mdash; icons come straight from the terrain atlas, so blocks needed no new art. The bot presses the same mouse and keyboard input a person does; it has no private path to the world."
+    },
+    {
       "id": "2026-08-24_private-accounts-and-chat",
       "date": "2026-08-24",
       "title": "Private accounts, module-side auth",

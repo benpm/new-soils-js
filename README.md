@@ -1,5 +1,5 @@
 # New Soils
-[CHANGELOG](CHANGELOG.md) - [TODO](TODO.md) - [docs](docs/README.md)
+[CHANGELOG](CHANGELOG.md) - [Tasks](Tasks.md) - [TODO](TODO.md) - [docs](docs/README.md)
 
 A Rust/[Bevy](https://bevyengine.org) port of the original Node.js + Three.js
 `new-soils` voxel sandbox — now a **client/server multiplayer game** with a
@@ -42,6 +42,45 @@ markdown, so the still links to it instead.*
 every recording the test suite produces, newest first, each naming the test
 that made it. Rebuilt with `python scripts/deploy_dashboard.py`.
 
+## Recorded demos
+
+Every one of these is a **test**, not a screen capture. CI runs the
+`#[ignore]`d recording tests on each push, and a take is only published if the
+test that produced it passed — `inventory_demo.rs` asserts all fourteen of its
+scripted beats fired, so a routine that stalled halfway fails the build instead
+of shipping a video of nothing happening. They render under Mesa lavapipe (a
+CPU rasteriser, no GPU on the runner), which is why they look rough; they are
+evidence, not a showreel. Played at 2x — half the frames, so the files stay
+small.
+
+**Browse them all, one tab per branch: [the Pages
+site](https://benpm.github.io/new-soils-js/).** Or run any of them yourself
+from the login screen — see [Demo worlds](#demo-worlds) below.
+
+| | |
+|---|---|
+| [![Lighting a dark room](docs/media/light.jpg)](https://benpm.github.io/new-soils-js/#light-falloff) | **Lighting a dark room** — a player flies ~100 voxels down into a sealed chamber the server carves under spawn, and rings himself with Lamp Blocks. His own lantern is switched off for the take, so every photon on screen comes from a block he placed. From `light_demo.rs`. |
+| [![The inventory loop](docs/media/inventory.jpg)](https://benpm.github.io/new-soils-js/#light-falloff) | **The inventory loop** — place a block, mine it, watch it drop, walk onto it to collect. Then the container loop: a Wooden Crate comes off the hotbar, goes down, and is opened by right-clicking it. From `inventory_demo.rs`. |
+| [![Two clients, one prop pile](docs/media/props.jpg)](https://benpm.github.io/new-soils-js/#light-falloff) | **Two clients, one prop pile** — two bots walk mirrored routines into 300 server-simulated rigid bodies and meet in the middle. Each pane is a real first-person view rebuilt from delta snapshots, not a replicated body. From `props_demo.rs`. |
+
+Two of the recent merges have nothing to film and are named here rather than
+faked: the CI pipeline itself is what *produces* these takes (release builds,
+the recorder, the per-branch site), and the lighting plan is a design document.
+
+## Demo worlds
+
+The scenes those tests build are also playable. Pick one from the login screen,
+or start it directly:
+
+```sh
+SOILS_DEMO=lamp-room  cargo run --release -p soils-client   # the sealed chamber
+SOILS_DEMO=prop-pile  cargo run --release -p soils-client   # 300 rigid bodies
+SOILS_DEMO=critters   cargo run --release -p soils-client   # wandering AI
+```
+
+Each runs an embedded server in its own `data/demo-<id>` directory, so a demo
+never touches the real single-player save.
+
 ## What works today
 
 - **Server authority + prediction** — clients send *inputs*, not positions;
@@ -77,11 +116,23 @@ that made it. Rebuilt with `python scripts/deploy_dashboard.py`.
   pathfind to them: per-chunk walkability grids, budgeted A* with jump/fall
   moves, an HPA* region-portal fallback for long routes, and flow fields
   ready for crowds — all invalidated by chunk edit versions.
-- **Worldgen** — multi-octave simplex heightmap, soil gradient, rock
-  outcrops, and 3D-noise caves (lattice-interpolated; a 48-chunk wave
-  generates in ~3.5 ms), persisted to zlib region files.
+- **Worldgen** — multi-octave simplex heightmap over a long-wavelength
+  continental octave (amplitude 300 against 115 for the rest combined, so
+  surfaces run roughly 60-430), soil gradient, rock outcrops, and 3D-noise
+  caves (lattice-interpolated; a 48-chunk wave generates in ~3.5 ms), persisted
+  to zlib region files. Spawn follows the generator's own surface height.
 - **Editing** — raycast break/place with optimistic application and rollback:
   the server validates reach/rate/residency and acks or rejects each edit.
+- **Occlusion-culled streaming** — the server withholds chunks that are sealed
+  behind solid neighbours on all six faces: nothing can see into them or walk
+  into them, so the client never generates, meshes or holds them. 26% of a
+  radius-8 subscription (4913 chunks) at the default terrain. Breaking a seal
+  hands the chunk over.
+- **Inventory and dropped items** — breaking a block yields it as an entity
+  lying in the world; walking into it collects it. Placing spends the block and
+  is refused when the stack is empty. The server owns the inventory and pushes
+  it whole; the client mirrors it and never decides it. Inventory screen on
+  E/I/Tab, with icons drawn from the block atlas.
 - **Player-vs-player collision** — players block, stand and jump on each other.
   Peers are resolved from a tick-boundary snapshot so the client can predict
   the same thing the server will, and a peer already interpenetrating at the
@@ -100,7 +151,8 @@ that made it. Rebuilt with `python scripts/deploy_dashboard.py`.
   variable unset the server behaves exactly as before. A returning player
   resumes where they logged out. See [`stdb/README.md`](stdb/README.md).
 - **The rest** — login/signup accounts, multiple named worlds (`/warp`),
-  LAN discovery, day/night cycle, HUD/console/pause menu.
+  LAN discovery, a 30-minute day/night cycle, a player who is himself a light
+  source, HUD/console/pause menu.
 
 ## Workspace layout
 
@@ -145,7 +197,9 @@ break/place, **1-9** pick a block, **F3** debug overlay, **/** command
 console, **Esc** pause/settings.
 
 Console commands: `tp x y z`, `warp <world>`, `daytime t`, `loadradius n`,
-`fog on|off`, `ao on|off`, `light on|off`, `gi on|off`.
+`sens n` (mouse sensitivity, 0.1-5.0, also in the pause menu), `playerlight n`
+(the player's own emission, 0-15; 0 turns it off), `fog on|off`, `ao on|off`,
+`light on|off`, `gi on|off`.
 
 ### Linux build dependencies
 
@@ -189,9 +243,12 @@ CI renders release screenshots headlessly under Mesa lavapipe
 
 ## Documentation
 
+- [`docs/README.md`](docs/README.md) — index of every doc and what it is for.
+- [`Tasks.md`](Tasks.md) — **open work**, one list: what is left and why it
+  matters, from inventory persistence through biomes.
 - [`docs/architecture.md`](docs/architecture.md) — how every system works
-  today: protocol, transports, server tick, chunk lifecycle, rendering, GI,
-  prediction, pathfinding, testing.
+  today: protocol, transports, server tick, chunk lifecycle, inventory,
+  rendering, GI, prediction, pathfinding, testing.
 - [`docs/perf-report.md`](docs/perf-report.md) — the optimization arc with
   measurements (23 MB → 498 KB joins, 849 → 187 ms bursts, the GI rework),
   methodology, and the ranked list of what to optimize next.
@@ -203,11 +260,16 @@ CI renders release screenshots headlessly under Mesa lavapipe
   guide: the traps this codebase actually produced (the asset-path void, delta
   snapshots that omit unchanged entities, barrier deadlocks that hide the real
   failure), and how to tell them apart quickly.
-- [`TODO.md`](TODO.md) — the 14-phase implementation log; each checkoff
-  records what shipped, what was measured, and what was deferred and why.
+- [`TODO.md`](TODO.md) — the implementation *log*: each checkoff records what
+  shipped, what was measured, and what was deferred and why. Historical —
+  open work lives in [`Tasks.md`](Tasks.md).
 - [`docs/plan-rendering.md`](docs/plan-rendering.md) /
   [`docs/plan-game-systems.md`](docs/plan-game-systems.md) — the original
   plans the phases implement.
+- [`docs/plan-ui.md`](docs/plan-ui.md) — the inventory/UI plan: the item ring,
+  the inventory screen, and the `UiMode` refactor they depend on.
+- [`docs/dev/server-tick.md`](docs/dev/server-tick.md) — tick phase ordering,
+  the determinism rules, and why login runs off the tick thread.
 
 ## Deliberate simplifications vs. the JS original
 

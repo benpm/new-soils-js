@@ -1,114 +1,83 @@
-//! Region-file persistence, a clean Rust take on the JS `Region` class.
+//! Chunk persistence: the typed layer over [`crate::paged`].
 //!
-//! Chunks are grouped into 16×16×16 regions, one file per region. Each file
-//! starts with a header of `16^3` little-endian `u32` pointers (one per chunk):
-//! `0` = absent, `1` = present-but-empty (all Air), anything else = a byte
-//! offset into the file where the chunk's data block lives. A data block is a
-//! `u32` length followed by zlib-compressed voxels.
+//! Chunks are grouped into 16x16x16 regions, one `r_<x>_<y>_<z>.bin` per
+//! region. The file format — a 4096-entry pointer table, append-and-repoint
+//! writes, zlib blocks, temp-file compaction — lives in `paged`; everything
+//! here is the chunk-shaped part of it: which slot a position maps to, that an
+//! all-Air chunk stores as the sentinel rather than 32 KB of zeroes, and that a
+//! *pristine* chunk is worth pruning because worldgen can reproduce it exactly.
 //!
-//! Saves are append-only (like the JS append path): rewriting a chunk appends a
-//! fresh block and repoints the header, which is simple and crash-safe at the
-//! cost of leaked space. [`compact_dir`] reclaims it on world open once a
-//! file's leaked ratio crosses a threshold (temp file + atomic rename).
+//! The paged [`FLAG`](crate::paged::FLAG) is this layer's "ever edited" bit.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
-use flate2::Compression;
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
 use glam::IVec3;
 use soils_protocol::{CHUNK_CUBED, REGION_SIZE, ChunkVolume};
 
+use crate::paged::{self, Put};
+
 const REGION_BITS: i32 = 4; // log2(16)
 const REGION_MASK: i32 = REGION_SIZE - 1; // 15
-const HEADER_ENTRIES: usize = (REGION_SIZE * REGION_SIZE * REGION_SIZE) as usize; // 4096
-const HEADER_BYTES: u64 = (HEADER_ENTRIES * 4) as u64; // 16384
 
-pub(crate) const ABSENT: u32 = 0;
-pub(crate) const EMPTY: u32 = 1;
-/// High bit of a header entry: the chunk has ever been edited (so it is not
-/// reproducible from the generator and must ship as a payload). Offsets stay
-/// well below 2 GB (a full region is ≲130 MB + bounded leaks), so the bit is
-/// free. All offset interpretation masks it off via [`entry_kind`].
-pub(crate) const EDITED_FLAG: u32 = 0x8000_0000;
-
-/// A header entry with the edited bit separated from the offset/sentinel.
-#[inline]
-pub(crate) fn entry_kind(entry: u32) -> u32 {
-    entry & !EDITED_FLAG
-}
+pub(crate) const EDITED_FLAG: u32 = paged::FLAG;
 
 #[inline]
 pub(crate) fn entry_edited(entry: u32) -> bool {
-    entry & EDITED_FLAG != 0
+    paged::entry_flag(entry)
 }
 
-pub(crate) fn region_path(dir: &Path, pos: IVec3) -> PathBuf {
+/// Path of the file holding `pos`'s data for a given kind of world structure.
+/// `prefix` names the structure (`r` = chunk voxels, `b` = block data), so
+/// parallel files share one addressing scheme: a chunk's voxels and its block
+/// data live at the same slot index in `r_*.bin` and `b_*.bin`.
+pub(crate) fn paged_path(dir: &Path, prefix: &str, pos: IVec3) -> PathBuf {
     dir.join(format!(
-        "r_{}_{}_{}.bin",
+        "{prefix}_{}_{}_{}.bin",
         pos.x >> REGION_BITS,
         pos.y >> REGION_BITS,
         pos.z >> REGION_BITS
     ))
 }
 
-/// Byte offset of this chunk's header entry within its region file.
-fn header_offset(pos: IVec3) -> u64 {
-    let lx = (pos.x & REGION_MASK) as u64;
-    let ly = (pos.y & REGION_MASK) as u64;
-    let lz = (pos.z & REGION_MASK) as u64;
-    (((ly + lz * REGION_SIZE as u64) * REGION_SIZE as u64) + lx) * 4
+pub(crate) fn region_path(dir: &Path, pos: IVec3) -> PathBuf {
+    paged_path(dir, "r", pos)
 }
 
-/// Index of this chunk's header entry within a region's 4096-entry header,
-/// for use with a [`read_header`] snapshot.
+/// Index of this chunk's entry within its file's 4096-entry table.
 pub(crate) fn header_index(pos: IVec3) -> usize {
-    (header_offset(pos) / 4) as usize
+    let lx = (pos.x & REGION_MASK) as usize;
+    let ly = (pos.y & REGION_MASK) as usize;
+    let lz = (pos.z & REGION_MASK) as usize;
+    ((ly + lz * REGION_SIZE as usize) * REGION_SIZE as usize) + lx
 }
 
-/// Read a region file's full 16 KB header in one shot. Returns `Ok(None)` if the
-/// region file doesn't exist (or is too short to hold a header) — i.e. nothing
-/// in that region has ever been persisted. Callers memoise this so per-chunk
-/// probes become in-memory lookups instead of a file open each.
-pub(crate) fn read_header(dir: &Path, pos: IVec3) -> io::Result<Option<Box<[u32; HEADER_ENTRIES]>>> {
-    read_header_path(&region_path(dir, pos))
+/// Read a region file's whole pointer table. `Ok(None)` if nothing in that
+/// region has ever been persisted. Callers memoise this so a per-chunk probe
+/// becomes an in-memory lookup instead of a file open each.
+pub(crate) fn read_header(dir: &Path, pos: IVec3) -> io::Result<Option<paged::Header>> {
+    paged::read_header(&region_path(dir, pos))
 }
 
 /// Resolve a single chunk given its already-known header `entry` (see
 /// [`read_header`]). Only opens the region file for a present, non-empty block.
 pub(crate) fn read_chunk(dir: &Path, pos: IVec3, entry: u32) -> io::Result<Option<ChunkVolume>> {
-    match entry_kind(entry) {
-        ABSENT => Ok(None),
-        EMPTY => Ok(Some(ChunkVolume::empty())),
-        offset => {
-            let mut file = File::open(region_path(dir, pos))?;
-            file.seek(SeekFrom::Start(offset as u64))?;
-            let mut buf = [0u8; 4];
-            file.read_exact(&mut buf)?;
-            let len = u32::from_le_bytes(buf) as usize;
-            let mut compressed = vec![0u8; len];
-            file.read_exact(&mut compressed)?;
-
-            let mut voxels = Vec::with_capacity(CHUNK_CUBED);
-            ZlibDecoder::new(&compressed[..]).read_to_end(&mut voxels)?;
-            if voxels.len() != CHUNK_CUBED {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "decompressed chunk has wrong size",
-                ));
-            }
-            Ok(Some(ChunkVolume::from_bytes(&voxels)))
-        }
+    let Some(bytes) = paged::read_block(&region_path(dir, pos), entry)? else { return Ok(None) };
+    if bytes.is_empty() {
+        return Ok(Some(ChunkVolume::empty()));
     }
+    if bytes.len() != CHUNK_CUBED {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "decompressed chunk has wrong size"));
+    }
+    Ok(Some(ChunkVolume::from_bytes(&bytes)))
 }
 
-/// Load a chunk from its region file. Returns `Ok(None)` if it has never been
-/// persisted (the caller should then generate it). The read path uses the
-/// cached [`read_header`] + [`read_chunk`] split directly; this whole-in-one
-/// helper is kept for tests and one-off callers.
+/// Load a chunk from its region file. `Ok(None)` if it has never been persisted
+/// (the caller should then generate it). The read path uses the cached
+/// [`read_header`] + [`read_chunk`] split directly; this whole-in-one helper is
+/// kept for tests and one-off callers.
 #[allow(dead_code)]
 pub fn load(dir: &Path, pos: IVec3) -> io::Result<Option<ChunkVolume>> {
     let Some(header) = read_header(dir, pos)? else { return Ok(None) };
@@ -121,54 +90,26 @@ pub fn save(dir: &Path, pos: IVec3, volume: &ChunkVolume, edited: bool) -> io::R
     save_many(dir, &[(pos, volume, edited)])
 }
 
-/// Persist many chunks at once, opening each region file only once and applying
-/// all of that region's updates before moving on. This is what the background
-/// writer uses to coalesce a fresh-world burst (hundreds of chunks spanning a
-/// handful of region files) into a few file writes. `edited` lands in the
-/// header entry's [`EDITED_FLAG`].
+/// Persist many chunks at once, opening each region file only once. This is
+/// what the background writer uses to coalesce a fresh-world burst (hundreds of
+/// chunks over a handful of region files) into a few file writes.
 pub fn save_many(dir: &Path, chunks: &[(IVec3, &ChunkVolume, bool)]) -> io::Result<()> {
     if chunks.is_empty() {
         return Ok(());
     }
     fs::create_dir_all(dir)?;
 
-    // Group by region file so each is opened/written once.
-    let mut by_region: HashMap<PathBuf, Vec<(IVec3, &ChunkVolume, bool)>> = HashMap::new();
+    let mut by_region: HashMap<PathBuf, Vec<Put<'_>>> = HashMap::new();
     for &(pos, vol, edited) in chunks {
-        by_region.entry(region_path(dir, pos)).or_default().push((pos, vol, edited));
+        // An all-Air chunk stores as the sentinel: present, but no payload.
+        let payload = (!vol.is_empty()).then(|| vol.as_bytes());
+        by_region
+            .entry(region_path(dir, pos))
+            .or_default()
+            .push(Put { slot: header_index(pos), payload, flag: edited });
     }
-
-    for (path, group) in by_region {
-        // Never truncate: region files are updated in place.
-        let mut file =
-            OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
-        // Initialize the header on a freshly created file.
-        if file.metadata()?.len() < HEADER_BYTES {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(&vec![0u8; HEADER_BYTES as usize])?;
-        }
-
-        for (pos, vol, edited) in group {
-            let mut entry = if vol.is_empty() {
-                EMPTY
-            } else {
-                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-                encoder.write_all(vol.as_bytes())?;
-                let compressed = encoder.finish()?;
-
-                let offset = file.seek(SeekFrom::End(0))?;
-                file.write_all(&(compressed.len() as u32).to_le_bytes())?;
-                file.write_all(&compressed)?;
-                offset as u32
-            };
-            if edited {
-                entry |= EDITED_FLAG;
-            }
-            file.seek(SeekFrom::Start(header_offset(pos)))?;
-            file.write_all(&entry.to_le_bytes())?;
-        }
-        file.flush()?;
+    for (path, puts) in by_region {
+        paged::write_many(&path, &puts)?;
     }
     Ok(())
 }
@@ -176,25 +117,20 @@ pub fn save_many(dir: &Path, chunks: &[(IVec3, &ChunkVolume, bool)]) -> io::Resu
 /// Reclassify every persisted chunk in `dir`: `classify` receives one region's
 /// worth of `(pos, volume)` at a time and returns the edited flag for each.
 /// Header-only rewrites, one pass per file. Used by the world-open migration
-/// sweep ("pristine ⇔ bytes equal current gen") — see `World::new`.
+/// sweep ("pristine <=> bytes equal current gen") — see `World::new`.
 pub(crate) fn classify_dir(
     dir: &Path,
     mut classify: impl FnMut(&[(IVec3, ChunkVolume)]) -> Vec<bool>,
 ) -> io::Result<()> {
-    let Ok(entries) = fs::read_dir(dir) else { return Ok(()) };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "bin") {
-            continue;
-        }
+    for path in region_files(dir) {
         let Some(rpos) = parse_region_name(&path) else { continue };
         let base = rpos * REGION_SIZE;
-        let Some(header) = read_header_path(&path)? else { continue };
+        let Some(header) = paged::read_header(&path)? else { continue };
 
         let mut present: Vec<(IVec3, ChunkVolume)> = Vec::new();
         let mut indices: Vec<usize> = Vec::new();
         for (i, &e) in header.iter().enumerate() {
-            if entry_kind(e) == ABSENT {
+            if paged::entry_kind(e) == paged::ABSENT {
                 continue;
             }
             let local = IVec3::new(
@@ -213,17 +149,37 @@ pub(crate) fn classify_dir(
         let flags = classify(&present);
         assert_eq!(flags.len(), present.len());
 
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        for (&i, &edited) in indices.iter().zip(&flags) {
-            let e = (header[i] & !EDITED_FLAG) | if edited { EDITED_FLAG } else { 0 };
-            if e != header[i] {
-                file.seek(SeekFrom::Start((i * 4) as u64))?;
-                file.write_all(&e.to_le_bytes())?;
-            }
-        }
-        file.flush()?;
+        let updates: Vec<(usize, u32)> = indices
+            .iter()
+            .zip(&flags)
+            .map(|(&i, &edited)| {
+                (i, (header[i] & !EDITED_FLAG) | if edited { EDITED_FLAG } else { 0 })
+            })
+            .filter(|&(i, e)| e != header[i])
+            .collect();
+        paged::write_entries(&path, &updates)?;
     }
     Ok(())
+}
+
+/// Every `.bin` file in `dir` — both region and block-data files, since they
+/// share a format and a compaction policy differs only in the `keep` rule.
+fn paged_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "bin")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&format!("{prefix}_")))
+        })
+        .collect()
+}
+
+fn region_files(dir: &Path) -> Vec<PathBuf> {
+    paged_files(dir, "r")
 }
 
 /// Region coordinates from a `r_<x>_<y>_<z>.bin` filename.
@@ -236,107 +192,23 @@ fn parse_region_name(path: &Path) -> Option<IVec3> {
     Some(IVec3::new(x, y, z))
 }
 
-/// [`read_header`] for an already-resolved path.
-fn read_header_path(path: &Path) -> io::Result<Option<Box<[u32; HEADER_ENTRIES]>>> {
-    let mut file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    if file.metadata()?.len() < HEADER_BYTES {
-        return Ok(None);
-    }
-    let mut bytes = vec![0u8; HEADER_BYTES as usize];
-    file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut bytes)?;
-    let mut header = Box::new([0u32; HEADER_ENTRIES]);
-    for (i, slot) in header.iter_mut().enumerate() {
-        *slot = u32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
-    }
-    Ok(Some(header))
-}
-
-/// Fraction of a file's data bytes that must be dead before it's rewritten.
-const COMPACT_LEAK_RATIO: f64 = 0.25;
-/// And at least this much absolute waste — tiny files aren't worth the churn.
-const COMPACT_MIN_LEAK: u64 = 64 * 1024;
-
-/// Compact every region file in `dir` whose leaked-byte share crosses the
+/// Compact every persisted file in `dir` whose leaked-byte share crosses the
 /// threshold. Called on world open; a corrupt or in-use file is skipped, never
 /// fatal.
+///
+/// Chunks keep only *edited* entries: a pristine chunk is byte-reproducible
+/// from the world identity, so pruning it costs a regeneration and saves its
+/// bytes. Block data keeps everything — nothing regenerates a chest.
 pub fn compact_dir(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else { return }; // nothing persisted yet
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "bin")
-            && let Err(e) = compact_file(&path)
-        {
-            eprintln!("region compaction skipped {path:?}: {e}");
+    for (prefix, keep) in
+        [("r", &entry_edited as &dyn Fn(u32) -> bool), ("b", &|_: u32| true as bool)]
+    {
+        for path in paged_files(dir, prefix) {
+            if let Err(e) = paged::compact(&path, keep) {
+                eprintln!("compaction skipped {path:?}: {e}");
+            }
         }
     }
-}
-
-/// Rewrite one region file keeping only header-referenced blocks, if enough
-/// bytes leaked. Crash-safe: the rebuilt image lands in a temp file that
-/// atomically replaces the original.
-fn compact_file(path: &Path) -> io::Result<()> {
-    let data = fs::read(path)?;
-    if data.len() < HEADER_BYTES as usize {
-        return Ok(());
-    }
-    let entry_at = |i: usize| {
-        u32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
-    };
-    let bad = || io::Error::new(io::ErrorKind::InvalidData, "block out of bounds");
-
-    // Measure live blocks: only *edited* entries survive. Pristine chunks
-    // (flag clear) are byte-reproducible from the world identity, so they
-    // prune to ABSENT — their bytes count as reclaimable alongside leaked
-    // (superseded) blocks, and a probe miss just regenerates them.
-    let mut blocks: Vec<(usize, usize, usize, u32)> = Vec::new(); // (idx, start, len, flag)
-    let mut live: u64 = 0;
-    for i in 0..HEADER_ENTRIES {
-        let e = entry_at(i);
-        if entry_kind(e) <= EMPTY {
-            continue;
-        }
-        let start = entry_kind(e) as usize;
-        let len_bytes: [u8; 4] = data.get(start..start + 4).ok_or_else(bad)?.try_into().unwrap();
-        let len = 4 + u32::from_le_bytes(len_bytes) as usize;
-        if start + len > data.len() {
-            return Err(bad());
-        }
-        if !entry_edited(e) {
-            continue; // pristine: prunes with the leaked blocks
-        }
-        blocks.push((i, start, len, e & EDITED_FLAG));
-        live += len as u64;
-    }
-    let total = data.len() as u64 - HEADER_BYTES;
-    let leaked = total.saturating_sub(live);
-    if leaked < COMPACT_MIN_LEAK || (leaked as f64) < COMPACT_LEAK_RATIO * total as f64 {
-        return Ok(());
-    }
-
-    // Rebuild: edited sentinel entries copy through (flag included), edited
-    // blocks re-pack in order; pristine entries fall back to ABSENT.
-    let mut out = vec![0u8; HEADER_BYTES as usize];
-    for i in 0..HEADER_ENTRIES {
-        let e = entry_at(i);
-        if entry_kind(e) == EMPTY && entry_edited(e) {
-            out[i * 4..i * 4 + 4].copy_from_slice(&e.to_le_bytes());
-        }
-    }
-    for (i, start, len, flag) in blocks {
-        let new_off = out.len() as u32 | flag;
-        out.extend_from_slice(&data[start..start + len]);
-        out[i * 4..i * 4 + 4].copy_from_slice(&new_off.to_le_bytes());
-    }
-    let tmp = path.with_extension("bin.tmp");
-    fs::write(&tmp, &out)?;
-    fs::rename(&tmp, path)?;
-    println!("region compacted {path:?}: reclaimed {leaked} bytes");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -359,7 +231,7 @@ mod tests {
         assert_eq!(loaded.get(31, 31, 31), 4);
         assert_eq!(loaded.get(0, 0, 0), 0);
 
-        // An empty chunk in the same region records the EMPTY sentinel.
+        // An empty chunk in the same region records the sentinel.
         let epos = IVec3::new(9, 7, 8);
         save(&dir, epos, &ChunkVolume::empty(), false).unwrap();
         assert!(load(&dir, epos).unwrap().unwrap().is_empty());
@@ -469,7 +341,7 @@ mod tests {
         };
         assert!(flag(p_edited));
         assert!(!flag(p_pristine));
-        assert!(flag(p_empty_edited), "EMPTY sentinel must carry the flag too");
+        assert!(flag(p_empty_edited), "the sentinel must carry the flag too");
         // Volumes still load correctly through the flagged entries.
         assert_eq!(load(&dir, p_edited).unwrap().unwrap().get(1, 1, 1), 2);
         assert!(load(&dir, p_empty_edited).unwrap().unwrap().is_empty());
@@ -538,7 +410,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("soils-region-hdr-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
 
-        // Missing region → no header, and `load` agrees.
+        // Missing region -> no header, and `load` agrees.
         let pos = IVec3::new(1, 2, 3);
         assert!(read_header(&dir, pos).unwrap().is_none());
         assert!(load(&dir, pos).unwrap().is_none());
@@ -554,5 +426,16 @@ mod tests {
         assert_eq!(via_load.map(|v| v.get(7, 8, 9)), Some(3));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The two structures address the same chunk identically, which is the
+    /// whole point of `paged_path`: one slot number serves both files.
+    #[test]
+    fn chunk_voxels_and_block_data_share_an_address() {
+        let dir = Path::new("regions");
+        let pos = IVec3::new(-17, 3, 40);
+        assert_eq!(region_path(dir, pos), paged_path(dir, "r", pos));
+        assert_ne!(paged_path(dir, "r", pos), paged_path(dir, "b", pos));
+        assert!(header_index(pos) < paged::SLOTS);
     }
 }

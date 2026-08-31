@@ -443,6 +443,13 @@ impl TerrainGraph {
     /// `256 + floor( s(1/1000)*50 - s(1/500)*30 + s(1/250)*20 - s(1/75)*10 + s(1/25)*5 )`
     /// Original rock: `s(1/15)*5 - |s(1/45)|*10 - |s(1/25)|*15`,
     /// where `s(f) = simplex([gx*f, gz*f])`.
+    /// Amplitude of the continental octave, in voxels of peak-to-trough swing
+    /// either side of the base height. Everything else in the heightmap sums to
+    /// 115, so this term dominates the terrain by design: it is the "vastly
+    /// increased amplitude" layer, and [`crate::terrain::MAX_SURFACE`] is
+    /// derived from it.
+    pub const CONTINENT_AMPLITUDE: f32 = 300.0;
+
     pub fn default_soils() -> Self {
         let mut nodes: Vec<Node> = Vec::new();
         let mut push = |kind: NodeKind| -> NodeId {
@@ -456,6 +463,15 @@ impl TerrainGraph {
         let scaled = |push: &mut dyn FnMut(NodeKind) -> NodeId, input: NodeId, scale: f32| {
             push(NodeKind::ScaleBias { input: In::from(input), scale, bias: 0.0 })
         };
+
+        // --- continental layer ---
+        // A very long-wavelength octave whose amplitude dwarfs every other
+        // one: it is what turns rolling hills into 600-voxel relief, so the
+        // world has deep interiors worth culling and a skyline worth drawing
+        // at range. Frequency is low enough that a whole draw distance sits on
+        // one flank of it rather than sampling the whole range at once.
+        let c0 = simplex(&mut push, 1.0 / 2000.0);
+        let c0s = scaled(&mut push, c0, Self::CONTINENT_AMPLITUDE);
 
         // --- height octaves ---
         let o1 = simplex(&mut push, 1.0 / 1000.0);
@@ -473,7 +489,8 @@ impl TerrainGraph {
         let s2 = push(NodeKind::Add { a: In::from(s1), b: In::from(o3s) });
         let s3 = push(NodeKind::Add { a: In::from(s2), b: In::from(o4s) });
         let s4 = push(NodeKind::Add { a: In::from(s3), b: In::from(o5s) });
-        let height = push(NodeKind::ScaleBias { input: In::from(s4), scale: 1.0, bias: 256.0 });
+        let s5 = push(NodeKind::Add { a: In::from(s4), b: In::from(c0s) });
+        let height = push(NodeKind::ScaleBias { input: In::from(s5), scale: 1.0, bias: 256.0 });
 
         // --- rock outcrops: s(1/15)*5 - |s(1/45)|*10 - |s(1/25)|*15 ---
         let r1 = simplex(&mut push, 1.0 / 15.0);
@@ -733,9 +750,16 @@ mod tests {
             max_h = max_h.max(s.height);
             assert!(s.rock <= 5.0 && s.rock >= -30.0, "rock out of envelope: {}", s.rock);
         }
-        assert!(min_h > 256.0 - 115.0 && max_h < 256.0 + 115.0, "height envelope: {min_h}..{max_h}");
-        // The terrain actually varies.
-        assert!(max_h - min_h > 20.0, "terrain suspiciously flat: {min_h}..{max_h}");
+        // Envelope = base + every amplitude summed (the continental octave's
+        // 300 plus the five original octaves' 115).
+        let amp = (TerrainGraph::CONTINENT_AMPLITUDE + 115.0) as f64;
+        assert!(
+            min_h > 256.0 - amp && max_h < 256.0 + amp,
+            "height envelope: {min_h}..{max_h}"
+        );
+        // The terrain actually varies, and the continental octave dominates:
+        // without it the spread over this many samples is well under 200.
+        assert!(max_h - min_h > 200.0, "continental layer missing: {min_h}..{max_h}");
     }
 
     #[test]

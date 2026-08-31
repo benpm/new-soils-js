@@ -1,0 +1,282 @@
+name: Test videos
+
+# Runs the `#[ignore]`d recording tests on the CI runner and publishes the
+# videos to GitHub Pages, one tab per branch.
+#
+# These are the same tests a local recording session runs; the only difference
+# is `SOILS_RECORDER`, which points them at `scripts/ffmpeg_record.py` (grabs
+# the Xvfb display) instead of `scripts/obs_record.py` (drives OBS Studio on
+# Windows). Everything else — the server, the scripted bots, the readiness
+# handshake, the assertions on which beats fired — is unchanged, so a published
+# video is a take the test *passed*, not merely one it produced. That matters:
+# a stalled routine records the right number of seconds of nothing happening,
+# which is indistinguishable from a good take by file size alone.
+#
+# Rendering is Mesa lavapipe, i.e. a software rasteriser on a 4-core runner, so
+# the takes are slow and ugly compared to a local capture. They are evidence
+# that the loop works on this commit, not a showcase; the release screenshots
+# in `screenshots.yml` are the pretty ones.
+
+on:
+  push:
+    # Every branch except the one this workflow writes to. A push made with
+    # GITHUB_TOKEN does not trigger workflows, so `gh-pages` would not actually
+    # recurse — but excluding it means a hand-push to the site does not queue a
+    # 90-minute build of a branch with no source on it.
+    branches-ignore: ["gh-pages"]
+    # A prose change cannot change a recording, and a run is a release build
+    # plus two takes under a software rasteriser. The TODO asked for "whenever
+    # there are changes"; this is the narrowest reading that still honours it.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".obsidianignore"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # Per branch, because the site is per branch. Superseding an in-flight run on
+  # the same branch is right — only the newest commit's video is published —
+  # but a run on another branch must not be cancelled, since its tab is not the
+  # one being replaced.
+  group: test-videos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: videos
+
+      - name: Install headless GPU, Bevy deps and the recorder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libasound2-dev libudev-dev \
+            libxkbcommon-x11-0 xvfb x11-utils xdotool ffmpeg
+          # WITH recommends: Mesa lavapipe's runtime .so is a recommended dep,
+          # and a missing one is why an ICD-present run can still report
+          # "no GPU". Same reasoning as screenshots.yml.
+          sudo apt-get install -y \
+            mesa-vulkan-drivers libvulkan1 vulkan-tools libgl1-mesa-dri
+
+      - name: Build client + server (release)
+        # Release, not debug: a debug server cannot generate and light chunks
+        # fast enough for the world to be on screen at all, and the take opens
+        # on empty void. The demo tests say so in their own headers.
+        # `small_pools` shrinks the GPU pools to fit lavapipe's 128 MiB
+        # storage-binding limit. Without it the client asserts on a 192 MiB
+        # light pool and dies before drawing anything. Off by default, so this
+        # is the only build that differs.
+        run: |
+          cargo build --release -p soils-server
+          cargo build --release -p soils-client --features small_pools
+
+      - name: Start Xvfb
+        run: |
+          # 1280x720 matches the client's default window, so the grabbed region
+          # is the window with nothing around it and no cropping is needed.
+          Xvfb :99 -screen 0 1280x720x24 -nolisten tcp &
+          for _ in $(seq 1 30); do
+            xdpyinfo -display :99 >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          xdpyinfo -display :99 | grep dimensions
+
+      # `screenshots.yml` renders four frames on this same runner, terrain
+      # included, so the client is not broken under lavapipe — yet the demo
+      # clients go silent straight after `gpu caps` and never signal readiness.
+      # The difference is the environment, not the renderer, so probe the two
+      # halves separately before spending an hour on a take. Never fails the
+      # job: this is evidence, not a gate.
+      - name: Probe the client in this environment
+        continue-on-error: true
+        env:
+          DISPLAY: ":99"
+          WGPU_BACKEND: vulkan
+          BEVY_ASSET_ROOT: crates/soils-client
+          RUST_LOG: "soils_client=debug,warn"
+        run: |
+          set -u
+          LVP="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1 || true)"
+          [ -n "$LVP" ] && export VK_ICD_FILENAMES="$LVP" VK_DRIVER_FILES="$LVP"
+
+          echo "=== A: does the shared :99 display work at all? ==="
+          # Exactly what screenshots.yml does, minus its private xvfb-run
+          # display. A PNG here means the display setup is fine and the demo
+          # environment is what differs.
+          rm -f /tmp/soils-selftest.png
+          timeout 150 env SOILS_SELFTEST=1 SOILS_GI_DEMO=1 SOILS_SHOT_SECS=22             SOILS_EXIT_SECS=28 ./target/release/soils-client 2>&1 | tail -25 || true
+          [ -f /tmp/soils-selftest.png ]             && echo "A: PNG produced — display OK"             || echo "A: NO PNG — the shared display is the problem"
+
+          echo "=== B: does a client with the demo's environment cue? ==="
+          ./target/release/soils-server & SRV=$!
+          sleep 5
+          READY=/tmp/probe-ready
+          rm -f "$READY"
+          # The demo env, but cueing early so 150s is enough to see it happen.
+          timeout 150 env             SOILS_AUTOLOGIN=127.0.0.1:9001 SOILS_NAME=probe             SOILS_READY_FILE="$READY" SOILS_RECORD_AFTER=10             SOILS_RECORD_WAIT=60 SOILS_RECORD_SECS=5 SOILS_RECORD_EXIT=1             SOILS_RADIUS=1 SOILS_DAYTIME=0.0 SOILS_VSYNC=1             ./target/release/soils-client 2>&1 | tail -30 || true
+          kill "$SRV" 2>/dev/null || true
+          [ -f "$READY" ]             && echo "B: ready file written — the cue works, timings are the issue"             || echo "B: NO ready file — the cue never fires in the demo environment"
+
+      - name: Record the takes
+        env:
+          DISPLAY: ":99"
+          WGPU_BACKEND: vulkan
+          SOILS_RECORDER: scripts/ffmpeg_record.py
+          SOILS_CAPTURE_FPS: "24"
+          # A little headroom over a real GPU, not the 4x that six runs were
+          # wrongly spent on: the probe below cues in ~70s, and `props_demo`
+          # recorded a full take here. The budgets were never the problem.
+          SOILS_DEMO_SCALE: "1.5"
+          # Chunk application on the client is time-boxed per frame, so at a
+          # couple of frames per second `streaming.pending` takes minutes to
+          # reach zero, and that is the cue the recorder waits for. Radius 1
+          # cuts the chunk count cubically; both demos film nose-to-the-ground
+          # and never see the horizon.
+          SOILS_DEMO_RADIUS: "1"
+          # Deliberately NOT raising RUST_LOG or forcing focus here. Both were
+          # tried against the "software rendering is too slow" theory, which the
+          # probe below disproved — and more log volume actively worsens the
+          # real bug, which was a stderr pipe nobody was draining.
+          RUST_LOG: "info"
+        run: |
+          set -u
+          # Resolve the lavapipe ICD by glob: an explicit-but-missing
+          # VK_ICD_FILENAMES makes the loader find zero drivers, which is worse
+          # than letting it auto-discover.
+          LVP="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1 || true)"
+          if [ -n "$LVP" ]; then
+            export VK_ICD_FILENAMES="$LVP" VK_DRIVER_FILES="$LVP"
+          fi
+          echo "VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-<loader auto-discovery>}"
+          mkdir -p out
+
+          # $1 = published name, $2 = test target, rest = extra env.
+          take() {
+            local name="$1" target="$2"; shift 2
+            local dir="$PWD/recordings/ci/$name"
+            rm -rf "$dir"
+            if env SOILS_CAPTURE_DIR="$dir" "$@" \
+                 cargo test --release -p soils-server --test "$target" \
+                 -- --ignored --nocapture
+            then
+              local mp4
+              mp4="$(ls "$dir"/take-*.mp4 2>/dev/null | head -1 || true)"
+              if [ -n "$mp4" ]; then
+                mv "$mp4" "out/$name.mp4"
+                echo "recorded $name.mp4 ($(du -h "out/$name.mp4" | cut -f1))"
+                return 0
+              fi
+              echo "::warning::$name: the test passed but produced no video"
+            else
+              echo "::warning::$name: recording test failed; see the log above"
+            fi
+            # Leave the recorder's own log where the artifact step will find it.
+            cp "$dir"/take-*.log "out/$name.recorder.log" 2>/dev/null || true
+            return 1
+          }
+
+          # One client: the strongest headless take, and the only one that needs
+          # no window placement.
+          take inventory inventory_demo || true
+
+          # Underground, one client, in a room carved by the server. The one
+          # take whose subject *is* the lighting, so it is also the one that
+          # would show a regression in the flood.
+          take light light_demo || true
+
+          # Two clients side by side. Without a window manager both map at the
+          # origin and the second hides the first, so the recorder is told to
+          # tile them by title before it rolls.
+          take props props_demo \
+            env SOILS_CAPTURE_TITLES="new-soils [alice],new-soils [bob]" || true
+
+          echo "=== recorded ==="
+          ls -la out || true
+          # Fail only if nothing at all came out: one flaky take should still
+          # publish the other.
+          ls out/*.mp4 >/dev/null 2>&1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: videos-${{ github.run_id }}
+          path: out/
+          if-no-files-found: warn
+
+  publish:
+    needs: record
+    runs-on: ubuntu-latest
+    # Serialised across every branch, and never cancelled: two branches
+    # publishing at once race on the same `gh-pages` ref, and a cancelled
+    # publish would drop a tab rather than merely delay it.
+    concurrency:
+      group: gh-pages-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: videos-${{ github.run_id }}
+          path: out
+
+      - name: Publish to gh-pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Fetch the existing site so other branches' videos survive this run.
+          # Depth 1: the history is replaced below, so there is nothing in it
+          # worth downloading.
+          if git fetch --depth 1 origin gh-pages 2>/dev/null; then
+            git worktree add --detach site FETCH_HEAD
+          else
+            echo "gh-pages does not exist yet; starting an empty site"
+            mkdir site
+          fi
+
+          # Word-split deliberately: one --live-branches argument per branch, so
+          # a tab for a branch that has since been deleted is pruned.
+          # shellcheck disable=SC2046
+          python3 scripts/build_pages.py \
+            --site site \
+            --branch "${GITHUB_REF_NAME}" \
+            --commit "${GITHUB_SHA}" \
+            --videos out \
+            --live-branches $(git ls-remote --heads origin | sed 's#.*refs/heads/##')
+
+          cd site
+          # Orphan commit, force-pushed: the videos are tens of megabytes per
+          # run and every push to any branch produces a set, so keeping history
+          # would grow the repository without bound. The site is derived state
+          # — the recordings that matter are on the workflow run.
+          rm -rf .git
+          git init -q -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "videos: ${GITHUB_REF_NAME} at ${GITHUB_SHA:0:7}"
+          git push -q --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            gh-pages
+          echo "published; site lists:"
+          python3 -c "import json;print(*json.load(open('branches.json')))"

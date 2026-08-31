@@ -22,3 +22,5 @@ artifact/
 # Obsidian settings are not to be included
 .obsidian
 *.stackdump
+scratch/
+__pycache__/

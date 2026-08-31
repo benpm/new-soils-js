@@ -20,6 +20,7 @@ mod gpu_gen;
 mod gpu_light;
 mod gpu_mesh;
 mod hud;
+mod inventory;
 mod light;
 mod login;
 mod material;
@@ -32,11 +33,14 @@ mod record;
 mod world_draw;
 mod server_msg;
 mod singleplayer;
+mod theme;
 mod social;
+mod ui;
 
 use bevy::app::{RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::camera::{Exposure, Hdr};
 use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::image::ImagePlugin;
 // Bevy 0.19 moved the atmosphere *description* types into `bevy_light`; the
 // render-side `AtmosphereSettings` stayed in `bevy_pbr`.
 use bevy::light::{
@@ -68,7 +72,11 @@ const PROVISIONAL_SPAWN: Vec3 = Vec3::new(282.0, 285.0, 268.0);
 
 fn main() {
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+    // The UI art is 16x16 pixel art magnified hard, so the linear default is
+    // rarely what's wanted. Both atlases pin their own sampler (`load_atlas`
+    // nearest, `load_mega_atlas` linear+repeat); this is the backstop for
+    // anything loaded without settings.
+    app.add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()).set(WindowPlugin {
         primary_window: Some(Window {
             // The player name is in the title so two clients of the same
             // executable are separable — OBS matches capture sources by
@@ -115,17 +123,28 @@ fn main() {
     .insert_resource(Blocks(default_registry()))
     .insert_resource(LocalPlayer::default())
     .insert_resource(ActorMap::default())
-    .insert_resource(edit::Hotbar::default())
+    .init_state::<ui::UiMode>()
+    .init_resource::<inventory::PlayerInventory>()
+    .init_resource::<inventory::Items>()
+    .init_resource::<inventory::Hotbar>()
+    .init_resource::<inventory::SelectedItem>()
+    .init_resource::<inventory::hotbar::DragItem>()
+    .init_resource::<inventory::container::OpenContainer>()
+    .init_resource::<bot::BotActions>()
+    .init_resource::<inventory::DroppedItemVisuals>()
+    .init_resource::<ui::CursorFreed>()
     .insert_resource(pause::RenderToggles::default())
     .init_resource::<console::Console>()
     .init_resource::<login::LoginState>()
     .init_resource::<singleplayer::Singleplayer>()
+    .init_resource::<player::LookSettings>()
     .init_resource::<player::PendingInput>()
     .init_resource::<player::InputRing>()
     .init_resource::<player::CameraHold>()
     .init_resource::<actor::InterpClock>()
     .init_resource::<edit::PendingEdits>()
     .init_resource::<light::LightQueue>()
+    .insert_resource(light::configured_player_light())
     .init_resource::<light::SkyTerm>()
     .insert_resource(net::connect())
     .insert_resource(discovery::spawn());
@@ -149,6 +168,9 @@ fn main() {
             hud::setup_hud,
             pause::setup_pause_menu,
             console::setup_console,
+            inventory::setup_item_icons,
+            inventory::screen::setup_inventory_ui,
+            inventory::hotbar::setup_hotbar,
             login::setup_login,
             selftest_login,
         ),
@@ -187,13 +209,18 @@ fn main() {
                 .after(server_msg::apply_init)
                 .after(server_msg::apply_warp)
                 .after(demand::process_demands),
+            // The player's own emitter moves before the batch is planned, so
+            // the voxel it vacated and the one it now occupies are both in
+            // this frame's flood rather than a frame late.
+            light::track_player_light.after(player::reconcile_self),
             // Light job planning runs once all voxel changes for the frame
             // landed (the flood itself is GPU compute — see gpu_light.rs).
             gpu_light::plan_light_jobs
                 .after(demand::process_demands)
                 .after(server_msg::apply_edits)
-                .after(edit::edit_blocks),
-            light::update_sky_term.after(server_msg::apply_time),
+                .after(edit::edit_blocks)
+                .after(light::track_player_light),
+            light::update_sky_term.after(server_msg::apply_time).after(PinnedTime),
         ),
     )
     // Always-on: login flow, day/night, camera interpolation, self-test.
@@ -210,7 +237,7 @@ fn main() {
             hud::toggle_hud,
             actor::interpolate_actors,
             player::sync_camera,
-            self_test_daytime.after(server_msg::apply_time).before(day_night),
+            self_test_daytime.after(server_msg::apply_time).before(day_night).in_set(PinnedTime),
             day_night,
             self_test,
             screenshot_once.after(player::sync_camera),
@@ -240,8 +267,26 @@ fn main() {
         Update,
         (
             player::track_streaming,
-            player::cursor_toggle,
-            edit::selection_highlight,
+            // Bot presses land before anything reads them, and outside the
+            // `ui::playing` gate below — otherwise the bot could open the
+            // inventory and never press the key that closes it again.
+            bot::press_bot_buttons
+                .run_if(bot::active)
+                .before(ui::ui_hotkeys)
+                // Every consumer of `just_pressed` this synthesizes must run
+                // after it. `ButtonInput` clears the flag at the start of the
+                // next frame, so a consumer scheduled *before* this simply
+                // never sees the press — and with no ordering that is a
+                // per-frame coin flip. `select_hotbar_slot` was missing here
+                // while `edit_blocks` was not, so a bot's `SelectKey` was
+                // usually dropped and the following `Place` put down whatever
+                // key 0 held instead of the block the script asked for.
+                .before(inventory::hotbar::select_hotbar_slot)
+                .before(edit::edit_blocks),
+            ui::track_alt,
+            ui::ui_hotkeys.run_if(console::console_closed),
+            ui::click_to_grab,
+            ui::apply_cursor_mode,
             console::console_input,
             console::update_console_text,
             hud::update_hud,
@@ -251,10 +296,55 @@ fn main() {
         )
             .run_if(login::logged_in),
     )
+    // Inventory: the mirror changed, so settle the hotbar and redraw both
+    // views. Its own block rather than folded into the gameplay tuple above —
+    // `add_systems` takes at most twenty systems in one tuple, and that one was
+    // already close to the limit.
+    .add_systems(
+        Update,
+        (
+            inventory::screen::update_inventory_visibility,
+            inventory::hotbar::update_hotbar_visibility,
+            // Reconcile first: both rebuilds draw what it settles on, so the
+            // other order shows the bar one frame stale every time an item runs
+            // out.
+            inventory::hotbar::reconcile_hotbar,
+            inventory::hotbar::rebuild_hotbar,
+            inventory::screen::rebuild_inventory_ui,
+            inventory::screen::select_item,
+            inventory::screen::highlight_item_cells,
+            inventory::screen::forget_missing_selection,
+            inventory::screen::rebuild_detail_panel,
+            inventory::hotbar::animate_wiggle,
+            inventory::container::update_container_visibility,
+            inventory::container::rebuild_container_ui,
+            inventory::container::close_on_exit,
+            inventory::screen::update_footer_hint,
+        )
+            .chain()
+            .run_if(login::logged_in),
+    )
     // Direct player input: authenticated and console closed.
     .add_systems(
         Update,
-        (player::mouse_look, edit::edit_blocks, edit::hotbar_select)
+        (
+            player::mouse_look,
+            edit::edit_blocks,
+            edit::selection_highlight,
+            inventory::hotbar::select_hotbar_slot,
+            inventory::hotbar::drop_selected,
+        )
+            .run_if(ui::playing)
+            .run_if(console::console_closed)
+            .run_if(login::logged_in),
+    )
+    // With the screen open the number keys assign the picked item to a key
+    // instead of choosing between keys, so this deliberately does not share the
+    // `ui::playing` gate above.
+    .add_systems(
+        Update,
+        inventory::hotbar::bind_selected_to_hotbar
+            .run_if(in_state(ui::UiMode::Inventory))
             .run_if(console::console_closed)
             .run_if(login::logged_in),
     )
@@ -269,6 +359,8 @@ fn main() {
             // Same slot as the keyboard it stands in for: freshest input, no
             // frame of latency before the fixed tick consumes it.
             bot::drive.run_if(bot::active),
+            bot::inventory_actions.run_if(bot::active),
+            bot::light_actions.run_if(bot::active),
         )
             .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop)
             .run_if(login::logged_in),
@@ -300,10 +392,17 @@ fn screenshot_once(
     mut hold: ResMut<player::CameraHold>,
     slots: Res<pool::ChunkSlots>,
     remote_actors: Query<&Transform, (With<Actor>, Without<Player>)>,
+    bot: Option<Res<bot::Bot>>,
 ) {
     if *taken || std::env::var("SOILS_SELFTEST").is_err() {
         return;
     }
+    // A bot's framing *is* the subject: it flew somewhere and aimed at
+    // something on purpose, and the whole reason to shoot a bot run is to see
+    // what the take will show. Parking the camera over spawn would photograph
+    // a different place than the one being filmed — which is exactly how a
+    // "verify the demo works" screenshot ends up proving nothing.
+    let keep_framing = gi_demo::demo_enabled() || bot.is_some();
     // Configurable so slow software-GPU CI (lavapipe) can allow more time to
     // stream/mesh/trace before the shot; defaults preserve local behaviour.
     if time.elapsed_secs() > env_secs("SOILS_SHOT_SECS", 9.0) {
@@ -311,7 +410,7 @@ fn screenshot_once(
         // In GI-demo mode keep the scene's own framing (see gi_demo.rs).
         // The hold stops the server position echo from dragging the framed
         // camera back toward the player's authoritative position mid-capture.
-        if !gi_demo::demo_enabled() {
+        if !keep_framing {
             hold.0 = true;
             if let Ok((mut p, mut t)) = camera.single_mut() {
                 if let Some(actor) = remote_actors.iter().next() {
@@ -381,6 +480,18 @@ fn spectator_camera(
 /// In self-test mode, pin the time of day so screenshots are deterministic
 /// (the server's clock drifts with wall-time). `SOILS_DAYTIME` overrides the
 /// default noon (0.0); e.g. 0.25 = dawn/dusk, 0.5 = midnight.
+/// The frame's authoritative time of day, once [`self_test_daytime`] has
+/// pinned it.
+///
+/// Everything that *reads* `WorldTime.daytime` must run after this, or on the
+/// frames a `ServerMsg::Time` lands it reads the server's drifting clock
+/// instead of the pin — and since that arrives once a second, the result is a
+/// 1 Hz two-value flicker in the sky term and the GI daylight factor, not a
+/// race that averages out. `update_sky_term` quantizes to 1/64, so the two
+/// values are visibly different steps rather than neighbouring ones.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PinnedTime;
+
 fn self_test_daytime(mut world_time: ResMut<WorldTime>) {
     // Honour SOILS_DAYTIME on its own, not only under SOILS_SELFTEST: a
     // recording session needs the light pinned too, or the take drifts into
@@ -520,9 +631,31 @@ fn setup(mut commands: Commands, mut mediums: ResMut<Assets<ScatteringMedium>>) 
 /// `SOILS_AUTOLOGIN=<host:port>` with an optional `SOILS_NAME`. The latter
 /// exists so a recording session can point a spectating client at a server on
 /// an ephemeral port without anyone typing into a dialog.
-fn selftest_login(net: Res<NetClient>) {
+fn selftest_login(net: Res<NetClient>, mut sp: ResMut<singleplayer::Singleplayer>) {
     if gi_demo::demo_enabled() {
         return; // demo builds a local scene; no server/login
+    }
+    // `SOILS_DEMO=<id>` starts one of the demo worlds embedded and dials it,
+    // so a scene the recording tests build can be opened — or screenshotted —
+    // without a separate server or any clicking.
+    if let Some(demo) = singleplayer::from_env() {
+        match sp.ensure_started_demo(demo) {
+            Ok(port) => {
+                let name = std::env::var("SOILS_NAME")
+                    .unwrap_or_else(|_| singleplayer::LOCAL_NAME.into());
+                let url = format!("{}://127.0.0.1:{port}", net::default_scheme());
+                info!("demo world '{}': {url} as {name}", demo.id);
+                net.connect(url);
+                net.send(soils_protocol::ClientMsg::Login {
+                    name,
+                    password: String::new(),
+                    signup: true,
+                    protocol: soils_protocol::PROTOCOL_VERSION,
+                });
+            }
+            Err(e) => error!("SOILS_DEMO: could not start {}: {e}", demo.id),
+        }
+        return;
     }
     let addr = match std::env::var("SOILS_AUTOLOGIN") {
         Ok(a) if !a.is_empty() => a,

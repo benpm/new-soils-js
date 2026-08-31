@@ -285,6 +285,26 @@ Four real examples, all of which looked fine:
 Ask of every assertion: *what value would make this fail?* If the answer is
 "none reachable", it is decoration.
 
+A fifth, from the inventory work: a baseline captured from a *mirror that has
+not caught up yet*. The test waited on a loose condition ("still holds some
+blocks"), which was already true, then measured every later delta from the
+pre-change count and reported a working pickup as a failure. Waiting on a
+mirror means waiting for the exact expected value, not for a predicate the
+stale state already satisfies.
+
+### An inventory test watches every dropped item fall away
+
+Players spawn ~29 voxels above the surface in fly mode. An item dropped there
+falls the whole way to the terrain and lands far outside pickup range, so the
+loop never closes and the pickup code looks broken when it is not. Lay a floor
+under the player first — `work_site` in `tests/inventory.rs` builds a 3x3
+platform for exactly this.
+
+The neighbouring trap: edits are rate-limited server-side (`EDIT_RATE`, 32/s
+with a 32 burst). Placements sent faster are dropped silently, so a loop that
+places 64 blocks lands 56 of them and reads as an accounting bug in the
+inventory rather than a pacing bug in the test.
+
 ---
 
 ## SpacetimeDB
@@ -378,7 +398,7 @@ Two tables are readable by any client and should not be:
 
 Both must be public because the *game server* reads them through the SDK cache,
 and a private table has no client accessor at all. Row-level security is the
-right tool and is unimplemented in 2.7.1. This is recorded in `TODO.md`; it is
+right tool and is unimplemented in 2.7.1. This is recorded in `Tasks.md`; it is
 a known limitation, not an oversight to re-report.
 
 Likewise `send_chat` trusts the caller's `world_id`, and `grant_server` is

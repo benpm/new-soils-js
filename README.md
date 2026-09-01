@@ -193,13 +193,35 @@ precompiled `.wasm`/`.wat` load without any toolchain.
 
 Controls: **WASD** move, **mouse** look, **Shift** sprint, **Space/Ctrl**
 up/down (fly) or jump, **F** toggle fly/walk, **left/right click**
-break/place, **1-9** pick a block, **F3** debug overlay, **/** command
+break/place, **1-9** pick a block, **F1** debug view (chunk bounds + minimap),
+**F2** greedy-quad wireframe, **F3** debug overlay, **/** command
 console, **Esc** pause/settings.
 
 Console commands: `tp x y z`, `warp <world>`, `daytime t`, `loadradius n`,
 `sens n` (mouse sensitivity, 0.1-5.0, also in the pause menu), `playerlight n`
 (the player's own emission, 0-15; 0 turns it off), `fog on|off`, `ao on|off`,
-`light on|off`, `gi on|off`.
+`light on|off`, `gi on|off`, `debugviz on|off`, `wireframe on|off`.
+
+**Debug view (F1).** Chunk bounds are drawn as boxes around every resident
+chunk near the player — cyan where the chunk owns a mesh slot, grey where it is
+air (light only), amber for the one you are standing in — and drawn *through*
+terrain, so the lattice is still readable underground. A minimap top-right maps
+the same residency from above, one cell per chunk column, and reads out the
+resident/meshed counts and the load radius. **F2** adds the wireframe overlay:
+the terrain shader outlines every greedy quad at a constant screen width and
+dims the faces behind it, which shows the *merge* the GPU mesher produced
+rather than a triangle soup. `SOILS_DEBUGVIZ=1` and `SOILS_WIREFRAME=1` start
+the client with them already on, for screenshots and scripted runs.
+
+| Chunk bounds + minimap (F1) | Greedy-quad wireframe (F2) |
+|---|---|
+| ![debug view: chunk bounds and the chunk minimap](docs/screenshots/debug-bounds.png) | ![debug view: the greedy-quad wireframe overlay](docs/screenshots/debug-wireframe.png) |
+
+*Both rendered headlessly under Mesa lavapipe by the same self-test path CI
+uses, which is why the frame counter reads 1 fps. A
+[30 s clip](docs/media/debug-view.webm) of the two keys being pressed in a live
+client is in `docs/media/` — hand-driven, not a recorded test like the takes
+above.*
 
 ### Linux build dependencies
 

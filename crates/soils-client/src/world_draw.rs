@@ -62,6 +62,9 @@ pub struct TerrainParams {
     pub gi_enabled: f32,
     pub sky_term: f32,
     pub light_enabled: f32,
+    /// Debug wireframe overlay (F2): outline every greedy quad and dim the
+    /// faces behind it. See `debugviz.rs`.
+    pub wireframe: f32,
 }
 
 impl Default for TerrainParams {
@@ -75,6 +78,7 @@ impl Default for TerrainParams {
             gi_enabled: 0.0,
             sky_term: TERRAIN_BRIGHTNESS,
             light_enabled: 1.0,
+            wireframe: 0.0,
         }
     }
 }
@@ -85,7 +89,7 @@ impl TerrainParams {
     /// out explicitly to avoid guessing: WGSL packs
     /// { f32, f32, f32, vec3 (align 16), vec3, f32, f32, f32 } as
     /// ao@0 brightness@4 fog_density@8 fog_color@16 gi_origin@32 gi_enabled@44
-    /// sky_term@48 light_enabled@52, size 64.
+    /// sky_term@48 light_enabled@52 wireframe@56, size 64.
     fn as_bytes(&self) -> [u8; 64] {
         let mut b = [0u8; 64];
         let mut put = |off: usize, v: f32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
@@ -101,6 +105,7 @@ impl TerrainParams {
         put(44, self.gi_enabled);
         put(48, self.sky_term);
         put(52, self.light_enabled);
+        put(56, self.wireframe);
         b
     }
 }
@@ -109,6 +114,7 @@ impl TerrainParams {
 /// each frame (main world; extracted by value).
 pub fn update_terrain_params(
     toggles: Res<RenderToggles>,
+    viz: Res<crate::debugviz::DebugViz>,
     sky: Res<SkyTerm>,
     gi: Option<Res<GiAssets>>,
     mut params: ResMut<TerrainParams>,
@@ -116,6 +122,7 @@ pub fn update_terrain_params(
     params.ambient_occlusion = if toggles.ao { 1.0 } else { 0.0 };
     params.fog_density = if toggles.fog { FOG_DENSITY } else { 0.0 };
     params.light_enabled = if toggles.light { 1.0 } else { 0.0 };
+    params.wireframe = if viz.wireframe_active() { 1.0 } else { 0.0 };
     params.sky_term = sky.0;
     if let Some(gi) = gi {
         let (origin, enabled) = gi.apply_params();

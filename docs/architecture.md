@@ -244,6 +244,16 @@ mutations replicate the same tick.
   *from* the cursor — the pause menu used to be whatever was on screen when
   the pointer was free, and any click re-grabbed it, so a second full-screen
   UI could not be clicked without dismissing itself.
+- **Debug view** (F1): chunk bounds as gizmo boxes over the resident set near
+  the player (own gizmo group, negative depth bias, so they read through
+  terrain), a top-down minimap of the same residency folded by column, and a
+  greedy-quad wireframe overlay (F2). The overlay lives in `atlas.wgsl` rather
+  than Bevy's `WireframePlugin`, because there is no per-chunk mesh entity to
+  hand it — the world is one `multi_draw_indirect`. Each quad carries its own
+  (du, dv) coordinate and size, so the fragment stage can measure the distance
+  to the nearest quad edge and draw it at a constant screen width whatever the
+  quad's size or distance. `SOILS_DEBUGVIZ` / `SOILS_WIREFRAME` and the console
+  open the same state without a keypress, for screenshots and scripted runs.
 - **Inventory UI**: the screen (E/I/Tab), the item strip, and the backpack
   affordance all render from the last `InventoryUpdate`; slot clicks and drops
   are requests, and the view only changes once the server answers. Icons come

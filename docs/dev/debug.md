@@ -491,6 +491,26 @@ guess is wrong somewhere.
 Related: **a debug-built server cannot generate and light chunks fast enough**
 for the world to be on screen at all. Record in release.
 
+### A capture is missing the UI down one side, and the game looks broken
+
+`Xvfb -screen 0 960x540x24` with a client whose window is Bevy's default
+1280x720 gives a capture that is the top-left crop of the window. Everything
+anchored to the right edge or the bottom (the chunk minimap, the hotbar) is
+simply not in the frame — while the HUD in the top-left is, so the frame looks
+like a rendering bug in exactly those elements rather than a cropped grab.
+`xvfb-run -s "-screen 0 1280x720x24"` (what `screenshots.yml` uses) matches the
+window and shows all of it.
+
+### A screenshot of a gizmo overlay draws it a frame behind
+
+`screenshot_once` teleports the camera on the same frame it requests the shot,
+and gizmo systems have no ordering against it, so anything drawn from the
+player transform can be built from the *previous* position. Park the camera
+with `SOILS_SPECTATE` instead: it re-parks every frame, so by the shot frame
+the transform has been settled for hundreds of frames and intra-frame order
+stops mattering. The debug-view shots in `screenshots.yml` pass the self-test's
+own default framing to `SOILS_SPECTATE` for this reason.
+
 ### The video shows judder that is not in the game
 
 If frames are captured by writing images, encoding cost perturbs the frame
@@ -577,6 +597,8 @@ later. Check `git status` before each commit, not just before the first.
 | `SOILS_NETSIM=lat,jitter,loss[,seed]` | Simulated bad link; seeded and reproducible |
 | `SOILS_RADIUS` | View radius (2–8); small values stream in far faster |
 | `SOILS_DAYTIME` | Pin time of day so a long take does not drift into night |
+| `SOILS_DEBUGVIZ=1` | Start with the debug view (F1) open: chunk bounds + minimap |
+| `SOILS_WIREFRAME=1` | Start with the greedy-quad wireframe (F2) on; implies the above |
 | `SOILS_NOFOCUS=1` | Visible window that does not steal focus |
 | `SOILS_HEADLESS=1` | Unmapped window — **not** for perf numbers |
 | `SOILS_PROPS=n` | Drop n rigid-body props near spawn (implies physics) |

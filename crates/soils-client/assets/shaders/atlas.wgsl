@@ -27,6 +27,9 @@ struct WorldParams {
     // sky-lit surface, and a >0.5 enable flag (off = flat `brightness`).
     sky_term: f32,
     light_enabled: f32,
+    // Debug wireframe overlay (F1/F2, see debugviz.rs): >0.5 outlines every
+    // greedy quad and dims the faces behind it.
+    wireframe: f32,
 };
 
 struct ChunkSlot {
@@ -164,6 +167,13 @@ struct VertexOutput {
     @location(2) @interpolate(flat) tile: u32,
     @location(3) ao: f32,
     @location(4) world_position: vec3<f32>,
+    // Position within this quad, in voxels along its own (du, dv) axes, and
+    // the quad's size in the same units. The wireframe overlay measures the
+    // distance to the nearest quad edge from these — the greedy merge means a
+    // quad is *not* one voxel, so nothing in the world position can stand in
+    // for them.
+    @location(5) quad_uv: vec2<f32>,
+    @location(6) @interpolate(flat) quad_size: vec2<f32>,
 };
 
 // Two triangles per quad: corners [0,1,2, 0,2,3] over [origin, +du, +du+dv, +dv].
@@ -207,6 +217,19 @@ fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     else if (corner == 2u) { p = base + vec3<f32>(du) + vec3<f32>(dv); }
     else if (corner == 3u) { p = base + vec3<f32>(dv); }
 
+    // (du, dv) lengths, in the order the corners below walk them.
+    let quad_size = select(
+        vec2<f32>(f32(qh), f32(qw)),
+        vec2<f32>(f32(qw), f32(qh)),
+        positive,
+    );
+    var quad_uv = vec2<f32>(0.0, 0.0);
+    if (corner == 1u) { quad_uv = vec2<f32>(quad_size.x, 0.0); }
+    else if (corner == 2u) { quad_uv = quad_size; }
+    else if (corner == 3u) { quad_uv = vec2<f32>(0.0, quad_size.y); }
+    out.quad_uv = quad_uv;
+    out.quad_size = quad_size;
+
     let origin = vec3<f32>(mesh_info[slot].xyz * 32);
     let world_position = origin + p;
     out.clip_position = position_world_to_clip(world_position);
@@ -219,9 +242,22 @@ fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
+// Wireframe overlay: line colour (in the same lux regime as everything else,
+// so it survives exposure and tonemapping), how far the faces behind it are
+// dimmed, and the line half-width in pixels.
+const WIRE_COLOR: vec3<f32> = vec3<f32>(0.30, 1.00, 0.65);
+const WIRE_FACE_DIM: f32 = 0.18;
+const WIRE_PX: f32 = 1.25;
+
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let n = in.normal;
+
+    // Screen-space rate of change of the quad coordinate, taken here rather
+    // than inside the `wireframe` branch below: derivatives must be evaluated
+    // in uniform control flow, and while a uniform-buffer flag technically is
+    // uniform, keeping it out of the branch removes the question.
+    let quad_fw = max(fwidth(in.quad_uv), vec2<f32>(1e-6));
 
     // Per-face 2D coordinate that advances by 1 per voxel along the face.
     var tile_uv = vec2<f32>(dot(n.zxy, in.local_position), dot(n.yzx, in.local_position));
@@ -279,6 +315,20 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let dist = length(in.world_position - view.world_position);
     let fog = 1.0 - exp(-pow(dist * params.fog_density, 2.0));
     color = vec4<f32>(mix(color.rgb, params.fog_color * view.exposure, fog), color.a);
+
+    // Debug wireframe: outline each greedy quad at a constant screen width.
+    // `d` is the distance to the nearest of this quad's four edges in voxels;
+    // dividing by the per-pixel rate of change turns it into pixels, so a
+    // 40-voxel quad on the horizon gets the same 1 px line as one underfoot.
+    // Applied last so the lines are not dimmed by fog they are meant to cut
+    // through.
+    if (params.wireframe > 0.5) {
+        let d = min(in.quad_uv, in.quad_size - in.quad_uv);
+        let px = min(d.x / quad_fw.x, d.y / quad_fw.y);
+        let line = 1.0 - smoothstep(0.0, WIRE_PX, px);
+        let wire = WIRE_COLOR * params.brightness * view.exposure;
+        color = vec4<f32>(mix(color.rgb * WIRE_FACE_DIM, wire, line), color.a);
+    }
 
     return color;
 }

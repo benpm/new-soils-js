@@ -1,7 +1,8 @@
 //! A small command console (open with `/`), mirroring the JS command box.
 //! Supported: `tp x y z`, `daytime t`, `loadradius n`, `sens n`, `playerlight n`,
 //! `fog on|off`,
-//! `ao on|off`, `gi on|off`, `spawn`/`cube` (drop a physics cube ahead of the
+//! `ao on|off`, `gi on|off`, `debugviz on|off`, `wireframe on|off`,
+//! `spawn`/`cube` (drop a physics cube ahead of the
 //! camera). While open, gameplay input is suppressed (see `console_closed`).
 
 use bevy::input::ButtonState;
@@ -11,6 +12,7 @@ use bevy::prelude::*;
 use soils_protocol::ClientMsg;
 
 use crate::chunk::WorldTime;
+use crate::debugviz::DebugViz;
 use crate::gi::GiSettings;
 use crate::net::NetClient;
 use crate::light::PlayerLight;
@@ -65,6 +67,7 @@ pub fn console_input(
     mut player_light: ResMut<PlayerLight>,
     mut toggles: ResMut<RenderToggles>,
     mut gi: ResMut<GiSettings>,
+    mut viz: ResMut<DebugViz>,
     net: Res<NetClient>,
     social: Res<crate::social::Social>,
 ) {
@@ -88,7 +91,7 @@ pub fn console_input(
                 console.open = false;
                 run_command(
                     &cmd, &mut player, &mut world_time, &mut streaming, &mut look,
-                    &mut player_light, &mut toggles, &mut gi, &net, &social,
+                    &mut player_light, &mut toggles, &mut gi, &mut viz, &net, &social,
                 );
             }
             Key::Escape => {
@@ -131,6 +134,7 @@ fn run_command(
     player_light: &mut PlayerLight,
     toggles: &mut RenderToggles,
     gi: &mut GiSettings,
+    viz: &mut DebugViz,
     net: &NetClient,
     social: &crate::social::Social,
 ) {
@@ -182,6 +186,16 @@ fn run_command(
         "light" => toggles.light = on_off(args.first()),
         "gi" => {
             gi.enabled = on_off(args.first());
+        }
+        // The debug view (F1) and its wireframe overlay (F2), for scripted
+        // runs and screenshots — the self-test and the demo bots press no
+        // keys. `wireframe on` opens the mode too, exactly as F2 does.
+        "debugviz" | "debug" => viz.enabled = on_off(args.first()),
+        "wireframe" | "wire" => {
+            viz.wireframe = on_off(args.first());
+            if viz.wireframe {
+                viz.enabled = true;
+            }
         }
         "warp" if !args.is_empty() => {
             // Server creates the world on demand and replies with `Warp`.

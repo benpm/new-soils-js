@@ -11,6 +11,7 @@ mod bot;
 mod chunk;
 mod console;
 mod cull;
+mod debugviz;
 mod demand;
 mod discovery;
 mod edit;
@@ -134,6 +135,9 @@ fn main() {
     .init_resource::<inventory::DroppedItemVisuals>()
     .init_resource::<ui::CursorFreed>()
     .insert_resource(pause::RenderToggles::default())
+    // Debug view (F1): off unless SOILS_DEBUGVIZ/SOILS_WIREFRAME ask for it.
+    .insert_resource(debugviz::configured())
+    .init_gizmo_group::<debugviz::DebugVizGizmos>()
     .init_resource::<console::Console>()
     .init_resource::<login::LoginState>()
     .init_resource::<singleplayer::Singleplayer>()
@@ -166,6 +170,8 @@ fn main() {
             actor::setup_actor_assets,
             edit::setup_crosshair,
             hud::setup_hud,
+            debugviz::setup_minimap,
+            debugviz::setup_gizmo_config,
             pause::setup_pause_menu,
             console::setup_console,
             inventory::setup_item_icons,
@@ -235,6 +241,7 @@ fn main() {
             login::update_server_list,
             login::server_buttons,
             hud::toggle_hud,
+            debugviz::toggle_debug_viz,
             actor::interpolate_actors,
             player::sync_camera,
             self_test_daytime.after(server_msg::apply_time).before(day_night).in_set(PinnedTime),
@@ -290,6 +297,8 @@ fn main() {
             console::console_input,
             console::update_console_text,
             hud::update_hud,
+            debugviz::draw_chunk_bounds,
+            debugviz::update_minimap,
             pause::pause_menu_visibility,
             pause::pause_menu_buttons,
             pause::update_pause_labels,

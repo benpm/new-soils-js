@@ -1,5 +1,83 @@
 # Changelog
 ****
+## A debug view: chunk bounds, a chunk minimap, and a greedy-quad wireframe
+
+**Branch `claude/issue-18-yrqvlo`, 2026-09-01.** Issue #18. **F1** opens the
+debug view; **F2** switches the wireframe overlay on inside it. Both also have
+console commands (`debugviz on|off`, `wireframe on|off`) and environment
+variables (`SOILS_DEBUGVIZ=1`, `SOILS_WIREFRAME=1`), because the self-test and
+the demo bots press no keys and a screenshot needs the state without one.
+
+### The wireframe cannot come from Bevy
+
+`WireframePlugin` needs mesh entities to attach to, and there are none: the
+terrain is one `multi_draw_indirect` over the pooled quad buffer, with no
+per-chunk entity, material or bind group anywhere in the render world. So the
+outline is drawn by `atlas.wgsl` itself. Each vertex now carries its position
+within its own quad along the quad's `(du, dv)` axes plus that quad's size
+(flat), the fragment stage measures the distance to the nearest of the four
+edges, and dividing by `fwidth` of the same coordinate turns voxels into
+pixels — so a 40-voxel quad on the horizon gets the same 1 px line as one
+underfoot.
+
+That is also the more useful picture. The quads *are* the greedy merge, so the
+overlay shows what the GPU mesher actually produced — long strips across a flat
+terrace, a dense mat where the terrain is stepped — rather than a triangle soup
+that would look the same whatever the mesher did.
+
+Two details worth keeping:
+
+- `fwidth` is evaluated before the `params.wireframe` branch, not inside it.
+  A uniform-buffer flag is uniform control flow and would be legal, but
+  hoisting the derivative removes the question entirely.
+- `WorldParams` had exactly two free floats after `light_enabled@52`. The flag
+  went at 56 and the uniform is still 64 bytes, so nothing about the layout
+  moved.
+
+### Bounds are drawn through terrain, deliberately
+
+Chunk bounds are gizmo boxes over the resident set within four chunks of the
+player, cyan where the chunk owns a mesh slot, grey where it is air, amber for
+the one you are standing in. They live in their own gizmo group with
+`depth_bias = -1.0`: a debug lattice you can only see when nothing is in front
+of it is no use underground, which is where residency questions are usually
+asked. The group is separate so the block-selection box in `edit.rs` keeps
+depth-testing normally.
+
+The four-chunk cap is legibility, not cost. At radius 8 the resident set is
+4913 boxes, and a lattice that dense says nothing about where you are; the
+minimap covers the far field instead, folding each column's chunks into one
+cell (meshed / air / absent, and how deep the meshed run is).
+
+### Two capture traps, both of which look like rendering bugs
+
+The minimap and the hotbar were missing from every recorded frame while the
+HUD in the top-left rendered fine. The cause was the capture, not the UI:
+`Xvfb -screen 0 960x540x24` against a default 1280x720 Bevy window records the
+top-left crop of the window, so everything anchored right or bottom is outside
+the grab. Matching the screen to the window shows all of it.
+
+The second: `screenshot_once` teleports the camera on the same frame it asks
+for the shot, and gizmo systems have no ordering against it, so bounds built
+from the player transform can be a frame behind — pointing at wherever the
+camera used to be. `SOILS_SPECTATE` re-parks every frame, so by shot time the
+transform has been settled for hundreds of frames; the new `debug-bounds` and
+`debug-wireframe` shots in `screenshots.yml` pass it the self-test's own
+default framing. Both traps are in `dev/debug.md`.
+
+Also: the legend read `±8` and drew a box. The default font has no plus-minus
+glyph, and a fixed-width text node under the grid wrapped the numbers mid-value
+as they changed. Both fixed; the readout is four short ASCII lines that never
+reflow.
+
+### Evidence
+
+`docs/screenshots/debug-bounds.png` and `debug-wireframe.png`, both rendered
+headlessly under lavapipe by the same self-test path CI uses, and
+`docs/media/debug-view.webm`, a 30 s clip of F1 and F2 being pressed in a live
+client. The clip is hand-driven, not a recorded test — the takes in the README
+table are tests and this one is not, which is why it is not in that table.
+
 ## The lamp demo filmed cobblestone, and demo worlds are playable
 
 **Branch `lamp-demo`, 2026-08-30.** The published lighting take was dark from

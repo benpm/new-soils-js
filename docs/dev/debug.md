@@ -508,8 +508,9 @@ and gizmo systems have no ordering against it, so anything drawn from the
 player transform can be built from the *previous* position. Park the camera
 with `SOILS_SPECTATE` instead: it re-parks every frame, so by the shot frame
 the transform has been settled for hundreds of frames and intra-frame order
-stops mattering. The debug-view shots in `screenshots.yml` pass the self-test's
-own default framing to `SOILS_SPECTATE` for this reason.
+stops mattering. Pass it the self-test's own default framing
+(`240,280,268,320,264,290`) and the shot is the one `screenshot_once` would
+have taken anyway, only with everything else settled.
 
 ### The video shows judder that is not in the game
 

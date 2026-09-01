@@ -61,9 +61,8 @@ The second: `screenshot_once` teleports the camera on the same frame it asks
 for the shot, and gizmo systems have no ordering against it, so bounds built
 from the player transform can be a frame behind — pointing at wherever the
 camera used to be. `SOILS_SPECTATE` re-parks every frame, so by shot time the
-transform has been settled for hundreds of frames; the new `debug-bounds` and
-`debug-wireframe` shots in `screenshots.yml` pass it the self-test's own
-default framing. Both traps are in `dev/debug.md`.
+transform has been settled for hundreds of frames, and both shots below were
+taken that way. Both traps are in `dev/debug.md`.
 
 Also: the legend read `±8` and drew a box. The default font has no plus-minus
 glyph, and a fixed-width text node under the grid wrapped the numbers mid-value
@@ -77,6 +76,11 @@ headlessly under lavapipe by the same self-test path CI uses, and
 `docs/media/debug-view.webm`, a 30 s clip of F1 and F2 being pressed in a live
 client. The clip is hand-driven, not a recorded test — the takes in the README
 table are tests and this one is not, which is why it is not in that table.
+
+**Not landed:** the two shots should also be rendered per release, which is
+four lines in `screenshots.yml` beside the terrain vista plus a table in the
+release notes. That file could not be pushed from the session that wrote this
+(the OAuth app has no `workflow` scope); the patch is on issue #18.
 
 ## The lamp demo filmed cobblestone, and demo worlds are playable
 

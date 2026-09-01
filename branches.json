@@ -1,0 +1,191 @@
+{
+  "ci-pipelines": {
+    "branch": "ci-pipelines",
+    "commit": "45385dfe0d57ac61cb8725a7c327dc30ffe96663",
+    "updated": "2026-08-29T19:23:57+00:00",
+    "videos": [
+      {
+        "name": "inventory",
+        "file": "b/ci-pipelines/inventory.mp4",
+        "title": "The inventory loop",
+        "description": "Place a block, mine it, watch it drop, walk onto it to collect, and open the screen. Then the container loop: the crate comes off the hotbar, goes down, and is opened by right-clicking it. Recorded from <code>inventory_demo.rs</code>, which asserts every scripted beat fired \u2014 a take of nothing happening fails the test rather than publishing.",
+        "bytes": 10202815
+      },
+      {
+        "name": "props",
+        "file": "b/ci-pipelines/props.mp4",
+        "title": "Two clients, one prop pile",
+        "description": "Two bots walk mirrored routines into a pile of physics props and meet in the middle, each pane a real first-person view rather than a replicated body. Recorded from <code>props_demo.rs</code>.",
+        "bytes": 5114602
+      }
+    ]
+  },
+  "lamp-demo": {
+    "branch": "lamp-demo",
+    "commit": "37a70dc79cd19a2b419ddac8c9d68089308c5852",
+    "updated": "2026-08-30T06:11:57+00:00",
+    "videos": [
+      {
+        "name": "inventory",
+        "file": "b/lamp-demo/inventory.mp4",
+        "title": "The inventory loop",
+        "description": "Place a block, mine it, watch it drop, walk onto it to collect, and open the screen. Then the container loop: the crate comes off the hotbar, goes down, and is opened by right-clicking it. Recorded from <code>inventory_demo.rs</code>, which asserts every scripted beat fired \u2014 a take of nothing happening fails the test rather than publishing.",
+        "bytes": 2745019
+      },
+      {
+        "name": "light",
+        "file": "b/lamp-demo/light.mp4",
+        "title": "Lighting a dark room",
+        "description": "A player flies down into a sealed chamber under the spawn and rings himself with Lamp Blocks, each one taking another sector of the floor out of the dark. His own lantern is switched off for the take, so every photon on screen comes from a block he placed. Recorded from <code>light_demo.rs</code>.",
+        "bytes": 1798467
+      },
+      {
+        "name": "props",
+        "file": "b/lamp-demo/props.mp4",
+        "title": "Two clients, one prop pile",
+        "description": "Two bots walk mirrored routines into a pile of physics props and meet in the middle, each pane a real first-person view rather than a replicated body. Recorded from <code>props_demo.rs</code>.",
+        "bytes": 1087231
+      }
+    ]
+  },
+  "master": {
+    "branch": "master",
+    "commit": "8398ed59d0b9dc7d22195480b8f5cde39e9f55de",
+    "updated": "2026-08-31T09:15:36+00:00",
+    "videos": [
+      {
+        "name": "inventory",
+        "file": "b/master/inventory.mp4",
+        "title": "The inventory loop",
+        "description": "Place a block, mine it, watch it drop, walk onto it to collect, and open the screen. Then the container loop: the crate comes off the hotbar, goes down, and is opened by right-clicking it. Recorded from <code>inventory_demo.rs</code>, which asserts every scripted beat fired \u2014 a take of nothing happening fails the test rather than publishing.",
+        "bytes": 798564
+      },
+      {
+        "name": "light",
+        "file": "b/master/light.mp4",
+        "title": "Lighting a dark room",
+        "description": "A player flies down into a sealed chamber under the spawn and rings himself with Lamp Blocks, each one taking another sector of the floor out of the dark. His own lantern is switched off for the take, so every photon on screen comes from a block he placed. Recorded from <code>light_demo.rs</code>.",
+        "bytes": 1268118
+      },
+      {
+        "name": "props",
+        "file": "b/master/props.mp4",
+        "title": "Two clients, one prop pile",
+        "description": "Two bots walk mirrored routines into a pile of physics props and meet in the middle, each pane a real first-person view rather than a replicated body. Recorded from <code>props_demo.rs</code>.",
+        "bytes": 828643
+      }
+    ]
+  },
+  "light-falloff": {
+    "branch": "light-falloff",
+    "commit": "68f10b2b565ac69bb62e2283e5ba5a34e287b66e",
+    "updated": "2026-08-30T20:56:20+00:00",
+    "videos": [
+      {
+        "name": "inventory",
+        "file": "b/light-falloff/inventory.mp4",
+        "title": "The inventory loop",
+        "description": "Place a block, mine it, watch it drop, walk onto it to collect, and open the screen. Then the container loop: the crate comes off the hotbar, goes down, and is opened by right-clicking it. Recorded from <code>inventory_demo.rs</code>, which asserts every scripted beat fired \u2014 a take of nothing happening fails the test rather than publishing.",
+        "bytes": 2393272
+      },
+      {
+        "name": "light",
+        "file": "b/light-falloff/light.mp4",
+        "title": "Lighting a dark room",
+        "description": "A player flies down into a sealed chamber under the spawn and rings himself with Lamp Blocks, each one taking another sector of the floor out of the dark. His own lantern is switched off for the take, so every photon on screen comes from a block he placed. Recorded from <code>light_demo.rs</code>.",
+        "bytes": 1539524
+      },
+      {
+        "name": "props",
+        "file": "b/light-falloff/props.mp4",
+        "title": "Two clients, one prop pile",
+        "description": "Two bots walk mirrored routines into a pile of physics props and meet in the middle, each pane a real first-person view rather than a replicated body. Recorded from <code>props_demo.rs</code>.",
+        "bytes": 784535
+      }
+    ]
+  },
+  "texture-nearest": {
+    "branch": "texture-nearest",
+    "commit": "038cebf07cebb79308f1b3446247e5a3aa239677",
+    "updated": "2026-08-30T22:39:48+00:00",
+    "videos": [
+      {
+        "name": "inventory",
+        "file": "b/texture-nearest/inventory.mp4",
+        "title": "The inventory loop",
+        "description": "Place a block, mine it, watch it drop, walk onto it to collect, and open the screen. Then the container loop: the crate comes off the hotbar, goes down, and is opened by right-clicking it. Recorded from <code>inventory_demo.rs</code>, which asserts every scripted beat fired \u2014 a take of nothing happening fails the test rather than publishing.",
+        "bytes": 3278484
+      },
+      {
+        "name": "light",
+        "file": "b/texture-nearest/light.mp4",
+        "title": "Lighting a dark room",
+        "description": "A player flies down into a sealed chamber under the spawn and rings himself with Lamp Blocks, each one taking another sector of the floor out of the dark. His own lantern is switched off for the take, so every photon on screen comes from a block he placed. Recorded from <code>light_demo.rs</code>.",
+        "bytes": 2891850
+      },
+      {
+        "name": "props",
+        "file": "b/texture-nearest/props.mp4",
+        "title": "Two clients, one prop pile",
+        "description": "Two bots walk mirrored routines into a pile of physics props and meet in the middle, each pane a real first-person view rather than a replicated body. Recorded from <code>props_demo.rs</code>.",
+        "bytes": 979952
+      }
+    ]
+  },
+  "add-claude-github-actions-1788143950947": {
+    "branch": "add-claude-github-actions-1788143950947",
+    "commit": "dbf8daa8853cbc65319fc01e76580b5617ae88ec",
+    "updated": "2026-08-31T02:47:04+00:00",
+    "videos": [
+      {
+        "name": "inventory",
+        "file": "b/add-claude-github-actions-1788143950947/inventory.mp4",
+        "title": "The inventory loop",
+        "description": "Place a block, mine it, watch it drop, walk onto it to collect, and open the screen. Then the container loop: the crate comes off the hotbar, goes down, and is opened by right-clicking it. Recorded from <code>inventory_demo.rs</code>, which asserts every scripted beat fired \u2014 a take of nothing happening fails the test rather than publishing.",
+        "bytes": 3263036
+      },
+      {
+        "name": "light",
+        "file": "b/add-claude-github-actions-1788143950947/light.mp4",
+        "title": "Lighting a dark room",
+        "description": "A player flies down into a sealed chamber under the spawn and rings himself with Lamp Blocks, each one taking another sector of the floor out of the dark. His own lantern is switched off for the take, so every photon on screen comes from a block he placed. Recorded from <code>light_demo.rs</code>.",
+        "bytes": 2808203
+      },
+      {
+        "name": "props",
+        "file": "b/add-claude-github-actions-1788143950947/props.mp4",
+        "title": "Two clients, one prop pile",
+        "description": "Two bots walk mirrored routines into a pile of physics props and meet in the middle, each pane a real first-person view rather than a replicated body. Recorded from <code>props_demo.rs</code>.",
+        "bytes": 1071892
+      }
+    ]
+  },
+  "claude-issue-18-yrqvlo": {
+    "branch": "claude/issue-18-yrqvlo",
+    "commit": "654a65271bc61e6a232be6e5e4ed25f4d7adcfed",
+    "updated": "2026-09-01T01:58:45+00:00",
+    "videos": [
+      {
+        "name": "inventory",
+        "file": "b/claude-issue-18-yrqvlo/inventory.mp4",
+        "title": "The inventory loop",
+        "description": "Place a block, mine it, watch it drop, walk onto it to collect, and open the screen. Then the container loop: the crate comes off the hotbar, goes down, and is opened by right-clicking it. Recorded from <code>inventory_demo.rs</code>, which asserts every scripted beat fired \u2014 a take of nothing happening fails the test rather than publishing.",
+        "bytes": 822724
+      },
+      {
+        "name": "light",
+        "file": "b/claude-issue-18-yrqvlo/light.mp4",
+        "title": "Lighting a dark room",
+        "description": "A player flies down into a sealed chamber under the spawn and rings himself with Lamp Blocks, each one taking another sector of the floor out of the dark. His own lantern is switched off for the take, so every photon on screen comes from a block he placed. Recorded from <code>light_demo.rs</code>.",
+        "bytes": 1398830
+      },
+      {
+        "name": "props",
+        "file": "b/claude-issue-18-yrqvlo/props.mp4",
+        "title": "Two clients, one prop pile",
+        "description": "Two bots walk mirrored routines into a pile of physics props and meet in the middle, each pane a real first-person view rather than a replicated body. Recorded from <code>props_demo.rs</code>.",
+        "bytes": 636961
+      }
+    ]
+  }
+}

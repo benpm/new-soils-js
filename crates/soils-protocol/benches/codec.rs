@@ -36,11 +36,21 @@ fn solid_chunk() -> ChunkVolume {
     v
 }
 
+fn sparse_chunk() -> ChunkVolume {
+    let mut v = ChunkVolume::empty();
+    for i in 0..256 {
+        v.as_bytes_mut()[i * 97 % soils_protocol::CHUNK_CUBED] = (i % 7 + 1) as u8;
+    }
+    v
+}
+
 fn bench_codec(c: &mut Criterion) {
     let air = ChunkVolume::empty();
     let surface = surface_chunk();
     let solid = solid_chunk();
+    let sparse = sparse_chunk();
     let enc_surface = encode_chunk(&surface);
+    let enc_sparse = encode_chunk(&sparse);
 
     let mut g = c.benchmark_group("codec");
     g.bench_function("encode_surface", |b| {
@@ -55,6 +65,22 @@ fn bench_codec(c: &mut Criterion) {
     g.bench_function("decode_surface", |b| {
         b.iter(|| black_box(decode_chunk(black_box(&enc_surface))))
     });
+    g.bench_function("encode_sparse_occupancy", |b| {
+        b.iter(|| black_box(encode_chunk(black_box(&sparse))))
+    });
+    g.bench_function("decode_sparse_occupancy", |b| {
+        b.iter(|| black_box(decode_chunk(black_box(&enc_sparse))))
+    });
+    g.bench_function("build_occupancy_32k", |b| {
+        b.iter(|| black_box(black_box(&sparse).occupancy_words()))
+    });
+    println!(
+        "codec sizes: air={} solid={} sparse={} surface={} bytes",
+        encode_chunk(&air).len(),
+        encode_chunk(&solid).len(),
+        enc_sparse.len(),
+        enc_surface.len()
+    );
     g.finish();
 }
 

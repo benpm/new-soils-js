@@ -9,12 +9,16 @@
 //!   `2 <= n <= 128` (1–7 bits per index, little-endian bit order).
 //! - `2` **RawDense**: `[2] ++ lz4(raw 32768 bytes)` — fallback for
 //!   pathological palettes (> 128 distinct ids, where packing wouldn't help).
+//! - `3` **SparseOccupancy**: `[3] ++ lz4(4096-byte occupancy ++ material
+//!   bytes)` for chunks with few non-air voxels. This preserves the
+//!   occupancy/material split from `voxel_compression.md` on the wire without
+//!   changing the renderer's authoritative dense representation.
 //!
 //! [`decode_chunk`] is the network attack surface: it must return `None` on
 //! arbitrary/malformed input, never panic and never over-allocate.
 
 use crate::coords::CHUNK_CUBED;
-use crate::voxel::{ChunkVolume, Voxel};
+use crate::voxel::{ChunkVolume, OCCUPANCY_WORDS, Voxel};
 
 /// Palettes above this size fall back to [`RawDense`]: at > 7 bits per index
 /// the packing gains nothing over LZ4 on the raw grid.
@@ -23,10 +27,30 @@ const MAX_PALETTE: usize = 128;
 const TAG_UNIFORM: u8 = 0;
 const TAG_PALETTED: u8 = 1;
 const TAG_RAW: u8 = 2;
+const TAG_SPARSE: u8 = 3;
+const SPARSE_THRESHOLD: usize = CHUNK_CUBED / 8;
 
 /// Encode a chunk for the wire.
 pub fn encode_chunk(v: &ChunkVolume) -> Vec<u8> {
     let raw = v.as_bytes();
+    let occupied = v.occupied_count();
+    if occupied > 0 && occupied <= SPARSE_THRESHOLD {
+        let mut sparse = Vec::with_capacity(OCCUPANCY_WORDS * 4 + occupied);
+        sparse.resize(OCCUPANCY_WORDS * 4, 0);
+        let mut materials = Vec::with_capacity(occupied);
+        for (i, &voxel) in raw.iter().enumerate() {
+            if voxel != 0 {
+                sparse[(i >> 5) * 4 + ((i & 31) >> 3)] |= 1 << (i & 7);
+                materials.push(voxel);
+            }
+        }
+        sparse.extend_from_slice(&materials);
+        let packed = lz4_flex::compress_prepend_size(&sparse);
+        let mut out = Vec::with_capacity(1 + packed.len());
+        out.push(TAG_SPARSE);
+        out.extend_from_slice(&packed);
+        return out;
+    }
 
     // Build the palette (order of first appearance, so encoding is
     // deterministic and golden-bytes tests stay stable).
@@ -120,6 +144,24 @@ pub fn decode_chunk(bytes: &[u8]) -> Option<ChunkVolume> {
             let raw = decompress(bytes.get(1..)?, CHUNK_CUBED)?;
             (raw.len() == CHUNK_CUBED).then(|| ChunkVolume::from_bytes(&raw))
         }
+        TAG_SPARSE => {
+            let sparse = decompress(bytes.get(1..)?, OCCUPANCY_WORDS * 4 + CHUNK_CUBED)?;
+            if sparse.len() < OCCUPANCY_WORDS * 4 {
+                return None;
+            }
+            let occupancy = &sparse[..OCCUPANCY_WORDS * 4];
+            let materials = &sparse[OCCUPANCY_WORDS * 4..];
+            let mut v = ChunkVolume::empty();
+            let out = v.as_bytes_mut();
+            let mut material = 0;
+            for i in 0..CHUNK_CUBED {
+                if occupancy[(i >> 5) * 4 + ((i & 31) >> 3)] & (1 << (i & 7)) != 0 {
+                    *out.get_mut(i)? = *materials.get(material)?;
+                    material += 1;
+                }
+            }
+            (material == materials.len()).then_some(v)
+        }
         _ => None,
     }
 }
@@ -154,7 +196,9 @@ mod tests {
         let mut s = seed;
         let out = v.as_bytes_mut();
         for slot in out.iter_mut() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *slot = ids[(s >> 33) as usize % ids.len()];
         }
         v
@@ -178,8 +222,16 @@ mod tests {
             v.as_bytes_mut()[i] = 1;
         }
         let enc = encode_chunk(&v);
-        assert_eq!(&enc[..4], &[1, 2, 1, 0], "tag, n, palette in first-seen order");
-        assert!(enc.len() < 200, "1-bit half/half packs tiny under LZ4, got {}", enc.len());
+        assert_eq!(
+            &enc[..4],
+            &[1, 2, 1, 0],
+            "tag, n, palette in first-seen order"
+        );
+        assert!(
+            enc.len() < 200,
+            "1-bit half/half packs tiny under LZ4, got {}",
+            enc.len()
+        );
     }
 
     #[test]
@@ -187,9 +239,9 @@ mod tests {
         let cases: Vec<ChunkVolume> = vec![
             ChunkVolume::empty(),
             lcg_volume(1, &[0, 5]),
-            lcg_volume(2, &[0, 1, 2, 3, 4, 5, 6, 7]),                 // 3 bits
-            lcg_volume(3, &(0..=100).collect::<Vec<u8>>()),           // 7 bits
-            lcg_volume(4, &(0..=200).collect::<Vec<u8>>()),           // RawDense
+            lcg_volume(2, &[0, 1, 2, 3, 4, 5, 6, 7]), // 3 bits
+            lcg_volume(3, &(0..=100).collect::<Vec<u8>>()), // 7 bits
+            lcg_volume(4, &(0..=200).collect::<Vec<u8>>()), // RawDense
         ];
         for (i, v) in cases.iter().enumerate() {
             let enc = encode_chunk(v);
@@ -219,22 +271,46 @@ mod tests {
         }
         v.set(5, 5, 5, 7);
         let enc = encode_chunk(&v);
-        assert!(enc.len() < 2048, "terrain chunk should encode ≤ 2 KB, got {}", enc.len());
+        assert!(
+            enc.len() < 2048,
+            "terrain chunk should encode ≤ 2 KB, got {}",
+            enc.len()
+        );
+        assert_eq!(decode_chunk(&enc).unwrap().as_bytes(), v.as_bytes());
+    }
+
+    #[test]
+    fn sparse_occupancy_round_trips_and_beats_dense() {
+        let mut v = ChunkVolume::empty();
+        for i in 0..256 {
+            v.as_bytes_mut()[i * 97 % CHUNK_CUBED] = (i % 7 + 1) as u8;
+        }
+        let enc = encode_chunk(&v);
+        assert_eq!(enc[0], TAG_SPARSE);
+        assert!(
+            enc.len() < CHUNK_CUBED / 2,
+            "sparse payload was {}",
+            enc.len()
+        );
         assert_eq!(decode_chunk(&enc).unwrap().as_bytes(), v.as_bytes());
     }
 
     #[test]
     fn decode_never_panics_on_malformed_input() {
         // Truncations and bit-flips of every valid encoding, plus junk.
-        let samples =
-            [encode_chunk(&ChunkVolume::empty()), encode_chunk(&lcg_volume(7, &[0, 1, 2, 9]))];
+        let samples = [
+            encode_chunk(&ChunkVolume::empty()),
+            encode_chunk(&lcg_volume(7, &[0, 1, 2, 9])),
+        ];
         for enc in &samples {
             for cut in 0..enc.len().min(64) {
                 let _ = decode_chunk(&enc[..cut]);
             }
             let mut s = 0xdeadbeefu64;
             for _ in 0..2000 {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let mut m = enc.clone();
                 let i = (s >> 33) as usize % m.len();
                 m[i] ^= (s >> 17) as u8 | 1;

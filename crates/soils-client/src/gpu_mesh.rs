@@ -203,6 +203,9 @@ fn init_pipeline(
                 storage_buffer_read_only_sized(false, None), // block faces
                 storage_buffer_sized(false, None),           // indirect args (rw, atomic)
                 storage_buffer_read_only_sized(false, None), // jobs
+                storage_buffer_read_only_sized(false, None), // mesh info
+                storage_buffer_read_only_sized(false, None), // descriptors
+                storage_buffer_read_only_sized(false, None), // slot table
             ),
         ),
     );
@@ -273,6 +276,9 @@ fn prepare_jobs(
             faces_buf.buffer.as_entire_buffer_binding(),
             pools.indirect.as_entire_buffer_binding(),
             jobs.jobs.as_ref().unwrap().buffer().unwrap().as_entire_buffer_binding(),
+            pools.mesh_info.as_entire_buffer_binding(),
+            pools.desc.as_entire_buffer_binding(),
+            pools.table.as_entire_buffer_binding(),
         )),
     );
     jobs.bind_group = Some(bind_group);

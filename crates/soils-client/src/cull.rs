@@ -44,11 +44,12 @@ pub struct CullParams {
     pub planes: [Vec4; 6],
     pub camera_chunk: IVec3,
     pub radius: i32,
+    pub max_surface: i32,
 }
 
 impl Default for CullParams {
     fn default() -> Self {
-        Self { planes: [Vec4::ZERO; 6], camera_chunk: IVec3::ZERO, radius: 0 }
+        Self { planes: [Vec4::ZERO; 6], camera_chunk: IVec3::ZERO, radius: 0, max_surface: 0 }
     }
 }
 
@@ -66,6 +67,7 @@ impl CullParams {
         {
             b[96 + j * 4..96 + j * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
+        b[112..116].copy_from_slice(&self.max_surface.to_le_bytes());
         b
     }
 }
@@ -152,6 +154,7 @@ fn on_demands(event: On<ReadbackComplete>, mut demanded: ResMut<DemandedChunks>)
 fn update_cull_params(
     mut params: ResMut<CullParams>,
     streaming: Res<Streaming>,
+    cgen: Res<crate::server_msg::ClientGen>,
     camera: Query<(&Frustum, &Transform), With<Player>>,
 ) {
     let Ok((frustum, transform)) = camera.single() else { return };
@@ -160,7 +163,8 @@ fn update_cull_params(
     }
     let p = transform.translation.floor().as_ivec3();
     params.camera_chunk = IVec3::new(p.x >> CHUNK_BIT, p.y >> CHUNK_BIT, p.z >> CHUNK_BIT);
-    params.radius = streaming.load_radius;
+    params.radius = streaming.detail_radius();
+    params.max_surface = cgen.terrain().map_or(0, |t| t.max_surface());
 }
 
 // ---------------- Render world ----------------

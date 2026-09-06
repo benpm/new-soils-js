@@ -436,6 +436,71 @@ pub struct Streaming {
     pub wanted: usize,
 }
 
+pub const DEFAULT_LOAD_RADIUS: i32 = 8;
+pub const MAX_LOAD_RADIUS: i32 = 32;
+pub const FULL_DETAIL_RADIUS: i32 = 8;
+pub const LOD_HYSTERESIS: i32 = 1;
+
+/// Render detail selected for a chunk. `shift` is the power-of-two terrain
+/// sampling scale used by GPU generation and meshing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkLod {
+    Full,
+    Half,
+    Quarter,
+}
+
+impl ChunkLod {
+    pub const fn shift(self) -> u8 {
+        match self {
+            Self::Full => 0,
+            Self::Half => 1,
+            Self::Quarter => 2,
+        }
+    }
+
+    pub const fn from_shift(shift: u8) -> Option<Self> {
+        match shift {
+            0 => Some(Self::Full),
+            1 => Some(Self::Half),
+            2 => Some(Self::Quarter),
+            _ => None,
+        }
+    }
+}
+
+/// Select a LOD from Chebyshev chunk distance. The hysteresis band is applied
+/// by retaining the previous level while it remains within its stable band.
+pub fn select_chunk_lod(distance: i32, previous: Option<ChunkLod>, radius: i32) -> ChunkLod {
+    let distance = distance.max(0);
+    let full = FULL_DETAIL_RADIUS;
+    let half = (FULL_DETAIL_RADIUS * 2).min(radius.max(full));
+    let selected = if distance <= full {
+        ChunkLod::Full
+    } else if distance <= half {
+        ChunkLod::Half
+    } else {
+        ChunkLod::Quarter
+    };
+
+    match previous {
+        Some(ChunkLod::Full) if distance <= full + LOD_HYSTERESIS => ChunkLod::Full,
+        Some(ChunkLod::Half)
+            if distance > full - LOD_HYSTERESIS && distance <= half + LOD_HYSTERESIS =>
+        {
+            ChunkLod::Half
+        }
+        Some(ChunkLod::Quarter) if distance > half - LOD_HYSTERESIS => ChunkLod::Quarter,
+        _ => selected,
+    }
+}
+
+impl Streaming {
+    pub fn detail_radius(&self) -> i32 {
+        self.load_radius.min(FULL_DETAIL_RADIUS)
+    }
+}
+
 impl Default for Streaming {
     fn default() -> Self {
         // `SOILS_RADIUS` sets the starting view radius (same clamp as the
@@ -444,7 +509,7 @@ impl Default for Streaming {
         let load_radius = std::env::var("SOILS_RADIUS")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
-            .map_or(4, |r| r.clamp(2, 8));
+            .map_or(DEFAULT_LOAD_RADIUS, |r| r.clamp(2, MAX_LOAD_RADIUS));
         Self { last_chunk: None, load_radius, sent_radius: None, pending: 0, wanted: 0 }
     }
 }
@@ -459,10 +524,11 @@ pub fn track_streaming(
     mut streaming: ResMut<Streaming>,
     query: Query<&Transform, With<Player>>,
 ) {
-    if streaming.sent_radius != Some(streaming.load_radius) {
-        streaming.sent_radius = Some(streaming.load_radius);
+    let detail_radius = streaming.detail_radius();
+    if streaming.sent_radius != Some(detail_radius) {
+        streaming.sent_radius = Some(detail_radius);
         net.send(ClientMsg::ViewRadius {
-            radius: streaming.load_radius as u8,
+            radius: detail_radius as u8,
             full_streams: !cgen.hash_ok,
         });
     }
@@ -581,5 +647,15 @@ mod tests {
             s.nudge(1);
         }
         assert_eq!(s.sensitivity, SENS_MAX, "must stop at the ceiling");
+    }
+
+    #[test]
+    fn lod_bands_are_stable_and_hysteretic() {
+        assert_eq!(select_chunk_lod(8, None, 32), ChunkLod::Full);
+        assert_eq!(select_chunk_lod(9, None, 32), ChunkLod::Half);
+        assert_eq!(select_chunk_lod(17, None, 32), ChunkLod::Quarter);
+        assert_eq!(select_chunk_lod(9, Some(ChunkLod::Full), 32), ChunkLod::Full);
+        assert_eq!(select_chunk_lod(16, Some(ChunkLod::Quarter), 32), ChunkLod::Quarter);
+        assert_eq!(ChunkLod::Quarter.shift(), 2);
     }
 }

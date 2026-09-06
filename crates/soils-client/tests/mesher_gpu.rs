@@ -123,6 +123,23 @@ fn gpu_mesh_chunk(
         contents: bytemuck::cast_slice(&[TEST_SLOT]),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    let mesh_info = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh_info"),
+        contents: bytemuck::cast_slice(&[0i32, 0, 0, 0, 0, 0, 0, 0]),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let desc = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("desc"),
+        contents: bytemuck::cast_slice(&[0u32, 0, 0, TEST_SLOT, 0, 0, 0, 0]),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let mut table_data = vec![u32::MAX; 64 * 64 * 64];
+    table_data[0] = 0;
+    let table = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("table"),
+        contents: bytemuck::cast_slice(&table_data),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
     // Quad pool + raw pre-finalize count + post-finalize indirect args.
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
@@ -159,6 +176,9 @@ fn gpu_mesh_chunk(
             buf_entry(2, true),
             buf_entry(3, false),
             buf_entry(4, true),
+            buf_entry(5, true),
+            buf_entry(6, true),
+            buf_entry(7, true),
         ],
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -189,6 +209,9 @@ fn gpu_mesh_chunk(
             wgpu::BindGroupEntry { binding: 2, resource: faces_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: indirect.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: jobs.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: mesh_info.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: desc.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: table.as_entire_binding() },
         ],
     });
 

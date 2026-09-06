@@ -4,7 +4,7 @@
 use bevy::prelude::*;
 
 use crate::gi::GiSettings;
-use crate::player::{LookSettings, Streaming};
+use crate::player::{LookSettings, MAX_LOAD_RADIUS, Streaming};
 use crate::singleplayer::Singleplayer;
 
 /// Render settings toggled from the pause menu. New chunks read this; toggling
@@ -24,7 +24,6 @@ impl Default for RenderToggles {
 }
 
 const RADIUS_MIN: i32 = 2;
-const RADIUS_MAX: i32 = 8;
 
 #[derive(Component, Clone, Copy)]
 pub enum MenuButton {
@@ -110,7 +109,7 @@ pub fn setup_pause_menu(mut commands: Commands) {
                     .with_children(|row| {
                         button(row, "-", MenuButton::RadiusDown);
                         row.spawn((
-                            Text::new("Load radius: 4"),
+                            Text::new("Load radius: 24"),
                             TextFont { font_size: 18.0.into(), ..default() },
                             TextColor(Color::WHITE),
                             RadiusLabel,
@@ -263,7 +262,7 @@ pub fn pause_menu_buttons(
                 streaming.last_chunk = None; // force a re-stream pass
             }
             MenuButton::RadiusUp => {
-                streaming.load_radius = (streaming.load_radius + 1).min(RADIUS_MAX);
+                streaming.load_radius = (streaming.load_radius + 1).min(MAX_LOAD_RADIUS);
                 streaming.last_chunk = None;
             }
             MenuButton::SensDown => look.nudge(-1),

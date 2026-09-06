@@ -456,6 +456,9 @@ fn surface_spawn(terrain: &TerrainGen, x: i32, z: i32) -> [f32; 3] {
 }
 
 impl World {
+    pub fn chunk_guaranteed_air(&self, pos: IVec3) -> bool {
+        self.terrain.chunk_guaranteed_air(pos)
+    }
     /// Turn on SpacetimeDB mirroring for this world's chunk saves.
     pub fn enable_stdb(&mut self, world_id: u16) {
         self.stdb_world_id = Some(world_id);

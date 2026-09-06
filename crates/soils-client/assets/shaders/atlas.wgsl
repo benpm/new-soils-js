@@ -91,9 +91,9 @@ fn block_falloff(level: f32) -> f32 {
 // wrap-window table, validating against the descriptor (stale cells are
 // expected; validation makes them read as "unloaded").
 fn slot_of(cpos: vec3<i32>) -> u32 {
-    let m = vec3<i32>(31);
+    let m = vec3<i32>(63);
     let c = cpos & m;
-    let slot = slot_table[u32(c.x + c.y * 32 + c.z * 1024)];
+    let slot = slot_table[u32(c.x + c.y * 64 + c.z * 4096)];
     if (slot == TABLE_EMPTY) { return TABLE_EMPTY; }
     let d = desc[slot];
     if (any(d.cpos != cpos)) { return TABLE_EMPTY; }
@@ -164,6 +164,7 @@ struct VertexOutput {
     @location(2) @interpolate(flat) tile: u32,
     @location(3) ao: f32,
     @location(4) world_position: vec3<f32>,
+    @location(5) @interpolate(flat) lod_shift: u32,
 };
 
 // Two triangles per quad: corners [0,1,2, 0,2,3] over [origin, +du, +du+dv, +dv].
@@ -207,15 +208,19 @@ fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     else if (corner == 2u) { p = base + vec3<f32>(du) + vec3<f32>(dv); }
     else if (corner == 3u) { p = base + vec3<f32>(dv); }
 
-    let origin = vec3<f32>(mesh_info[slot].xyz * 32);
-    let world_position = origin + p;
+    let info = mesh_info[slot];
+    let lod_shift = u32(info.w) >> 24u;
+    let scale = f32(1u << lod_shift);
+    let origin = vec3<f32>(info.xyz * 32);
+    let world_position = origin + p * scale;
     out.clip_position = position_world_to_clip(world_position);
-    out.local_position = p;
+    out.local_position = p * scale;
     out.world_position = world_position;
     out.normal = normal;
     out.tile = (w1 >> 1u) & 0xffu;
     let ao_lvl = (w1 >> (9u + corner * 2u)) & 3u;
     out.ao = 0.1 + f32(ao_lvl) * 0.3;
+    out.lod_shift = lod_shift;
     return out;
 }
 
@@ -261,12 +266,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // With the grid disabled it falls back to the flat `brightness` (GI demo).
     // The radiance-cascades GI then adds coloured bounce on top.
     var lit = vec3<f32>(params.brightness);
-    if (params.light_enabled > 0.5) {
+    if (params.light_enabled > 0.5 && in.lod_shift == 0u) {
         let l = light_at(in.world_position, n);
         let skyf = f32(l >> 4u) / 15.0;
         let sky_l = params.sky_term * skyf * skyf;
         let block_l = BLOCK_TINT * (BLOCK_LUX * block_falloff(f32(l & 15u)));
         lit = vec3<f32>(sky_l + params.brightness * 0.015) + block_l;
+    } else if (in.lod_shift > 0u) {
+        lit = vec3<f32>(params.sky_term + params.brightness * 0.015);
     }
     var gi = vec3<f32>(0.0);
     if (params.gi_enabled > 0.5) {

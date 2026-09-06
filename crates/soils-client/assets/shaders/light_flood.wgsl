@@ -64,8 +64,8 @@ const NO_MESH: u32 = 0xffffffffu;
 const MAX_LIGHT: u32 = 15u;
 
 fn slot_of(cpos: vec3<i32>) -> u32 {
-    let c = cpos & vec3<i32>(31);
-    let slot = slot_table[u32(c.x + c.y * 32 + c.z * 1024)];
+    let c = cpos & vec3<i32>(63);
+    let slot = slot_table[u32(c.x + c.y * 64 + c.z * 4096)];
     if (slot == TABLE_EMPTY) { return TABLE_EMPTY; }
     if (any(desc[slot].cpos != cpos)) { return TABLE_EMPTY; }
     return slot;

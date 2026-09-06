@@ -340,13 +340,13 @@ none of the five bullets is about direction encoding.
 
 ## Draw Distance Upgrade 2.0
 
-**Deferred — not enough detail to build.** Self-labelled WIP, and the two
-bullets name outcomes rather than designs:
+Chunk LOD prototype work landed in PR #19. The remaining compression-focused
+work is now tracked as a dedicated follow-up plan tied to issue #20.
 
-- Chunk compression over the network and before the copy to GPU memory
-- Chunk LOD, also over the network and on the GPU
+- Plan: [`plan-chunk-compression.md`](plan-chunk-compression.md)
+- Issue: [#20](https://github.com/benpm/new-soils-js/issues/20)
 
-Both need a plan doc before they need code. Notes toward one:
+What this keeps from the earlier notes:
 
 - Chunks are *already* compressed on the wire — palette + LZ4, which took the
   join burst from 23 MB to 498 KB and has a 2 MB regression gate. So the

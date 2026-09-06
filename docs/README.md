@@ -37,6 +37,7 @@ implemented — `architecture.md` describes what actually shipped.
 | [`plan-rgb-light-rework.md`](plan-rgb-light-rework.md) | RGB blocklight in a `u32` (5:5:5:5) with range 31, and the pool halving that pays for it. **Designed, not landed.** |
 | [`plan-sun.md`](plan-sun.md) | Semidirectional sunlight: a directional channel in the light word's spare bits. **Design only.** |
 | [`plan-better-lighting.md`](plan-better-lighting.md) | Coarse light stored with world data, fine light GPU-only. **Sketch.** |
+| [`plan-chunk-compression.md`](plan-chunk-compression.md) | Follow-up plan for issue #20: occupancy/depth bitfields and selective visible-voxel expansion for chunk rendering. **Design only.** |
 | [`plan-storage.md`](plan-storage.md) | Region files, chunk persistence, and containers. **Phase 1 shipped.** |
 | [`plan-death-chest.md`](plan-death-chest.md) | A minimal death model, the grave it drops, and filming it. **Plan only.** |
 | [`plan-server-commands.md`](plan-server-commands.md) | Player-typed slash commands: server-parsed lines, account roles, and the chunk-granular bulk-edit engine behind `/fill` and the excavator. **Design only.** |

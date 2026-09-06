@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>soils — recorded test cases</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #14161a; --panel: #1c1f26; --line: #2b3039;
+    --fg: #e6e8ec; --dim: #9aa3b2; --accent: #7dd3a0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header { padding: 2rem 1.5rem 1rem; max-width: 1100px; margin: 0 auto; }
+  h1 { margin: 0 0 .35rem; font-size: 1.5rem; letter-spacing: -.01em; }
+  .sub { color: var(--dim); margin: 0; }
+  .sub a { color: var(--accent); }
+  main { max-width: 1100px; margin: 0 auto; padding: 0 1.5rem 4rem; }
+  nav {
+    display: flex; flex-wrap: wrap; gap: .4rem;
+    border-bottom: 1px solid var(--line); padding-bottom: .75rem; margin: 1.5rem 0;
+  }
+  button.tab {
+    font: inherit; cursor: pointer; color: var(--dim);
+    background: transparent; border: 1px solid var(--line);
+    border-radius: 999px; padding: .3rem .85rem;
+  }
+  button.tab:hover { color: var(--fg); }
+  button.tab[aria-selected="true"] {
+    color: #10131a; background: var(--accent); border-color: var(--accent);
+  }
+  .meta { color: var(--dim); font-size: .85rem; margin: 0 0 1.5rem; }
+  .meta code { color: var(--fg); }
+  figure {
+    margin: 0 0 2.5rem; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+  }
+  video { display: block; width: 100%; background: #000; }
+  figcaption { padding: .9rem 1.1rem 1.1rem; }
+  figcaption h2 { margin: 0 0 .35rem; font-size: 1.05rem; }
+  figcaption p { margin: 0; color: var(--dim); }
+  figcaption code { color: var(--fg); }
+  .empty { color: var(--dim); padding: 2rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>soils — recorded test cases</h1>
+  <p class="sub">
+    Videos rendered on CI by the <code>#[ignore]</code>d recording tests, one
+    tab per branch. Source:
+    <a href="https://github.com/benpm/new-soils-js">benpm/new-soils-js</a>.
+  </p>
+</header>
+<main>
+  <nav id="tabs"></nav>
+  <div id="panel"><p class="empty">Loading…</p></div>
+</main>
+<script>
+const $tabs = document.getElementById('tabs');
+const $panel = document.getElementById('panel');
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function render(slug, data) {
+  const b = data[slug];
+  for (const el of $tabs.children)
+    el.setAttribute('aria-selected', String(el.dataset.slug === slug));
+  if (location.hash.slice(1) !== slug) history.replaceState(null, '', '#' + slug);
+
+  if (!b || !b.videos.length) {
+    $panel.innerHTML = '<p class="empty">No recordings for this branch.</p>';
+    return;
+  }
+  const when = new Date(b.updated).toLocaleString();
+  const parts = [
+    `<p class="meta">Branch <code>${esc(b.branch)}</code> at ` +
+    `<code>${esc(b.commit.slice(0, 7))}</code> — recorded ${esc(when)}</p>`
+  ];
+  for (const v of b.videos) {
+    parts.push(
+      `<figure>` +
+      `<video controls preload="metadata" playsinline loop ` +
+      `src="${esc(v.file)}"></video>` +
+      `<figcaption><h2>${esc(v.title)}</h2><p>${v.description}</p></figcaption>` +
+      `</figure>`
+    );
+  }
+  $panel.innerHTML = parts.join('');
+}
+
+fetch('branches.json?' + Date.now())
+  .then(r => r.ok ? r.json() : Promise.reject(r.status))
+  .then(data => {
+    // Default branch first, then most-recently-recorded, so the tab that
+    // opens is the one a visitor almost always wants.
+    const slugs = Object.keys(data).sort((a, b) => {
+      if ((data[a].branch === 'master') !== (data[b].branch === 'master'))
+        return data[a].branch === 'master' ? -1 : 1;
+      return data[b].updated.localeCompare(data[a].updated);
+    });
+    if (!slugs.length) {
+      $panel.innerHTML = '<p class="empty">Nothing recorded yet.</p>';
+      return;
+    }
+    for (const slug of slugs) {
+      const btn = document.createElement('button');
+      btn.className = 'tab';
+      btn.dataset.slug = slug;
+      btn.textContent = data[slug].branch;
+      btn.onclick = () => render(slug, data);
+      $tabs.append(btn);
+    }
+    const want = decodeURIComponent(location.hash.slice(1));
+    render(slugs.includes(want) ? want : slugs[0], data);
+  })
+  .catch(e => {
+    $panel.innerHTML = '<p class="empty">Could not load branches.json (' +
+      esc(e) + ').</p>';
+  });
+</script>
+</body>
+</html>

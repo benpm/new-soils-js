@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use wgpu::util::DeviceExt;
 
-const N_MESH: usize = 4096;
+const N_MESH: usize = 8192;
 const TABLE_EMPTY: u32 = u32::MAX;
 /// Camera chunk and load radius the params below are built from.
 const CAMERA_CHUNK_X: i32 = 4;

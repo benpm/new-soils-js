@@ -17,7 +17,7 @@ struct CullParams {
     camera_chunk: vec3<i32>,
     radius: i32,
     max_surface: i32,
-    _pad0: i32,
+    mesh_count: i32,
     _pad1: i32,
     _pad2: i32,
 }
@@ -52,7 +52,7 @@ struct DemandBuffer {
 @group(0) @binding(4) var<storage, read> slot_table: array<u32>;
 @group(0) @binding(5) var<storage, read_write> demands: DemandBuffer;
 
-const N_MESH: u32 = 4096u;
+const N_MESH: u32 = 8192u;
 const TABLE_EMPTY: u32 = 0xffffffffu;
 const DEMAND_CAP: u32 = 8192u;
 
@@ -76,7 +76,8 @@ fn aabb_visible(mn: vec3<f32>, mx: vec3<f32>) -> bool {
 @compute @workgroup_size(64)
 fn cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     let slot = gid.x;
-    if (slot >= N_MESH) {
+    let mesh_count = select(N_MESH, u32(params.mesh_count), params.mesh_count > 0);
+    if (slot >= mesh_count) {
         return;
     }
     let info = mesh_info[slot];

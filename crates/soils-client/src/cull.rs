@@ -45,11 +45,18 @@ pub struct CullParams {
     pub camera_chunk: IVec3,
     pub radius: i32,
     pub max_surface: i32,
+    pub mesh_count: i32,
 }
 
 impl Default for CullParams {
     fn default() -> Self {
-        Self { planes: [Vec4::ZERO; 6], camera_chunk: IVec3::ZERO, radius: 0, max_surface: 0 }
+        Self {
+            planes: [Vec4::ZERO; 6],
+            camera_chunk: IVec3::ZERO,
+            radius: 0,
+            max_surface: 0,
+            mesh_count: crate::pool::N_MESH as i32,
+        }
     }
 }
 
@@ -68,6 +75,7 @@ impl CullParams {
             b[96 + j * 4..96 + j * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         b[112..116].copy_from_slice(&self.max_surface.to_le_bytes());
+        b[116..120].copy_from_slice(&self.mesh_count.to_le_bytes());
         b
     }
 }
@@ -165,6 +173,7 @@ fn update_cull_params(
     params.camera_chunk = IVec3::new(p.x >> CHUNK_BIT, p.y >> CHUNK_BIT, p.z >> CHUNK_BIT);
     params.radius = streaming.detail_radius();
     params.max_surface = cgen.terrain().map_or(0, |t| t.max_surface());
+    params.mesh_count = crate::pool::N_MESH as i32;
 }
 
 // ---------------- Render world ----------------

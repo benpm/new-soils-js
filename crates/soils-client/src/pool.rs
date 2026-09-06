@@ -20,12 +20,12 @@ use soils_protocol::{CHUNK_CUBED, ChunkVolume};
 /// `max_storage_buffer_binding_size` — 192 MiB at the default, which a real
 /// GPU has and Mesa lavapipe (128 MiB) does not. See `small_pools`.
 #[cfg(not(feature = "small_pools"))]
-pub const N_SLOTS: u32 = 6144;
+pub const N_SLOTS: u32 = 9216;
 /// Mesh slots (voxels + quads + indirect). Only non-air chunks need one
 /// (~2.5k at r8). Slot 0 is a permanently-zero sentinel so air chunks' voxel
 /// reads resolve to air without branching; it is never handed out.
 #[cfg(not(feature = "small_pools"))]
-pub const N_MESH: u32 = 4096;
+pub const N_MESH: u32 = 8192;
 
 /// Pool sizes for a software rasteriser: light 96 MiB, voxels 64 MiB, quads
 /// 64 MiB, all inside lavapipe's 128 MiB storage-binding limit.
@@ -39,9 +39,8 @@ pub const N_MESH: u32 = 4096;
 ///
 /// The ratio is preserved (`N_SLOTS > N_MESH`): light slots cover padded
 /// neighbours, so there must be more of them than mesh slots. Nothing needs
-/// to change in the shaders — `N_SLOTS` appears there only in comments, and
-/// `cull_demand.wgsl`'s hardcoded `N_MESH = 4096u` is an upper bound check,
-/// so a smaller Rust-side pool merely never reaches it.
+/// The culling shader uses the same fixed mesh capacity; keep that constant in
+/// sync when changing this pool.
 ///
 /// Capacity is the cost: this covers a radius-4 window, not radius-8. The
 /// recordings set `SOILS_RADIUS=2`, so it is not the binding constraint there.
@@ -640,9 +639,9 @@ mod tests {
     #[test]
     fn table_index_wraps() {
         assert_eq!(table_index(IVec3::ZERO), 0);
-        assert_eq!(table_index(IVec3::new(32, 0, 0)), 0);
-        assert_eq!(table_index(IVec3::new(-1, 0, 0)), 31);
-        assert_eq!(table_index(IVec3::new(1, 1, 1)), (1 + 32 + 1024) as usize);
+        assert_eq!(table_index(IVec3::new(64, 0, 0)), 0);
+        assert_eq!(table_index(IVec3::new(-1, 0, 0)), 63);
+        assert_eq!(table_index(IVec3::new(1, 1, 1)), (1 + 64 + 4096) as usize);
         // Distinct within a 17-chunk window.
         assert_ne!(table_index(IVec3::new(8, 0, 0)), table_index(IVec3::new(-8, 0, 0)));
     }

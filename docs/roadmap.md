@@ -341,7 +341,8 @@ none of the five bullets is about direction encoding.
 ## Draw Distance Upgrade 2.0
 
 Chunk LOD prototype work landed in PR #19. The remaining compression-focused
-work is now tracked as a dedicated follow-up plan tied to issue #20.
+work is now tracked as a dedicated follow-up plan tied to issue #20, centered
+on occupancy-bit meshing plus deferred visible-fragment material lookup.
 
 - Plan: [`plan-chunk-compression.md`](plan-chunk-compression.md)
 - Issue: [#20](https://github.com/benpm/new-soils-js/issues/20)

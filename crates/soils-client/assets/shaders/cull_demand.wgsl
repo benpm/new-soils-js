@@ -16,6 +16,10 @@ struct CullParams {
     // Camera chunk coordinate and desired radius (chunks).
     camera_chunk: vec3<i32>,
     radius: i32,
+    max_surface: i32,
+    mesh_count: i32,
+    _pad1: i32,
+    _pad2: i32,
 }
 
 struct ChunkSlot {
@@ -48,7 +52,7 @@ struct DemandBuffer {
 @group(0) @binding(4) var<storage, read> slot_table: array<u32>;
 @group(0) @binding(5) var<storage, read_write> demands: DemandBuffer;
 
-const N_MESH: u32 = 4096u;
+const N_MESH: u32 = 8192u;
 const TABLE_EMPTY: u32 = 0xffffffffu;
 const DEMAND_CAP: u32 = 8192u;
 
@@ -72,7 +76,8 @@ fn aabb_visible(mn: vec3<f32>, mx: vec3<f32>) -> bool {
 @compute @workgroup_size(64)
 fn cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     let slot = gid.x;
-    if (slot >= N_MESH) {
+    let mesh_count = select(N_MESH, u32(params.mesh_count), params.mesh_count > 0);
+    if (slot >= mesh_count) {
         return;
     }
     let info = mesh_info[slot];
@@ -91,13 +96,15 @@ fn cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     // frustum, so anything still holding a mesh slot draws at any distance —
     // and the server unloads at > radius + 1 while loading at <= radius, so
     // that one-chunk shell would never be demanded and never go away.
+    let lod_shift = u32(info.w) >> 24u;
     let d = abs(info.xyz - params.camera_chunk);
-    if (max(d.x, max(d.y, d.z)) > params.radius) {
+    if (lod_shift == 0u && max(d.x, max(d.y, d.z)) > params.radius) {
         indirect[slot * 4u + 1u] = 0u;
         return;
     }
+    let scale = f32(1u << lod_shift);
     let mn = vec3<f32>(info.xyz * 32);
-    let visible = aabb_visible(mn, mn + vec3<f32>(32.0));
+    let visible = aabb_visible(mn, mn + vec3<f32>(32.0 * scale));
     indirect[slot * 4u + 1u] = select(0u, 1u, visible);
 }
 
@@ -109,11 +116,14 @@ fn demand_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let offs = vec3<i32>(gid) - vec3<i32>(params.radius);
     let cpos = params.camera_chunk + offs;
+    if (cpos.y * 32 > params.max_surface && max(abs(offs.x), max(abs(offs.y), abs(offs.z))) > 1) {
+        return;
+    }
     // Resolve through the wrap-window table; a stale or vacant cell means the
     // chunk isn't mapped.
-    let m = vec3<i32>(31);
+    let m = vec3<i32>(63);
     let c = cpos & m;
-    let slot = slot_table[u32(c.x + c.y * 32 + c.z * 1024)];
+    let slot = slot_table[u32(c.x + c.y * 64 + c.z * 4096)];
     if (slot != TABLE_EMPTY && all(desc[slot].cpos == cpos)) {
         return;
     }

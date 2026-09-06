@@ -70,7 +70,7 @@ const CACHED_WAVES_PER_TICK: u32 = 8;
 const GEN_WAVES_INFLIGHT: usize = 8;
 /// Default and maximum client view radii (chunks). The client's `ViewRadius`
 /// only *sizes* its subscription; the server owns membership.
-const DEFAULT_RADIUS: i32 = 4;
+const DEFAULT_RADIUS: i32 = 8;
 const MAX_RADIUS: i32 = 8;
 /// Chunks stay subscribed until they leave radius + this margin, so hovering
 /// on a chunk border doesn't thrash load/unload.
@@ -1912,6 +1912,9 @@ fn resubscribe(c: &mut Client, world: &mut World) {
         for dy in -r..=r {
             for dz in -r..=r {
                 let pos = center + IVec3::new(dx, dy, dz);
+                if world.chunk_guaranteed_air(pos) && dx.abs().max(dy.abs()).max(dz.abs()) > CULL_KEEP {
+                    continue;
+                }
                 if !c.subs.contains(&pos) {
                     enters.push(pos);
                 }

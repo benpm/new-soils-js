@@ -35,12 +35,13 @@ use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 
 use crate::chunk::{Blocks, ChunkMap};
 use crate::demand::ChunkDirectory;
+use crate::player::{select_chunk_lod, ChunkLod, Player, Streaming};
 use crate::pool::{ChunkSlots, DirtyMesh, PoolOpQueue};
 use crate::server_msg::ClientGen;
 
 /// Max GPU gen jobs dispatched per frame (also sizes the lattice scratch and
 /// the occupancy readback).
-pub const GEN_BUDGET: usize = 16;
+pub const GEN_BUDGET: usize = 128;
 
 const LATTICE_WORDS: u64 = 9 * 9 * 9;
 
@@ -60,10 +61,19 @@ pub struct GenShader {
     key: (i64, u8),
 }
 
-/// Positions process_demands routed to GPU gen this frame (with their
-/// freshly allocated mesh slots).
+#[derive(Clone, Copy)]
+pub struct GpuGenJob {
+    pub cpos: IVec3,
+    pub mesh: u32,
+    pub lod_shift: u8,
+}
+
+/// Positions routed to GPU gen this frame.
 #[derive(Resource, Default)]
-pub struct GpuGenQueue(pub Vec<(IVec3, u32)>);
+pub struct GpuGenQueue(pub Vec<GpuGenJob>);
+
+#[derive(Resource, Default)]
+pub struct LodChunks(pub HashMap<IVec3, u8>);
 
 /// This frame's dispatch, handed to the render world.
 #[derive(Resource, Clone, Default, ExtractResource)]
@@ -93,6 +103,7 @@ impl Plugin for GpuGenPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GenShaderInfo>()
             .init_resource::<GpuGenQueue>()
+            .init_resource::<LodChunks>()
             .init_resource::<GpuGenBatch>()
             .init_resource::<GenBatches>()
             .add_plugins(ExtractResourcePlugin::<GenShaderInfo>::default())
@@ -119,6 +130,84 @@ impl Plugin for GpuGenPlugin {
                     prepare_gen.in_set(RenderSystems::PrepareBindGroups),
                 ),
             );
+    }
+}
+
+pub fn maintain_lod(
+    ready: Option<Res<GenReady>>,
+    cgen: Res<ClientGen>,
+    streaming: Res<Streaming>,
+    player: Query<&Transform, With<Player>>,
+    mut lod_chunks: ResMut<LodChunks>,
+    mut slots: ResMut<ChunkSlots>,
+    mut ops: ResMut<PoolOpQueue>,
+    mut dirty: ResMut<DirtyMesh>,
+    mut queue: ResMut<GpuGenQueue>,
+) {
+    let Ok(transform) = player.single() else { return };
+    let Some(terrain) = cgen.terrain() else { return };
+    if ready.is_none() || !cgen.hash_ok {
+        return;
+    }
+    let center = transform.translation.floor().as_ivec3() >> IVec3::splat(5);
+    let mut desired: HashMap<IVec3, u8> = HashMap::default();
+    for (level, inner, outer) in [
+        (ChunkLod::Half, 8, streaming.load_radius.min(16)),
+        (ChunkLod::Quarter, 16, streaming.load_radius),
+    ] {
+        if outer <= inner {
+            continue;
+        }
+        let scale = 1i32 << level.shift();
+        let x0 = (center.x - outer).div_euclid(scale) * scale;
+        let x1 = (center.x + outer).div_euclid(scale) * scale;
+        let z0 = (center.z - outer).div_euclid(scale) * scale;
+        let z1 = (center.z + outer).div_euclid(scale) * scale;
+        for x in (x0..=x1).step_by(scale as usize) {
+            for z in (z0..=z1).step_by(scale as usize) {
+                let dx = (x + scale / 2 - center.x).abs();
+                let dz = (z + scale / 2 - center.z).abs();
+                let distance = dx.max(dz);
+                if distance <= inner || distance > outer {
+                    continue;
+                }
+                let world_x = x * 32 + scale * 16;
+                let world_z = z * 32 + scale * 16;
+                let height = terrain.surface_height(world_x, world_z);
+                let y = height.div_euclid(32 * scale) * scale;
+                let cpos = IVec3::new(x, y, z);
+                let distance = (cpos - center).abs().max_element();
+                let previous = lod_chunks
+                    .0
+                    .get(&cpos)
+                    .and_then(|shift| ChunkLod::from_shift(*shift));
+                let shift = select_chunk_lod(distance, previous.or(Some(level)), streaming.load_radius).shift();
+                desired.insert(cpos, shift);
+            }
+        }
+    }
+
+    let stale: Vec<_> = lod_chunks
+        .0
+        .keys()
+        .filter(|p| !desired.contains_key(*p))
+        .copied()
+        .collect();
+    for cpos in stale {
+        slots.unmap_chunk(&mut ops, &mut dirty, cpos);
+        lod_chunks.0.remove(&cpos);
+    }
+    for (cpos, lod_shift) in desired {
+        if lod_chunks.0.contains_key(&cpos)
+            || queue.0.len() >= GEN_BUDGET
+            || slots.get(cpos).is_some()
+        {
+            continue;
+        }
+        if let Some(slot) = slots.map_chunk_gen_lod(&mut ops, &mut dirty, cpos, lod_shift) {
+            lod_chunks.0.insert(cpos, lod_shift);
+            queue.0.push(GpuGenJob { cpos, mesh: slot.mesh, lod_shift });
+        }
     }
 }
 
@@ -190,7 +279,7 @@ pub fn flush_gen_batch(
         return;
     }
     let Some(occ) = occ else { return };
-    let list: Vec<(IVec3, u32)> = queue.0.drain(..).collect();
+    let list: Vec<GpuGenJob> = queue.0.drain(..).collect();
     batches.next_id += 1;
     let tag = batches.next_id;
     let mut data = vec![0u32; 1 + GEN_BUDGET];
@@ -198,11 +287,12 @@ pub fn flush_gen_batch(
     if let Some(mut buf) = buffers.get_mut(&occ.0) {
         buf.set_data(data);
     }
-    for (cpos, mesh) in &list {
-        let o = *cpos * 32;
-        batch.jobs.push([o.x, o.y, o.z, *mesh as i32]);
+    for job in &list {
+        let o = job.cpos * 32;
+        let packed = job.mesh | (u32::from(job.lod_shift) << 24);
+        batch.jobs.push([o.x, o.y, o.z, packed as i32]);
     }
-    batches.pending.insert(tag, list);
+    batches.pending.insert(tag, list.iter().map(|j| (j.cpos, j.mesh)).collect());
     // Drop stale batches whose readback never matched (warp races).
     let cur = batches.next_id;
     batches.pending.retain(|id, _| cur.wrapping_sub(*id) < 64);

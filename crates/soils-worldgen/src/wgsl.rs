@@ -392,15 +392,17 @@ fn gen_lattice(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
     // 729 samples over one workgroup of 64 threads; one workgroup per job.
     let job = wg.y;
     let o = jobs[job].xyz;
+    let lod_shift = u32(jobs[job].w) >> 24u;
+    let step = i32(1u << lod_shift);
     for (var i = i32(t); i < CAVE_N * CAVE_N * CAVE_N; i = i + 64) {
         let iy = i / (CAVE_N * CAVE_N);
         let rem = i % (CAVE_N * CAVE_N);
         let iz = rem / CAVE_N;
         let ix = rem % CAVE_N;
         lattice[i32(job) * (CAVE_N * CAVE_N * CAVE_N) + i] = cave_noise_at(
-            o.x + ix * CAVE_STEP,
-            o.y + iy * CAVE_STEP,
-            o.z + iz * CAVE_STEP,
+            o.x + ix * CAVE_STEP * step,
+            o.y + iy * CAVE_STEP * step,
+            o.z + iz * CAVE_STEP * step,
         );
     }
 }
@@ -441,7 +443,10 @@ fn gen_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
     SEED = gen.seed;
     let job = gid.z;
     let o = jobs[job].xyz;
-    let slot = u32(jobs[job].w);
+    let packed = u32(jobs[job].w);
+    let slot = packed & 0x00ffffffu;
+    let lod_shift = packed >> 24u;
+    let step = i32(1u << lod_shift);
     let xw = i32(gid.x);   // word column 0..8
     let z = i32(gid.y);    // 0..32
     if (xw >= 8 || z >= 32) { return; }
@@ -454,8 +459,8 @@ fn gen_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
     var heights: array<i32, 4>;
     var rocks: array<i32, 4>;
     for (var k = 0; k < 4; k = k + 1) {
-        let gx = o.x + xw * 4 + k;
-        let gz = o.z + z;
+        let gx = o.x + (xw * 4 + k) * step;
+        let gz = o.z + z * step;
         if (flat) {
             heights[k] = 256; rocks[k] = 0;
         } else {
@@ -466,7 +471,7 @@ fn gen_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var non_air = 0u;
     for (var y = 0; y < 32; y = y + 1) {
-        let gy = o.y + y;
+        let gy = o.y + y * step;
         var word = 0u;
         if (!all_air) {
             for (var k = 0; k < 4; k = k + 1) {

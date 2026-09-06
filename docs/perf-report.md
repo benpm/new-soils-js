@@ -205,6 +205,39 @@ cost, per-render-pass GPU/CPU time, and the light backlog to stdout
 
 ## What's left on the table
 
+### Voxel compression assessment (2026-09-06)
+
+The occupancy/material proposal was implemented first at the protocol boundary,
+not as an unmeasured renderer rewrite. Sparse edited chunks now have a bounded
+occupancy-plus-material codec path (tag `3`) and the protocol bench reports
+its encode/decode cost alongside the existing palette/LZ4 cases. This reduces
+wire/storage payloads for sparse edits; it does **not** claim a frame-time win,
+because the client still decodes to the dense volume required by the GPU
+mesher, lighting, collision, and LOD neighbour sampling.
+
+The deferred ID-buffer material pass remains deferred. On the reference RTX
+5070, terrain rasterization is approximately 0.07 ms GPU, so adding a
+visibility/material pass without first proving a meshing-bandwidth reduction
+would likely regress rendering time. `docs/plan-voxel-compression.md` defines
+the matched benchmark required before changing that conclusion.
+
+Measured on the RTX 5070 / Ryzen 5 3600 release build:
+
+| Case | Codec result |
+|---|---:|
+| Sparse occupancy payload | 80 B |
+| Layered surface payload | 113 B |
+| Sparse encode | 24.6 us |
+| Sparse decode | 30.9 us |
+| Occupancy sidecar build | 11.8 us |
+| Radius 4 steady self-test | 14.18 ms/frame, 0.061 ms terrain GPU |
+| Radius 8 steady self-test | 14.75 ms/frame, 0.085 ms terrain GPU |
+
+The last two rows are the rendering baseline for this change, not an
+improvement claim: the first implementation intentionally leaves the dense GPU
+mesher unchanged. They make the absence of a frame-time regression explicit
+and provide the comparison target for the future GPU occupancy sidecar.
+
 Ranked by expected payoff on the reference hardware:
 
 1. **Client dense light regions** — port the server's `LightJob`/`DenseWorld`

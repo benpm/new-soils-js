@@ -25,18 +25,52 @@ const QUADS_PER_SLOT: u32 = 4096u;
 @group(0) @binding(2) var<storage, read>       block_faces: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read_write> indirect: array<atomic<u32>>; // N_MESH × 4 words
 @group(0) @binding(4) var<storage, read>       jobs: array<u32>;        // mesh slots this pass
+@group(0) @binding(5) var<storage, read>       mesh_info: array<vec4<i32>>;
+@group(0) @binding(6) var<storage, read>       desc: array<ChunkSlot>;
+@group(0) @binding(7) var<storage, read>       slot_table: array<u32>;
+
+struct ChunkSlot {
+    cpos: vec3<i32>,
+    mesh_slot: u32,
+    flags: u32,
+    flags_gpu: u32,
+    quad_count: u32,
+    pad: u32,
+};
+
+const TABLE_EMPTY: u32 = 0xffffffffu;
+const NO_MESH: u32 = 0xffffffffu;
 
 // Per-slice scratch, filled cooperatively (one row per lane, see mesh_slice).
 var<workgroup> mask: array<i32, 1024>;
 var<workgroup> aokey: array<u32, 1024>; // 4 corner occlusion levels packed 8 bits each
 
-fn vox(slot: u32, x: i32, y: i32, z: i32) -> u32 {
-    if (x < 0 || x >= CHUNK || y < 0 || y >= CHUNK || z < 0 || z >= CHUNK) {
-        return 0u;
-    }
+fn raw_vox(slot: u32, x: i32, y: i32, z: i32) -> u32 {
     let idx = (y + z * CHUNK) * CHUNK + x;
     let w = voxels[slot * 8192u + (u32(idx) >> 2u)];
     return (w >> ((u32(idx) & 3u) * 8u)) & 0xffu;
+}
+
+fn vox(slot: u32, x0: i32, y0: i32, z0: i32) -> u32 {
+    var p = vec3<i32>(x0, y0, z0);
+    var offset = vec3<i32>(0);
+    for (var axis = 0; axis < 3; axis += 1) {
+        if (p[axis] < 0) { p[axis] += CHUNK; offset[axis] = -1; }
+        else if (p[axis] >= CHUNK) { p[axis] -= CHUNK; offset[axis] = 1; }
+    }
+    if (all(offset == vec3<i32>(0))) {
+        return raw_vox(slot, p.x, p.y, p.z);
+    }
+    let info = mesh_info[slot];
+    let lod_shift = u32(info.w) >> 24u;
+    let scale = i32(1u << lod_shift);
+    let cpos = info.xyz + offset * scale;
+    let c = cpos & vec3<i32>(63);
+    let unified = slot_table[u32(c.x + c.y * 64 + c.z * 4096)];
+    if (unified == TABLE_EMPTY || any(desc[unified].cpos != cpos)) { return 0u; }
+    let neighbour = desc[unified].mesh_slot;
+    if (neighbour == NO_MESH || (u32(mesh_info[neighbour].w) >> 24u) != lod_shift) { return 0u; }
+    return raw_vox(neighbour, p.x, p.y, p.z);
 }
 
 fn solid(slot: u32, p: array<i32, 3>) -> bool {

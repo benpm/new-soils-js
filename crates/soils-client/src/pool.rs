@@ -20,12 +20,12 @@ use soils_protocol::{CHUNK_CUBED, ChunkVolume};
 /// `max_storage_buffer_binding_size` — 192 MiB at the default, which a real
 /// GPU has and Mesa lavapipe (128 MiB) does not. See `small_pools`.
 #[cfg(not(feature = "small_pools"))]
-pub const N_SLOTS: u32 = 6144;
+pub const N_SLOTS: u32 = 9216;
 /// Mesh slots (voxels + quads + indirect). Only non-air chunks need one
 /// (~2.5k at r8). Slot 0 is a permanently-zero sentinel so air chunks' voxel
 /// reads resolve to air without branching; it is never handed out.
 #[cfg(not(feature = "small_pools"))]
-pub const N_MESH: u32 = 4096;
+pub const N_MESH: u32 = 8192;
 
 /// Pool sizes for a software rasteriser: light 96 MiB, voxels 64 MiB, quads
 /// 64 MiB, all inside lavapipe's 128 MiB storage-binding limit.
@@ -39,9 +39,8 @@ pub const N_MESH: u32 = 4096;
 ///
 /// The ratio is preserved (`N_SLOTS > N_MESH`): light slots cover padded
 /// neighbours, so there must be more of them than mesh slots. Nothing needs
-/// to change in the shaders — `N_SLOTS` appears there only in comments, and
-/// `cull_demand.wgsl`'s hardcoded `N_MESH = 4096u` is an upper bound check,
-/// so a smaller Rust-side pool merely never reaches it.
+/// The culling shader uses the same fixed mesh capacity; keep that constant in
+/// sync when changing this pool.
 ///
 /// Capacity is the cost: this covers a radius-4 window, not radius-8. The
 /// recordings set `SOILS_RADIUS=2`, so it is not the binding constraint there.
@@ -51,11 +50,11 @@ pub const N_SLOTS: u32 = 3072;
 pub const N_MESH: u32 = 2048;
 /// `Slot::mesh` value for air chunks (no mesh slot).
 pub const NO_MESH: u32 = u32::MAX;
-/// Slot-table axis size: chunk coord masked to `& 31` per axis. Collision-free
-/// while the active window is < 32 chunks per axis (radius ≤ 8 → 17), but
+/// Slot-table axis size: chunk coord masked to `& 63` per axis. Collision-free
+/// while the active window is < 64 chunks per axis (radius 24 → 49), but
 /// entries left behind by movement go stale, so every lookup — GPU and CPU —
 /// validates the resolved slot's chunk position.
-pub const TABLE_DIM: i32 = 32;
+pub const TABLE_DIM: i32 = 64;
 /// Empty slot-table entry.
 pub const TABLE_EMPTY: u32 = u32::MAX;
 
@@ -172,7 +171,7 @@ impl ChunkSlots {
         let s = self.alloc(cpos, non_air)?;
         if s.mesh != NO_MESH {
             ops.push(PoolOp::UploadVoxels { mesh: s.mesh, volume: volume.clone() });
-            ops.push(PoolOp::WriteMeshInfo { mesh: s.mesh, cpos, slot: s.slot });
+            ops.push(PoolOp::WriteMeshInfo { mesh: s.mesh, cpos, slot: s.slot, lod_shift: 0 });
             dirty.0.push(s.mesh);
         }
         ops.push(PoolOp::WriteDesc { slot: s.slot, cpos, mesh: s.mesh });
@@ -191,8 +190,18 @@ impl ChunkSlots {
         dirty: &mut DirtyMesh,
         cpos: IVec3,
     ) -> Option<Slot> {
+        self.map_chunk_gen_lod(ops, dirty, cpos, 0)
+    }
+
+    pub fn map_chunk_gen_lod(
+        &mut self,
+        ops: &mut PoolOpQueue,
+        dirty: &mut DirtyMesh,
+        cpos: IVec3,
+        lod_shift: u8,
+    ) -> Option<Slot> {
         let s = self.alloc(cpos, true)?;
-        ops.push(PoolOp::WriteMeshInfo { mesh: s.mesh, cpos, slot: s.slot });
+        ops.push(PoolOp::WriteMeshInfo { mesh: s.mesh, cpos, slot: s.slot, lod_shift });
         dirty.0.push(s.mesh);
         ops.push(PoolOp::WriteDesc { slot: s.slot, cpos, mesh: s.mesh });
         let idx = table_index(cpos) as u32;
@@ -336,7 +345,7 @@ pub enum PoolOp {
     /// Point a slot-table cell at a slot (or `TABLE_EMPTY`).
     WriteTable { index: u32, slot: u32 },
     /// (Re)write a mesh slot's info row (chunk pos + owning light slot).
-    WriteMeshInfo { mesh: u32, cpos: IVec3, slot: u32 },
+    WriteMeshInfo { mesh: u32, cpos: IVec3, slot: u32, lod_shift: u8 },
     /// Zero a freed mesh slot's draw args so it stops drawing.
     ClearIndirect { mesh: u32 },
 }
@@ -377,7 +386,12 @@ pub struct DirtyMesh(pub Vec<u32>);
 /// same frame has a *legitimate* new dirty entry, and a blanket "freed this
 /// frame" filter would drop it and leave the new chunk invisible.
 fn retire_mesh(ops: &mut PoolOpQueue, dirty: &mut DirtyMesh, mesh: u32) {
-    ops.push(PoolOp::WriteMeshInfo { mesh, cpos: IVec3::MAX, slot: TABLE_EMPTY });
+    ops.push(PoolOp::WriteMeshInfo {
+        mesh,
+        cpos: IVec3::MAX,
+        slot: TABLE_EMPTY,
+        lod_shift: 0,
+    });
     dirty.0.retain(|m| *m != mesh);
 }
 
@@ -452,12 +466,13 @@ fn apply_pool_ops(
             PoolOp::WriteTable { index, slot } => {
                 stage(&slot.to_le_bytes(), Dst::Table, index as u64 * 4, &mut staging, &mut copies, &mut dsts);
             }
-            PoolOp::WriteMeshInfo { mesh, cpos, slot } => {
+            PoolOp::WriteMeshInfo { mesh, cpos, slot, lod_shift } => {
                 let mut d = [0u8; 16];
                 d[0..4].copy_from_slice(&cpos.x.to_le_bytes());
                 d[4..8].copy_from_slice(&cpos.y.to_le_bytes());
                 d[8..12].copy_from_slice(&cpos.z.to_le_bytes());
-                d[12..16].copy_from_slice(&slot.to_le_bytes());
+                let packed = slot | (u32::from(lod_shift) << 24);
+                d[12..16].copy_from_slice(&packed.to_le_bytes());
                 stage(&d, Dst::MeshInfo, mesh as u64 * 16, &mut staging, &mut copies, &mut dsts);
             }
             PoolOp::ClearIndirect { mesh } => {
@@ -624,9 +639,9 @@ mod tests {
     #[test]
     fn table_index_wraps() {
         assert_eq!(table_index(IVec3::ZERO), 0);
-        assert_eq!(table_index(IVec3::new(32, 0, 0)), 0);
-        assert_eq!(table_index(IVec3::new(-1, 0, 0)), 31);
-        assert_eq!(table_index(IVec3::new(1, 1, 1)), (1 + 32 + 1024) as usize);
+        assert_eq!(table_index(IVec3::new(64, 0, 0)), 0);
+        assert_eq!(table_index(IVec3::new(-1, 0, 0)), 63);
+        assert_eq!(table_index(IVec3::new(1, 1, 1)), (1 + 64 + 4096) as usize);
         // Distinct within a 17-chunk window.
         assert_ne!(table_index(IVec3::new(8, 0, 0)), table_index(IVec3::new(-8, 0, 0)));
     }

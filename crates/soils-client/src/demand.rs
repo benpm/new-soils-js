@@ -27,7 +27,7 @@ use soils_protocol::{CHUNK_BIT, ChunkInfo, ChunkVolume};
 
 use crate::chunk::{ChunkMap, VoxelChunk};
 use crate::cull::DemandedChunks;
-use crate::gpu_gen::{GEN_BUDGET as GPU_GEN_BUDGET, GenReady, GpuGenQueue};
+use crate::gpu_gen::{GEN_BUDGET as GPU_GEN_BUDGET, GenReady, GpuGenJob, GpuGenQueue};
 use crate::light::LightQueue;
 use crate::player::{Player, Streaming};
 use crate::pool::{ChunkSlots, DirtyMesh, PoolOpQueue};
@@ -44,7 +44,7 @@ const PROP_RADIUS: i32 = 1;
 const FETCH_TTL: f32 = 2.0;
 /// Hard cap on chunks mapped into the pools per frame (see the old
 /// apply_chunks: a join burst mapping everything at once hangs weak GPUs).
-const MAP_MAX: usize = 32;
+const MAP_MAX: usize = 128;
 /// Time box within the cap; wall-time so slow frames self-regulate.
 const MAP_MS: f32 = 3.0;
 /// Pristine positions handed to one background gen batch per frame.
@@ -418,7 +418,7 @@ pub fn process_demands(
                         if let Some(s) =
                             slots.map_chunk_gen(&mut pool_ops, &mut dirty_mesh, cpos)
                         {
-                            gpu_gen.0.push((cpos, s.mesh));
+                            gpu_gen.0.push(GpuGenJob { cpos, mesh: s.mesh, lod_shift: 0 });
                             light_queue.chunks.push(cpos);
                             dir.entries.remove(&cpos);
                             proc.priority_set.remove(&cpos);
@@ -475,7 +475,7 @@ pub fn process_demands(
                 if *t > FETCH_TTL {
                     proc.fetch_wait.remove(&cpos);
                     if let Some(last) = streaming.last_chunk
-                        && (cpos - last).abs().max_element() <= streaming.load_radius
+                        && (cpos - last).abs().max_element() <= streaming.detail_radius()
                     {
                         cgen.fetch.push(cpos.to_array());
                     }

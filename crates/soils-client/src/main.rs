@@ -194,6 +194,7 @@ fn main() {
                 server_msg::apply_edits,
                 demand::maintain_cpu_mirror,
                 demand::process_demands,
+                gpu_gen::maintain_lod,
                 gpu_gen::flush_gen_batch,
             )
                 .chain()

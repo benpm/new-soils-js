@@ -206,7 +206,12 @@ pub fn apply_edit(
                     mesh: m,
                     volume: chunk.volume.clone(),
                 });
-                pool_ops.push(crate::pool::PoolOp::WriteMeshInfo { mesh: m, cpos, slot: s.slot });
+                pool_ops.push(crate::pool::PoolOp::WriteMeshInfo {
+                    mesh: m,
+                    cpos,
+                    slot: s.slot,
+                    lod_shift: 0,
+                });
                 pool_ops.push(crate::pool::PoolOp::WriteDesc { slot: s.slot, cpos, mesh: m });
                 dirty_mesh.0.push(m);
                 return;

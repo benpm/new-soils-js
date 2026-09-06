@@ -127,6 +127,17 @@ impl TerrainGen {
         }
     }
 
+    pub fn max_surface(&self) -> i32 {
+        match self.world_type {
+            WorldType::Flat => 256,
+            WorldType::Normal => MAX_SURFACE,
+        }
+    }
+
+    pub fn chunk_guaranteed_air(&self, chunk_pos: glam::IVec3) -> bool {
+        chunk_origin(chunk_pos).y > self.max_surface()
+    }
+
     /// The graph this generator evaluates.
     pub fn graph(&self) -> &TerrainGraph {
         &self.graph

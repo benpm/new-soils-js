@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use wgpu::util::DeviceExt;
 
-const N_MESH: usize = 4096;
+const N_MESH: usize = 8192;
 const TABLE_EMPTY: u32 = u32::MAX;
 /// Camera chunk and load radius the params below are built from.
 const CAMERA_CHUNK_X: i32 = 4;
@@ -55,12 +55,12 @@ fn cull_and_demand_match_cpu_replica() {
         desc[i * 8] = i as i32;
     }
     desc[6 * 8] = 99; // stale: descriptor no longer names chunk (6,0,0)
-    let mut table = vec![TABLE_EMPTY; 32 * 32 * 32];
+    let mut table = vec![TABLE_EMPTY; 64 * 64 * 64];
     for i in 0..mapped {
         if i == 5 {
             continue; // vacant cell
         }
-        table[i] = i as u32; // (i,0,0) & 31 = (i,0,0) → index i
+        table[i] = i as u32;
     }
 
     // Cull params: camera at chunk (4,0,0), radius 2 → window x 2..6, y/z -2..2.
@@ -73,6 +73,7 @@ fn cull_and_demand_match_cpu_replica() {
     for v in [CAMERA_CHUNK_X, 0, 0, RADIUS] {
         params.extend_from_slice(&v.to_le_bytes());
     }
+    params.extend_from_slice(&10_000i32.to_le_bytes());
     params.resize(128, 0);
 
     // CPU replica of the demand scan: window positions whose table cell is
@@ -81,7 +82,7 @@ fn cull_and_demand_match_cpu_replica() {
     for x in 2..=6i32 {
         for y in -2..=2i32 {
             for z in -2..=2i32 {
-                let idx = ((x & 31) + (y & 31) * 32 + (z & 31) * 1024) as usize;
+                let idx = ((x & 63) + (y & 63) * 64 + (z & 63) * 4096) as usize;
                 let slot = table[idx];
                 let mapped_here = slot != TABLE_EMPTY
                     && desc[slot as usize * 8] == x
